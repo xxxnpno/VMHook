@@ -10,6 +10,7 @@
 // DeleteLocalRef cleanup loop, Call*MethodA dispatch, result-handle release, and
 // the round-trip of a built jstring) is covered by JVM integration modules.
 #include <vmhook/vmhook.hpp>
+#include <array>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -2709,6 +2710,651 @@ int main()
         // the unit count for a no-astral multi-width string.
         check("Y3_3byte_2byte_count_is_two",
               utf8_to_utf16(std::string_view{ "\xE2\x82\xAC\xC2\xA2" }).size() == 2);
+    }
+
+    // =====================================================================
+    // SECTION Z -- ADDITIVE DEEPENING (this pass).  return_value::set() /
+    // cancel() value-byte + cancel-flag ENCODING into a caller-owned
+    // return_slot, WITHOUT a live frame.  return_slot is a plain POD
+    // (vmhook.hpp:1313-1317: `bool cancel{false}; int64_t retval{0};`) and
+    // return_value::set<T>() (vmhook.hpp:1353-1382) writes ONLY into that
+    // slot -- it never touches stack_frame on the set/cancel paths -- so the
+    // entire encoding is observable by handing set() a stack-local slot and
+    // reading the bytes back.  (set_arg()/caller()/stack_trace() DO walk a
+    // frame and are deliberately NOT exercised here -- HARD RULE 5: no
+    // fabricated frame deref.)  Every expected value is derived from the
+    // source: cancel := true on every set/cancel; then BY TYPE --
+    //   signed integral && sizeof<int64  -> retval = static_cast<int64>(value)
+    //                                        (SIGN-EXTENDED, the ireturn fix);
+    //   everything else (unsigned, 8-byte, fp, bool, void*) -> retval = 0 then
+    //                                        memcpy(low sizeof(T) bytes).
+    // Targets are little-endian (the whole CI matrix), so the memcpy'd value
+    // lands in the LOW bytes and the high bytes stay zero -- matching this
+    // file's existing union-aliasing LE assertions.
+    // =====================================================================
+    {
+        // ---- (Z1) the POD itself: defaults + member types/layout ----------
+        // Pure value/type facts -- no frame, no JVM.  A default-constructed
+        // slot must read cancel==false / retval==0 (the "callback did nothing"
+        // state the trampoline checks), and the members must keep their exact
+        // widths (a bool flag + a 64-bit raw cell).
+        {
+            vmhook::hotspot::return_slot slot{};
+            check("Z1_slot_default_cancel_false", slot.cancel == false);
+            check("Z1_slot_default_retval_zero", slot.retval == 0);
+        }
+        static_assert(std::is_same_v<decltype(vmhook::hotspot::return_slot::cancel), bool>,
+                      "return_slot::cancel must be bool (the trampoline's cancel flag).");
+        static_assert(std::is_same_v<decltype(vmhook::hotspot::return_slot::retval), std::int64_t>,
+                      "return_slot::retval must be int64 (the raw 64-bit return cell).");
+        static_assert(std::is_trivially_copyable_v<vmhook::hotspot::return_slot>,
+                      "return_slot must be trivially copyable (a stack POD the trampoline allocates).");
+
+        // ---- (Z2) cancel() sets the flag and leaves retval untouched ------
+        // cancel() (vmhook.hpp:1411-1415) sets ONLY cancel=true; a retval the
+        // slot already held is NOT cleared (it is the void-method suppress
+        // path -- the interpreter ignores retval when the method is void).
+        {
+            vmhook::hotspot::return_slot slot{};
+            slot.retval = static_cast<std::int64_t>(0x0123'4567'89AB'CDEFLL);
+            vmhook::return_value ret{ &slot };
+            ret.cancel();
+            check("Z2_cancel_sets_flag", slot.cancel == true);
+            check("Z2_cancel_leaves_retval_untouched",
+                  slot.retval == static_cast<std::int64_t>(0x0123'4567'89AB'CDEFLL));
+        }
+
+        // ---- (Z3) SIGNED sub-int64 set() SIGN-EXTENDS into retval ----------
+        // The `is_signed && integral && sizeof<8` arm assigns
+        // retval = static_cast<int64_t>(value), so a negative narrow value
+        // fills the ENTIRE 64-bit cell with sign bits (the ireturn-pops-+255
+        // bug fix the source comment documents).
+        {
+            vmhook::hotspot::return_slot slot{};
+            vmhook::return_value ret{ &slot };
+
+            ret.set(std::int8_t{ -1 });
+            check("Z3_int8_minus_one_sign_extends", slot.retval == static_cast<std::int64_t>(-1));
+            check("Z3_int8_set_cancels", slot.cancel == true);
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::int8_t{ -128 });
+            check("Z3_int8_min_sign_extends", slot.retval == static_cast<std::int64_t>(-128));
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::int16_t{ -2 });
+            check("Z3_int16_minus_two_sign_extends", slot.retval == static_cast<std::int64_t>(-2));
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::int16_t{ -32768 });
+            check("Z3_int16_min_sign_extends", slot.retval == static_cast<std::int64_t>(-32768));
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::int32_t{ -1 });
+            check("Z3_int32_minus_one_sign_extends", slot.retval == static_cast<std::int64_t>(-1));
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::int32_t{ (std::numeric_limits<std::int32_t>::min)() });
+            check("Z3_int32_min_sign_extends",
+                  slot.retval == static_cast<std::int64_t>((std::numeric_limits<std::int32_t>::min)()));
+
+            // A POSITIVE signed narrow value also goes through static_cast: the
+            // high bytes stay zero (sign bit 0), retval == the value verbatim.
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::int32_t{ 0x0BADF00D });
+            check("Z3_int32_positive_no_high_fill", slot.retval == 0x0BADF00DLL);
+        }
+
+        // ---- (Z4) UNSIGNED / 8-byte set() takes the memcpy (no-extend) arm -
+        // Unsigned narrow values are NOT sign-extended: retval is zeroed then
+        // the low sizeof(T) bytes are memcpy'd, so the high bytes stay zero
+        // even for a high-bit-set source (0xFFFFFFFF -> 0x00000000FFFFFFFF,
+        // NOT -1).  This is the documented contrast with the signed arm.
+        {
+            vmhook::hotspot::return_slot slot{};
+            vmhook::return_value ret{ &slot };
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::uint8_t{ 0xFF });
+            check("Z4_uint8_max_zero_extends", slot.retval == 0x00000000000000FFLL);
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::uint16_t{ 0xFFFF });
+            check("Z4_uint16_max_zero_extends", slot.retval == 0x000000000000FFFFLL);
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::uint32_t{ 0xFFFFFFFFu });
+            check("Z4_uint32_max_zero_extends_not_minus_one",
+                  slot.retval == 0x00000000FFFFFFFFLL);
+            check("Z4_uint32_max_is_not_sign_extended", slot.retval != static_cast<std::int64_t>(-1));
+
+            // 8-byte integrals (signed or unsigned) are sizeof==int64 -> NOT the
+            // sign-extend arm (which requires sizeof<int64); they take memcpy at
+            // full width, so the whole 64-bit pattern lands verbatim.
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::int64_t{ static_cast<std::int64_t>(0xCAFEBABEDEADBEEFULL) });
+            check("Z4_int64_full_width_verbatim",
+                  slot.retval == static_cast<std::int64_t>(0xCAFEBABEDEADBEEFULL));
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(std::uint64_t{ 0xFFFFFFFFFFFFFFFFULL });
+            check("Z4_uint64_max_full_width", slot.retval == static_cast<std::int64_t>(-1));
+        }
+
+        // ---- (Z5) bool set() -> low byte 1/0, high bytes zero --------------
+        // bool is integral but std::is_signed_v<bool> is false, so it takes the
+        // memcpy arm: a single byte 0x01 / 0x00 over a zeroed cell.
+        {
+            vmhook::hotspot::return_slot slot{};
+            vmhook::return_value ret{ &slot };
+
+            ret.set(true);
+            check("Z5_bool_true_is_one", slot.retval == 1);
+            check("Z5_bool_true_high_bytes_zero", (slot.retval >> 8) == 0);
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(false);
+            check("Z5_bool_false_is_zero", slot.retval == 0);
+        }
+
+        // ---- (Z6) float / double set() -> IEEE-754 bits in the cell --------
+        // float / double are not integral -> memcpy arm.  float writes the low
+        // 4 bytes (1.0f == 0x3F800000) over the zeroed cell (high word zero);
+        // double writes all 8 (1.0 == 0x3FF0000000000000).
+        {
+            vmhook::hotspot::return_slot slot{};
+            vmhook::return_value ret{ &slot };
+
+            ret.set(1.0f);
+            check("Z6_float_one_low_word_ieee_high_zero",
+                  slot.retval == 0x000000003F800000LL);
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(-2.0f); // 0xC0000000
+            check("Z6_float_neg_two_low_word_ieee_high_zero",
+                  slot.retval == 0x00000000C0000000LL);
+
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(1.0);
+            check("Z6_double_one_full_width_ieee",
+                  slot.retval == static_cast<std::int64_t>(0x3FF0000000000000LL));
+
+            // -0.0 keeps its sign bit in the top bit of the full-width cell.
+            slot = vmhook::hotspot::return_slot{};
+            ret.set(-0.0);
+            check("Z6_double_neg_zero_sign_bit_kept",
+                  (static_cast<std::uint64_t>(slot.retval) & 0x8000000000000000ULL) != 0ULL);
+        }
+
+        // ---- (Z7) void* (oop) set() -> pointer bits in the low cell --------
+        // A reference return is an oop written as a raw pointer.  void* is not
+        // integral -> memcpy arm: the pointer's bit pattern lands in retval.
+        // (Real-buffer, owned local; never dereferenced -- HARD RULE 5.)
+        {
+            vmhook::hotspot::return_slot slot{};
+            vmhook::return_value ret{ &slot };
+            std::int64_t witness{ 0 };
+            void* const oop{ &witness }; // a real, mapped, owned address
+            ret.set(oop);
+            check("Z7_void_ptr_lands_in_retval",
+                  slot.retval == static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(oop)));
+            check("Z7_void_ptr_set_cancels", slot.cancel == true);
+
+            // A null oop return: retval cleared to 0, cancel set.
+            slot = vmhook::hotspot::return_slot{};
+            void* const null_oop{ nullptr };
+            ret.set(null_oop);
+            check("Z7_null_void_ptr_zero", slot.retval == 0);
+            check("Z7_null_void_ptr_cancels", slot.cancel == true);
+        }
+    }
+
+    // =====================================================================
+    // SECTION AA -- ADDITIVE DEEPENING (this pass).  The two pure descriptor
+    // classifiers the field/signature machinery shares with the arg packer:
+    //   vmhook::detail::sig_char_to_basic_type(char)  (vmhook.hpp:16215) ->
+    //     the HotSpot BasicType int for a single type-descriptor char, and
+    //   vmhook::detail::jvm_primitive_byte_width(string_view) (vmhook.hpp:
+    //     16250) -> the in-heap byte width of a primitive field's signature.
+    // Both are pure switch tables with NO JVM dependency.  Exhaustively cover
+    // EVERY descriptor char + the documented fallbacks, and tie each back to
+    // jni_signature_for_arg's letters (the packer side) so the BasicType the
+    // JVM would read for a packed arg is pinned end to end.  Every expected
+    // value is the literal from the source switch.
+    // =====================================================================
+    {
+        using vmhook::detail::sig_char_to_basic_type;
+        using vmhook::detail::jvm_primitive_byte_width;
+
+        // ---- (AA1) sig_char_to_basic_type: the full T_* table -------------
+        // Values from the source switch (T_BOOLEAN=4 .. T_VOID=14); the L/[ and
+        // the default both map to T_OBJECT=12.
+        check("AA1_Z_boolean_4", sig_char_to_basic_type('Z') == 4);
+        check("AA1_C_char_5",    sig_char_to_basic_type('C') == 5);
+        check("AA1_F_float_6",   sig_char_to_basic_type('F') == 6);
+        check("AA1_D_double_7",  sig_char_to_basic_type('D') == 7);
+        check("AA1_B_byte_8",    sig_char_to_basic_type('B') == 8);
+        check("AA1_S_short_9",   sig_char_to_basic_type('S') == 9);
+        check("AA1_I_int_10",    sig_char_to_basic_type('I') == 10);
+        check("AA1_J_long_11",   sig_char_to_basic_type('J') == 11);
+        check("AA1_L_object_12", sig_char_to_basic_type('L') == 12);
+        check("AA1_array_13",    sig_char_to_basic_type('[') == 13);
+        check("AA1_V_void_14",   sig_char_to_basic_type('V') == 14);
+
+        // Fallback: any unrecognised char -> T_OBJECT (12).  A spread of
+        // never-a-descriptor chars (lowercase, digit, punctuation, NUL) all
+        // collapse to the object fallback, exactly like 'L'.
+        check("AA1_fallback_lower_z", sig_char_to_basic_type('z') == 12);
+        check("AA1_fallback_digit",   sig_char_to_basic_type('0') == 12);
+        check("AA1_fallback_semicolon", sig_char_to_basic_type(';') == 12);
+        check("AA1_fallback_Q",       sig_char_to_basic_type('Q') == 12);
+        check("AA1_fallback_nul",     sig_char_to_basic_type(static_cast<char>(0)) == 12);
+        // The fallback equals the explicit 'L' (object) value -- pin that they
+        // are indistinguishable (an unknown char is treated AS an object type).
+        check("AA1_fallback_equals_L_object",
+              sig_char_to_basic_type('?') == sig_char_to_basic_type('L'));
+
+        // ---- (AA2) jvm_primitive_byte_width: width table + non-1-len reject -
+        // Single-char primitive signatures map to their in-heap byte width;
+        // reference/array/void and any unknown char map to 0 (the "skip size
+        // validation" sentinel), and a non-length-1 signature is 0 by the
+        // leading `signature.size() != 1` guard.
+        check("AA2_Z_width_1", jvm_primitive_byte_width("Z") == 1);
+        check("AA2_B_width_1", jvm_primitive_byte_width("B") == 1);
+        check("AA2_S_width_2", jvm_primitive_byte_width("S") == 2);
+        check("AA2_C_width_2", jvm_primitive_byte_width("C") == 2);
+        check("AA2_I_width_4", jvm_primitive_byte_width("I") == 4);
+        check("AA2_F_width_4", jvm_primitive_byte_width("F") == 4);
+        check("AA2_J_width_8", jvm_primitive_byte_width("J") == 8);
+        check("AA2_D_width_8", jvm_primitive_byte_width("D") == 8);
+
+        // Reference / array / void -> 0 (width is OOP-mode-dependent or N/A).
+        check("AA2_L_width_0", jvm_primitive_byte_width("L") == 0);
+        check("AA2_array_width_0", jvm_primitive_byte_width("[") == 0);
+        check("AA2_V_width_0", jvm_primitive_byte_width("V") == 0);
+        // Unknown single char -> 0.
+        check("AA2_unknown_width_0", jvm_primitive_byte_width("X") == 0);
+
+        // Non-length-1 signatures -> 0 via the size guard (empty, a full object
+        // descriptor, an array descriptor, a multi-char primitive-looking str).
+        check("AA2_empty_width_0", jvm_primitive_byte_width(std::string_view{}) == 0);
+        check("AA2_object_descriptor_width_0",
+              jvm_primitive_byte_width("Ljava/lang/String;") == 0);
+        check("AA2_array_of_int_width_0", jvm_primitive_byte_width("[I") == 0);
+        check("AA2_two_char_II_width_0", jvm_primitive_byte_width("II") == 0);
+        // An interior NUL does not shorten the view (counted length) -- a 2-char
+        // view "I\0" is size 2 -> guard rejects -> 0 (NOT the 'I' width 4).
+        {
+            const std::string sig_with_nul{ std::string("I") + '\0' };
+            check("AA2_I_plus_nul_len2_width_0",
+                  jvm_primitive_byte_width(std::string_view{ sig_with_nul }) == 0);
+        }
+
+        // ---- (AA3) cross-tie: a packed primitive's descriptor letter -> the
+        // BasicType + width the JVM would read.  jni_signature_for_arg gives a
+        // 1-char letter for every primitive; feed it to both classifiers and
+        // confirm they agree about the Java type.  (sig<T>() is the packer side;
+        // sig_char_to_basic_type / jvm_primitive_byte_width are the field side.)
+        check("AA3_bool_letter_to_basictype_and_width",
+              sig_char_to_basic_type(sig<bool>()[0]) == 4
+              && jvm_primitive_byte_width(sig<bool>()) == 1);
+        check("AA3_int8_letter_B_basictype8_width1",
+              sig_char_to_basic_type(sig<std::int8_t>()[0]) == 8
+              && jvm_primitive_byte_width(sig<std::int8_t>()) == 1);
+        check("AA3_uint16_letter_C_basictype5_width2",
+              sig_char_to_basic_type(sig<std::uint16_t>()[0]) == 5
+              && jvm_primitive_byte_width(sig<std::uint16_t>()) == 2);
+        check("AA3_int16_letter_S_basictype9_width2",
+              sig_char_to_basic_type(sig<std::int16_t>()[0]) == 9
+              && jvm_primitive_byte_width(sig<std::int16_t>()) == 2);
+        check("AA3_int32_letter_I_basictype10_width4",
+              sig_char_to_basic_type(sig<std::int32_t>()[0]) == 10
+              && jvm_primitive_byte_width(sig<std::int32_t>()) == 4);
+        check("AA3_int64_letter_J_basictype11_width8",
+              sig_char_to_basic_type(sig<std::int64_t>()[0]) == 11
+              && jvm_primitive_byte_width(sig<std::int64_t>()) == 8);
+        check("AA3_float_letter_F_basictype6_width4",
+              sig_char_to_basic_type(sig<float>()[0]) == 6
+              && jvm_primitive_byte_width(sig<float>()) == 4);
+        check("AA3_double_letter_D_basictype7_width8",
+              sig_char_to_basic_type(sig<double>()[0]) == 7
+              && jvm_primitive_byte_width(sig<double>()) == 8);
+        // A String arg's descriptor begins with 'L' -> T_OBJECT(12), width 0
+        // (the whole multi-char descriptor is non-length-1 -> 0 anyway).
+        check("AA3_string_first_char_L_object",
+              sig_char_to_basic_type(sig<std::string>()[0]) == 12
+              && jvm_primitive_byte_width(sig<std::string>()) == 0);
+    }
+
+    // =====================================================================
+    // SECTION AB -- ADDITIVE DEEPENING (this pass).  decode_u5 -- the pure
+    // UNSIGNED5 byte-stream decoder (vmhook.hpp:3848, the JDK 21+
+    // FieldInfoStream codec).  Signature:
+    //   klass::decode_u5(const uint8_t* data, int& stream_pos) -> uint32_t
+    // It indexes `data[stream_pos++]` directly (no safe_read) so every input
+    // here is a REAL owned buffer (std::array) -- HARD RULE 5, never a
+    // fabricated address.  Algorithm (from the source):
+    //   sum += (b_i - 1) << (6*i)   for i = 0..4 ;
+    //   stop + return sum at the first b_i < 192 (a "low byte") ;
+    //   b_i == 0 -> End marker: REWIND (--stream_pos) and return ~0u ;
+    //   after 5 bytes -> return sum.
+    // Every expected value below is hand-derived from that arithmetic, and the
+    // CURSOR delta (stream_pos advance / rewind) is asserted alongside the
+    // value -- the two are the only way to disambiguate End from a real
+    // UINT32_MAX, per the source caveat.
+    // =====================================================================
+    {
+        using vmhook::hotspot::klass;
+
+        // ---- (AB1) single low byte b in [1,191] -> sum = b-1, advance 1 ----
+        // b=1 -> 0 ; b=2 -> 1 ; b=128 -> 127 ; b=191 -> 190 (max single-byte).
+        {
+            const std::array<std::uint8_t, 1> buf{ { std::uint8_t{ 1 } } };
+            int pos{ 0 };
+            const std::uint32_t v{ klass::decode_u5(buf.data(), pos) };
+            check("AB1_byte_1_is_zero", v == 0u);
+            check("AB1_byte_1_advances_one", pos == 1);
+        }
+        {
+            const std::array<std::uint8_t, 1> buf{ { std::uint8_t{ 2 } } };
+            int pos{ 0 };
+            check("AB1_byte_2_is_one", klass::decode_u5(buf.data(), pos) == 1u);
+            check("AB1_byte_2_advances_one", pos == 1);
+        }
+        {
+            const std::array<std::uint8_t, 1> buf{ { std::uint8_t{ 128 } } };
+            int pos{ 0 };
+            check("AB1_byte_128_is_127", klass::decode_u5(buf.data(), pos) == 127u);
+        }
+        {
+            const std::array<std::uint8_t, 1> buf{ { std::uint8_t{ 191 } } };
+            int pos{ 0 };
+            const std::uint32_t v{ klass::decode_u5(buf.data(), pos) };
+            check("AB1_byte_191_is_190_max_single", v == 190u);
+            check("AB1_byte_191_advances_one", pos == 1);
+        }
+
+        // ---- (AB2) two-byte sequences {b0>=192, b1<192} --------------------
+        // sum = (b0-1) + (b1-1)<<6.
+        // {192,1} -> 191 + 0      = 191 (first value needing two bytes).
+        // {193,1} -> 192 + 0      = 192.
+        // {192,2} -> 191 + (1<<6) = 191 + 64  = 255.
+        // {255,191} -> 254 + (190<<6) = 254 + 12160 = 12414 (max two-byte).
+        {
+            const std::array<std::uint8_t, 2> buf{ { std::uint8_t{ 192 }, std::uint8_t{ 1 } } };
+            int pos{ 0 };
+            const std::uint32_t v{ klass::decode_u5(buf.data(), pos) };
+            check("AB2_192_1_is_191", v == 191u);
+            check("AB2_192_1_advances_two", pos == 2);
+        }
+        {
+            const std::array<std::uint8_t, 2> buf{ { std::uint8_t{ 193 }, std::uint8_t{ 1 } } };
+            int pos{ 0 };
+            check("AB2_193_1_is_192", klass::decode_u5(buf.data(), pos) == 192u);
+        }
+        {
+            const std::array<std::uint8_t, 2> buf{ { std::uint8_t{ 192 }, std::uint8_t{ 2 } } };
+            int pos{ 0 };
+            check("AB2_192_2_is_255", klass::decode_u5(buf.data(), pos) == 255u);
+        }
+        {
+            const std::array<std::uint8_t, 2> buf{ { std::uint8_t{ 255 }, std::uint8_t{ 191 } } };
+            int pos{ 0 };
+            const std::uint32_t v{ klass::decode_u5(buf.data(), pos) };
+            check("AB2_255_191_is_12414_max_two_byte", v == 12414u);
+            check("AB2_255_191_advances_two", pos == 2);
+        }
+
+        // ---- (AB3) three-byte sequence ------------------------------------
+        // {192,192,1}: i0 sum=191 (b>=192 cont); i1 sum+=(191<<6)=12224 ->
+        // 12415 (b>=192 cont); i2 b=1<192 sum+=0 -> 12415, advance 3.
+        {
+            const std::array<std::uint8_t, 3> buf{ { std::uint8_t{ 192 }, std::uint8_t{ 192 }, std::uint8_t{ 1 } } };
+            int pos{ 0 };
+            const std::uint32_t v{ klass::decode_u5(buf.data(), pos) };
+            check("AB3_192_192_1_is_12415", v == 12415u);
+            check("AB3_192_192_1_advances_three", pos == 3);
+        }
+
+        // ---- (AB4) the genuine 5-byte UINT32_MAX {192,254,253,253,253} -----
+        // Decodes to exactly 0xFFFFFFFF AND advances by 5 (the source caveat:
+        // same return value as the End marker, disambiguated only by the cursor
+        // -- here it ADVANCES, End rewinds; AB5 pins the contrast).
+        {
+            const std::array<std::uint8_t, 5> buf{ {
+                std::uint8_t{ 192 }, std::uint8_t{ 254 }, std::uint8_t{ 253 },
+                std::uint8_t{ 253 }, std::uint8_t{ 253 } } };
+            int pos{ 0 };
+            const std::uint32_t v{ klass::decode_u5(buf.data(), pos) };
+            check("AB4_uint32_max_value", v == ~0u);
+            check("AB4_uint32_max_advances_five", pos == 5);
+        }
+
+        // ---- (AB5) End marker: a 0 byte rewinds and returns ~0u ------------
+        // current_byte==0 -> --stream_pos (rewind so the 0 is NOT consumed) and
+        // return ~0u.  Same RETURN as AB4 but the cursor is UNCHANGED -- the
+        // disambiguator the source documents.
+        {
+            const std::array<std::uint8_t, 1> buf{ { std::uint8_t{ 0 } } };
+            int pos{ 0 };
+            const std::uint32_t v{ klass::decode_u5(buf.data(), pos) };
+            check("AB5_end_marker_returns_all_ones", v == ~0u);
+            check("AB5_end_marker_rewinds_cursor_unchanged", pos == 0);
+        }
+        // A 0 byte mid-buffer at a non-zero start position rewinds to exactly
+        // that position (not to 0): start pos 3, the 0 at index 3 leaves pos 3.
+        {
+            const std::array<std::uint8_t, 4> buf{ {
+                std::uint8_t{ 5 }, std::uint8_t{ 6 }, std::uint8_t{ 7 }, std::uint8_t{ 0 } } };
+            int pos{ 3 };
+            const std::uint32_t v{ klass::decode_u5(buf.data(), pos) };
+            check("AB5_mid_buffer_end_returns_all_ones", v == ~0u);
+            check("AB5_mid_buffer_end_rewinds_to_start_pos", pos == 3);
+        }
+
+        // ---- (AB6) THREADED walk: decode_u5 advances the SAME cursor across
+        // back-to-back reads (the FieldInfoStream usage at vmhook.hpp:3967+).
+        // A buffer of [low, low-low(2B), End] decodes to the three logical
+        // values in order, with the cursor threading through, and the final
+        // End leaves the cursor parked on the 0 byte.
+        {
+            // byte 10            -> single low byte, value 9, adv to 1
+            // {192,1} at [1..2]  -> value 191, adv to 3
+            // 0 at [3]           -> End, value ~0u, cursor stays 3
+            const std::array<std::uint8_t, 4> buf{ {
+                std::uint8_t{ 10 }, std::uint8_t{ 192 }, std::uint8_t{ 1 }, std::uint8_t{ 0 } } };
+            int pos{ 0 };
+
+            const std::uint32_t v0{ klass::decode_u5(buf.data(), pos) };
+            check("AB6_walk_first_value_9", v0 == 9u);
+            check("AB6_walk_after_first_pos_1", pos == 1);
+
+            const std::uint32_t v1{ klass::decode_u5(buf.data(), pos) };
+            check("AB6_walk_second_value_191", v1 == 191u);
+            check("AB6_walk_after_second_pos_3", pos == 3);
+
+            const std::uint32_t v2{ klass::decode_u5(buf.data(), pos) };
+            check("AB6_walk_third_is_end", v2 == ~0u);
+            check("AB6_walk_end_parks_on_zero_byte", pos == 3);
+        }
+
+        // ---- (AB7) continuation byte exactly 192 is the boundary -----------
+        // 192 is NOT a low byte (the test is `< 192`), so a 192 continues the
+        // sequence; 191 terminates it.  {192, 191}: i0 sum=191 cont; i1 b=191<
+        // 192 sum+=190<<6=12160 -> 12351, terminate, adv 2.
+        {
+            const std::array<std::uint8_t, 2> buf{ { std::uint8_t{ 192 }, std::uint8_t{ 191 } } };
+            int pos{ 0 };
+            const std::uint32_t v{ klass::decode_u5(buf.data(), pos) };
+            check("AB7_192_then_191_is_12351", v == 12351u);
+            check("AB7_192_then_191_advances_two", pos == 2);
+        }
+    }
+
+    // =====================================================================
+    // SECTION AC -- ADDITIVE DEEPENING (this pass).  vmhook::get_array_element
+    // / set_array_element / array_length element-stride + bounds math on a
+    // REAL owned buffer laid out as a HotSpot primitive-array object (vmhook.hpp
+    // 14778-14876).  Layout from the source comment: +12 = int32 _length,
+    // +16 = element data; stride = sizeof(element_type); the element read/write
+    // is bounds-checked against array_length() and the byte offset is computed
+    // in ptrdiff_t.  The buffer is a std::vector<uint8_t> (a real, mapped,
+    // owned allocation that passes is_valid_pointer and whose bytes safe_read
+    // returns verbatim) -- HARD RULE 5: no fabricated address is ever read as
+    // data.  Header fields and elements are written via memcpy into the owned
+    // bytes, so every expected value is exact arithmetic over real memory.
+    // =====================================================================
+    {
+        // Helper: build an owned array buffer of `count` elements of width
+        // `elem_size`, header at +12 (length) / data at +16, zero-filled.  The
+        // returned vector OWNS the storage; array_oop = buf.data().
+        auto make_array_buffer = [](std::int32_t count, std::size_t elem_size) -> std::vector<std::uint8_t> {
+            const std::size_t total{ 16u + static_cast<std::size_t>(count) * elem_size };
+            std::vector<std::uint8_t> buf(total, std::uint8_t{ 0 });
+            std::memcpy(buf.data() + 12, &count, sizeof(count));
+            return buf;
+        };
+
+        // ---- (AC1) array_length reads the +12 int32 length slot -----------
+        {
+            std::vector<std::uint8_t> buf{ make_array_buffer(5, sizeof(std::int32_t)) };
+            void* const oop{ buf.data() };
+            check("AC1_array_length_reads_header", vmhook::array_length(oop) == 5);
+        }
+        // A zero-length array reports 0; null oop reports 0 (no fault).
+        {
+            std::vector<std::uint8_t> buf{ make_array_buffer(0, sizeof(std::int32_t)) };
+            check("AC1_zero_length", vmhook::array_length(buf.data()) == 0);
+        }
+        check("AC1_null_oop_length_zero", vmhook::array_length(nullptr) == 0);
+
+        // ---- (AC2) int32 element round-trip + stride ----------------------
+        // Write distinct values at every index, then read them back: proves the
+        // stride (sizeof(int32)=4) lands each element at +16 + index*4 with no
+        // overlap.  Also memcpy the raw bytes out to confirm the data offset.
+        {
+            std::vector<std::uint8_t> buf{ make_array_buffer(4, sizeof(std::int32_t)) };
+            void* const oop{ buf.data() };
+            vmhook::set_array_element<std::int32_t>(oop, 0, 0x11111111);
+            vmhook::set_array_element<std::int32_t>(oop, 1, static_cast<std::int32_t>(0x22222222));
+            vmhook::set_array_element<std::int32_t>(oop, 2, static_cast<std::int32_t>(0xFFFFFFFF));
+            vmhook::set_array_element<std::int32_t>(oop, 3, static_cast<std::int32_t>(0x80000000));
+
+            check("AC2_int32_get0", vmhook::get_array_element<std::int32_t>(oop, 0) == 0x11111111);
+            check("AC2_int32_get1", vmhook::get_array_element<std::int32_t>(oop, 1) == static_cast<std::int32_t>(0x22222222));
+            check("AC2_int32_get2_high_bit", vmhook::get_array_element<std::int32_t>(oop, 2) == static_cast<std::int32_t>(0xFFFFFFFF));
+            check("AC2_int32_get3_sign_bit", vmhook::get_array_element<std::int32_t>(oop, 3) == static_cast<std::int32_t>(0x80000000));
+
+            // Element 1 must sit at byte offset 16 + 1*4 = 20 (stride proof).
+            std::int32_t raw_at_20{ 0 };
+            std::memcpy(&raw_at_20, buf.data() + 20, sizeof(raw_at_20));
+            check("AC2_element1_at_offset_20", raw_at_20 == static_cast<std::int32_t>(0x22222222));
+        }
+
+        // ---- (AC3) bounds: index < 0 and index >= length are rejected ------
+        // An out-of-range get returns element_type{} (here 0) WITHOUT reading
+        // past the buffer; an out-of-range set is a no-op (the in-bounds
+        // neighbours stay untouched).  All on real owned memory.  The buffer is
+        // sized for 4 int32 slots but _length is set to 3, so the 4th physical
+        // slot (offset 16+3*4=28) is a REAL owned, zeroed cell an out-of-range
+        // write to index 3 must NOT touch -- and reading it back is in-bounds
+        // of OUR buffer (no over-read; HARD RULE 6 / stringop-overflow safe).
+        {
+            std::vector<std::uint8_t> buf{ make_array_buffer(4, sizeof(std::int32_t)) };
+            const std::int32_t logical_len{ 3 };
+            std::memcpy(buf.data() + 12, &logical_len, sizeof(logical_len)); // shrink _length to 3
+            void* const oop{ buf.data() };
+            check("AC3_length_is_three", vmhook::array_length(oop) == 3);
+            vmhook::set_array_element<std::int32_t>(oop, 0, 0x0A0A0A0A);
+            vmhook::set_array_element<std::int32_t>(oop, 2, 0x0C0C0C0C);
+
+            check("AC3_get_negative_index_zero",
+                  vmhook::get_array_element<std::int32_t>(oop, -1) == 0);
+            check("AC3_get_index_equal_length_zero",
+                  vmhook::get_array_element<std::int32_t>(oop, 3) == 0);
+            check("AC3_get_index_past_length_zero",
+                  vmhook::get_array_element<std::int32_t>(oop, 1000) == 0);
+
+            // Out-of-range SET must not change anything in-bounds (or the spare
+            // physical slot at index 3).
+            vmhook::set_array_element<std::int32_t>(oop, 3, static_cast<std::int32_t>(0x01020304));
+            vmhook::set_array_element<std::int32_t>(oop, -5, static_cast<std::int32_t>(0x01020304));
+            check("AC3_oob_set_left_index0_intact",
+                  vmhook::get_array_element<std::int32_t>(oop, 0) == 0x0A0A0A0A);
+            check("AC3_oob_set_left_index2_intact",
+                  vmhook::get_array_element<std::int32_t>(oop, 2) == 0x0C0C0C0C);
+            // The spare 4th slot (offset 28, in-bounds of the 32-byte buffer)
+            // was never written -- the rejected index-3 set left it zero.
+            std::int32_t spare_slot{ 0 };
+            std::memcpy(&spare_slot, buf.data() + 28, sizeof(spare_slot));
+            check("AC3_oob_set_did_not_write_spare_slot", spare_slot == 0);
+        }
+
+        // ---- (AC4) byte (int8) stride 1 + boundary indices -----------------
+        {
+            std::vector<std::uint8_t> buf{ make_array_buffer(8, sizeof(std::int8_t)) };
+            void* const oop{ buf.data() };
+            vmhook::set_array_element<std::int8_t>(oop, 0, std::int8_t{ -1 });
+            vmhook::set_array_element<std::int8_t>(oop, 7, std::int8_t{ 127 });
+            check("AC4_int8_first", vmhook::get_array_element<std::int8_t>(oop, 0) == std::int8_t{ -1 });
+            check("AC4_int8_last", vmhook::get_array_element<std::int8_t>(oop, 7) == std::int8_t{ 127 });
+            check("AC4_int8_oob_at_length", vmhook::get_array_element<std::int8_t>(oop, 8) == std::int8_t{ 0 });
+            // Last element sits at +16 + 7*1 = 23 (the final byte of the buffer).
+            check("AC4_int8_last_at_offset_23", buf[23] == static_cast<std::uint8_t>(127));
+        }
+
+        // ---- (AC5) wide (int64 / double) stride 8 round-trip ---------------
+        // Confirms the 8-byte stride and that the ptrdiff_t offset math places
+        // element i at +16 + i*8 for a value with set high bits (no 32-bit
+        // multiply truncation on these small honest indices).
+        {
+            std::vector<std::uint8_t> buf{ make_array_buffer(3, sizeof(std::int64_t)) };
+            void* const oop{ buf.data() };
+            vmhook::set_array_element<std::int64_t>(oop, 0, static_cast<std::int64_t>(0x1122334455667788LL));
+            vmhook::set_array_element<std::int64_t>(oop, 2, static_cast<std::int64_t>(0xFFFFFFFFFFFFFFFFULL));
+            check("AC5_int64_get0", vmhook::get_array_element<std::int64_t>(oop, 0) == 0x1122334455667788LL);
+            check("AC5_int64_get2_all_ones", vmhook::get_array_element<std::int64_t>(oop, 2) == static_cast<std::int64_t>(-1));
+            // Element 2 at byte offset 16 + 2*8 = 32.
+            std::int64_t raw_at_32{ 0 };
+            std::memcpy(&raw_at_32, buf.data() + 32, sizeof(raw_at_32));
+            check("AC5_element2_at_offset_32", raw_at_32 == static_cast<std::int64_t>(-1));
+
+            // double stride 8: a bit-exact round-trip (NaN-safe via bits_eq).
+            std::vector<std::uint8_t> dbuf{ make_array_buffer(2, sizeof(double)) };
+            void* const doop{ dbuf.data() };
+            vmhook::set_array_element<double>(doop, 1, -2.5);
+            check("AC5_double_round_trip", bits_eq(vmhook::get_array_element<double>(doop, 1), -2.5));
+        }
+
+        // ---- (AC6) uint16 (jchar width) stride 2 + zero-extension ----------
+        {
+            std::vector<std::uint8_t> buf{ make_array_buffer(4, sizeof(std::uint16_t)) };
+            void* const oop{ buf.data() };
+            vmhook::set_array_element<std::uint16_t>(oop, 0, std::uint16_t{ 0x4E2D });
+            vmhook::set_array_element<std::uint16_t>(oop, 3, std::uint16_t{ 0xFFFF });
+            check("AC6_uint16_get0", vmhook::get_array_element<std::uint16_t>(oop, 0) == std::uint16_t{ 0x4E2D });
+            check("AC6_uint16_get3_max", vmhook::get_array_element<std::uint16_t>(oop, 3) == std::uint16_t{ 0xFFFF });
+            // Element 3 at +16 + 3*2 = 22.
+            std::uint16_t raw_at_22{ 0 };
+            std::memcpy(&raw_at_22, buf.data() + 22, sizeof(raw_at_22));
+            check("AC6_element3_at_offset_22", raw_at_22 == std::uint16_t{ 0xFFFF });
+        }
+
+        // ---- (AC7) length boundary: highest valid index vs first invalid ---
+        // For an N-element array the valid indices are [0, N-1]; index N is the
+        // first rejected one.  Pin the exact edge with a witness write at N-1
+        // surviving and the index==N read returning {} on a freshly-zeroed slot.
+        {
+            const std::int32_t n{ 6 };
+            std::vector<std::uint8_t> buf{ make_array_buffer(n, sizeof(std::int32_t)) };
+            void* const oop{ buf.data() };
+            vmhook::set_array_element<std::int32_t>(oop, n - 1, static_cast<std::int32_t>(0x5A5A5A5A));
+            check("AC7_highest_valid_index_round_trips",
+                  vmhook::get_array_element<std::int32_t>(oop, n - 1) == static_cast<std::int32_t>(0x5A5A5A5A));
+            check("AC7_index_equal_length_rejected",
+                  vmhook::get_array_element<std::int32_t>(oop, n) == 0);
+            check("AC7_array_length_matches_n", vmhook::array_length(oop) == n);
+        }
     }
 
     return failures == 0 ? 0 : 1;

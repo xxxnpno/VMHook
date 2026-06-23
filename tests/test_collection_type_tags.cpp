@@ -67,6 +67,9 @@
 #include <utility>
 #include <limits>
 #include <string_view>
+#include <cstring>
+#include <array>
+#include <tuple>
 
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
@@ -2844,6 +2847,557 @@ static auto test_is_unique_ptr_trait() -> void
     check("is_unique_ptr_trait_static_asserts_held", true);
 }
 
+// ---------------------------------------------------------------------------
+// 26. [ADDITIVE] hotspot::return_slot POD layout + return_value cancel-flag /
+//     value-byte ENCODING logic, WITHOUT a live frame.
+//
+// return_slot is the {bool cancel; int64_t retval;} cell the trampoline
+// allocates and the callback writes via return_value::set()/cancel().  set<T>
+// is the ENCODER: it sets cancel=true and writes retval as EITHER a sign-
+// extended int64 (for signed integral T narrower than 8 bytes) OR a zero-filled
+// memcpy of the raw bytes (everything else — bool, unsigned, float/double,
+// void*).  cancel() flips cancel WITHOUT touching retval; the object_base null-
+// return overload zeroes retval.  All of this is pure POD + byte arithmetic on a
+// caller-owned return_slot — no frame is dereferenced (return_value takes the
+// frame defaulted to nullptr; set/cancel never read it).  This section feeds a
+// REAL stack return_slot and pins the exact bytes the encoder lands, the area
+// the file never touched.  Every expected value is computed by the SAME closed
+// form the header documents (sign-extend vs zero-fill memcpy).
+// ---------------------------------------------------------------------------
+static auto test_return_slot_encoding() -> void
+{
+    // The POD is exactly the documented two fields with their brace defaults.
+    {
+        vmhook::hotspot::return_slot slot{};
+        check("return_slot_default_cancel_false", slot.cancel == false);
+        check("return_slot_default_retval_zero",  slot.retval == 0);
+    }
+    static_assert(std::is_trivially_copyable_v<vmhook::hotspot::return_slot>,
+                  "return_slot is a raw stack cell -- must be trivially copyable.");
+    static_assert(std::is_standard_layout_v<vmhook::hotspot::return_slot>,
+                  "return_slot is written by hand-rolled trampoline asm -- standard layout.");
+    static_assert(std::is_same_v<decltype(vmhook::hotspot::return_slot::cancel), bool>);
+    static_assert(std::is_same_v<decltype(vmhook::hotspot::return_slot::retval), std::int64_t>);
+
+    // return_value is constructed from a slot pointer with the frame DEFAULTED to
+    // nullptr; the ctor and set/cancel are noexcept and never read the frame.
+    static_assert(std::is_constructible_v<vmhook::return_value,
+                                          vmhook::hotspot::return_slot*>,
+                  "return_value{slot} (frame defaulted nullptr) must be constructible.");
+    {
+        vmhook::hotspot::return_slot probe{};
+        check("return_value_ctor_noexcept",
+              noexcept(vmhook::return_value{ &probe }));
+        const vmhook::return_value rv{ &probe };
+        check("return_value_frame_null_when_defaulted", rv.frame() == nullptr);
+        check("return_value_frame_noexcept", noexcept(rv.frame()));
+    }
+
+    // --- cancel() sets cancel=true and leaves retval UNTOUCHED. ---
+    {
+        vmhook::hotspot::return_slot slot{};
+        slot.retval = static_cast<std::int64_t>(0x0123'4567'89AB'CDEFLL);
+        vmhook::return_value rv{ &slot };
+        check("cancel_noexcept", noexcept(rv.cancel()));
+        rv.cancel();
+        check("cancel_sets_cancel_true", slot.cancel == true);
+        check("cancel_leaves_retval_untouched",
+              slot.retval == static_cast<std::int64_t>(0x0123'4567'89AB'CDEFLL));
+    }
+
+    // --- set<T>() always raises cancel. ---
+    {
+        vmhook::hotspot::return_slot slot{};
+        vmhook::return_value rv{ &slot };
+        check("set_noexcept", noexcept(rv.set(std::int32_t{ 0 })));
+        rv.set(std::int32_t{ 7 });
+        check("set_raises_cancel", slot.cancel == true);
+        check("set_i32_value_in_slot", slot.retval == 7);
+    }
+
+    // --- SIGNED integral narrower than int64 -> SIGN-EXTENDED into retval. ---
+    // The header takes the static_cast<int64_t>(value) branch, so -1 fills all
+    // 64 bits (0xFFFF...FF == int64 -1), NOT a zero-extended 0x000000FF.
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(std::int8_t{ -1 });
+        check("set_i8_neg1_sign_extended", s.retval == static_cast<std::int64_t>(-1));
+    }
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(std::int16_t{ -2 });
+        check("set_i16_neg2_sign_extended", s.retval == static_cast<std::int64_t>(-2));
+    }
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(std::int32_t{ -123456 });
+        check("set_i32_neg_sign_extended", s.retval == static_cast<std::int64_t>(-123456));
+    }
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(std::int8_t{ 127 });
+        check("set_i8_max_positive", s.retval == 127);
+    }
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(std::int16_t{ -32768 });
+        check("set_i16_min_sign_extended", s.retval == static_cast<std::int64_t>(-32768));
+    }
+
+    // --- int64 itself takes the ZERO-FILL memcpy branch (sizeof==8, the
+    //     sizeof<8 guard is false), but the full 8 bytes are copied so a negative
+    //     int64 still lands intact. ---
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(std::int64_t{ -1 });
+        check("set_i64_neg1_full_copy", s.retval == static_cast<std::int64_t>(-1));
+    }
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(std::int64_t{ 0x0011'2233'4455'6677LL });
+        check("set_i64_full_pattern", s.retval == 0x0011'2233'4455'6677LL);
+    }
+
+    // --- UNSIGNED narrow integral -> ZERO-FILL memcpy (NOT sign-extend): the low
+    //     N bytes carry the value, the upper bytes stay zero from the retval=0. ---
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(std::uint8_t{ 0xFF });
+        check("set_u8_max_zero_filled", s.retval == static_cast<std::int64_t>(0xFFLL));
+    }
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(std::uint16_t{ 0xFFFF });
+        check("set_u16_max_zero_filled", s.retval == static_cast<std::int64_t>(0xFFFFLL));
+    }
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(std::uint32_t{ 0xDEAD'BEEFu });
+        check("set_u32_zero_filled", s.retval == static_cast<std::int64_t>(0xDEAD'BEEFLL));
+    }
+    // --- bool true/false: integral but unsigned, so the zero-fill branch lands a
+    //     single 0x01 / 0x00 byte. ---
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(true);
+        check("set_bool_true_is_one", s.retval == 1);
+    }
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        s.retval = 0x55;             // pre-dirty to prove the zero-fill clears it
+        r.set(false);
+        check("set_bool_false_clears_to_zero", s.retval == 0);
+    }
+
+    // --- void* (oop) value: pointer-width memcpy into the low bytes. ---
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        r.set(static_cast<void*>(nullptr));
+        check("set_null_void_ptr_zero", s.retval == 0);
+    }
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        void* const p{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1234'5678u)) };
+        r.set(p);
+        check("set_void_ptr_low_bytes",
+              s.retval == static_cast<std::int64_t>(0x1234'5678LL));
+    }
+
+    // --- float / double take the zero-fill memcpy branch: the IEEE-754 bit
+    //     pattern lands in the low bytes.  Recover it via memcpy and compare to
+    //     the value's own bit pattern (no float formatting, no NaN — exact bits). ---
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        const float f{ 2.5F };
+        r.set(f);
+        std::uint32_t f_bits{ 0 };
+        std::memcpy(&f_bits, &f, sizeof(f_bits));
+        check("set_float_low4_is_bit_pattern",
+              static_cast<std::uint32_t>(static_cast<std::uint64_t>(s.retval) & 0xFFFF'FFFFu) == f_bits);
+        // The float path zero-fills the high 4 bytes (only sizeof(float)==4 copied).
+        check("set_float_high4_zero",
+              (static_cast<std::uint64_t>(s.retval) >> 32) == 0u);
+    }
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        const double d{ 3.9 };
+        r.set(d);
+        std::uint64_t d_bits{ 0 };
+        std::memcpy(&d_bits, &d, sizeof(d_bits));
+        check("set_double_full8_is_bit_pattern",
+              static_cast<std::uint64_t>(s.retval) == d_bits);
+    }
+
+    // --- The object_base-derived null-return overload: cancel=true, retval=0,
+    //     selected for a wrapper type (documentation-only template arg). ---
+    {
+        vmhook::hotspot::return_slot s{}; vmhook::return_value r{ &s };
+        s.retval = 0x77;                          // pre-dirty
+        r.set<elem_w>(nullptr);
+        check("set_wrapper_nullptr_cancel_true", s.cancel == true);
+        check("set_wrapper_nullptr_retval_zero", s.retval == 0);
+    }
+
+    // --- set<T> compile-time contract: only trivially-copyable, <=8-byte T are
+    //     accepted (the two static_asserts in the body).  Pin the GATE shape that
+    //     keeps the wrappers' return path honest. ---
+    static_assert(sizeof(std::int64_t) == 8,
+                  "the retval cell is a 64-bit word; T must fit it.");
+    static_assert(std::is_trivially_copyable_v<vmhook::oop_t>,
+                  "an oop_t (void*) return is the canonical reference set<T> case.");
+}
+
+// ---------------------------------------------------------------------------
+// 27. [ADDITIVE] array_length / get_array_element STRIDE-LENGTH-INDEX boundaries
+//     on a REAL OWNED BUFFER laid out as a Java array header.
+//
+// Sections 16/17 pinned the null / invalid-pointer / OOB rejection (every read
+// returns 0 / T{}).  They never exercised the POSITIVE element-read path because
+// no JVM is up.  But array_length and get_array_element are PURE offset
+// arithmetic over the supplied oop: length at +12, element[i] at +16 + i*stride,
+// both routed through os::safe_read on a MAPPED page (never faults on our own
+// buffer).  So a caller-owned, 8-byte-aligned buffer whose +12 word holds a
+// length and whose +16 body holds known element bytes lets us pin the stride /
+// length / index math directly — a REAL owned buffer, no fabricated address.
+//
+// is_valid_pointer must ACCEPT the buffer for the read path to engage; a stack
+// std::array<uint64_t,N> is in user range, even-aligned, and (astronomically)
+// non-sentinel, but we GATE every read-back assertion on a runtime
+// is_valid_pointer(buf) check so the section stays deterministic and never reads
+// a rejected pointer: if accepted we pin the exact decoded values; either way
+// the never-fault contract holds.
+// ---------------------------------------------------------------------------
+static auto test_array_element_real_buffer() -> void
+{
+    // 8-byte-aligned backing store: header (16 bytes) + body.  Lay out as:
+    //   [+0 .. +11] mark/klass header (don't-care)
+    //   [+12]       int32 length
+    //   [+16 ..]    element body
+    // Use a uint64 array so the base is 8-aligned (even -> passes the alignment
+    // gate) and large enough for the widest element sweep.
+    alignas(8) std::array<std::uint64_t, 16> storage{};
+    auto* const base{ reinterpret_cast<std::uint8_t*>(storage.data()) };
+    auto* const oop{ static_cast<vmhook::oop_t>(storage.data()) };
+
+    const bool accepted{ vmhook::hotspot::is_valid_pointer(oop) };
+    // A null oop is ALWAYS rejected by is_valid_pointer; our non-null buffer is
+    // the live input under test.  (We never read it unless `accepted`.)
+    check("array_buffer_null_oop_never_valid",
+          !vmhook::hotspot::is_valid_pointer(static_cast<vmhook::oop_t>(nullptr)));
+
+    // Write a length of 4 at +12.
+    {
+        const std::int32_t len{ 4 };
+        std::memcpy(base + 12, &len, sizeof(len));
+    }
+    if (accepted)
+    {
+        check("real_buffer_array_length_reads_field", vmhook::array_length(oop) == 4);
+    }
+    else
+    {
+        // Pointer (improbably) rejected -> documented 0, never a fault.
+        check("real_buffer_array_length_rejected_zero", vmhook::array_length(oop) == 0);
+    }
+
+    // --- int32 elements at stride 4, body base +16. ---
+    {
+        const std::int32_t elems[4]{ 0, 0x1111'1111, -1, 0x7FFF'FFFF };
+        std::memcpy(base + 16, elems, sizeof(elems));
+        if (accepted)
+        {
+            check("gae_i32_idx0", vmhook::get_array_element<std::int32_t>(oop, 0) == 0);
+            check("gae_i32_idx1", vmhook::get_array_element<std::int32_t>(oop, 1) == 0x1111'1111);
+            check("gae_i32_idx2", vmhook::get_array_element<std::int32_t>(oop, 2) == -1);
+            check("gae_i32_idx3", vmhook::get_array_element<std::int32_t>(oop, 3) == 0x7FFF'FFFF);
+            // Index == length and beyond -> default 0 (the >= length guard).
+            check("gae_i32_idx4_oob_zero", vmhook::get_array_element<std::int32_t>(oop, 4) == 0);
+            check("gae_i32_idx_neg_zero",  vmhook::get_array_element<std::int32_t>(oop, -1) == 0);
+        }
+    }
+
+    // --- int8 elements at stride 1: with length 4, indices 0..3 read the first
+    //     four body bytes.  Pin the stride is sizeof(T)==1, not 4. ---
+    {
+        const std::uint8_t bytes[4]{ 0xDE, 0xAD, 0xBE, 0xEF };
+        std::memcpy(base + 16, bytes, sizeof(bytes));
+        if (accepted)
+        {
+            check("gae_i8_stride1_idx0",
+                  vmhook::get_array_element<std::uint8_t>(oop, 0) == 0xDE);
+            check("gae_i8_stride1_idx1",
+                  vmhook::get_array_element<std::uint8_t>(oop, 1) == 0xAD);
+            check("gae_i8_stride1_idx3",
+                  vmhook::get_array_element<std::uint8_t>(oop, 3) == 0xEF);
+        }
+    }
+
+    // --- int64 / double elements at stride 8.  Reset the length to 2 so two
+    //     8-byte slots fit the body, and pin both the value and the stride. ---
+    {
+        const std::int32_t len{ 2 };
+        std::memcpy(base + 12, &len, sizeof(len));
+        const std::int64_t longs[2]{ static_cast<std::int64_t>(0x0011'2233'4455'6677LL),
+                                     static_cast<std::int64_t>(-1) };
+        std::memcpy(base + 16, longs, sizeof(longs));
+        if (accepted)
+        {
+            check("real_buffer_length_two", vmhook::array_length(oop) == 2);
+            check("gae_i64_stride8_idx0",
+                  vmhook::get_array_element<std::int64_t>(oop, 0) == 0x0011'2233'4455'6677LL);
+            check("gae_i64_stride8_idx1",
+                  vmhook::get_array_element<std::int64_t>(oop, 1) == static_cast<std::int64_t>(-1));
+            check("gae_i64_idx2_oob_zero",
+                  vmhook::get_array_element<std::int64_t>(oop, 2) == 0);
+        }
+
+        const double doubles[2]{ 2.5, 3.9 };
+        std::memcpy(base + 16, doubles, sizeof(doubles));
+        if (accepted)
+        {
+            check("gae_double_stride8_idx0", vmhook::get_array_element<double>(oop, 0) == 2.5);
+            check("gae_double_stride8_idx1", vmhook::get_array_element<double>(oop, 1) == 3.9);
+        }
+    }
+
+    // --- A ZERO length makes every index OOB -> default, with the body bytes
+    //     still present (proves the bound, not the bytes, gates the read). ---
+    {
+        const std::int32_t len{ 0 };
+        std::memcpy(base + 12, &len, sizeof(len));
+        const std::int32_t elems[2]{ 0x4242'4242, 0x4343'4343 };
+        std::memcpy(base + 16, elems, sizeof(elems));
+        if (accepted)
+        {
+            check("gae_zero_length_idx0_default",
+                  vmhook::get_array_element<std::int32_t>(oop, 0) == 0);
+        }
+        // Whether the buffer was accepted (reads the 0 field) or rejected (short-
+        // circuits to 0), array_length is 0 here — and never faults either way.
+        check("array_length_zero_field_reads_zero", vmhook::array_length(oop) == 0);
+    }
+
+    // --- The clamp the walks apply rides on whatever length we read: a length of
+    //     5 clamps to 5 (well under the 1<<24 cap); pin the composition. ---
+    {
+        const std::int32_t len{ 5 };
+        std::memcpy(base + 12, &len, sizeof(len));
+        if (accepted)
+        {
+            check("array_length_then_clamp_passthrough",
+                  vmhook::clamp_safe_container_count(vmhook::array_length(oop)) == 5);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 28. [ADDITIVE] jni::signature_for_arg WIDTH-LADDER partitions + multi-arg
+//     PACKING concatenation — the parts of the classifier section 23 did NOT
+//     reach.
+//
+// Section 23 pinned the FIXED-WIDTH aliases (int8/16/32/64, bool, char16_t,
+// uint16, float, double), the string family, and the wrapper Object-fallback.
+// It never exercised the EXTENDED integral types that ride the generic
+// `is_integral && sizeof==N` ladder: plain `char`, `signed char`, `unsigned
+// char`, `short`, `unsigned short`, `int`, `unsigned int`, `long`, `unsigned
+// long`, `long long`, `char8_t`, `char32_t`, `wchar_t`, `std::size_t`,
+// `std::ptrdiff_t`.  Several of these are LLP64/LP64-variant (`long`,
+// `wchar_t`, `size_t`), so the expected descriptor is DERIVED from sizeof +
+// signedness rather than hard-coded — exactly as the header's ladder does.
+// Plus the MULTI-ARG packing contract jni_make_unique builds the "(...)V"
+// descriptor with: a fold concatenating per-arg descriptors.  All pure
+// compile-time-ish string building, no JVM.
+// ---------------------------------------------------------------------------
+namespace
+{
+    // The header ladder's exact classification for an integral type, derived
+    // from the SAME rules: bool->"Z"; char16_t/uint16_t->"C"; then by sizeof
+    // 1->"B" 2->"S" 4->"I" 8->"J".  char8_t/char32_t/wchar_t/char/long/... all
+    // fall through to the sizeof ladder.
+    template<typename integral_t>
+    auto expected_integral_descriptor() -> std::string
+    {
+        if constexpr (std::is_same_v<integral_t, bool>) { return "Z"; }
+        else if constexpr (std::is_same_v<integral_t, char16_t>
+                           || std::is_same_v<integral_t, std::uint16_t>) { return "C"; }
+        else if constexpr (sizeof(integral_t) == 1) { return "B"; }
+        else if constexpr (sizeof(integral_t) == 2) { return "S"; }
+        else if constexpr (sizeof(integral_t) == 4) { return "I"; }
+        else { return "J"; }   // sizeof == 8
+    }
+
+    // Mirror of the jni_make_unique constructor-descriptor fold: "(" + each
+    // per-arg descriptor (decay-normalised) + ")V".
+    template<typename... args_t>
+    auto build_ctor_descriptor() -> std::string
+    {
+        std::string signature{ "(" };
+        ((signature += vmhook::detail::jni_signature_for_arg<std::remove_cvref_t<args_t>>()), ...);
+        signature += ")V";
+        return signature;
+    }
+}
+
+static auto test_jni_signature_width_ladder_and_packing() -> void
+{
+    using vmhook::jni::signature_for_arg;
+
+    // --- Extended integral types ride the generic sizeof ladder.  Each expected
+    //     descriptor is derived from sizeof/signedness (LLP64-safe), NEVER a
+    //     hard-coded letter, so this passes identically on Windows (long==4,
+    //     wchar_t==2) and *nix (long==8, wchar_t==4). ---
+    check("sig_char_matches_sizeof_ladder",
+          signature_for_arg<char>() == expected_integral_descriptor<char>());
+    check("sig_signed_char_matches_ladder",
+          signature_for_arg<signed char>() == expected_integral_descriptor<signed char>());
+    check("sig_unsigned_char_matches_ladder",
+          signature_for_arg<unsigned char>() == expected_integral_descriptor<unsigned char>());
+    check("sig_short_matches_ladder",
+          signature_for_arg<short>() == expected_integral_descriptor<short>());
+    check("sig_unsigned_short_matches_ladder",
+          signature_for_arg<unsigned short>() == expected_integral_descriptor<unsigned short>());
+    check("sig_int_matches_ladder",
+          signature_for_arg<int>() == expected_integral_descriptor<int>());
+    check("sig_unsigned_int_matches_ladder",
+          signature_for_arg<unsigned int>() == expected_integral_descriptor<unsigned int>());
+    check("sig_long_matches_ladder",
+          signature_for_arg<long>() == expected_integral_descriptor<long>());
+    check("sig_unsigned_long_matches_ladder",
+          signature_for_arg<unsigned long>() == expected_integral_descriptor<unsigned long>());
+    check("sig_long_long_matches_ladder",
+          signature_for_arg<long long>() == expected_integral_descriptor<long long>());
+    check("sig_unsigned_long_long_matches_ladder",
+          signature_for_arg<unsigned long long>() == expected_integral_descriptor<unsigned long long>());
+    check("sig_char8_matches_ladder",
+          signature_for_arg<char8_t>() == expected_integral_descriptor<char8_t>());
+    check("sig_char32_matches_ladder",
+          signature_for_arg<char32_t>() == expected_integral_descriptor<char32_t>());
+    check("sig_wchar_matches_ladder",
+          signature_for_arg<wchar_t>() == expected_integral_descriptor<wchar_t>());
+    check("sig_size_t_matches_ladder",
+          signature_for_arg<std::size_t>() == expected_integral_descriptor<std::size_t>());
+    check("sig_ptrdiff_t_matches_ladder",
+          signature_for_arg<std::ptrdiff_t>() == expected_integral_descriptor<std::ptrdiff_t>());
+
+    // --- char8_t is a distinct 1-byte integral -> "B" on every platform (its
+    //     size is fixed by the standard, unlike long/wchar_t). ---
+    check("sig_char8_is_B_fixed", signature_for_arg<char8_t>() == "B");
+    // char32_t is a fixed 4-byte integral -> "I" on every platform.
+    check("sig_char32_is_I_fixed", signature_for_arg<char32_t>() == "I");
+
+    // --- The descriptor for any integral is exactly one byte and lands in the
+    //     primitive BasicType band [4,11] (ties the classifier to the parser). ---
+    {
+        const std::string ladder[]{
+            signature_for_arg<char>(),      signature_for_arg<short>(),
+            signature_for_arg<int>(),       signature_for_arg<long>(),
+            signature_for_arg<long long>(), signature_for_arg<wchar_t>(),
+            signature_for_arg<char8_t>(),   signature_for_arg<char32_t>(),
+            signature_for_arg<std::size_t>(),
+        };
+        bool all_one_byte_band{ true };
+        for (const auto& d : ladder)
+        {
+            if (d.size() != 1u) { all_one_byte_band = false; continue; }
+            const int basic{ vmhook::detail::sig_char_to_basic_type(d.front()) };
+            if (basic < 4 || basic > 11) { all_one_byte_band = false; }
+        }
+        check("sig_width_ladder_all_primitive_band", all_one_byte_band);
+    }
+
+    // --- MULTI-ARG packing: the constructor descriptor is "(" + concat + ")V".
+    //     With no JVM the wrapper args take the Object fallback, and primitives
+    //     use their ladder letter.  Pin the exact concatenation/order. ---
+    check("ctor_desc_empty_is_paren_V",
+          build_ctor_descriptor<>() == "()V");
+    check("ctor_desc_single_int",
+          build_ctor_descriptor<std::int32_t>() == "(I)V");
+    check("ctor_desc_int_bool_double",
+          build_ctor_descriptor<std::int32_t, bool, double>() == "(IZD)V");
+    check("ctor_desc_string_then_long",
+          build_ctor_descriptor<std::string, std::int64_t>() == "(Ljava/lang/String;J)V");
+    // Wrappers (unregistered w/o JVM) fall to Ljava/lang/Object; — packing keeps
+    // each descriptor whole, in order, with no separators.
+    check("ctor_desc_wrapper_then_int",
+          build_ctor_descriptor<elem_w, std::int32_t>() == "(Ljava/lang/Object;I)V");
+    check("ctor_desc_unique_ptr_wrapper_pair",
+          build_ctor_descriptor<std::unique_ptr<key_w>, std::unique_ptr<val_w>>()
+              == "(Ljava/lang/Object;Ljava/lang/Object;)V");
+    // char16_t and uint16_t both pack as "C" (claimed before the 2-byte "S").
+    check("ctor_desc_char16_uint16_both_C",
+          build_ctor_descriptor<char16_t, std::uint16_t>() == "(CC)V");
+    // cvref noise on each arg is decayed before classification (remove_cvref_t).
+    check("ctor_desc_cvref_decayed",
+          build_ctor_descriptor<const std::int32_t&, double&&, const bool>() == "(IDZ)V");
+
+    // --- The single-arg public descriptor equals the first concatenation token,
+    //     proving signature_for_arg IS the packing unit. ---
+    check("packing_unit_is_signature_for_arg",
+          build_ctor_descriptor<float>() == std::string{ "(" } + signature_for_arg<float>() + ")V");
+}
+
+// ---------------------------------------------------------------------------
+// 29. [ADDITIVE] decode_u5 threaded-walk over a REAL owned buffer, framed as the
+//     FieldInfoStream cursor the find_field path threads to recover a field
+//     offset/signature index.  (The dedicated test_decode_u5.cpp owns the
+//     exhaustive codec matrix; here we add ONLY the small set of inputs that tie
+//     the decoder to THIS feature's concerns — a multi-field record walk and the
+//     End(0) stop — that this file never exercised, all over a caller-owned
+//     std::array buffer, no fabricated address.)
+//
+// Contract (header decode_u5): value = sum (b_i-1)<<(6*i); first low byte (<192)
+// terminates; byte 0 at any position is End -> returns ~0u and REWINDS (cursor
+// unchanged); at most 5 bytes read.  Every expected value below is hand-derived
+// from that loop body.
+// ---------------------------------------------------------------------------
+static auto test_decode_u5_threaded_record_walk() -> void
+{
+    using vmhook::hotspot::klass;
+
+    // A miniature FieldInfoStream record: name_idx=7, sig_idx=64, offset=4096,
+    // access=0, flags=0, then End(0).  Encodings (canonical, no 0 bytes):
+    //   7    -> {8}            (1 byte:  8-1)
+    //   64   -> {65}           (1 byte:  65-1)
+    //   4096 -> {193,62}       (2 bytes: 192 + 61*64 == 4096)
+    //   0    -> {1}            (1 byte:  1-1)
+    //   0    -> {1}            (1 byte)
+    // Trailing real End marker byte 0 at the end.  Buffer is caller-owned and
+    // padded so the 5-byte peek window is always in-bounds.
+    std::array<std::uint8_t, 16> stream{
+        8u, 65u, 193u, 62u, 1u, 1u, 0u,  // 7, 64, 4096, 0, 0, End
+        0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u
+    };
+
+    int pos{ 0 };
+    const std::uint32_t name_idx{ klass::decode_u5(stream.data(), pos) };
+    const std::uint32_t sig_idx{ klass::decode_u5(stream.data(), pos) };
+    const std::uint32_t offset{ klass::decode_u5(stream.data(), pos) };
+    const std::uint32_t access{ klass::decode_u5(stream.data(), pos) };
+    const std::uint32_t flags{ klass::decode_u5(stream.data(), pos) };
+    const int pos_after_record{ pos };
+    const std::uint32_t end{ klass::decode_u5(stream.data(), pos) };
+
+    check("u5_walk_name_idx",   name_idx == 7u);
+    check("u5_walk_sig_idx",    sig_idx == 64u);
+    check("u5_walk_offset",     offset == 4096u);
+    check("u5_walk_access",     access == 0u);
+    check("u5_walk_flags",      flags == 0u);
+    // Cursor after the five fields: 1+1+2+1+1 == 6.
+    check("u5_walk_cursor_after_record", pos_after_record == 6);
+    // The End(0) marker returns ~0u and REWINDS (cursor unchanged at 6).
+    check("u5_walk_end_is_sentinel", end == ~0u);
+    check("u5_walk_end_rewinds_cursor", pos == pos_after_record);
+
+    // decode_u5 is noexcept (it runs on a detour thread during find_field).
+    check("decode_u5_noexcept", noexcept(klass::decode_u5(stream.data(), pos)));
+
+    // The offset value recovered (4096) feeds straight into the clamp the
+    // container walks apply to a derived count — a value well under the cap is
+    // returned verbatim, tying the decoder output to the safety clamp.
+    check("u5_decoded_offset_clamps_passthrough",
+          vmhook::clamp_safe_container_count(static_cast<std::int32_t>(offset)) == 4096);
+}
+
 int main()
 {
     // Registering the element wrappers mirrors real usage; harmless with no JVM.
@@ -2890,6 +3444,10 @@ int main()
     test_jni_signature_for_arg_mapping();
     test_capability_macro_consistency();
     test_is_unique_ptr_trait();
+    test_return_slot_encoding();
+    test_array_element_real_buffer();
+    test_jni_signature_width_ladder_and_packing();
+    test_decode_u5_threaded_record_walk();
 
     return failures == 0 ? 0 : 1;
 }

@@ -50,7 +50,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -1472,6 +1477,516 @@ int main()
                   rv.set_arg(0, std::int32_t{ 99 }) == false);
             check("set_arg_no_frame_ref_category_slot_clean",
                   slot.cancel == false && slot.retval == 0);
+        }
+    }
+
+    // =====================================================================
+    // SECTION M — ADDITIVE deepening pass (Criterion 2, exhaustive inputs).
+    // GENUINELY NEW input-space NOT touched by sections A..L2 above: the pure,
+    // no-JVM-determinable helper surface that surrounds return_value but is
+    // never exercised by the slot/cancel/set_arg tests.  Every expected value is
+    // derived from the vmhook.hpp source (line refs inline), every const is
+    // referenced in a check()/static_assert, every array/string input is a REAL
+    // owned buffer, and no fabricated address is ever dereferenced as data.
+    //   M1  decode_u5            (vmhook::hotspot::klass, vmhook.hpp:3848-3871)
+    //   M2  sig_char_to_basic_type / jvm_primitive_byte_width (detail, 16215/16250)
+    //   M3  clamp_safe_container_count (vmhook, 14753-14765)
+    //   M4  jni_signature_for_arg / signature_for_arg (detail/jni, 12994/13712)
+    //   M5  is_unique_ptr_v / function_traits::args_tuple_t (detail, 1788/9319)
+    //   M6  array_length / get_array_element / set_array_element on a REAL owned
+    //       buffer laid out as a HotSpot array header (vmhook.hpp:14778/14814/14860)
+    // =====================================================================
+
+    // ---------------------------------------------------------------------
+    // M1 — decode_u5 UNSIGNED5 codec (vmhook.hpp:3848-3871).  The decoder is
+    // pure arithmetic over an owned byte buffer:
+    //   sum += (byte_i - 1) << (6 * i), for i = 0..4, stop at first byte < 192;
+    //   byte value 0 is the End marker (REWINDS stream_pos, returns ~0u).
+    // We feed REAL std::array buffers (never a fabricated address) and assert the
+    // decoded value AND the exact cursor delta for every continuation length.
+    // ---------------------------------------------------------------------
+    {
+        using vmhook::hotspot::klass;
+
+        // (a) Single low byte b in [1, 191] => value (b - 1), cursor +1.  Sweep
+        //     the WHOLE single-byte terminal domain (191 distinct values).
+        {
+            bool all_ok{ true };
+            for (int b{ 1 }; b <= 191; ++b)
+            {
+                std::array<std::uint8_t, 1> buf{ { static_cast<std::uint8_t>(b) } };
+                int pos{ 0 };
+                const std::uint32_t got{ klass::decode_u5(buf.data(), pos) };
+                if (got != static_cast<std::uint32_t>(b - 1) || pos != 1) { all_ok = false; }
+            }
+            check("decode_u5_single_low_byte_full_domain_1_to_191", all_ok);
+        }
+
+        // (b) Two-byte sequences: a high byte (>=192) then a low byte.
+        //     {192, low} => 191 + (low-1)*64.  Worked from source: 192 gives
+        //     (192-1)<<0 = 191, then low contributes (low-1)<<6.
+        {
+            std::array<std::uint8_t, 2> b1{ { 192u, 1u } };   // 191 + 0
+            int p1{ 0 };
+            check("decode_u5_two_byte_192_1_is_191",
+                  klass::decode_u5(b1.data(), p1) == 191u && p1 == 2);
+
+            std::array<std::uint8_t, 2> b2{ { 192u, 2u } };   // 191 + 64
+            int p2{ 0 };
+            check("decode_u5_two_byte_192_2_is_255",
+                  klass::decode_u5(b2.data(), p2) == 255u && p2 == 2);
+
+            std::array<std::uint8_t, 2> b3{ { 255u, 1u } };   // (255-1)=254 at pos0
+            int p3{ 0 };
+            check("decode_u5_two_byte_255_1_is_254",
+                  klass::decode_u5(b3.data(), p3) == 254u && p3 == 2);
+        }
+
+        // (c) The documented 5-byte UINT32_MAX sequence {192,254,253,253,253}
+        //     (vmhook.hpp:3839-3846) decodes to exactly 0xFFFFFFFF and ADVANCES
+        //     the cursor by 5 — the value that aliases the End sentinel but is
+        //     distinguished by the cursor delta.
+        {
+            std::array<std::uint8_t, 5> mx{ { 192u, 254u, 253u, 253u, 253u } };
+            int pos{ 0 };
+            const std::uint32_t got{ klass::decode_u5(mx.data(), pos) };
+            check("decode_u5_five_byte_uint32_max_value", got == 0xFFFFFFFFu);
+            check("decode_u5_five_byte_uint32_max_advances_cursor_by_5", pos == 5);
+        }
+
+        // (d) End marker: a 0 byte AT the cursor returns ~0u and REWINDS (cursor
+        //     unchanged) so the byte is not consumed (vmhook.hpp:3855-3862).
+        //     Distinguished from the real UINT32_MAX above purely by pos delta.
+        //     We start the cursor at index 1, where the 0 byte sits, to prove the
+        //     rewind restores the cursor to exactly where it was (1), not 0.
+        {
+            std::array<std::uint8_t, 3> buf{ { 5u, 0u, 5u } };
+            int pos{ 1 };                       // cursor parked on the 0 byte
+            const std::uint32_t got{ klass::decode_u5(buf.data(), pos) };
+            check("decode_u5_end_marker_returns_tilde_zero", got == ~0u);
+            check("decode_u5_end_marker_rewinds_cursor_unchanged", pos == 1);
+        }
+
+        // (e) Threaded walk: three values packed back-to-back in one owned buffer
+        //     must decode in order with the cursor advancing across the whole
+        //     stream, then the trailing 0 byte signals End and rewinds.  This is
+        //     the FieldInfoStream consumption pattern (vmhook.hpp:3967-4001) in
+        //     miniature, driven entirely from a real buffer.
+        {
+            // value0 = 41   -> single byte (41+1)=42  (low, since 42<192)
+            // value1 = 190  -> single byte 191        (low)
+            // value2 = 255  -> {192, 2}  (191 + 64 = 255)
+            std::array<std::uint8_t, 5> stream{ { 42u, 191u, 192u, 2u, 0u } };
+            int pos{ 0 };
+            const std::uint32_t v0{ klass::decode_u5(stream.data(), pos) };
+            const int after0{ pos };
+            const std::uint32_t v1{ klass::decode_u5(stream.data(), pos) };
+            const int after1{ pos };
+            const std::uint32_t v2{ klass::decode_u5(stream.data(), pos) };
+            const int after2{ pos };
+            const std::uint32_t vend{ klass::decode_u5(stream.data(), pos) };
+            const int afterEnd{ pos };
+            check("decode_u5_threaded_walk_value0_41", v0 == 41u && after0 == 1);
+            check("decode_u5_threaded_walk_value1_190", v1 == 190u && after1 == 2);
+            check("decode_u5_threaded_walk_value2_255", v2 == 255u && after2 == 4);
+            check("decode_u5_threaded_walk_trailing_end_marker",
+                  vend == ~0u && afterEnd == 4);
+        }
+
+        // (f) Continuation-length boundary: the loop runs at most 5 bytes
+        //     (vmhook.hpp:3852).  A buffer of five all-high (>=192) bytes never
+        //     hits a low byte, so the loop exits after exactly 5 iterations and
+        //     the cursor lands at 5.  We only assert the cursor/length contract
+        //     (the value is an implementation detail of the 5th-byte overflow).
+        {
+            std::array<std::uint8_t, 5> allhigh{ { 200u, 200u, 200u, 200u, 200u } };
+            int pos{ 0 };
+            (void)klass::decode_u5(allhigh.data(), pos);
+            check("decode_u5_five_high_bytes_consumes_exactly_5", pos == 5);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // M2 — sig_char_to_basic_type (vmhook.hpp:16215-16232) and
+    // jvm_primitive_byte_width (vmhook.hpp:16250-16265).  Both are pure switch
+    // tables; we exhaust EVERY documented descriptor character plus the default
+    // fallbacks across the entire 8-bit char domain.
+    // ---------------------------------------------------------------------
+    {
+        // (a) Every mapped descriptor char => its HotSpot BasicType int.  Values
+        //     copied verbatim from the source switch.
+        check("basic_type_Z_boolean_4", vmhook::detail::sig_char_to_basic_type('Z') == 4);
+        check("basic_type_C_char_5",    vmhook::detail::sig_char_to_basic_type('C') == 5);
+        check("basic_type_F_float_6",   vmhook::detail::sig_char_to_basic_type('F') == 6);
+        check("basic_type_D_double_7",  vmhook::detail::sig_char_to_basic_type('D') == 7);
+        check("basic_type_B_byte_8",    vmhook::detail::sig_char_to_basic_type('B') == 8);
+        check("basic_type_S_short_9",   vmhook::detail::sig_char_to_basic_type('S') == 9);
+        check("basic_type_I_int_10",    vmhook::detail::sig_char_to_basic_type('I') == 10);
+        check("basic_type_J_long_11",   vmhook::detail::sig_char_to_basic_type('J') == 11);
+        check("basic_type_L_object_12", vmhook::detail::sig_char_to_basic_type('L') == 12);
+        check("basic_type_array_13",    vmhook::detail::sig_char_to_basic_type('[') == 13);
+        check("basic_type_V_void_14",   vmhook::detail::sig_char_to_basic_type('V') == 14);
+
+        // (b) EVERY other byte value falls to the T_OBJECT (12) default.  Sweep
+        //     the whole signed-char domain and assert: the 11 mapped chars give
+        //     their value, all others give 12.  No char is left unclassified.
+        {
+            const std::array<char, 11> mapped{ {
+                'Z', 'C', 'F', 'D', 'B', 'S', 'I', 'J', 'L', '[', 'V',
+            } };
+            bool all_ok{ true };
+            for (int code{ 0 }; code <= 255; ++code)
+            {
+                const char c{ static_cast<char>(code) };
+                bool is_mapped{ false };
+                for (const char m : mapped) { if (m == c) { is_mapped = true; } }
+                const int bt{ vmhook::detail::sig_char_to_basic_type(c) };
+                if (!is_mapped && bt != 12) { all_ok = false; }
+                if (is_mapped && (bt < 4 || bt > 14)) { all_ok = false; }
+            }
+            check("basic_type_unmapped_chars_default_to_T_OBJECT_12", all_ok);
+        }
+
+        // (c) jvm_primitive_byte_width: single-char primitive widths and the
+        //     "0 for everything else" contract (reference/array/unknown/multi).
+        check("prim_width_Z_is_1", vmhook::detail::jvm_primitive_byte_width("Z") == 1u);
+        check("prim_width_B_is_1", vmhook::detail::jvm_primitive_byte_width("B") == 1u);
+        check("prim_width_S_is_2", vmhook::detail::jvm_primitive_byte_width("S") == 2u);
+        check("prim_width_C_is_2", vmhook::detail::jvm_primitive_byte_width("C") == 2u);
+        check("prim_width_I_is_4", vmhook::detail::jvm_primitive_byte_width("I") == 4u);
+        check("prim_width_F_is_4", vmhook::detail::jvm_primitive_byte_width("F") == 4u);
+        check("prim_width_J_is_8", vmhook::detail::jvm_primitive_byte_width("J") == 8u);
+        check("prim_width_D_is_8", vmhook::detail::jvm_primitive_byte_width("D") == 8u);
+        // Reference/array/void/unknown single chars => 0.
+        check("prim_width_L_reference_is_0", vmhook::detail::jvm_primitive_byte_width("L") == 0u);
+        check("prim_width_array_is_0",       vmhook::detail::jvm_primitive_byte_width("[") == 0u);
+        check("prim_width_V_void_is_0",      vmhook::detail::jvm_primitive_byte_width("V") == 0u);
+        check("prim_width_unknown_X_is_0",   vmhook::detail::jvm_primitive_byte_width("X") == 0u);
+        // size != 1 => 0 regardless of content (empty, full descriptors, arrays).
+        check("prim_width_empty_is_0",            vmhook::detail::jvm_primitive_byte_width("") == 0u);
+        check("prim_width_object_descriptor_is_0",
+              vmhook::detail::jvm_primitive_byte_width("Ljava/lang/String;") == 0u);
+        check("prim_width_int_array_descriptor_is_0",
+              vmhook::detail::jvm_primitive_byte_width("[I") == 0u);
+        check("prim_width_two_char_II_is_0",      vmhook::detail::jvm_primitive_byte_width("II") == 0u);
+
+        // (d) Cross-check: every primitive descriptor whose width is non-zero is
+        //     also a mapped (non-default) BasicType char, and the 1-char
+        //     reference/array/void chars are mapped too but report width 0.  This
+        //     ties the two tables together across the full single-char domain.
+        {
+            const std::array<char, 8> prims{ { 'Z', 'B', 'S', 'C', 'I', 'F', 'J', 'D' } };
+            bool all_ok{ true };
+            for (const char c : prims)
+            {
+                const char s[2]{ c, '\0' };
+                if (vmhook::detail::jvm_primitive_byte_width(std::string_view{ s, 1 }) == 0u) { all_ok = false; }
+                if (vmhook::detail::sig_char_to_basic_type(c) == 12) { all_ok = false; }
+            }
+            check("prim_widths_align_with_nondefault_basic_types", all_ok);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // M3 — clamp_safe_container_count (vmhook.hpp:14753-14765).  Pure clamp:
+    //   raw <= 0            -> 0
+    //   0 < raw < (1<<24)   -> raw
+    //   raw >= (1<<24)      -> (1<<24)
+    // Exhaust the boundaries and signs; the cap is k_max_safe_container_elems.
+    // ---------------------------------------------------------------------
+    {
+        constexpr std::int32_t cap{ static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) };
+        static_assert(cap == (1 << 24), "k_max_safe_container_elems must be 1<<24 (vmhook.hpp:14733).");
+
+        check("clamp_zero_is_zero",            vmhook::clamp_safe_container_count(0) == 0);
+        check("clamp_one_is_one",              vmhook::clamp_safe_container_count(1) == 1);
+        check("clamp_negative_one_is_zero",    vmhook::clamp_safe_container_count(-1) == 0);
+        check("clamp_int_min_is_zero",
+              vmhook::clamp_safe_container_count(std::numeric_limits<std::int32_t>::min()) == 0);
+        check("clamp_below_cap_passes_through", vmhook::clamp_safe_container_count(cap - 1) == cap - 1);
+        check("clamp_at_cap_is_cap",            vmhook::clamp_safe_container_count(cap) == cap);
+        check("clamp_above_cap_is_cap",         vmhook::clamp_safe_container_count(cap + 1) == cap);
+        check("clamp_int_max_is_cap",
+              vmhook::clamp_safe_container_count(std::numeric_limits<std::int32_t>::max()) == cap);
+
+        // Dense boundary + power-of-two sweep: result is min(max(raw,0), cap).
+        {
+            const std::array<std::int32_t, 12> table{ {
+                std::numeric_limits<std::int32_t>::min(), -1000000, -2, -1,
+                0, 1, 2, 1000, 65536, cap - 1, cap,
+                std::numeric_limits<std::int32_t>::max(),
+            } };
+            bool all_ok{ true };
+            for (const std::int32_t raw : table)
+            {
+                const std::int32_t want{ raw <= 0 ? 0 : (raw < cap ? raw : cap) };
+                if (vmhook::clamp_safe_container_count(raw) != want) { all_ok = false; }
+            }
+            // every power of two in int32 range
+            for (int shift{ 0 }; shift < 31; ++shift)
+            {
+                const std::int32_t raw{ std::int32_t{ 1 } << shift };
+                const std::int32_t want{ raw < cap ? raw : cap };
+                if (vmhook::clamp_safe_container_count(raw) != want) { all_ok = false; }
+            }
+            check("clamp_exhaustive_table_and_bitwalk", all_ok);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // M4 — jni_signature_for_arg / signature_for_arg (vmhook.hpp:12994-13103,
+    // 13712-13715).  Compile-time descriptor table.  We assert ONLY the pure
+    // branches that produce a fixed string with no type_to_class_map lookup
+    // (string/bool/char/integral-width/float/double), exhaustively across the
+    // type domain, and prove jni::signature_for_arg delegates byte-identically.
+    // ---------------------------------------------------------------------
+    {
+        using vmhook::detail::jni_signature_for_arg;
+
+        // String family => "Ljava/lang/String;" (vmhook.hpp:12999-13002).
+        check("jni_sig_std_string",       jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
+        check("jni_sig_string_view",      jni_signature_for_arg<std::string_view>() == "Ljava/lang/String;");
+        check("jni_sig_const_char_ptr",   jni_signature_for_arg<const char*>() == "Ljava/lang/String;");
+        check("jni_sig_char_ptr",         jni_signature_for_arg<char*>() == "Ljava/lang/String;");
+
+        // bool => "Z", claimed BEFORE the generic 1-byte branch (13003-13009).
+        check("jni_sig_bool_is_Z",        jni_signature_for_arg<bool>() == "Z");
+
+        // char16_t / uint16_t => "C", claimed BEFORE the generic 2-byte branch
+        // (13014-13017) so uint16_t is "C", NOT "S".
+        check("jni_sig_char16_is_C",      jni_signature_for_arg<char16_t>() == "C");
+        check("jni_sig_uint16_is_C",      jni_signature_for_arg<std::uint16_t>() == "C");
+
+        // Generic integral width ladder (13028-13043): 1->B, 2->S, 4->I, 8->J.
+        check("jni_sig_int8_is_B",        jni_signature_for_arg<std::int8_t>() == "B");
+        check("jni_sig_uint8_is_B",       jni_signature_for_arg<std::uint8_t>() == "B");
+        check("jni_sig_int16_is_S",       jni_signature_for_arg<std::int16_t>() == "S");
+        check("jni_sig_int32_is_I",       jni_signature_for_arg<std::int32_t>() == "I");
+        check("jni_sig_uint32_is_I",      jni_signature_for_arg<std::uint32_t>() == "I");
+        check("jni_sig_int64_is_J",       jni_signature_for_arg<std::int64_t>() == "J");
+        check("jni_sig_uint64_is_J",      jni_signature_for_arg<std::uint64_t>() == "J");
+
+        // Extended/implementation integral types that newly route by sizeof
+        // (the comment at 13018-13027): plain char (size 1) => "B"; char8_t
+        // (size 1, distinct unsigned) => "B"; char32_t (size 4) => "I".
+        check("jni_sig_plain_char_is_B",  jni_signature_for_arg<char>() == "B");
+        check("jni_sig_char8_is_B",       jni_signature_for_arg<char8_t>() == "B");
+        check("jni_sig_char32_is_I",      jni_signature_for_arg<char32_t>() == "I");
+
+        // float => "F", double => "D" (13044-13051).
+        check("jni_sig_float_is_F",       jni_signature_for_arg<float>() == "F");
+        check("jni_sig_double_is_D",      jni_signature_for_arg<double>() == "D");
+
+        // cv/ref qualifiers are stripped via std::decay_t (clean_t, 12997) — a
+        // const/ref-qualified arg yields the SAME descriptor as its bare type.
+        check("jni_sig_const_ref_int32_decays_to_I",
+              jni_signature_for_arg<const std::int32_t&>() == "I");
+        check("jni_sig_const_double_decays_to_D",
+              jni_signature_for_arg<const double>() == "D");
+
+        // jni::signature_for_arg is a thin delegate (13712-13715) — byte-identical
+        // to the detail mapping for a representative spread of types.
+        check("signature_for_arg_delegates_string",
+              vmhook::jni::signature_for_arg<std::string>() == jni_signature_for_arg<std::string>());
+        check("signature_for_arg_delegates_bool",
+              vmhook::jni::signature_for_arg<bool>() == jni_signature_for_arg<bool>());
+        check("signature_for_arg_delegates_int64",
+              vmhook::jni::signature_for_arg<std::int64_t>() == jni_signature_for_arg<std::int64_t>());
+        check("signature_for_arg_delegates_double",
+              vmhook::jni::signature_for_arg<double>() == jni_signature_for_arg<double>());
+        check("signature_for_arg_delegates_char16_C",
+              vmhook::jni::signature_for_arg<char16_t>() == jni_signature_for_arg<char16_t>());
+    }
+
+    // ---------------------------------------------------------------------
+    // M5 — is_unique_ptr_v (vmhook.hpp:1788-1813) and function_traits::
+    // args_tuple_t (vmhook.hpp:9319-9376).  Pure compile-time partitions; every
+    // result is fixed into a static_assert AND surfaced through one runtime
+    // check() so no const/trait is left unreferenced.
+    // ---------------------------------------------------------------------
+    {
+        // is_unique_ptr_v: true for any unique_ptr (cv/ref-stripped, 1812-1813),
+        // false for everything else.
+        static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<int>>,
+                      "unique_ptr<int> must be detected.");
+        static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<int>&>,
+                      "cv/ref-qualified unique_ptr must be detected (remove_cvref_t).");
+        static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<fake_wrapper>>,
+                      "unique_ptr<wrapper> must be detected.");
+        static_assert(!vmhook::detail::is_unique_ptr_v<int>, "int is not a unique_ptr.");
+        static_assert(!vmhook::detail::is_unique_ptr_v<int*>, "raw ptr is not a unique_ptr.");
+        static_assert(!vmhook::detail::is_unique_ptr_v<std::shared_ptr<int>>,
+                      "shared_ptr is not a unique_ptr.");
+        check("is_unique_ptr_partitions_unique_vs_raw_vs_shared",
+              vmhook::detail::is_unique_ptr_v<std::unique_ptr<int>>
+              && vmhook::detail::is_unique_ptr_v<const std::unique_ptr<fake_wrapper>&>
+              && !vmhook::detail::is_unique_ptr_v<int>
+              && !vmhook::detail::is_unique_ptr_v<int*>
+              && !vmhook::detail::is_unique_ptr_v<std::shared_ptr<int>>);
+
+        // is_unique_ptr<...>::value_type_t recovers the wrapped type (1803).
+        static_assert(std::is_same_v<
+                          vmhook::detail::is_unique_ptr<std::unique_ptr<fake_wrapper>>::value_type_t,
+                          fake_wrapper>,
+                      "value_type_t must recover the wrapped type, not the inherited bool.");
+        check("is_unique_ptr_value_type_t_recovers_wrapped",
+              std::is_same_v<
+                  vmhook::detail::is_unique_ptr<std::unique_ptr<fake_wrapper>>::value_type_t,
+                  fake_wrapper>);
+
+        // function_traits::args_tuple_t for the spectrum of callable shapes
+        // (free ptr / noexcept free ptr / std::function / lambda / member ptr).
+        // Arity and per-position element types come straight from the parameter
+        // packs the specialisations capture.
+        using free_ptr_t       = int(*)(double, std::int64_t);
+        using free_ptr_ne_t    = int(*)(float) noexcept;
+        using std_function_t   = std::function<void(bool, char16_t, double)>;
+        using free_args        = vmhook::detail::function_traits<free_ptr_t>::args_tuple_t;
+        using free_ne_args     = vmhook::detail::function_traits<free_ptr_ne_t>::args_tuple_t;
+        using fn_args          = vmhook::detail::function_traits<std_function_t>::args_tuple_t;
+
+        static_assert(std::tuple_size_v<free_args> == 2, "free ptr arity 2.");
+        static_assert(std::is_same_v<std::tuple_element_t<0, free_args>, double>, "arg0 double.");
+        static_assert(std::is_same_v<std::tuple_element_t<1, free_args>, std::int64_t>, "arg1 int64.");
+        static_assert(std::tuple_size_v<free_ne_args> == 1, "noexcept free ptr arity 1.");
+        static_assert(std::is_same_v<std::tuple_element_t<0, free_ne_args>, float>, "ne arg0 float.");
+        static_assert(std::tuple_size_v<fn_args> == 3, "std::function arity 3.");
+        static_assert(std::is_same_v<std::tuple_element_t<1, fn_args>, char16_t>, "fn arg1 char16.");
+
+        // A generic lambda-free functor: operator() with a const qualifier maps
+        // to the const-member specialisation (9347-9351).
+        auto lam{ [](std::int32_t, void*) -> bool { return false; } };
+        using lam_args = vmhook::detail::function_traits<decltype(lam)>::args_tuple_t;
+        static_assert(std::tuple_size_v<lam_args> == 2, "lambda arity 2.");
+        static_assert(std::is_same_v<std::tuple_element_t<0, lam_args>, std::int32_t>, "lam arg0 int32.");
+        static_assert(std::is_same_v<std::tuple_element_t<1, lam_args>, void*>, "lam arg1 void*.");
+        (void)lam;
+
+        check("function_traits_arity_and_arg_types_across_callable_shapes",
+              std::tuple_size_v<free_args> == 2
+              && std::tuple_size_v<free_ne_args> == 1
+              && std::tuple_size_v<fn_args> == 3
+              && std::tuple_size_v<lam_args> == 2
+              && std::is_same_v<std::tuple_element_t<0, free_args>, double>
+              && std::is_same_v<std::tuple_element_t<1, fn_args>, char16_t>);
+    }
+
+    // ---------------------------------------------------------------------
+    // M6 — array_length / get_array_element / set_array_element on a REAL OWNED
+    // buffer (vmhook.hpp:14778/14814/14860).  HotSpot array header layout:
+    //   +12 _length (int32), +16 _data[0], element stride sizeof(T).
+    // We build the header by hand in a heap-owned, over-aligned buffer (NOT a
+    // fabricated address — genuinely mapped memory that os::safe_read can read),
+    // gate the data assertions on is_valid_pointer (the only no-JVM precondition
+    // the helpers impose), and exhaust index/length/stride boundaries.  The
+    // invalid-input paths (null oop, negative / out-of-range index) are asserted
+    // unconditionally — they short-circuit before any read.
+    // ---------------------------------------------------------------------
+    {
+        // --- invalid-input contracts: deterministic, no buffer needed ---
+        check("array_length_null_oop_is_zero", vmhook::array_length(nullptr) == 0);
+        check("get_array_element_null_oop_is_default",
+              vmhook::get_array_element<std::int32_t>(nullptr, 0) == 0);
+        // is_valid_pointer rejects a low constant (<= user_address_floor 0xFFFF,
+        // vmhook.hpp:520): this address is NEVER dereferenced — it is filtered.
+        void* const low_reject{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x10u)) };
+        check("array_length_rejected_low_pointer_is_zero",
+              vmhook::array_length(low_reject) == 0);
+        check("get_array_element_rejected_low_pointer_is_default",
+              vmhook::get_array_element<std::int64_t>(low_reject, 0) == 0);
+
+        // --- REAL owned buffer laid out as a length-N int32[] array object ---
+        constexpr std::int32_t length{ 6 };
+        constexpr std::size_t  header{ 16u };
+        // 16-byte header + length*8 (widest element we test is int64/double) +
+        // slack so an out-of-bounds read attempt still lands in owned memory.
+        std::vector<std::uint8_t> backing(header + static_cast<std::size_t>(length) * 8u + 64u, std::uint8_t{ 0 });
+        void* const oop{ static_cast<void*>(backing.data()) };
+
+        // Write the _length field at +12 (the slot array_length reads).
+        std::int32_t len_field{ length };
+        std::memcpy(backing.data() + 12, &len_field, sizeof(len_field));
+
+        // is_valid_pointer is the sole no-JVM precondition; a heap buffer
+        // satisfies the range/alignment checks except for the astronomically
+        // unlikely debug-sentinel low-32 collision.  Gate the data round-trip on
+        // it so the test is robust on every allocator; assert it normally holds.
+        const bool oop_usable{ vmhook::hotspot::is_valid_pointer(oop) };
+        check("owned_array_buffer_is_valid_pointer", oop_usable);
+
+        if (oop_usable)
+        {
+            check("array_length_reads_owned_length_field",
+                  vmhook::array_length(oop) == length);
+
+            // int32 element stride: set then get every in-bounds index.
+            bool i32_ok{ true };
+            for (std::int32_t i{ 0 }; i < length; ++i)
+            {
+                const std::int32_t v{ static_cast<std::int32_t>(0x11110000 + i) };
+                vmhook::set_array_element<std::int32_t>(oop, i, v);
+                if (vmhook::get_array_element<std::int32_t>(oop, i) != v) { i32_ok = false; }
+            }
+            check("array_int32_set_get_roundtrip_all_indices", i32_ok);
+
+            // Element-stride independence: re-interpret the SAME buffer as int8
+            // and int16 arrays (the helper computes offset = 16 + index*sizeof(T)
+            // purely from T) and round-trip representative values + boundaries.
+            vmhook::set_array_element<std::int8_t>(oop, 0, std::int8_t{ -1 });
+            vmhook::set_array_element<std::int8_t>(oop, length - 1, std::int8_t{ 0x7F });
+            check("array_int8_stride1_first_roundtrip",
+                  vmhook::get_array_element<std::int8_t>(oop, 0) == std::int8_t{ -1 });
+            check("array_int8_stride1_last_roundtrip",
+                  vmhook::get_array_element<std::int8_t>(oop, length - 1) == std::int8_t{ 0x7F });
+
+            vmhook::set_array_element<std::int16_t>(oop, 2, std::int16_t{ -12345 });
+            check("array_int16_stride2_roundtrip",
+                  vmhook::get_array_element<std::int16_t>(oop, 2) == std::int16_t{ -12345 });
+
+            // int64 / double strides (8 bytes) on the same buffer.
+            vmhook::set_array_element<std::int64_t>(oop, 0, std::int64_t{ 0x0123456789ABCDEFll });
+            check("array_int64_stride8_roundtrip",
+                  vmhook::get_array_element<std::int64_t>(oop, 0) == std::int64_t{ 0x0123456789ABCDEFll });
+            vmhook::set_array_element<double>(oop, 1, -2.5);
+            check("array_double_stride8_roundtrip",
+                  vmhook::get_array_element<double>(oop, 1) == -2.5);
+
+            // --- index BOUNDARY contracts (vmhook.hpp:14824 / 14869): index < 0
+            //     or index >= length returns the default and writes nothing. ---
+            check("get_array_element_negative_index_default",
+                  vmhook::get_array_element<std::int32_t>(oop, -1) == 0);
+            check("get_array_element_index_equals_length_default",
+                  vmhook::get_array_element<std::int32_t>(oop, length) == 0);
+            check("get_array_element_index_far_out_default",
+                  vmhook::get_array_element<std::int32_t>(oop, 1000000) == 0);
+            check("get_array_element_int_min_index_default",
+                  vmhook::get_array_element<std::int32_t>(oop, std::numeric_limits<std::int32_t>::min()) == 0);
+
+            // set at an out-of-range index must NOT alter an in-range element:
+            // seed index (length-1), attempt OOB writes, confirm the seed holds.
+            vmhook::set_array_element<std::int32_t>(oop, length - 1, std::int32_t{ 0x5AA55AA5 });
+            vmhook::set_array_element<std::int32_t>(oop, length, std::int32_t{ 0x12345678 });   // == length, OOB
+            vmhook::set_array_element<std::int32_t>(oop, -1, std::int32_t{ 0x12345678 });        // negative, OOB
+            check("set_array_element_oob_does_not_touch_in_range",
+                  vmhook::get_array_element<std::int32_t>(oop, length - 1) == std::int32_t{ 0x5AA55AA5 });
+
+            // --- length-boundary: rewriting _length to 0 makes EVERY index OOB ---
+            std::int32_t zero_len{ 0 };
+            std::memcpy(backing.data() + 12, &zero_len, sizeof(zero_len));
+            check("array_length_zero_after_rewrite", vmhook::array_length(oop) == 0);
+            check("get_array_element_zero_length_index0_default",
+                  vmhook::get_array_element<std::int32_t>(oop, 0) == 0);
+
+            // --- negative _length collapses array_length's own contract: it
+            //     returns the raw (negative) length verbatim (the clamp lives at
+            //     call sites, NOT in array_length — vmhook.hpp:14727-14731), and
+            //     index 0 is then rejected because 0 >= (negative) is true. ---
+            std::int32_t neg_len{ -5 };
+            std::memcpy(backing.data() + 12, &neg_len, sizeof(neg_len));
+            check("array_length_returns_negative_length_verbatim",
+                  vmhook::array_length(oop) == -5);
+            check("get_array_element_negative_length_rejects_index0",
+                  vmhook::get_array_element<std::int32_t>(oop, 0) == 0);
         }
     }
 

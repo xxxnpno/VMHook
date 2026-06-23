@@ -2173,5 +2173,231 @@ int main()
         check("wave6_runtime_cap_sets_bit_31", (v & 0x80000000u) != 0u);
     }
 
+    // #####################################################################
+    // ##  EXHAUSTIVE WAVE 7 (additive) - the CONTINUATION (high) byte at   ##
+    // ##  an INTERIOR position swept across its full 192..255 range.       ##
+    // ##                                                                   ##
+    // ##  Gap closed: prior waves swept the TERMINATING low byte (1..191)  ##
+    // ##  at positions 1..4 (sections G/R) and the 2-byte joint domain     ##
+    // ##  (b0 continuation x b1 low, section Y), but NEVER swept the byte   ##
+    // ##  at an interior position across the CONTINUATION range 192..255.   ##
+    // ##  That byte both (a) feeds digit (byte-1) at weight 64^pos AND      ##
+    // ##  (b) keeps the sequence going (>= 192 does not terminate), so it   ##
+    // ##  exercises the `current_byte < 192` branch staying FALSE for the   ##
+    // ##  whole high range at a middle position - an input class distinct   ##
+    // ##  from the leading-byte high sweep (Q, which used a MINIMAL low     ##
+    // ##  follow) and from the terminal-digit sweeps (which used the byte   ##
+    // ##  under test as the LOW terminator).  Every expected value is hand- ##
+    // ##  derived from sum += (byte-1) << (6*pos) using the decoder's own   ##
+    // ##  uint32 shift arithmetic; all sequences are real owned buffers     ##
+    // ##  padded with trailing End(0); no fabricated addresses.            ##
+    // #####################################################################
+
+    // =====================================================================
+    // (AA) POSITION-1 CONTINUATION BYTE SWEEP - hold b0 == 192 (digit 191 at
+    //      weight 1) and sweep b1 across the FULL continuation range 192..255.
+    //      Because b1 >= 192 the sequence does NOT terminate at position 1; a
+    //      minimal low byte (1 -> digit 0) at position 2 ends it.  So the
+    //      decoded value is 191 + (b1-1)*64 with the position-2 digit 0
+    //      contributing nothing, and the decode consumes exactly 3 bytes.
+    //      This pins the high branch (current_byte >= 192) staying live at a
+    //      middle position for every continuation byte value.
+    // =====================================================================
+    {
+        bool value_ok{ true };
+        bool pos_ok{ true };
+        int  first_bad{ -1 };
+        for (int b1{ 192 }; b1 <= 255; ++b1)
+        {
+            int pos{ 0 };
+            const std::uint32_t v{ decode_at0(
+                { 192u, static_cast<std::uint8_t>(b1), 1u }, pos) };
+            const std::uint32_t expected{ 191u + static_cast<std::uint32_t>(b1 - 1) * 64u };
+            if (v != expected) { value_ok = false; if (first_bad < 0) first_bad = b1; }
+            if (pos != 3)      { pos_ok = false;   if (first_bad < 0) first_bad = b1; }
+        }
+        if (!value_ok || !pos_ok)
+        {
+            std::printf("       (first failing pos1 continuation byte = %d)\n", first_bad);
+        }
+        check("pos1_continuation_byte_sweep_192_to_255_value", value_ok);
+        check("pos1_continuation_byte_sweep_192_to_255_consumes_three", pos_ok);
+    }
+
+    // =====================================================================
+    // (BB) FULL 3-BYTE CONTINUATION-MIDDLE JOINT DOMAIN - fix b0 == 192
+    //      (digit 191 at weight 1) and enumerate the full cross product of
+    //      the position-1 CONTINUATION byte (b1 in 192..255) x the position-2
+    //      terminating LOW byte (b2 in 1..191): 64 * 191 == 12224 distinct
+    //      3-byte sequences.  decode_u5 must return
+    //        191 + (b1-1)*64 + (b2-1)*4096
+    //      consuming exactly 3 bytes for every pair.  A trailing 200
+    //      (continuation) sits after the triple to confirm it is never read
+    //      once b2 terminates.  Distinct from section (Y) (a 2-byte joint
+    //      domain) and from (R) (which fixed the middle byte at 192 and swept
+    //      only the terminator): here BOTH the middle continuation digit and
+    //      the terminal digit vary jointly.
+    // =====================================================================
+    {
+        bool value_ok{ true };
+        bool pos_ok{ true };
+        int  first_bad_b1{ -1 };
+        int  first_bad_b2{ -1 };
+        for (int b1{ 192 }; b1 <= 255; ++b1)
+        {
+            for (int b2{ 1 }; b2 <= 191; ++b2)
+            {
+                int pos{ 0 };
+                const std::uint32_t v{ decode_at0(
+                    { 192u, static_cast<std::uint8_t>(b1), static_cast<std::uint8_t>(b2), 200u }, pos) };
+                const std::uint32_t expected{
+                    191u
+                  + (static_cast<std::uint32_t>(b1 - 1) << 6)
+                  + (static_cast<std::uint32_t>(b2 - 1) << 12) };
+                if (v != expected) { value_ok = false; if (first_bad_b1 < 0) { first_bad_b1 = b1; first_bad_b2 = b2; } }
+                if (pos != 3)      { pos_ok = false;   if (first_bad_b1 < 0) { first_bad_b1 = b1; first_bad_b2 = b2; } }
+            }
+        }
+        if (!value_ok || !pos_ok)
+        {
+            std::printf("       (first failing 3-byte continuation-middle pair b1=%d b2=%d)\n",
+                        first_bad_b1, first_bad_b2);
+        }
+        check("full_3byte_continuation_middle_joint_domain_value", value_ok);
+        check("full_3byte_continuation_middle_joint_domain_consumes_three", pos_ok);
+    }
+
+    // =====================================================================
+    // (CC) POSITION-2 AND POSITION-3 CONTINUATION BYTE SWEEPS - the same
+    //      "high byte stays live at an interior position" property pushed
+    //      deeper.  For position p in {2,3}, hold positions 0..p-1 at 192
+    //      (each digit 191) and sweep the position-p byte across 192..255;
+    //      a minimal low byte (1 -> digit 0) at position p+1 terminates.  The
+    //      value is prefix191(p) + (byte-1) << (6*p), built with the decoder's
+    //      own uint32 shift math so the position-3 weight (64^3 == 262144)
+    //      contributions that climb toward the high word are pinned exactly.
+    //      Consumes p+2 bytes (p continuations + the swept high byte + the
+    //      terminating low byte).
+    // =====================================================================
+    {
+        auto prefix_sum = [](int k) -> std::uint32_t {
+            std::uint32_t s{ 0 };
+            for (int i{ 0 }; i < k; ++i) { s += static_cast<std::uint32_t>(191u) << (6 * i); }
+            return s;
+        };
+        for (int p{ 2 }; p <= 3; ++p)
+        {
+            bool value_ok{ true };
+            bool pos_ok{ true };
+            int  first_bad{ -1 };
+            const std::uint32_t base{ prefix_sum(p) };
+            for (int hb{ 192 }; hb <= 255; ++hb)
+            {
+                std::vector<std::uint8_t> bytes(static_cast<std::size_t>(p), 192u);  // p leading continuations
+                bytes.push_back(static_cast<std::uint8_t>(hb));                       // swept continuation byte at pos p
+                bytes.push_back(1u);                                                  // digit-0 low terminator at pos p+1
+                int pos{ 0 };
+                const std::uint32_t v{ decode_at0(bytes, pos) };
+                const std::uint32_t expected{
+                    base + (static_cast<std::uint32_t>(hb - 1) << (6 * p)) };
+                if (v != expected) { value_ok = false; if (first_bad < 0) first_bad = hb; }
+                if (pos != p + 2)  { pos_ok = false;   if (first_bad < 0) first_bad = hb; }
+            }
+            if (!value_ok || !pos_ok)
+            {
+                std::printf("       (first failing position-%d continuation byte = %d)\n", p, first_bad);
+            }
+            std::string lbl_v{ std::string{ "position_" } + std::to_string(p) + "_continuation_byte_sweep_192_to_255_value" };
+            std::string lbl_p{ std::string{ "position_" } + std::to_string(p) + "_continuation_byte_sweep_192_to_255_consumes" };
+            check(lbl_v.c_str(), value_ok);
+            check(lbl_p.c_str(), pos_ok);
+        }
+    }
+
+    // =====================================================================
+    // (DD) LARGE NON-ZERO START OFFSET on a real owned buffer.  Sections (H)
+    //      and (V) covered offsets 0..16; the cursor is a plain `int`, so a
+    //      far-from-zero start exercises the same data[stream_pos++] / pos
+    //      arithmetic at large index values.  We build a single large owned
+    //      std::vector (no fabricated pointer), prefill it with filler low
+    //      byte 1 (each a complete value 0, never read by the target decode),
+    //      splice a canonical encoding at a large offset, and confirm the
+    //      decode is value-correct and advances by exactly the encoded length
+    //      from that large offset.
+    // =====================================================================
+    {
+        const std::uint32_t probes[]{ 0u, 4096u, 65535u, 50864255u, 0xFFFFFFFFu };
+        const int starts[]{ 1000, 4000, 8000 };
+        bool ok{ true };
+        std::uint32_t first_bad_val{ 0 };
+        int           first_bad_start{ -1 };
+        for (const int start : starts)
+        {
+            for (const std::uint32_t val : probes)
+            {
+                const std::vector<std::uint8_t> enc{ u5_oracle::encode(val) };
+                std::vector<std::uint8_t> buf(static_cast<std::size_t>(start), 1u);  // filler (each value 0)
+                buf.insert(buf.end(), enc.begin(), enc.end());
+                buf.resize(buf.size() + 8, 0u);  // peek padding
+                int pos{ start };
+                const std::uint32_t v{ vmhook::hotspot::klass::decode_u5(buf.data(), pos) };
+                if (v != val
+                 || static_cast<std::size_t>(pos) != static_cast<std::size_t>(start) + enc.size())
+                {
+                    ok = false;
+                    if (first_bad_start < 0) { first_bad_start = start; first_bad_val = val; }
+                }
+            }
+        }
+        if (!ok)
+        {
+            std::printf("       (first failing large-offset start=%d val=%u)\n", first_bad_start, first_bad_val);
+        }
+        check("decode_from_large_nonzero_start_offset_value_and_cursor", ok);
+    }
+
+    // =====================================================================
+    // (EE) CONTINUATION BYTE AT EVERY INTERIOR POSITION FLIPS THE LENGTH -
+    //      a single-step "does this byte continue?" probe at positions 1..3.
+    //      For each interior position p, hold positions 0..p-1 at 192 and put
+    //      byte 191 (LOW, the largest non-continuation byte) vs byte 192
+    //      (the smallest CONTINUATION byte) at position p.  The 191 case
+    //      TERMINATES at p (consuming p+1 bytes); the 192 case CONTINUES and a
+    //      following digit-0 low byte ends it at p+1 (consuming p+2 bytes).
+    //      The single-unit change 191->192 at the same position must flip the
+    //      consumed length by exactly 1 - pinning the `< 192` split at every
+    //      interior position, not just positions 0/1/2 already covered by (S).
+    //      p stops at 3: at p == 4 the "continue" case would need a 6th byte,
+    //      but the 5-byte cap (positions 0..4 all continuation) terminates the
+    //      loop at 5 instead - that cap behaviour is pinned separately in (T).
+    // =====================================================================
+    {
+        bool ok{ true };
+        int  first_bad{ -1 };
+        for (int p{ 1 }; p <= 3; ++p)
+        {
+            // LOW (191) at position p -> terminates there.
+            std::vector<std::uint8_t> low_bytes(static_cast<std::size_t>(p), 192u);
+            low_bytes.push_back(191u);
+            low_bytes.push_back(200u);  // must NOT be read
+            int low_pos{ 0 };
+            (void)decode_at0(low_bytes, low_pos);
+
+            // CONTINUATION (192) at position p -> continues; digit-0 low byte ends it.
+            std::vector<std::uint8_t> high_bytes(static_cast<std::size_t>(p), 192u);
+            high_bytes.push_back(192u);
+            high_bytes.push_back(1u);   // digit-0 terminator at position p+1
+            int high_pos{ 0 };
+            (void)decode_at0(high_bytes, high_pos);
+
+            if (low_pos != p + 1 || high_pos != p + 2 || (high_pos - low_pos) != 1)
+            {
+                ok = false; if (first_bad < 0) first_bad = p;
+            }
+        }
+        if (!ok) { std::printf("       (first failing interior split position = %d)\n", first_bad); }
+        check("interior_191_vs_192_flips_length_by_one_at_positions_1_to_3", ok);
+    }
+
     return failures == 0 ? 0 : 1;
 }

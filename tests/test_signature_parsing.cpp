@@ -3088,5 +3088,216 @@ int main()
               only_expected_widths && exactly_1_2_4_8);
     }
 
+    // =====================================================================
+    // EXHAUSTIVE PASS 12 -- the UNSIGNED5 codec decode_u5 (the JDK 21+
+    // FieldInfoStream variable-length integer the field-metadata walk consumes,
+    // vmhook.hpp:3848-3871).  ADDITIVE: no earlier pass touches decode_u5 at all.
+    // It is a PURE codec over a caller-owned std::uint8_t buffer with an int&
+    // cursor -- no oop, no fabricated address, no JVM -- so it is exhaustively
+    // testable here on REAL owned buffers.  Every expected value is derived
+    // directly from the source algorithm:
+    //   sum += (b_i - 1) << (6*i) for i=0..4; stop after the first byte < 192
+    //   (a "low byte"); a byte == 0 is the stream-End marker -> return ~0u AND
+    //   REWIND (leave stream_pos unchanged); after 5 bytes with no low byte the
+    //   accumulated sum is returned (advancing 5).  The End sentinel ~0u is NOT
+    //   private: the genuine 5-byte sequence {192,254,253,253,253} also decodes
+    //   to 0xFFFFFFFF but ADVANCES 5 -- End is distinguished only by the cursor
+    //   delta.  These pins were independently cross-checked against a reference
+    //   implementation of the same algorithm.
+    // =====================================================================
+
+    // Local reference driver: decode ONE value and report (value, bytes consumed)
+    // so the cursor-delta semantics (the only thing that separates End from a real
+    // UINT32_MAX) are observable.  Mirrors the live signature
+    // vmhook::hotspot::klass::decode_u5(const std::uint8_t*, int&) exactly.
+    struct u5_result { std::uint32_t value; int consumed; };
+    auto decode_one = [](const std::uint8_t* data, int start) -> u5_result
+    {
+        int pos{ start };
+        const std::uint32_t v{ vmhook::hotspot::klass::decode_u5(data, pos) };
+        return u5_result{ v, pos - start };
+    };
+
+    // ---- single LOW byte (b < 192): value == b-1, consumes exactly 1 ---------
+    // The whole one-byte domain 1..191 is a complete single-byte value b-1.
+    {
+        std::uint8_t buf[1]{ 0 };
+        bool all_ok{ true };
+        for (int b{ 1 }; b <= 191; ++b)
+        {
+            buf[0] = static_cast<std::uint8_t>(b);
+            const u5_result r{ decode_one(buf, 0) };
+            if (r.value != static_cast<std::uint32_t>(b - 1) || r.consumed != 1)
+            {
+                all_ok = false;
+            }
+        }
+        check("decode_u5_single_low_byte_1_to_191_is_b_minus_1_consume_1", all_ok);
+    }
+    // The low-byte boundary: 191 is the HIGHEST single-byte (191<192 -> low, value
+    // 190, consume 1); 192 is the LOWEST continuation byte (>=192 -> needs a
+    // following low byte).  Pin the boundary pair explicitly.
+    {
+        std::uint8_t hi_single[1]{ 191 };
+        const u5_result r1{ decode_one(hi_single, 0) };
+        check("decode_u5_byte_191_is_highest_single_value_190_consume_1",
+              r1.value == 190u && r1.consumed == 1);
+        std::uint8_t cont[2]{ 192, 1 };
+        const u5_result r2{ decode_one(cont, 0) };
+        check("decode_u5_byte_192_is_lowest_continuation_consume_2",
+              r2.value == 191u && r2.consumed == 2);
+    }
+
+    // ---- two-byte sequences (one continuation + one low) ---------------------
+    // value = (b0-1) + ((b1-1) << 6).  Pin the canonical rows derived from source.
+    {
+        struct two_byte { std::uint8_t b0; std::uint8_t b1; std::uint32_t value; };
+        const two_byte rows[]{
+            { 192, 1, 191u },   // (191) + (0<<6)            = 191
+            { 193, 1, 192u },   // (192) + (0<<6)            = 192
+            { 192, 2, 255u },   // (191) + (1<<6=64)         = 255
+            { 255, 1, 254u },   // (254) + (0<<6)            = 254
+        };
+        // Every row is exactly ONE continuation byte (b0>=192) followed by ONE low
+        // byte (b1<192), so each consumes exactly 2 bytes; the buffer is sized to 2
+        // and decode_u5 never reads past the low byte (it returns on it).
+        bool all_ok{ true };
+        for (const two_byte& t : rows)
+        {
+            // Sized to the full UNSIGNED5 width (5 bytes) even though b1<192
+            // terminates at 2: GCC-15 cannot prove the terminator after inlining
+            // decode_u5, so a minimal size-2 buffer trips a -Wstringop-overflow
+            // worst-case read past the end.  The trailing zeros are never reached.
+            std::uint8_t buf[5]{ t.b0, t.b1, 0, 0, 0 };
+            const u5_result r{ decode_one(buf, 0) };
+            if (r.value != t.value || r.consumed != 2) { all_ok = false; }
+        }
+        check("decode_u5_two_byte_sequences_match_formula_consume_2", all_ok);
+    }
+
+    // ---- three-byte continuation: {192,192,1} -> 191 + (191<<6) + (0<<12) -----
+    // Two continuation bytes then a low byte: 191 + 12224 = 12415, consume 3.
+    {
+        std::uint8_t buf[3]{ 192, 192, 1 };
+        const u5_result r{ decode_one(buf, 0) };
+        check("decode_u5_three_byte_192_192_1_is_12415_consume_3",
+              r.value == 12415u && r.consumed == 3);
+    }
+
+    // ---- max 5-byte UINT32_MAX vs End share the return value ~0u --------------
+    // The genuine {192,254,253,253,253} decodes to 0xFFFFFFFF and ADVANCES 5; the
+    // End marker {0} also returns 0xFFFFFFFF but REWINDS (consumes 0).  Pin BOTH
+    // halves of the documented sentinel collision: equal return value, different
+    // cursor delta -- the only disambiguator.
+    {
+        std::uint8_t max5[5]{ 192, 254, 253, 253, 253 };
+        const u5_result rm{ decode_one(max5, 0) };
+        std::uint8_t end_marker[1]{ 0 };
+        const u5_result re{ decode_one(end_marker, 0) };
+        check("decode_u5_genuine_max5_is_UINT32_MAX_consume_5",
+              rm.value == 0xFFFFFFFFu && rm.consumed == 5);
+        check("decode_u5_end_marker_zero_is_UINT32_MAX_rewinds_consume_0",
+              re.value == 0xFFFFFFFFu && re.consumed == 0);
+        check("decode_u5_end_and_max5_share_value_differ_by_cursor_delta",
+              rm.value == re.value && rm.consumed != re.consumed);
+    }
+
+    // ---- five all-continuation bytes (no low byte in 5): sum, consume 5 -------
+    // {192,192,192,192,192}: every byte is 192 (b-1 == 191) so the loop runs all
+    // five iterations without a low byte and returns sum of 191 << (6*i), i=0..4.
+    {
+        std::uint8_t all_high[5]{ 192, 192, 192, 192, 192 };
+        std::uint32_t expected{ 0 };
+        for (int i{ 0 }; i < 5; ++i)
+        {
+            expected += static_cast<std::uint32_t>(191) << (6 * i);
+        }
+        const u5_result r{ decode_one(all_high, 0) };
+        check("decode_u5_five_continuations_no_low_returns_sum_consume_5",
+              r.value == expected && r.consumed == 5);
+    }
+
+    // ---- mid-stream End marker rewinds only the byte-0 read -------------------
+    // {193,0}: byte0=193 is a continuation (sum=192, pos->1); byte1=0 is End ->
+    // rewind that single read (pos back to 1) and return ~0u.  So from start the
+    // cursor advances 1 (the continuation byte stays consumed; only the 0 is
+    // un-read).  Pins that the rewind undoes ONE byte, not the whole value.
+    {
+        std::uint8_t buf[2]{ 193, 0 };
+        const u5_result r{ decode_one(buf, 0) };
+        check("decode_u5_end_after_continuation_rewinds_one_byte_consume_1",
+              r.value == 0xFFFFFFFFu && r.consumed == 1);
+    }
+
+    // ---- the `int& stream_pos` start OFFSET contract -------------------------
+    // decode_u5 begins at the caller's stream_pos, not at 0.  Decode the SECOND
+    // value of {9,1} by starting at index 1: data[1]==1 is a low byte -> value 0,
+    // and stream_pos advances from 1 to 2.  Proves the cursor is honoured as both
+    // an in- and out-parameter.
+    {
+        std::uint8_t buf[2]{ 9, 1 };
+        int pos{ 1 };
+        const std::uint32_t v{ vmhook::hotspot::klass::decode_u5(buf, pos) };
+        check("decode_u5_starts_at_caller_stream_pos_and_advances",
+              v == 0u && pos == 2);
+    }
+
+    // ---- THREADED walk: decode a back-to-back run until the End marker --------
+    // A real FieldInfoStream is a sequence of UNSIGNED5 values terminated by a 0
+    // byte.  Walk {1, 64, 192,1, 192,2, 0} value-by-value advancing the shared
+    // cursor, and assert (a) the decoded sequence is exactly {0,63,191,255}, (b)
+    // the cursor lands on the End byte (index 6) with the End decode rewinding
+    // there, and (c) the per-value cursor positions are {0,1,2,4,6}.  This is the
+    // exact consumption pattern read_field_info performs.
+    {
+        std::uint8_t stream[7]{ 1, 64, 192, 1, 192, 2, 0 };
+        const std::uint32_t expected_vals[4]{ 0u, 63u, 191u, 255u };
+        const int expected_pos[5]{ 0, 1, 2, 4, 6 };
+        int pos{ 0 };
+        bool walk_ok{ true };
+        int produced{ 0 };
+        if (pos != expected_pos[0]) { walk_ok = false; }
+        for (int i{ 0 }; i < 4; ++i)
+        {
+            const int before{ pos };
+            const std::uint32_t v{ vmhook::hotspot::klass::decode_u5(stream, pos) };
+            if (v != expected_vals[i]) { walk_ok = false; }
+            if (pos == before) { walk_ok = false; }  // a real value must advance
+            if (pos != expected_pos[i + 1]) { walk_ok = false; }
+            ++produced;
+        }
+        // The cursor now sits on the End byte; decoding it returns ~0u and does
+        // NOT advance (rewind), confirming the terminator is detected in place.
+        const int at_end{ pos };
+        const std::uint32_t end_val{ vmhook::hotspot::klass::decode_u5(stream, pos) };
+        check("decode_u5_threaded_walk_decodes_full_sequence_then_end",
+              walk_ok && produced == 4 && end_val == 0xFFFFFFFFu && pos == at_end
+              && at_end == 6);
+    }
+
+    // ---- single low byte 128 (>127 but <192) is still a one-byte value --------
+    // 128 is NOT a continuation byte (the threshold is 192, not the UTF-8 0x80),
+    // so {128} is a complete single byte -> value 127, consume 1.  Pins that the
+    // continuation test is `< 192`, distinct from any high-bit notion.
+    {
+        std::uint8_t buf[1]{ 128 };
+        const u5_result r{ decode_one(buf, 0) };
+        check("decode_u5_byte_128_is_single_low_byte_value_127_consume_1",
+              r.value == 127u && r.consumed == 1);
+    }
+
+    // ---- decode of {64} and {1}: lower single-byte corners -------------------
+    // {1} is the smallest emitted byte -> value 0; {64} -> 63.  (Byte 0 is never a
+    // value, it is the End marker, pinned above.)  Pins the bottom of the
+    // single-byte range distinctly from the End sentinel.
+    {
+        std::uint8_t one[1]{ 1 };
+        std::uint8_t sixtyfour[1]{ 64 };
+        const u5_result r1{ decode_one(one, 0) };
+        const u5_result r64{ decode_one(sixtyfour, 0) };
+        check("decode_u5_byte_1_is_value_0_consume_1", r1.value == 0u && r1.consumed == 1);
+        check("decode_u5_byte_64_is_value_63_consume_1", r64.value == 63u && r64.consumed == 1);
+    }
+
     return failures == 0 ? 0 : 1;
 }

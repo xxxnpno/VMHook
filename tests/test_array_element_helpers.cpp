@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -3168,6 +3169,410 @@ static auto test_element_type_identity() -> void
     }
 }
 
+// ===========================================================================
+// ADDITIVE DEEPENING WAVE (49-52).  Sections 1-48 exhaust value / index /
+// offset / bounds / guard / clamp / type-identity on the three helpers using
+// only 1/2/4/8-byte element widths and the EXACT nine is_valid_pointer
+// sentinels.  This wave adds four input partitions none of the earlier sections
+// reach, all pure arithmetic or REAL owned std::vector buffers:
+//
+//   * 49 NON-POWER-OF-TWO and OVER-8-BYTE element strides.  Every width tested
+//     so far is 1/2/4/8 (so `index * sizeof(T)` only ever scales by a power of
+//     two).  The helpers accept ANY trivially-copyable element_type (their only
+//     static_assert, vmhook.hpp:14818/14863).  A 3-, 7-, 12- and 24-byte custom
+//     POD exercises the stride multiply with NON-power-of-two and >8-byte values
+//     -- a genuinely new input to `+16 + index*sizeof(T)` -- proving the offset
+//     is the C++ sizeof, not a hard-coded width table.  Compile-time stride pin
+//     + runtime round-trip + oracle-offset + tiling-delta on owned buffers.
+//   * 50 is_valid_pointer SENTINEL-ADJACENCY partition.  Section 41 pins the
+//     nine EXACT low-32 sentinels are rejected; nothing pins that the switch is
+//     EXACT-match -- i.e. that low32 values one/two away from each sentinel are
+//     NOT rejected (when otherwise even + in-range).  A regression widening any
+//     `case` to a range would slip past section 41 but fail here.  Pure
+//     arithmetic against the documented constants (vmhook.hpp:2068-2082), no
+//     dereference: compile-time + runtime via the section-40 oracle.
+//   * 51 array_length / get / set independence from the DATA region.  Sections
+//     20/45 poison the HEADER (+0..+11); none poisons the DATA bytes (+16..) and
+//     proves array_length still reads only the int32 at +12, and that a get/set
+//     round-trip is unaffected by arbitrary pre-existing data-region bytes (the
+//     helper overwrites exactly its slot, reads exactly its slot).
+//   * 52 is_unique_ptr_v collection tag partition (pure compile-time).  The
+//     collection/arg-packing dispatch keys on vmhook::detail::is_unique_ptr_v
+//     (vmhook.hpp:1788-1813): unique_ptr<T> (any deleter, any cv-ref form) is
+//     true; every non-unique_ptr (raw ptr, shared_ptr, value, the element types
+//     these array helpers use) is false.  Pin that partition as static_asserts.
+//
+// Expected values derived from vmhook.hpp: data base +16, stride sizeof(T)
+// (L14845/14875); is_valid_pointer reject set (L2051-2082); array_length signed
+// int32 at +12 (L14796-14801); is_unique_ptr_v over remove_cvref_t (L1812-1813).
+// All REAL owned buffers or pure arithmetic -- no fabricated-address data reads,
+// no value_t->container cast, no raw NUL / non-ASCII, fixed-width types only.
+// ===========================================================================
+
+// A 3-byte trivially-copyable POD: stride 3 is the smallest non-power-of-two,
+// so `index * 3` is never a shift and a 32-vs-64-bit or shift-based stride bug
+// would land at the wrong byte.  Packed so sizeof is exactly 3 (no tail pad).
+#pragma pack(push, 1)
+struct pod3 { std::uint8_t a; std::uint8_t b; std::uint8_t c; };
+struct pod7 { std::uint8_t v[7]; };
+#pragma pack(pop)
+// 12- and 24-byte PODs are naturally that size (no packing needed): three /
+// six uint32, exercising an over-8-byte and a larger non-power-of-two-multiple
+// stride through the same `index * sizeof(T)` arithmetic.
+struct pod12 { std::uint32_t w[3]; };
+struct pod24 { std::uint32_t w[6]; };
+
+static_assert(sizeof(pod3) == 3u,  "pod3 must be a 3-byte stride");
+static_assert(sizeof(pod7) == 7u,  "pod7 must be a 7-byte stride");
+static_assert(sizeof(pod12) == 12u, "pod12 must be a 12-byte stride");
+static_assert(sizeof(pod24) == 24u, "pod24 must be a 24-byte stride");
+static_assert(std::is_trivially_copyable_v<pod3> && std::is_trivially_copyable_v<pod7>
+              && std::is_trivially_copyable_v<pod12> && std::is_trivially_copyable_v<pod24>,
+              "custom PODs must satisfy the helpers' trivially-copyable contract");
+// Compile-time stride pin: the oracle offset uses sizeof(T), so a non-power-of-
+// two stride scales linearly (3/7/12/24), not by a shift.
+static_assert(layout_oracle::element_offset<pod3>(0u) == 16u
+              && layout_oracle::element_offset<pod3>(1u) == 19u
+              && layout_oracle::element_offset<pod3>(10u) == 46u,
+              "pod3 element offsets are 16 + 3*index");
+static_assert(layout_oracle::element_offset<pod7>(3u) == 16u + 21u, "pod7[3] is 16 + 7*3 == 37");
+static_assert(layout_oracle::element_offset<pod12>(5u) == 16u + 60u, "pod12[5] is 16 + 12*5 == 76");
+static_assert(layout_oracle::element_offset<pod24>(7u) == 16u + 168u, "pod24[7] is 16 + 24*7 == 184");
+// Consecutive non-power-of-two slots still tile with no gap (stride == sizeof).
+static_assert(stride_delta_is_sizeof<pod3>(0u) && stride_delta_is_sizeof<pod3>(99u),
+              "3-byte slots tile with a 3-byte stride");
+static_assert(stride_delta_is_sizeof<pod7>(0u) && stride_delta_is_sizeof<pod7>(40u),
+              "7-byte slots tile with a 7-byte stride");
+static_assert(stride_delta_is_sizeof<pod12>(0u) && stride_delta_is_sizeof<pod12>(20u),
+              "12-byte slots tile with a 12-byte stride");
+static_assert(stride_delta_is_sizeof<pod24>(0u) && stride_delta_is_sizeof<pod24>(10u),
+              "24-byte slots tile with a 24-byte stride");
+
+// ---------------------------------------------------------------------------
+// 49. Non-power-of-two / over-8-byte custom-POD strides: round-trip + oracle.
+// ---------------------------------------------------------------------------
+template<typename T>
+static auto exercise_pod_stride(const char* label, std::int32_t count) -> void
+{
+    // Distinct, byte-spanning value per slot so a wrong stride lands on a
+    // neighbour and is visible.
+    std::vector<T> seed(static_cast<std::size_t>(count));
+    for (std::int32_t i{ 0 }; i < count; ++i)
+    {
+        std::uint8_t bytes[sizeof(T)];
+        for (std::size_t b{ 0 }; b < sizeof(T); ++b)
+        {
+            bytes[b] = static_cast<std::uint8_t>((static_cast<unsigned>(i) * 31u + static_cast<unsigned>(b) * 7u + 1u) & 0xFFu);
+        }
+        std::memcpy(&seed[static_cast<std::size_t>(i)], bytes, sizeof(T));
+    }
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    bool ok{ vmhook::array_length(oop) == count };
+    // Read every seeded slot via the helper; cross-check against the oracle
+    // offset (+16 + index*sizeof(T)) read straight from the backing bytes.
+    for (std::int32_t i{ 0 }; i < count && ok; ++i)
+    {
+        if (!bits_equal(vmhook::get_array_element<T>(oop, i), seed[static_cast<std::size_t>(i)])) { ok = false; break; }
+        if (!bits_equal(raw_peek<T>(buffer, i), seed[static_cast<std::size_t>(i)]))               { ok = false; break; }
+    }
+    // Overwrite every slot with a second distinct pattern; confirm helper and
+    // oracle agree and no neighbour moved.
+    for (std::int32_t i{ 0 }; i < count && ok; ++i)
+    {
+        T v{};
+        std::uint8_t bytes[sizeof(T)];
+        for (std::size_t b{ 0 }; b < sizeof(T); ++b)
+        {
+            bytes[b] = static_cast<std::uint8_t>((static_cast<unsigned>(count - i) * 17u + static_cast<unsigned>(b) * 3u + 0x80u) & 0xFFu);
+        }
+        std::memcpy(&v, bytes, sizeof(T));
+        vmhook::set_array_element<T>(oop, i, v);
+        if (!bits_equal(raw_peek<T>(buffer, i), v))                  { ok = false; break; }
+        if (!bits_equal(vmhook::get_array_element<T>(oop, i), v))    { ok = false; break; }
+        seed[static_cast<std::size_t>(i)] = v;
+    }
+    // Full re-read: every slot still holds its own value (no overlap/gap).
+    for (std::int32_t i{ 0 }; i < count && ok; ++i)
+    {
+        if (!bits_equal(vmhook::get_array_element<T>(oop, i), seed[static_cast<std::size_t>(i)])) { ok = false; break; }
+    }
+    // OOB index (== length) rejected for read AND write at this stride too.
+    {
+        T probe{};
+        std::memset(&probe, 0x5A, sizeof(T));
+        if (!bits_equal(vmhook::get_array_element<T>(oop, opaque_index(count)), T{})) { ok = false; }
+        const std::vector<std::uint8_t> before{ buffer };
+        vmhook::set_array_element<T>(oop, opaque_index(count), probe);
+        if (buffer != before) { ok = false; }
+    }
+    // Header (+0..+11) untouched by the data writes.
+    for (std::size_t i{ 0 }; i < 12u && ok; ++i)
+    {
+        if (buffer[i] != 0u) { ok = false; }
+    }
+    check(label, ok);
+}
+
+static auto test_non_pow2_pod_strides() -> void
+{
+    check("pod_stride_static_asserts_compiled", true);
+    exercise_pod_stride<pod3>("pod3_stride3_roundtrip", 40);
+    exercise_pod_stride<pod7>("pod7_stride7_roundtrip", 30);
+    exercise_pod_stride<pod12>("pod12_stride12_roundtrip", 24);
+    exercise_pod_stride<pod24>("pod24_stride24_roundtrip", 16);
+
+    // Explicit numeric offset spot-checks for a non-power-of-two stride: a value
+    // written at index i must appear at exactly +16 + 3*i in the raw buffer.
+    {
+        const std::vector<pod3> seed(20u, pod3{ 0u, 0u, 0u });
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        vmhook::set_array_element<pod3>(oop, 0,  pod3{ 0x11u, 0x12u, 0x13u });
+        vmhook::set_array_element<pod3>(oop, 1,  pod3{ 0x21u, 0x22u, 0x23u });
+        vmhook::set_array_element<pod3>(oop, 19, pod3{ 0x91u, 0x92u, 0x93u });
+        // Oracle offsets: 16, 19, 16+19*3 == 73.
+        const bool off0{ offset_of<pod3>(0) == 16u && buffer[16] == 0x11u && buffer[17] == 0x12u && buffer[18] == 0x13u };
+        const bool off1{ offset_of<pod3>(1) == 19u && buffer[19] == 0x21u && buffer[20] == 0x22u && buffer[21] == 0x23u };
+        const bool off19{ offset_of<pod3>(19) == 73u && buffer[73] == 0x91u && buffer[74] == 0x92u && buffer[75] == 0x93u };
+        check("pod3_explicit_offsets_16_19_73", off0 && off1 && off19);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 50. is_valid_pointer sentinel-ADJACENCY: only the EXACT nine low-32 patterns
+//     are rejected by the switch; an otherwise-valid (even, in-range) address
+//     whose low32 is one/two away from a sentinel must be ACCEPTED.  Pure
+//     arithmetic via the section-40 oracle -- no dereference.
+// ---------------------------------------------------------------------------
+// Build an in-range, even high-word address carrying a given low-32 pattern.
+// High word 0x2 keeps addr in (floor, ceiling); forcing the low bit even where
+// the pattern itself is odd would change the pattern, so we choose adjacency
+// offsets that keep the result even and assert evenness explicitly per case.
+namespace sentinel_adjacency
+{
+    inline constexpr std::uintptr_t high_word{ std::uintptr_t{ 2ull } << 32 };
+    constexpr auto with_low32(std::uint32_t low) noexcept -> std::uintptr_t
+    {
+        return high_word | static_cast<std::uintptr_t>(low);
+    }
+}
+// EVEN sentinels (CAFEBABE, CCCCCCCC, FEEEFEEE): the +/-2 neighbour keeps the
+// even parity, stays in range, and is not the exact pattern -> accepted (the
+// switch is exact-match, not a range), and is not odd-rejected.
+static_assert(!deepening_wave_40::pointer_rejected_oracle(sentinel_adjacency::with_low32(0xCAFEBABEu - 2u)),
+              "CAFEBABE-2 (even, in range, not the sentinel) accepted");
+static_assert(!deepening_wave_40::pointer_rejected_oracle(sentinel_adjacency::with_low32(0xCAFEBABEu + 2u)),
+              "CAFEBABE+2 accepted");
+static_assert(!deepening_wave_40::pointer_rejected_oracle(sentinel_adjacency::with_low32(0xCCCCCCCCu - 2u)),
+              "CCCCCCCC-2 accepted");
+static_assert(!deepening_wave_40::pointer_rejected_oracle(sentinel_adjacency::with_low32(0xCCCCCCCCu + 2u)),
+              "CCCCCCCC+2 accepted");
+static_assert(!deepening_wave_40::pointer_rejected_oracle(sentinel_adjacency::with_low32(0xFEEEFEECu)),
+              "FEEEFEEC (FEEEFEEE-2, even) accepted");
+// ODD sentinels (BAADF00D, DDDDDDDD): the +/-1 EVEN neighbour clears the low bit,
+// so it passes the odd-address clause AND is not the exact pattern -> accepted.
+// This proves the switch is not silently catching the whole odd-sentinel range.
+static_assert(!deepening_wave_40::pointer_rejected_oracle(sentinel_adjacency::with_low32(0xBAADF00Cu)),
+              "BAADF00C (BAADF00D-1, even) accepted -- one below the odd sentinel");
+static_assert(!deepening_wave_40::pointer_rejected_oracle(sentinel_adjacency::with_low32(0xBAADF00Eu)),
+              "BAADF00E (BAADF00D+1, even) accepted -- one above the odd sentinel");
+static_assert(!deepening_wave_40::pointer_rejected_oracle(sentinel_adjacency::with_low32(0xDDDDDDDCu)),
+              "DDDDDDDC (DDDDDDDD-1, even) accepted -- one below the odd sentinel");
+// Sanity: the EXACT even sentinels ARE still rejected (the switch fires).
+static_assert(deepening_wave_40::pointer_rejected_oracle(sentinel_adjacency::with_low32(0xCAFEBABEu)),
+              "CAFEBABE exact still rejected");
+static_assert(deepening_wave_40::pointer_rejected_oracle(sentinel_adjacency::with_low32(0xBAADF00Du)),
+              "BAADF00D exact still rejected");
+
+static auto test_sentinel_adjacency() -> void
+{
+    using deepening_wave_40::pointer_rejected_oracle;
+    using sentinel_adjacency::with_low32;
+
+    // Exactly THREE of the nine sentinels are even (last nibble even): CAFEBABE,
+    // CCCCCCCC, FEEEFEEE.  Their +/-2 neighbours (still even, in range, not the
+    // exact pattern) must be ACCEPTED, while the exact pattern is rejected by the
+    // switch.  (The other six sentinels end in an odd nibble -- B/D/F -- so their
+    // +/-2 neighbours stay odd and are caught by the odd-address clause; they are
+    // handled by the odd_sentinels loop below instead.)
+    const std::uint32_t even_sentinels[]{ 0xCAFEBABEu, 0xCCCCCCCCu, 0xFEEEFEEEu };
+    // Keep the intent honest: each listed value is genuinely even.
+    bool listed_even{ true };
+    for (const std::uint32_t s : even_sentinels)
+    {
+        if ((s & 1u) != 0u) { listed_even = false; break; }
+    }
+    check("adjacency_even_sentinels_are_even", listed_even);
+
+    bool exact_rejected_neighbours_accepted{ true };
+    for (const std::uint32_t s : even_sentinels)
+    {
+        // -2 and +2 keep the even parity -> not independently odd-rejected.
+        const std::uint32_t below{ s - 2u };
+        const std::uint32_t above{ s + 2u };
+        if (pointer_rejected_oracle(with_low32(below))) { exact_rejected_neighbours_accepted = false; break; }
+        if (pointer_rejected_oracle(with_low32(above))) { exact_rejected_neighbours_accepted = false; break; }
+        if (!pointer_rejected_oracle(with_low32(s)))    { exact_rejected_neighbours_accepted = false; break; }
+    }
+    check("adjacency_even_sentinel_neighbours_accepted_exact_rejected",
+          exact_rejected_neighbours_accepted);
+
+    // The six ODD sentinels (DEADBEEF, CDCDCDCD, BAADF00D, ABABABAB, FDFDFDFD,
+    // DDDDDDDD) are caught by the odd-address clause, NOT the switch -- so the
+    // EVEN neighbour at sentinel-1 (which clears the low bit) must be ACCEPTED,
+    // proving the switch does not also list them as a range.  sentinel-1 of an
+    // odd value is even.
+    const std::uint32_t odd_sentinels[]{
+        0xDEADBEEFu, 0xCDCDCDCDu, 0xBAADF00Du, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu };
+    bool odd_neighbour_even_accepted{ true };
+    for (const std::uint32_t s : odd_sentinels)
+    {
+        const std::uint32_t even_neighbour{ s - 1u }; // clears low bit -> even
+        if ((even_neighbour & 1u) != 0u) { odd_neighbour_even_accepted = false; break; }
+        if (pointer_rejected_oracle(with_low32(even_neighbour))) { odd_neighbour_even_accepted = false; break; }
+        // The exact odd sentinel is still rejected (by the odd clause).
+        if (!pointer_rejected_oracle(with_low32(s))) { odd_neighbour_even_accepted = false; break; }
+    }
+    check("adjacency_odd_sentinel_even_neighbour_accepted", odd_neighbour_even_accepted);
+
+    // Live cross-check: a REAL owned buffer whose address obviously is not any
+    // sentinel passes the guard (positive control already relied upon).  And a
+    // header-only buffer with an honest length reads back through array_length,
+    // confirming the accept path is the one the helpers actually take.
+    {
+        const std::vector<std::int32_t> seed{ 0x24682468 };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        check("adjacency_real_buffer_accepted_live",
+              vmhook::array_length(buffer.data()) == 1
+              && vmhook::get_array_element<std::int32_t>(buffer.data(), 0) == 0x24682468);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 51. array_length / get / set independence from the DATA region (+16..).
+//     Sections 20/45 poison the header (+0..+11); this poisons the DATA bytes
+//     and proves: (a) array_length still reads ONLY the int32 at +12; (b) a
+//     get reads exactly its slot regardless of surrounding poison; (c) a set
+//     overwrites exactly its slot, leaving every other data byte and the whole
+//     header byte-identical.
+// ---------------------------------------------------------------------------
+static auto test_data_region_independence() -> void
+{
+    // (a) array_length ignores arbitrary data-region bytes: build a buffer whose
+    // ENTIRE data region is 0xCC (a byte that, read as a length, would be a huge
+    // number) but whose +12 length is a small honest value.
+    {
+        const std::int32_t len{ 6 };
+        std::vector<std::uint8_t> buffer(
+            16u + static_cast<std::size_t>(len) * sizeof(std::int32_t), std::uint8_t{ 0 });
+        std::memset(buffer.data() + 16, 0xCC, buffer.size() - 16u); // poison data only
+        std::memcpy(buffer.data() + 12, &len, sizeof(len));
+        check("data_poison_length_still_reads_off12",
+              vmhook::array_length(buffer.data()) == len);
+        // A get reads exactly its 4-byte slot: index 0 reads the four 0xCC bytes.
+        check("data_poison_get_reads_exact_slot",
+              vmhook::get_array_element<std::uint32_t>(buffer.data(), 0) == 0xCCCCCCCCu);
+    }
+
+    // (b) A set into one slot leaves the OTHER data bytes and the full 16-byte
+    // header byte-identical: poison all data with a recognisable pattern, write
+    // index 2, confirm only the index-2 bytes changed.
+    {
+        const std::int32_t len{ 8 };
+        std::vector<std::uint8_t> buffer(
+            16u + static_cast<std::size_t>(len) * sizeof(std::int32_t), std::uint8_t{ 0 });
+        std::memset(buffer.data() + 16, 0xA7, buffer.size() - 16u);
+        std::memcpy(buffer.data() + 12, &len, sizeof(len));
+        const std::vector<std::uint8_t> before{ buffer };
+
+        vmhook::set_array_element<std::int32_t>(buffer.data(), 2, 0x1A2B3C4D);
+
+        // Header (+0..+15) untouched.
+        const bool header_same{ std::memcmp(before.data(), buffer.data(), 16u) == 0 };
+        // Slot 2 occupies bytes +24..+27 (16 + 2*4); those four changed.
+        const bool slot_written{ vmhook::get_array_element<std::int32_t>(buffer.data(), 2) == 0x1A2B3C4D };
+        // Every data byte OUTSIDE +24..+27 is still 0xA7 (untouched poison).
+        bool others_unchanged{ true };
+        for (std::size_t i{ 16u }; i < buffer.size(); ++i)
+        {
+            const bool in_slot2{ i >= 24u && i < 28u };
+            if (!in_slot2 && buffer[i] != before[i]) { others_unchanged = false; break; }
+        }
+        check("data_poison_set_touches_only_target_slot",
+              header_same && slot_written && others_unchanged);
+    }
+
+    // (c) Round-trip across an all-poison data buffer: each write-then-read at a
+    // valid index returns exactly what was written, independent of the poison.
+    {
+        const std::int32_t len{ 5 };
+        std::vector<std::uint8_t> buffer(
+            16u + static_cast<std::size_t>(len) * sizeof(std::int64_t), std::uint8_t{ 0 });
+        // length lives at +12; data stride here is int64 so size is 16 + 5*8.
+        std::memset(buffer.data() + 16, 0x3C, buffer.size() - 16u);
+        std::memcpy(buffer.data() + 12, &len, sizeof(len));
+        void* const oop{ buffer.data() };
+        bool ok{ vmhook::array_length(oop) == len };
+        for (std::int32_t i{ 0 }; i < len && ok; ++i)
+        {
+            const std::int64_t v{ 0x0F0F000000000000ll + i };
+            vmhook::set_array_element<std::int64_t>(oop, i, v);
+            if (vmhook::get_array_element<std::int64_t>(oop, i) != v) { ok = false; break; }
+        }
+        check("data_poison_full_roundtrip_independent", ok);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 52. is_unique_ptr_v collection-tag partition (pure compile-time).  The
+//     arg-packing / collection dispatch keys on this trait; pin its truth table
+//     so a regression (or a cv-ref stripping change) is a build failure.  The
+//     element types these array helpers operate on are all NON-unique_ptr, which
+//     is exactly why they flow through the raw-byte path rather than the wrapper
+//     path -- assert that negative side too.
+// ---------------------------------------------------------------------------
+struct unique_ptr_tag_probe {};
+// unique_ptr<T> (default deleter) is true; cv-ref forms strip to the same.
+static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<unique_ptr_tag_probe>>,
+              "unique_ptr<T> must tag true");
+static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<unique_ptr_tag_probe>&>,
+              "const unique_ptr<T>& must tag true (cv-ref stripped)");
+static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<unique_ptr_tag_probe>&&>,
+              "unique_ptr<T>&& must tag true (cv-ref stripped)");
+static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<unique_ptr_tag_probe[]>>,
+              "unique_ptr<T[]> (array deleter) must tag true");
+// The value_type_t recovers the wrapped type.
+static_assert(std::is_same_v<
+                  vmhook::detail::is_unique_ptr<std::unique_ptr<unique_ptr_tag_probe>>::value_type_t,
+                  unique_ptr_tag_probe>,
+              "is_unique_ptr<unique_ptr<T>>::value_type_t must be T");
+// Negatives: a raw pointer, a shared_ptr, a plain value, and the array-element
+// types these helpers use are all NOT unique_ptr -> false.
+static_assert(!vmhook::detail::is_unique_ptr_v<unique_ptr_tag_probe*>, "raw ptr is not unique_ptr");
+static_assert(!vmhook::detail::is_unique_ptr_v<std::shared_ptr<unique_ptr_tag_probe>>,
+              "shared_ptr is not unique_ptr");
+static_assert(!vmhook::detail::is_unique_ptr_v<unique_ptr_tag_probe>, "value is not unique_ptr");
+static_assert(!vmhook::detail::is_unique_ptr_v<std::int32_t>, "int32 element is not unique_ptr");
+static_assert(!vmhook::detail::is_unique_ptr_v<double>, "double element is not unique_ptr");
+static_assert(!vmhook::detail::is_unique_ptr_v<std::uint32_t>, "narrow-oop element is not unique_ptr");
+static_assert(!vmhook::detail::is_unique_ptr_v<void*>, "void* element is not unique_ptr");
+static_assert(!vmhook::detail::is_unique_ptr_v<pod3>, "custom POD element is not unique_ptr");
+
+static auto test_is_unique_ptr_tag_partition() -> void
+{
+    // All assertions above are compile-time; record the TU built with them.
+    check("is_unique_ptr_tag_static_asserts_compiled", true);
+    // Runtime mirror of the partition so the section reports a [PASS] line and a
+    // constant-folding regression that somehow built would still be visible.
+    check("is_unique_ptr_tag_runtime_partition",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<unique_ptr_tag_probe>>
+          && !vmhook::detail::is_unique_ptr_v<std::int32_t>
+          && !vmhook::detail::is_unique_ptr_v<std::uint32_t>
+          && !vmhook::detail::is_unique_ptr_v<void*>);
+}
+
 int main()
 {
     test_all_widths();
@@ -3215,6 +3620,10 @@ int main()
     test_constant_stride_tiling();
     test_clamp_never_expands_range();
     test_element_type_identity();
+    test_non_pow2_pod_strides();
+    test_sentinel_adjacency();
+    test_data_region_independence();
+    test_is_unique_ptr_tag_partition();
 
     if (failures == 0)
     {
