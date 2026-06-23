@@ -140,3 +140,6 @@ vmhook_add_test(midi2i_trampoline_alloc        SOURCES test_midi2i_trampoline_al
 vmhook_add_test(read_java_string_nul_astral    SOURCES test_read_java_string_nul_astral.cpp)
 vmhook_add_test(method_call_arg_cap            SOURCES test_method_call_arg_cap.cpp)
 vmhook_add_test(seh_invoke_detour              SOURCES test_seh_invoke_detour.cpp)
+vmhook_add_test(dont_inline_dont_compile       SOURCES test_dont_inline_dont_compile.cpp)
+vmhook_add_test(hook_common_detour_dispatch    SOURCES test_hook_common_detour_dispatch.cpp)
+vmhook_add_test(klass_introspection_nojvm      SOURCES test_klass_introspection_nojvm.cpp)
