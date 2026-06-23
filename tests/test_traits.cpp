@@ -38,6 +38,8 @@
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <typeindex>
+#include <typeinfo>
 #include <vector>
 
 // -----------------------------------------------------------------------------
@@ -870,6 +872,156 @@ static_assert(std::is_same_v<decltype(vmhook::make_unique<zoo::wrapper_a>(std::i
                              std::unique_ptr<zoo::wrapper_a>>,
               "make_unique<T>(args...) returns unique_ptr<T>");
 
+// =============================================================================
+// ADDITIVE DEEPENING — unified_call_syntax feature owner, no-JVM surface.
+//
+// All-OS / all-compiler -Werror, no live JVM (gHotSpotVMStructs null).  Four
+// independent truth tables, each derived directly from the live header:
+//   (A) build_dr7  — the DR7 control-mask bit-field assembly (pure integer math,
+//       no dereference; works on every OS because the bit layout is replicated
+//       from the Intel-SDM formula in source and cross-checked against the real
+//       build_dr7 on the Windows/x86_64 config that compiles it).
+//   (B) jni:: forwarders — the NULL/empty/false no-JVM contract over the
+//       handle/name matrix (every call short-circuits on a null JNIEnv or null
+//       handle WITHOUT dereferencing a fabricated address).
+//   (C) register_class / make_unique — the no-JVM map+factory contract
+//       (register_class returns false and leaves type_to_class_map unpopulated
+//       when find_class cannot verify the class; make_unique yields null).
+//   (D) base traits over more shapes — function_traits / type-trait facts not
+//       already pinned above.
+// Additive only: a fresh namespace, no existing assertion touched.
+// =============================================================================
+namespace unified_deep
+{
+    // -------------------------------------------------------------------------
+    // (A) build_dr7 — DR7 control-mask bit-field assembly.
+    //
+    // Source (vmhook.hpp ~1241): build_dr7(slot, rw, len) =
+    //     local_enable | rw_bits | len_bits, where
+    //   local_enable = uint64{1} << (slot * 2)          // L0/L1/L2/L3 enables
+    //   rw_bits      = uint64(rw)  << (16 + slot * 4)    // R/W field per slot
+    //   len_bits     = uint64(len) << (18 + slot * 4)    // LEN field per slot
+    // Global-enable (G*) and LE/GE bits stay cleared by construction.
+    //
+    // The access-kind enum (vmhook.hpp ~1210) defines EXACTLY two encodings:
+    //   data_breakpoint_kind::write      = 0b01
+    //   data_breakpoint_kind::read_write = 0b11
+    // and the length enum (vmhook.hpp ~1219):
+    //   one_byte = 0b00, two_bytes = 0b01, eight_bytes = 0b10, four_bytes = 0b11
+    // These enums are defined on EVERY platform (only the build_dr7 function is
+    // Windows/x86_64-gated), so their encodings are asserted unconditionally and
+    // the packed reference values are derived from them with pure integer math.
+    // -------------------------------------------------------------------------
+
+    // The enum encodings the bit-math depends on — straight from source.
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_kind::write)      == 0x1u,
+                  "data_breakpoint_kind::write encodes 0b01");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_kind::read_write) == 0x3u,
+                  "data_breakpoint_kind::read_write encodes 0b11");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_length::one_byte)    == 0x0u,
+                  "data_breakpoint_length::one_byte encodes 0b00");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_length::two_bytes)   == 0x1u,
+                  "data_breakpoint_length::two_bytes encodes 0b01");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_length::eight_bytes) == 0x2u,
+                  "data_breakpoint_length::eight_bytes encodes 0b10");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_length::four_bytes)  == 0x3u,
+                  "data_breakpoint_length::four_bytes encodes 0b11");
+
+    // Independent reference implementation of the source formula (constexpr, so it
+    // packs at compile time and is usable in static_assert on every platform).
+    constexpr auto dr7_ref(const int slot,
+                           const vmhook::os::data_breakpoint_kind rw,
+                           const vmhook::os::data_breakpoint_length len) noexcept -> std::uint64_t
+    {
+        const std::uint64_t local_enable{ std::uint64_t{ 1 } << (slot * 2) };
+        const std::uint64_t rw_bits     { static_cast<std::uint64_t>(rw)  << (16 + slot * 4) };
+        const std::uint64_t len_bits    { static_cast<std::uint64_t>(len) << (18 + slot * 4) };
+        return local_enable | rw_bits | len_bits;
+    }
+
+    using bk  = vmhook::os::data_breakpoint_kind;
+    using blen = vmhook::os::data_breakpoint_length;
+
+    // Per-slot local-enable bit lands at index slot*2: 0x1, 0x4, 0x10, 0x40.
+    static_assert((dr7_ref(0, bk::write, blen::one_byte) & 0xFFu) == 0x1u,  "slot 0 local-enable bit is bit 0");
+    static_assert((dr7_ref(1, bk::write, blen::one_byte) & 0xFFu) == 0x4u,  "slot 1 local-enable bit is bit 2");
+    static_assert((dr7_ref(2, bk::write, blen::one_byte) & 0xFFu) == 0x10u, "slot 2 local-enable bit is bit 4");
+    static_assert((dr7_ref(3, bk::write, blen::one_byte) & 0xFFu) == 0x40u, "slot 3 local-enable bit is bit 6");
+
+    // Slot 0 — full length sweep (write), then read_write corners.  Exact u64.
+    static_assert(dr7_ref(0, bk::write,      blen::one_byte)    == 0x10001u, "s0 write/1B  = L0 | (1<<16) | (0<<18)");
+    static_assert(dr7_ref(0, bk::write,      blen::two_bytes)   == 0x50001u, "s0 write/2B  = L0 | (1<<16) | (1<<18)");
+    static_assert(dr7_ref(0, bk::write,      blen::eight_bytes) == 0x90001u, "s0 write/8B  = L0 | (1<<16) | (2<<18)");
+    static_assert(dr7_ref(0, bk::write,      blen::four_bytes)  == 0xD0001u, "s0 write/4B  = L0 | (1<<16) | (3<<18)");
+    static_assert(dr7_ref(0, bk::read_write, blen::one_byte)    == 0x30001u, "s0 rw/1B     = L0 | (3<<16) | (0<<18)");
+    static_assert(dr7_ref(0, bk::read_write, blen::four_bytes)  == 0xF0001u, "s0 rw/4B     = L0 | (3<<16) | (3<<18)");
+
+    // Slots 1-3 — the R/W & LEN nibble shifts by 4 bits per slot.
+    static_assert(dr7_ref(1, bk::write,      blen::one_byte)    == 0x100004u,    "s1 write/1B = L1 | (1<<20)");
+    static_assert(dr7_ref(1, bk::read_write, blen::four_bytes)  == 0xF00004u,    "s1 rw/4B    = L1 | (3<<20) | (3<<22)");
+    static_assert(dr7_ref(2, bk::write,      blen::one_byte)    == 0x1000010u,   "s2 write/1B = L2 | (1<<24)");
+    static_assert(dr7_ref(2, bk::read_write, blen::eight_bytes) == 0xB000010u,   "s2 rw/8B    = L2 | (3<<24) | (2<<26)");
+    static_assert(dr7_ref(3, bk::write,      blen::one_byte)    == 0x10000040u,  "s3 write/1B = L3 | (1<<28)");
+    static_assert(dr7_ref(3, bk::read_write, blen::four_bytes)  == 0xF0000040u,  "s3 rw/4B    = L3 | (3<<28) | (3<<30)");
+
+    // The R/W and LEN fields occupy disjoint 2-bit lanes within the slot's
+    // nibble at (16 + slot*4): rw at the low 2 bits, len at the high 2 bits.
+    static_assert(((dr7_ref(0, bk::read_write, blen::four_bytes) >> 16) & 0x3u) == 0x3u, "s0 R/W lane = read_write(0b11)");
+    static_assert(((dr7_ref(0, bk::read_write, blen::four_bytes) >> 18) & 0x3u) == 0x3u, "s0 LEN lane = four_bytes(0b11)");
+    static_assert(((dr7_ref(3, bk::write,      blen::eight_bytes) >> 28) & 0x3u) == 0x1u, "s3 R/W lane = write(0b01)");
+    static_assert(((dr7_ref(3, bk::write,      blen::eight_bytes) >> 30) & 0x3u) == 0x2u, "s3 LEN lane = eight_bytes(0b10)");
+
+    // Global-enable / LE / GE control bits are never set by build_dr7: bits
+    // {1,3,5,7} (G0-G3) and {8,9} (LE,GE) stay clear for every slot/kind/len.
+    static_assert((dr7_ref(0, bk::read_write, blen::four_bytes) & 0x3AAu) == 0x0u,
+                  "build_dr7 leaves G0-G3 / LE / GE clear (s0)");
+    static_assert((dr7_ref(3, bk::read_write, blen::four_bytes) & 0x3AAu) == 0x0u,
+                  "build_dr7 leaves G0-G3 / LE / GE clear (s3)");
+
+    // -------------------------------------------------------------------------
+    // (D) base traits over more shapes — additive to the type-zoo coverage above.
+    //
+    // function_traits exposes a SINGLE member, args_tuple_t (a std::tuple of the
+    // raw parameter types) — NO return_type / arity / argument<N> members exist
+    // (header ~vmhook.hpp:9316-9357).  The function_traits->tuple decomposition
+    // CHAIN itself is owned by test_traits_extra.cpp / test_traits_function_traits
+    // .cpp; here we pin ONLY the detour-functor parameter list — the exact
+    // (return_value&, const unique_ptr<wrapper_a>&) shape that the typed hook<T>()
+    // entry-point reads — which those files do not assert, plus the
+    // noexcept-functor and member-pointer specialisations resolving to the same
+    // tuple (regression guard for the C++17 "noexcept is part of the type" gap
+    // the header documents at 9325-9333 / 9359-9376).
+    // -------------------------------------------------------------------------
+    using detour_args = vmhook::detail::function_traits<zoo::detour_functor>::args_tuple_t;
+    static_assert(std::tuple_size_v<detour_args> == 2,
+                  "detour functor operator() has exactly two parameters");
+    static_assert(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<0, detour_args>>,
+                                 vmhook::return_value>,
+                  "detour arg 0 is return_value& (cvref-stripped)");
+    static_assert(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<1, detour_args>>,
+                                 std::unique_ptr<zoo::wrapper_a>>,
+                  "detour arg 1 is const unique_ptr<wrapper_a>& (cvref-stripped)");
+
+    // Plain function-pointer + member-function-pointer + noexcept-pointer shapes
+    // all decompose to the same parameter tuple (the qualifier is irrelevant to
+    // the Java parameter list, per the header's enumerated specialisations).
+    static_assert(std::is_same_v<vmhook::detail::function_traits<zoo::free_fn_ptr_t>::args_tuple_t,
+                                 std::tuple<double, char>>,
+                  "function_traits<int(*)(double,char)>::args_tuple_t == tuple<double,char>");
+    static_assert(std::is_same_v<vmhook::detail::function_traits<zoo::free_fn_noex_t>::args_tuple_t,
+                                 std::tuple<double, char>>,
+                  "noexcept fn-ptr decomposes to the same arg tuple (C++17 noexcept-in-type guard)");
+    static_assert(std::is_same_v<vmhook::detail::function_traits<zoo::mem_fn_ptr>::args_tuple_t,
+                                 std::tuple<int>>,
+                  "function_traits<void(with_members::*)(int)>::args_tuple_t == tuple<int>");
+
+    // A bare wrapper value is NOT itself a unique_ptr/vector; object<T> never
+    // leaks std::true_type's value_type into the public surface.
+    static_assert(!vmhook::detail::is_unique_ptr_v<zoo::wrapper_a>,            "a bare wrapper value is not a unique_ptr");
+    static_assert(!vmhook::detail::is_vector_v<zoo::wrapper_a>,                "a bare wrapper value is not a vector");
+    static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<zoo::wrapper_a_child>>, "unique_ptr<grandchild wrapper> is a unique_ptr");
+}
+
 // -----------------------------------------------------------------------------
 // Platform / compiler / arch self-check (unchanged)
 // -----------------------------------------------------------------------------
@@ -966,6 +1118,96 @@ int main()
     check("signature_for_arg<double> == D",  vmhook::jni::signature_for_arg<double>() == "D");
     check("signature_for_arg<string> == Ljava/lang/String;",
           vmhook::jni::signature_for_arg<std::string>() == "Ljava/lang/String;");
+
+    // -------------------------------------------------------------------------
+    // ADDITIVE runtime tally — unified_call_syntax no-JVM surface.
+    // -------------------------------------------------------------------------
+
+    // (A) build_dr7 reference values (pure bit-math, every OS).  A representative
+    //     slice of the compile-time truth table, echoed for a visible pass count.
+    check("dr7 s0 write/1B == 0x10001",
+          unified_deep::dr7_ref(0, unified_deep::bk::write, unified_deep::blen::one_byte) == 0x10001u);
+    check("dr7 s0 rw/4B == 0xF0001",
+          unified_deep::dr7_ref(0, unified_deep::bk::read_write, unified_deep::blen::four_bytes) == 0xF0001u);
+    check("dr7 s3 rw/4B == 0xF0000040",
+          unified_deep::dr7_ref(3, unified_deep::bk::read_write, unified_deep::blen::four_bytes) == 0xF0000040u);
+    check("dr7 leaves G/LE/GE clear",
+          (unified_deep::dr7_ref(0, unified_deep::bk::read_write, unified_deep::blen::four_bytes) & 0x3AAu) == 0x0u);
+
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+    // On the Windows/x86_64 config that actually compiles build_dr7, the real
+    // function must agree byte-for-byte with the independent reference for every
+    // slot / kind / length — proving the source matches the Intel-SDM layout.
+    {
+        bool dr7_all_match{ true };
+        for (int slot{ 0 }; slot < 4; ++slot)
+        {
+            for (const auto rw : { unified_deep::bk::write, unified_deep::bk::read_write })
+            {
+                for (const auto len : { unified_deep::blen::one_byte, unified_deep::blen::two_bytes,
+                                        unified_deep::blen::eight_bytes, unified_deep::blen::four_bytes })
+                {
+                    if (vmhook::os::detail_dr::build_dr7(slot, rw, len) != unified_deep::dr7_ref(slot, rw, len))
+                    {
+                        dr7_all_match = false;
+                    }
+                }
+            }
+        }
+        check("build_dr7 == reference for all slot/kind/len", dr7_all_match);
+    }
+#endif
+
+    // (B) jni:: forwarders — NULL/empty no-JVM contract (current_jni_env is the
+    //     thread_local null default; every forwarder short-circuits with no
+    //     dereference of a fabricated address).  Type signatures are pinned by
+    //     the static_asserts above; here we exercise the runtime no-op behaviour.
+    {
+        void* storage{ nullptr };
+        // oop_handle is pure pointer-arithmetic: it stores its first argument into
+        // `storage` and returns &storage — never dereferencing the value.  Passing
+        // a known is_valid_pointer-rejected low constant is safe (never read).
+        void* const fake_oop{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1234u)) };
+        check("jni::oop_handle returns &storage",  vmhook::jni::oop_handle(fake_oop, storage) == &storage);
+        check("jni::oop_handle stores the oop",    storage == fake_oop);
+    }
+    check("jni::decode_object(nullptr) == nullptr",      vmhook::jni::decode_object(nullptr) == nullptr);
+    check("jni::get_object_class(nullptr) == nullptr",   vmhook::jni::get_object_class(nullptr) == nullptr);
+    check("jni::klass_from_class_mirror(nullptr)==null", vmhook::jni::klass_from_class_mirror(nullptr) == nullptr);
+    check("jni::get_method_id(null) == nullptr",         vmhook::jni::get_method_id(nullptr, "m", "()V") == nullptr);
+    check("jni::get_static_method_id(null) == nullptr",  vmhook::jni::get_static_method_id(nullptr, "m", "()V") == nullptr);
+    check("jni::get_static_field_id(null) == nullptr",   vmhook::jni::get_static_field_id(nullptr, "f", "I") == nullptr);
+    check("jni::get_static_object_field(null)==nullptr", vmhook::jni::get_static_object_field(nullptr, nullptr) == nullptr);
+    check("jni::call_object_method(null) == nullptr",    vmhook::jni::call_object_method(nullptr, nullptr) == nullptr);
+    check("jni::call_static_object_method(null)==null",  vmhook::jni::call_static_object_method(nullptr, nullptr) == nullptr);
+    check("jni::new_string_utf(no JVM) == nullptr",      vmhook::jni::new_string_utf("x") == nullptr);
+    check("jni::get_string_utf(nullptr) is empty",       vmhook::jni::get_string_utf(nullptr).empty());
+    // exception_clear() is a void no-op when no JNIEnv resolves; calling it must
+    // not fault — observe by confirming control reaches the next line.
+    vmhook::jni::exception_clear();
+    check("jni::exception_clear() is a no-op (returned)", true);
+
+    // (C) register_class / make_unique — no-JVM map+factory contract.
+    //     Without a JVM, find_class() cannot verify the class, so register_class
+    //     returns false and DOES NOT populate type_to_class_map / g_type_factory_map.
+    //     make_unique() then yields null (attach fails / type unregistered).
+    {
+        const std::type_index wrapper_a_idx{ typeid(zoo::wrapper_a) };
+        const bool registered{ vmhook::register_class<zoo::wrapper_a>("vmhook/test/UnifiedCallSyntax") };
+        check("register_class returns false with no JVM", registered == false);
+        check("type_to_class_map not populated on failed register",
+              vmhook::type_to_class_map.find(wrapper_a_idx) == vmhook::type_to_class_map.end());
+        // An empty class name can never resolve: find_class short-circuits to
+        // nullptr by pure logic (no graph walk), so register_class also fails.
+        check("register_class(\"\") returns false",
+              vmhook::register_class<zoo::wrapper_b>("") == false);
+        // make_unique on an unregistered type returns null (no JVM, no factory).
+        const std::unique_ptr<zoo::wrapper_a> made{ vmhook::make_unique<zoo::wrapper_a>() };
+        check("make_unique(unregistered, no JVM) == nullptr", made == nullptr);
+    }
+
+    // find_class("") is the pure-logic empty-name fast-reject (no JVM deref).
+    check("find_class(\"\") == nullptr", vmhook::find_class("") == nullptr);
 
     std::printf("vmhook traits: %d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

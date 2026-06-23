@@ -971,6 +971,347 @@ namespace
             check("pin(null unique_ptr): empty", !static_cast<bool>(p));
         }
     }
+
+    // =========================================================================
+    // ADDITIVE DEEPENING PASS (Criterion 2 — exhaustive inputs)
+    //
+    // Three fresh angles on the jni:: forwarder layer that the sections above do
+    // NOT cover, and that are NOT covered by any sibling no-JVM test:
+    //
+    //   (D1) noexcept-IN-PRACTICE, COMPILE-TIME.  Every jni:: forwarder is
+    //        declared noexcept (a throw would call std::terminate inside a hook
+    //        detour).  Part 1 above pins noexcept only for the two PURE
+    //        forwarders (decode_object / oop_handle).  Here we pin
+    //        static_assert(noexcept(...)) for the ENTIRE remaining forwarder set
+    //        — the JVM-dependent free forwarders AND the templates — so a
+    //        regression that drops a noexcept on any forwarder fails the build on
+    //        every compiler / platform.  Pure compile-time; no call is evaluated.
+    //
+    //   (D2) VALUE-LEVEL forwarder fidelity, RUNTIME no-JVM.  Part 1 pins that
+    //        each public jni::F has the SAME callable TYPE as the detail::jni_F
+    //        it re-exports (decltype equality).  That proves the type can't
+    //        drift, but NOT that the public spelling actually delegates to the
+    //        primitive at run time — a forwarder body could be edited to do
+    //        something else while keeping its signature.  Here we drive each
+    //        forwarder AND its detail:: primitive over the SAME input matrix and
+    //        require BYTE-IDENTICAL results (both the no-JVM sentinel), closing
+    //        that gap.  Every result is the documented null / empty no-JVM value;
+    //        no fabricated live klass/oop/handle is ever dereferenced (only null
+    //        and is_valid_pointer-REJECTED low-constant / in-range handles that
+    //        the gate rejects before any deref).
+    //
+    //   (D3) jni::value UNION write/read ROUND-TRIP, RUNTIME.  Part 1 pins each
+    //        member's TYPE; here we WRITE a representative value into every member
+    //        and READ it back, proving the union storage actually round-trips the
+    //        jvalue payload HotSpot reads off the stack.  Pure value math; no JVM.
+    // =========================================================================
+
+    // ---- (D1) noexcept-in-practice for the full forwarder set ----------------
+    // Free forwarders. is_invocable already pinned the signatures in Part 1; the
+    // noexcept(call-expr) form below additionally requires the call to be a
+    // non-throwing expression, i.e. the function is declared noexcept.
+    static_assert(noexcept(vmhook::jni::find_class(std::declval<std::string_view>())),
+                  "jni::find_class must be noexcept");
+    static_assert(noexcept(vmhook::jni::find_class_with_context_loader(std::declval<std::string_view>())),
+                  "jni::find_class_with_context_loader must be noexcept");
+    static_assert(noexcept(vmhook::jni::exception_clear()),
+                  "jni::exception_clear must be noexcept");
+    static_assert(noexcept(vmhook::jni::get_object_class(std::declval<void*>())),
+                  "jni::get_object_class must be noexcept");
+    static_assert(noexcept(vmhook::jni::get_method_id(
+                      std::declval<void*>(), std::declval<const std::string&>(), std::declval<const std::string&>())),
+                  "jni::get_method_id must be noexcept");
+    static_assert(noexcept(vmhook::jni::get_static_method_id(
+                      std::declval<void*>(), std::declval<const std::string&>(), std::declval<const std::string&>())),
+                  "jni::get_static_method_id must be noexcept");
+    static_assert(noexcept(vmhook::jni::get_static_field_id(
+                      std::declval<void*>(), std::declval<const std::string&>(), std::declval<const std::string&>())),
+                  "jni::get_static_field_id must be noexcept");
+    static_assert(noexcept(vmhook::jni::get_static_object_field(std::declval<void*>(), std::declval<void*>())),
+                  "jni::get_static_object_field must be noexcept");
+    static_assert(noexcept(vmhook::jni::call_object_method(std::declval<void*>(), std::declval<void*>())),
+                  "jni::call_object_method must be noexcept");
+    static_assert(noexcept(vmhook::jni::call_static_object_method(std::declval<void*>(), std::declval<void*>())),
+                  "jni::call_static_object_method must be noexcept");
+    static_assert(noexcept(vmhook::jni::klass_from_class_mirror(std::declval<void*>())),
+                  "jni::klass_from_class_mirror must be noexcept");
+    static_assert(noexcept(vmhook::jni::new_string_utf(std::declval<std::string_view>())),
+                  "jni::new_string_utf must be noexcept");
+    static_assert(noexcept(vmhook::jni::get_string_utf(std::declval<void*>())),
+                  "jni::get_string_utf must be noexcept");
+    // Templates: function<index, fn_t>, signature_for_arg<T>, make_unique<T>.
+    static_assert(noexcept(vmhook::jni::function<6, sample_jni_fn_t>(std::declval<void*>())),
+                  "jni::function<index, fn_t> must be noexcept");
+    static_assert(noexcept(vmhook::jni::signature_for_arg<int>()),
+                  "jni::signature_for_arg<T> must be noexcept");
+    static_assert(noexcept(vmhook::jni::make_unique<test_wrapper>(std::declval<const std::string&>())),
+                  "jni::make_unique<T> must be noexcept");
+    // The detail:: primitives the public forwarders re-export are noexcept too
+    // (their noexcept-ness is what makes the public forwarder's noexcept honest).
+    static_assert(noexcept(vmhook::detail::jni_find_class(std::declval<std::string_view>())),
+                  "detail::jni_find_class must be noexcept");
+    static_assert(noexcept(vmhook::detail::jni_find_class_with_context_loader(std::declval<std::string_view>())),
+                  "detail::jni_find_class_with_context_loader must be noexcept");
+
+    // -------------------------------------------------------------------------
+    // (D2) VALUE-LEVEL forwarder fidelity: jni::F(args) == detail::jni_F(args).
+    //
+    // For each forwarder, drive BOTH the public spelling and the primitive it
+    // re-exports over the SAME inputs and require identical results.  With no
+    // JVM each side returns its sentinel, so equality holds at the sentinel —
+    // but a forwarder that stopped delegating (e.g. hard-coded a different
+    // sentinel, or swapped argument order) would diverge here even while its
+    // Part-1 type assertion still passed.  This is the run-time companion to the
+    // decltype-equality block (vmhook.hpp forwarder-fidelity).
+    // -------------------------------------------------------------------------
+    auto run_forwarder_value_fidelity_matrix() -> void
+    {
+        const std::string name{ "doStuff" };
+        const std::string sigv{ "()V" };
+        void* const fake_handle{ as_ptr(valid_addrs[0]) };
+        void* const fake_handle2{ as_ptr(valid_addrs[1]) };
+
+        // A distinct, compact spread of name shapes for the class-resolution
+        // forwarders (the assigned feature).  Kept disjoint from the cache-key
+        // matrix in test_classloader_reanchor.cpp; here the angle is the
+        // PUBLIC-vs-DETAIL equality, not the cache contract.
+        const char* const class_names[]{
+            "",                       // empty
+            "java/lang/String",       // bootstrap, '/'-form
+            "java/lang/Object",
+            "does/not/Exist",         // would-miss
+            "net/minecraft/Client",   // app-ish (feature's reason to exist)
+            "java.lang.Object",       // dotted (the '/'->'.' replace is a no-op)
+            "[Ljava/lang/String;",    // array descriptor
+            "trailing/slash/",        // separator pathology
+            "/leading/slash",
+            "a",                      // single char
+            "Nested$Inner",           // '$' nested-class form
+        };
+
+        // find_class: forwarder result must equal the primitive's, for each name.
+        bool fc_fidelity{ true };
+        for (const char* n : class_names)
+        {
+            const std::string_view sv{ n };
+            if (vmhook::jni::find_class(sv) != vmhook::detail::jni_find_class(sv))
+            {
+                fc_fidelity = false;
+            }
+        }
+        check("fidelity: jni::find_class == detail::jni_find_class (all names)", fc_fidelity);
+
+        // find_class_with_context_loader: forwarder == primitive (the feature).
+        bool ctx_fidelity{ true };
+        for (const char* n : class_names)
+        {
+            const std::string_view sv{ n };
+            if (vmhook::jni::find_class_with_context_loader(sv)
+                != vmhook::detail::jni_find_class_with_context_loader(sv))
+            {
+                ctx_fidelity = false;
+            }
+        }
+        check("fidelity: jni::find_class_with_context_loader == detail (all names)", ctx_fidelity);
+
+        // get_object_class: forwarder == primitive for null and a fake handle.
+        check("fidelity: get_object_class(null) == detail",
+              vmhook::jni::get_object_class(nullptr) == vmhook::detail::jni_get_object_class(nullptr));
+        check("fidelity: get_object_class(fake) == detail",
+              vmhook::jni::get_object_class(fake_handle) == vmhook::detail::jni_get_object_class(fake_handle));
+
+        // get_method_id / static method / static field: forwarder == primitive.
+        check("fidelity: get_method_id(null) == detail",
+              vmhook::jni::get_method_id(nullptr, name, sigv)
+                  == vmhook::detail::jni_get_method_id(nullptr, name, sigv));
+        check("fidelity: get_method_id(fake) == detail",
+              vmhook::jni::get_method_id(fake_handle, name, sigv)
+                  == vmhook::detail::jni_get_method_id(fake_handle, name, sigv));
+        check("fidelity: get_static_method_id(fake) == detail",
+              vmhook::jni::get_static_method_id(fake_handle, name, sigv)
+                  == vmhook::detail::jni_get_static_method_id(fake_handle, name, sigv));
+        check("fidelity: get_static_field_id(fake) == detail",
+              vmhook::jni::get_static_field_id(fake_handle, name, sigv)
+                  == vmhook::detail::jni_get_static_field_id(fake_handle, name, sigv));
+
+        // get_static_object_field: forwarder == primitive.
+        check("fidelity: get_static_object_field == detail",
+              vmhook::jni::get_static_object_field(fake_handle, fake_handle2)
+                  == vmhook::detail::jni_get_static_object_field(fake_handle, fake_handle2));
+
+        // call_object_method / call_static_object_method: forwarder == primitive,
+        // for both the default-args 2-arg form and a real stack arg array.
+        vmhook::jni::value one_arg[1]{};
+        one_arg[0].i = 7;
+        check("fidelity: call_object_method(2-arg) == detail",
+              vmhook::jni::call_object_method(fake_handle, fake_handle2)
+                  == vmhook::detail::jni_call_object_method(fake_handle, fake_handle2, nullptr));
+        check("fidelity: call_object_method(args) == detail",
+              vmhook::jni::call_object_method(fake_handle, fake_handle2, one_arg)
+                  == vmhook::detail::jni_call_object_method(fake_handle, fake_handle2, one_arg));
+        check("fidelity: call_static_object_method(args) == detail",
+              vmhook::jni::call_static_object_method(fake_handle, fake_handle2, one_arg)
+                  == vmhook::detail::jni_call_static_object_method(fake_handle, fake_handle2, one_arg));
+
+        // klass_from_class_mirror: forwarder == primitive for null + fake.
+        check("fidelity: klass_from_class_mirror(null) == detail",
+              vmhook::jni::klass_from_class_mirror(nullptr)
+                  == vmhook::detail::jni_klass_from_class_mirror(nullptr));
+        check("fidelity: klass_from_class_mirror(fake) == detail",
+              vmhook::jni::klass_from_class_mirror(fake_handle)
+                  == vmhook::detail::jni_klass_from_class_mirror(fake_handle));
+
+        // new_string_utf: forwarder == primitive over a spread of strings.
+        const char* const utf_inputs[]{ "", "hello", "\xC3\xA9\xE2\x82\xAC" };
+        bool nsu_fidelity{ true };
+        for (const char* s : utf_inputs)
+        {
+            const std::string_view sv{ s };
+            if (vmhook::jni::new_string_utf(sv) != vmhook::detail::jni_new_string_utf(sv))
+            {
+                nsu_fidelity = false;
+            }
+        }
+        check("fidelity: jni::new_string_utf == detail (all inputs)", nsu_fidelity);
+
+        // get_string_utf: forwarder == primitive (both empty) for null + fake.
+        check("fidelity: get_string_utf(null) == detail",
+              vmhook::jni::get_string_utf(nullptr) == vmhook::detail::jni_get_string_utf(nullptr));
+        check("fidelity: get_string_utf(fake) == detail",
+              vmhook::jni::get_string_utf(fake_handle) == vmhook::detail::jni_get_string_utf(fake_handle));
+
+        // decode_object: forwarder == primitive across the validity gate (null,
+        // valid in-range, sentinel-rejected).  The handle is a pointer to a
+        // local slot holding the candidate oop (a real JNI local-ref shape), so
+        // nothing fabricated is dereferenced past the is_valid_pointer gate.
+        bool decode_fidelity{ true };
+        {
+            void* slot_null{ nullptr };
+            if (vmhook::jni::decode_object(&slot_null) != vmhook::detail::jni_decode_object(&slot_null))
+            {
+                decode_fidelity = false;
+            }
+            for (const std::uintptr_t addr : valid_addrs)
+            {
+                void* slot{ as_ptr(addr) };
+                if (vmhook::jni::decode_object(&slot) != vmhook::detail::jni_decode_object(&slot))
+                {
+                    decode_fidelity = false;
+                }
+            }
+            for (const std::uint32_t low : sentinel_low32)
+            {
+                void* slot{ as_ptr(static_cast<std::uintptr_t>(low)) };
+                if (vmhook::jni::decode_object(&slot) != vmhook::detail::jni_decode_object(&slot))
+                {
+                    decode_fidelity = false;
+                }
+            }
+        }
+        check("fidelity: jni::decode_object == detail (gate matrix)", decode_fidelity);
+
+        // signature_for_arg: forwarder == primitive over the descriptor table
+        // (a deeper spread than Part 1's representative five, all categories).
+        check("fidelity: signature_for_arg<bool> == detail",
+              vmhook::jni::signature_for_arg<bool>() == vmhook::detail::jni_signature_for_arg<bool>());
+        check("fidelity: signature_for_arg<int8_t> == detail",
+              vmhook::jni::signature_for_arg<std::int8_t>() == vmhook::detail::jni_signature_for_arg<std::int8_t>());
+        check("fidelity: signature_for_arg<uint16_t> == detail",
+              vmhook::jni::signature_for_arg<std::uint16_t>() == vmhook::detail::jni_signature_for_arg<std::uint16_t>());
+        check("fidelity: signature_for_arg<int16_t> == detail",
+              vmhook::jni::signature_for_arg<std::int16_t>() == vmhook::detail::jni_signature_for_arg<std::int16_t>());
+        check("fidelity: signature_for_arg<int64_t> == detail",
+              vmhook::jni::signature_for_arg<std::int64_t>() == vmhook::detail::jni_signature_for_arg<std::int64_t>());
+        check("fidelity: signature_for_arg<float> == detail",
+              vmhook::jni::signature_for_arg<float>() == vmhook::detail::jni_signature_for_arg<float>());
+        check("fidelity: signature_for_arg<double> == detail",
+              vmhook::jni::signature_for_arg<double>() == vmhook::detail::jni_signature_for_arg<double>());
+        check("fidelity: signature_for_arg<string_view> == detail",
+              vmhook::jni::signature_for_arg<std::string_view>()
+                  == vmhook::detail::jni_signature_for_arg<std::string_view>());
+        check("fidelity: signature_for_arg<const char*> == detail",
+              vmhook::jni::signature_for_arg<const char*>()
+                  == vmhook::detail::jni_signature_for_arg<const char*>());
+    }
+
+    // -------------------------------------------------------------------------
+    // (D3) jni::value union write/read round-trip.  The union is the jvalue
+    // layout HotSpot reads off the stack for CallXMethodA; Part 1 pins each
+    // member's TYPE — here we prove a written payload survives the read for
+    // every member.  Each member is written and read in its OWN union object
+    // (writing one member then reading another is UB; we never do that).
+    // -------------------------------------------------------------------------
+    auto run_jni_value_roundtrip_matrix() -> void
+    {
+        {
+            vmhook::jni::value v{};
+            v.z = true;
+            check("jni::value.z round-trip (true)", v.z == true);
+            v.z = false;
+            check("jni::value.z round-trip (false)", v.z == false);
+        }
+        {
+            vmhook::jni::value v{};
+            v.b = std::int8_t{ -7 };
+            check("jni::value.b round-trip", v.b == std::int8_t{ -7 });
+        }
+        {
+            vmhook::jni::value v{};
+            v.c = std::uint16_t{ 0xBEEF };
+            check("jni::value.c round-trip", v.c == std::uint16_t{ 0xBEEF });
+        }
+        {
+            vmhook::jni::value v{};
+            v.s = std::int16_t{ -12345 };
+            check("jni::value.s round-trip", v.s == std::int16_t{ -12345 });
+        }
+        {
+            vmhook::jni::value v{};
+            v.i = std::int32_t{ -123456789 };
+            check("jni::value.i round-trip", v.i == std::int32_t{ -123456789 });
+        }
+        {
+            vmhook::jni::value v{};
+            v.j = std::int64_t{ -1234567890123456789LL };
+            check("jni::value.j round-trip", v.j == std::int64_t{ -1234567890123456789LL });
+        }
+        {
+            vmhook::jni::value v{};
+            v.f = 3.5f;
+            check("jni::value.f round-trip", v.f == 3.5f);
+        }
+        {
+            vmhook::jni::value v{};
+            v.d = 2.718281828;
+            check("jni::value.d round-trip", v.d == 2.718281828);
+        }
+        {
+            vmhook::jni::value v{};
+            void* const marker{ as_ptr(valid_addrs[2]) };
+            v.l = marker;
+            check("jni::value.l round-trip", v.l == marker);
+            v.l = nullptr;
+            check("jni::value.l round-trip (null)", v.l == nullptr);
+        }
+        // A whole-array of jvalue (the shape CallXMethodA consumes) round-trips
+        // independently per slot.
+        {
+            vmhook::jni::value args[3]{};
+            args[0].i = std::int32_t{ 11 };
+            args[1].j = std::int64_t{ 22 };
+            args[2].l = as_ptr(valid_addrs[3]);
+            check("jni::value[] slot0 round-trip", args[0].i == std::int32_t{ 11 });
+            check("jni::value[] slot1 round-trip", args[1].j == std::int64_t{ 22 });
+            check("jni::value[] slot2 round-trip", args[2].l == as_ptr(valid_addrs[3]));
+        }
+    }
+
+    // Drives both additive deepening matrices (D2 + D3); D1 is compile-time.
+    auto run_additive_deepening_matrix() -> void
+    {
+        run_forwarder_value_fidelity_matrix();
+        run_jni_value_roundtrip_matrix();
+    }
 }
 
 int main()
@@ -983,6 +1324,7 @@ int main()
     run_no_jvm_sentinel_matrix();
     run_global_ref_primitives_matrix();
     run_global_ref_matrix();
+    run_additive_deepening_matrix();
 
     if (failures == 0)
     {

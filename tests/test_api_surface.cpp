@@ -1206,6 +1206,76 @@ namespace matrix
     static_assert(sig_for_arg_string_v<std::string>,     "signature_for_arg<std::string>");
     static_assert(sig_for_arg_string_v<const char*>,     "signature_for_arg<const char*>");
     static_assert(sig_for_arg_string_v<std::string_view>,"signature_for_arg<string_view>");
+
+    // ===== GROUP 19 — DR7 bit-field assembly + DR enum layout + wider =========
+    // signature_for_arg shapes.  ADDITIVE: no Group above touches build_dr7, the
+    // hardware-breakpoint enums, or these extra signature_for_arg type shapes.
+    //
+    // The DR7 builder and its two enums are a Windows-x86_64-only path
+    // (VMHOOK_HAS_HW_DATA_BREAKPOINTS) — the os::watch_static_field hardware
+    // backend.  They are pure integer bit math (noexcept, no dereference), so
+    // their no-JVM-determinable contract is the EXACT packed u64 the Intel SDM
+    // DR7 layout prescribes.  Everything here is derived from the source at
+    // vmhook.hpp:1210-1250 (enum values + build_dr7 formula), never from a spec
+    // restatement.  Enum underlying-type and value asserts are platform-invariant
+    // (the enums exist on every target); the build_dr7 invocability/value asserts
+    // are gated behind the capability macro so the gcc/clang Linux+macOS legs
+    // (where the symbol does not exist) still compile.
+    //
+    // data_breakpoint_kind: write = 0b01, read_write = 0b11 (uint8_t underlying).
+    static_assert(std::is_same_v<std::underlying_type_t<vmhook::os::data_breakpoint_kind>,
+                                 std::uint8_t>,
+                  "data_breakpoint_kind underlying type is uint8_t");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_kind::write) == 0b01u,
+                  "data_breakpoint_kind::write encodes 0b01");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_kind::read_write) == 0b11u,
+                  "data_breakpoint_kind::read_write encodes 0b11");
+    // data_breakpoint_length: one=0b00, two=0b01, eight=0b10, four=0b11 (note the
+    // non-monotonic eight-before-four ordering the Intel LEN field actually uses).
+    static_assert(std::is_same_v<std::underlying_type_t<vmhook::os::data_breakpoint_length>,
+                                 std::uint8_t>,
+                  "data_breakpoint_length underlying type is uint8_t");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_length::one_byte) == 0b00u,
+                  "data_breakpoint_length::one_byte encodes 0b00");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_length::two_bytes) == 0b01u,
+                  "data_breakpoint_length::two_bytes encodes 0b01");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_length::eight_bytes) == 0b10u,
+                  "data_breakpoint_length::eight_bytes encodes 0b10");
+    static_assert(static_cast<std::uint8_t>(vmhook::os::data_breakpoint_length::four_bytes) == 0b11u,
+                  "data_breakpoint_length::four_bytes encodes 0b11");
+
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+    // build_dr7(int slot, kind, length) -> uint64_t, noexcept, pure bit math.
+    // (build_dr7 is `inline`, NOT `constexpr`, so its EXACT packed values cannot
+    // be pinned in a static_assert — those are runtime-asserted in PART 5.  Here
+    // we pin only its return type and noexcept-ness, both unevaluated contexts.)
+    static_assert(std::is_same_v<
+                      decltype(vmhook::os::detail_dr::build_dr7(
+                          std::declval<int>(),
+                          std::declval<vmhook::os::data_breakpoint_kind>(),
+                          std::declval<vmhook::os::data_breakpoint_length>())),
+                      std::uint64_t>,
+                  "build_dr7(int, kind, length) must return uint64_t");
+    static_assert(noexcept(vmhook::os::detail_dr::build_dr7(
+                      std::declval<int>(),
+                      std::declval<vmhook::os::data_breakpoint_kind>(),
+                      std::declval<vmhook::os::data_breakpoint_length>())),
+                  "build_dr7 must be noexcept");
+#endif // VMHOOK_HAS_HW_DATA_BREAKPOINTS
+
+    // Wider signature_for_arg<T> SHAPE coverage (still type-only — the EXACT
+    // string each yields is runtime-asserted in PART 4, where std::string
+    // equality is cheap and platform-invariant).  Adds the sizeof-classified
+    // integral spellings + the char family the Group-18 set above omits.
+    static_assert(sig_for_arg_string_v<std::uint8_t>,    "signature_for_arg<uint8>");
+    static_assert(sig_for_arg_string_v<std::uint16_t>,   "signature_for_arg<uint16>");
+    static_assert(sig_for_arg_string_v<std::uint32_t>,   "signature_for_arg<uint32>");
+    static_assert(sig_for_arg_string_v<std::uint64_t>,   "signature_for_arg<uint64>");
+    static_assert(sig_for_arg_string_v<char>,            "signature_for_arg<char>");
+    static_assert(sig_for_arg_string_v<signed char>,     "signature_for_arg<signed char>");
+    static_assert(sig_for_arg_string_v<unsigned char>,   "signature_for_arg<unsigned char>");
+    static_assert(sig_for_arg_string_v<char16_t>,        "signature_for_arg<char16_t>");
+    static_assert(sig_for_arg_string_v<char*>,           "signature_for_arg<char*>");
 } // namespace matrix
 
 // =============================================================================
@@ -1414,6 +1484,183 @@ static auto run_runtime_noop_checks() -> void
     }
 }
 
+// =============================================================================
+// PART 5 — ADDITIVE no-JVM-determinable runtime checks for THIS lane's feature
+// surface that PART 4 (and the extended file) do not exercise:
+//   * build_dr7 exact packed values + bit-field decomposition (pure integer
+//     math, Windows-x86_64-only, no dereference);
+//   * jni:: forwarder no-op contract at RUNTIME over the null/empty/handle
+//     matrix (every forwarder returns null/empty and never throws with no JVM);
+//   * the register_class / object-factory no-JVM contract — register_class<T>
+//     returns false BEFORE populating type_to_class_map / g_type_factory_map
+//     when find_class cannot verify the class, so a never-elsewhere-registered
+//     wrapper stays absent from BOTH maps and its factory is never installed;
+//   * signature_for_arg<T> exact descriptor strings (a compile-time table, so
+//     the value is JVM-independent and derivable from source).
+// All values are derived from vmhook.hpp source; no fabricated address is read.
+// =============================================================================
+namespace fixtures
+{
+    // A wrapper registered NOWHERE else in this TU (main() registers my_class /
+    // element_w / key_w / value_w; the matrices only name fx::* in unevaluated
+    // contexts).  Used to prove the register_class map-untouched no-JVM contract
+    // without colliding with an already-populated entry.
+    class unreg_w : public vmhook::object<unreg_w>
+    {
+    public:
+        explicit unreg_w(vmhook::oop_t oop) noexcept
+            : vmhook::object<unreg_w>{ oop } {}
+    };
+} // namespace fixtures
+
+static auto run_extra_noop_checks() -> void
+{
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+    // --- build_dr7: exact packed u64 at runtime (mirrors the static_asserts in
+    // GROUP 19) PLUS a field-by-field decomposition proving the slot/rw/len bit
+    // positions, derived from local_enable=1<<(2s), rw<<(16+4s), len<<(18+4s).
+    {
+        using vmhook::os::data_breakpoint_kind;
+        using vmhook::os::data_breakpoint_length;
+        const std::uint64_t s0_w_one{ vmhook::os::detail_dr::build_dr7(
+            0, data_breakpoint_kind::write, data_breakpoint_length::one_byte) };
+        const std::uint64_t s2_rw_two{ vmhook::os::detail_dr::build_dr7(
+            2, data_breakpoint_kind::read_write, data_breakpoint_length::two_bytes) };
+        const std::uint64_t s3_rw_eight{ vmhook::os::detail_dr::build_dr7(
+            3, data_breakpoint_kind::read_write, data_breakpoint_length::eight_bytes) };
+        // slot2/rw(3)/two(1) = (1<<4) | (3<<24) | (1<<26) = 0x07000010
+        // slot3/rw(3)/eight(2) = (1<<6) | (3<<28) | (2<<30) = 0xB0000040
+        check("build_dr7_slot0_write_one_exact",  s0_w_one    == 0x00010001ull);
+        check("build_dr7_slot2_rw_two_exact",     s2_rw_two   == 0x07000010ull);
+        check("build_dr7_slot3_rw_eight_exact",   s3_rw_eight == 0xB0000040ull);
+
+        // Decompose s2_rw_two and re-extract each field at its documented slot-2
+        // bit position; every field must round-trip to the source enum value.
+        const int slot{ 2 };
+        const std::uint64_t local_enable_bit{ (s2_rw_two >> (slot * 2)) & 0x3ull };
+        const std::uint64_t rw_field { (s2_rw_two >> (16 + slot * 4)) & 0x3ull };
+        const std::uint64_t len_field{ (s2_rw_two >> (18 + slot * 4)) & 0x3ull };
+        check("build_dr7_local_enable_bit_set",
+              local_enable_bit == 0x1ull);
+        check("build_dr7_rw_field_is_read_write",
+              rw_field == static_cast<std::uint64_t>(data_breakpoint_kind::read_write));
+        check("build_dr7_len_field_is_two_bytes",
+              len_field == static_cast<std::uint64_t>(data_breakpoint_length::two_bytes));
+        // No OTHER slot's local-enable bit may be set (only slot 2's is on).
+        const std::uint64_t other_enables{ s2_rw_two
+            & ((0x1ull << 0) | (0x1ull << 2) | (0x1ull << 6)) };
+        check("build_dr7_other_slot_enables_clear", other_enables == 0ull);
+        // The global-enable / GE / LE control bits the builder deliberately
+        // leaves cleared: bits 1,3,5,7 (G0..G3) and bits 8,9 (LE,GE) are 0.
+        const std::uint64_t global_and_control{ s2_rw_two
+            & ((0x1ull << 1) | (0x1ull << 3) | (0x1ull << 5) | (0x1ull << 7)
+               | (0x1ull << 8) | (0x1ull << 9)) };
+        check("build_dr7_global_and_le_ge_bits_clear", global_and_control == 0ull);
+    }
+#else
+    // On non-Windows / non-x86_64 the builder does not exist; record the lane
+    // as deliberately skipped so the output stays greppable and deterministic.
+    check("build_dr7_skipped_off_platform", true);
+#endif // VMHOOK_HAS_HW_DATA_BREAKPOINTS
+
+    // --- jni:: forwarder no-op contract at RUNTIME, no JVM: every string-taking
+    // forwarder returns null/empty over the full string-argument matrix, and the
+    // handle-taking ones tolerate a null handle.  None throw (all are noexcept;
+    // we still wrap to PROVE the no-throw contract end to end).
+    {
+        bool threw{ false };
+        bool all_null_or_empty{ false };
+        try
+        {
+            // find_class over const char* / std::string / std::string_view / "".
+            const void* fc_cstr{ vmhook::jni::find_class("java/lang/String") };
+            const void* fc_str { vmhook::jni::find_class(std::string{ "java/util/List" }) };
+            const void* fc_sv  { vmhook::jni::find_class(std::string_view{ "java/lang/Object" }) };
+            const void* fc_empty{ vmhook::jni::find_class("") };
+            // find_class_with_context_loader -> Klass* (null with no JVM).
+            const vmhook::hotspot::klass* fccl{
+                vmhook::jni::find_class_with_context_loader(std::string_view{ "java/lang/Thread" }) };
+            // new_string_utf over const char* / std::string / "".
+            const void* ns_cstr{ vmhook::jni::new_string_utf("hello") };
+            const void* ns_str { vmhook::jni::new_string_utf(std::string{ "world" }) };
+            const void* ns_empty{ vmhook::jni::new_string_utf("") };
+            // get_string_utf over a null handle -> empty string.
+            const std::string gs_null{ vmhook::jni::get_string_utf(nullptr) };
+            all_null_or_empty =
+                (fc_cstr == nullptr) && (fc_str == nullptr) && (fc_sv == nullptr)
+                && (fc_empty == nullptr) && (fccl == nullptr)
+                && (ns_cstr == nullptr) && (ns_str == nullptr) && (ns_empty == nullptr)
+                && gs_null.empty();
+        }
+        catch (...) { threw = true; }
+        check("jni_forwarders_null_or_empty_without_jvm", all_null_or_empty);
+        check("jni_forwarders_do_not_throw_without_jvm", !threw);
+    }
+
+    // --- register_class / object-factory no-JVM contract: with no JVM,
+    // find_class cannot verify the class, so register_class<unreg_w> returns
+    // false WITHOUT populating type_to_class_map or g_type_factory_map.  A
+    // wrapper registered nowhere else must therefore be absent from BOTH maps,
+    // and no factory is installed for its (never-stored) class name.
+    {
+        bool threw{ false };
+        bool returned_false{ true };
+        bool type_map_untouched{ false };
+        bool factory_map_untouched{ false };
+        try
+        {
+            const std::type_index unreg_idx{ typeid(fixtures::unreg_w) };
+            // Pre-condition: not present before the call (defensive — it is
+            // registered nowhere else, but assert the starting state too).
+            const bool absent_before{
+                vmhook::type_to_class_map.find(unreg_idx) == vmhook::type_to_class_map.end() };
+            const std::string class_name{ "vmhook/test/Unregistered" };
+            returned_false = vmhook::register_class<fixtures::unreg_w>(class_name);
+            type_map_untouched = absent_before
+                && (vmhook::type_to_class_map.find(unreg_idx) == vmhook::type_to_class_map.end());
+            factory_map_untouched =
+                (vmhook::g_type_factory_map.find(class_name) == vmhook::g_type_factory_map.end());
+        }
+        catch (...) { threw = true; }
+        check("register_class_returns_false_without_jvm", returned_false == false);
+        check("register_class_leaves_type_map_untouched", type_map_untouched);
+        check("register_class_leaves_factory_map_untouched", factory_map_untouched);
+        check("register_class_does_not_throw_without_jvm", !threw);
+    }
+
+    // --- signature_for_arg<T> exact descriptor strings.  This is a compile-time
+    // table (jni_signature_for_arg), so the value is JVM-INDEPENDENT and derived
+    // straight from vmhook.hpp:12994-13091.  No JVM is consulted.
+    {
+        bool threw{ false };
+        bool sigs_ok{ false };
+        try
+        {
+            const std::string s_bool   { vmhook::jni::signature_for_arg<bool>() };
+            const std::string s_i8     { vmhook::jni::signature_for_arg<std::int8_t>() };
+            const std::string s_i16    { vmhook::jni::signature_for_arg<std::int16_t>() };
+            const std::string s_i32    { vmhook::jni::signature_for_arg<std::int32_t>() };
+            const std::string s_i64    { vmhook::jni::signature_for_arg<std::int64_t>() };
+            const std::string s_u16    { vmhook::jni::signature_for_arg<std::uint16_t>() };
+            const std::string s_char   { vmhook::jni::signature_for_arg<char16_t>() };
+            const std::string s_float  { vmhook::jni::signature_for_arg<float>() };
+            const std::string s_double { vmhook::jni::signature_for_arg<double>() };
+            const std::string s_str    { vmhook::jni::signature_for_arg<std::string>() };
+            const std::string s_cstr   { vmhook::jni::signature_for_arg<const char*>() };
+            const std::string s_sv     { vmhook::jni::signature_for_arg<std::string_view>() };
+            sigs_ok =
+                (s_bool == "Z") && (s_i8 == "B") && (s_i16 == "S") && (s_i32 == "I")
+                && (s_i64 == "J") && (s_u16 == "C") && (s_char == "C")
+                && (s_float == "F") && (s_double == "D")
+                && (s_str == "Ljava/lang/String;") && (s_cstr == "Ljava/lang/String;")
+                && (s_sv == "Ljava/lang/String;");
+        }
+        catch (...) { threw = true; }
+        check("signature_for_arg_exact_descriptors", sigs_ok);
+        check("signature_for_arg_does_not_throw", !threw);
+    }
+}
+
 int main()
 {
     // PART 1 — the original compile-only surface proof.  These instantiate and
@@ -1428,6 +1675,10 @@ int main()
 
     // PART 4 — runtime no-op assertions for the surface this lane owns.
     run_runtime_noop_checks();
+
+    // PART 5 — additive build_dr7 / jni-forwarder / register_class-factory /
+    // signature_for_arg no-JVM-determinable runtime checks.
+    run_extra_noop_checks();
 
     // The hundreds of static_asserts in namespace matrix are the real guard:
     // this translation unit does not COMPILE if any pinned invocability or
@@ -1452,6 +1703,7 @@ int main()
     check("matrix_g16_container_member_type_matrix", true);
     check("matrix_g17_reanchor_initlist_matrix", true);
     check("matrix_g18_jni_forwarder_arg_matrix", true);
+    check("matrix_g19_dr7_bitfield_and_enum_layout", true);
 
     std::printf("vmhook API surface (no-JVM): %s\n",
                 g_failures == 0 ? "OK" : "FAILED");

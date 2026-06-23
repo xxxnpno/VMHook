@@ -550,6 +550,35 @@ static auto array_is_null_and_safe(const char* name,
     return result == nullptr && !threw;
 }
 
+// ---------------------------------------------------------------------------
+// Independent reference re-implementation of os::detail_dr::build_dr7's exact
+// bit-field assembly, derived line-for-line from the header source (the
+// `Hardware data breakpoints` block).  build_dr7 itself only exists on
+// Windows-x86_64 (it is wrapped in VMHOOK_HAS_HW_DATA_BREAKPOINTS), so this
+// PURE INTEGER reimplementation lets the DR7 layout be pinned on EVERY OS /
+// compiler; where build_dr7 is compiled in we additionally assert the library
+// function equals this reference (byte-identical u64).  No pointer is touched —
+// it is closed-form shift/or math, exactly as in the source:
+//
+//   const std::uint64_t local_enable{ 1ull << (slot * 2) };           // L0..L3
+//   const std::uint64_t rw_bits     { uint64(rw)  << (16 + slot * 4) };// R/W field
+//   const std::uint64_t len_bits    { uint64(len) << (18 + slot * 4) };// LEN field
+//   return local_enable | rw_bits | len_bits;
+//
+// The rw / len arguments here are the RAW underlying integer encodings the
+// source enums carry (kind: write=0b01, read_write=0b11; length: one=0b00,
+// two=0b01, eight=0b10, four=0b11), so the function is a faithful mirror of the
+// packing regardless of the enum spelling.
+static auto expected_dr7(const int slot,
+                         const std::uint64_t rw_encoding,
+                         const std::uint64_t len_encoding) noexcept -> std::uint64_t
+{
+    const std::uint64_t local_enable{ std::uint64_t{ 1 } << (slot * 2) };
+    const std::uint64_t rw_bits{ rw_encoding << (16 + slot * 4) };
+    const std::uint64_t len_bits{ len_encoding << (18 + slot * 4) };
+    return local_enable | rw_bits | len_bits;
+}
+
 int main()
 {
     // =====================================================================
@@ -1915,6 +1944,420 @@ int main()
 
         // The fifth, unregistered type still falls back to Object.
         check("R26_unmapped_falls_back", sig<registry_unmapped>() == "Ljava/lang/Object;");
+    }
+
+    // #####################################################################
+    // ##  ADDITIVE DEEPENING PASS (wave: exhaustive no-JVM inputs).        ##
+    // ##  Sections D (build_dr7 bit-field), J (jni:: forwarder matrix),    ##
+    // ##  T (base traits / concept shapes).  All pure-logic / null-        ##
+    // ##  contract / pure-integer-math; no fabricated address is ever      ##
+    // ##  dereferenced.  No existing assertion above is touched.           ##
+    // #####################################################################
+
+    // =====================================================================
+    // D0. build_dr7 — derived-literal SPOT TABLE.  Each expected u64 below is
+    // hand-derived from the Intel DR7 layout AS THE SOURCE PACKS IT (L-bit at
+    // 2*slot, R/W field at 16+4*slot, LEN field at 18+4*slot; enum encodings
+    // write=0b01 / read_write=0b11, len one=0b00 / two=0b01 / eight=0b10 /
+    // four=0b11) and cross-checked against expected_dr7().  These pin the exact
+    // packed constant, not just self-consistency with the reference.  The raw
+    // encodings are taken straight from the enum underlying values so a future
+    // enum-value edit is caught here.
+    // =====================================================================
+    {
+        constexpr std::uint64_t rw_write{
+            static_cast<std::uint64_t>(vmhook::os::data_breakpoint_kind::write) };
+        constexpr std::uint64_t rw_rdwr{
+            static_cast<std::uint64_t>(vmhook::os::data_breakpoint_kind::read_write) };
+        constexpr std::uint64_t len_one{
+            static_cast<std::uint64_t>(vmhook::os::data_breakpoint_length::one_byte) };
+        constexpr std::uint64_t len_two{
+            static_cast<std::uint64_t>(vmhook::os::data_breakpoint_length::two_bytes) };
+        constexpr std::uint64_t len_eight{
+            static_cast<std::uint64_t>(vmhook::os::data_breakpoint_length::eight_bytes) };
+        constexpr std::uint64_t len_four{
+            static_cast<std::uint64_t>(vmhook::os::data_breakpoint_length::four_bytes) };
+
+        // The enum underlying encodings are EXACTLY the source's bit patterns.
+        check("D0_kind_write_encoding_is_0b01", rw_write == 0x1u);
+        check("D0_kind_read_write_encoding_is_0b11", rw_rdwr == 0x3u);
+        check("D0_len_one_byte_encoding_is_0b00", len_one == 0x0u);
+        check("D0_len_two_bytes_encoding_is_0b01", len_two == 0x1u);
+        check("D0_len_eight_bytes_encoding_is_0b10", len_eight == 0x2u);
+        check("D0_len_four_bytes_encoding_is_0b11", len_four == 0x3u);
+
+        // --- Slot 0: L0=bit0 (0x1), R/W at bit16, LEN at bit18. ---
+        check("D0_slot0_write_one_literal", expected_dr7(0, rw_write, len_one) == std::uint64_t{ 0x10001 });
+        check("D0_slot0_write_two_literal", expected_dr7(0, rw_write, len_two) == std::uint64_t{ 0x50001 });
+        check("D0_slot0_write_eight_literal", expected_dr7(0, rw_write, len_eight) == std::uint64_t{ 0x90001 });
+        check("D0_slot0_write_four_literal", expected_dr7(0, rw_write, len_four) == std::uint64_t{ 0xD0001 });
+        check("D0_slot0_rdwr_one_literal", expected_dr7(0, rw_rdwr, len_one) == std::uint64_t{ 0x30001 });
+        check("D0_slot0_rdwr_four_literal", expected_dr7(0, rw_rdwr, len_four) == std::uint64_t{ 0xF0001 });
+
+        // --- Slot 1: L1=bit2 (0x4), R/W at bit20, LEN at bit22. ---
+        check("D0_slot1_write_one_literal", expected_dr7(1, rw_write, len_one) == std::uint64_t{ 0x100004 });
+        check("D0_slot1_rdwr_four_literal", expected_dr7(1, rw_rdwr, len_four) == std::uint64_t{ 0xF00004 });
+
+        // --- Slot 2: L2=bit4 (0x10), R/W at bit24, LEN at bit26. ---
+        check("D0_slot2_write_one_literal", expected_dr7(2, rw_write, len_one) == std::uint64_t{ 0x1000010 });
+        check("D0_slot2_rdwr_eight_literal", expected_dr7(2, rw_rdwr, len_eight) == std::uint64_t{ 0xB000010 });
+
+        // --- Slot 3: L3=bit6 (0x40), R/W at bit28, LEN at bit30. ---
+        check("D0_slot3_write_one_literal", expected_dr7(3, rw_write, len_one) == std::uint64_t{ 0x10000040 });
+        check("D0_slot3_rdwr_four_literal", expected_dr7(3, rw_rdwr, len_four) == std::uint64_t{ 0xF0000040 });
+    }
+
+    // =====================================================================
+    // D1. build_dr7 — EXHAUSTIVE bit-field assembly over every slot × rw × len,
+    // each value derived independently from the Intel layout (per-field shift +
+    // OR), proving:
+    //   * the local-enable (Lx) bit lands at exactly 2*slot and NOTHING sets a
+    //     global-enable (Gx) bit at 2*slot+1 (the source keeps G* cleared),
+    //   * the R/W field occupies bits [16+4*slot .. 17+4*slot],
+    //   * the LEN field occupies bits [18+4*slot .. 19+4*slot],
+    //   * the three sub-fields are disjoint (their popcounts add up; no overlap),
+    //   * the LE/GE control bits (DR7 bits 8/9) are NEVER set by build_dr7.
+    // All derived from sizeof/shift constants — no platform literal.
+    // =====================================================================
+    {
+        constexpr std::array<vmhook::os::data_breakpoint_kind, 2> kinds{ {
+            vmhook::os::data_breakpoint_kind::write,
+            vmhook::os::data_breakpoint_kind::read_write,
+        } };
+        constexpr std::array<vmhook::os::data_breakpoint_length, 4> lengths{ {
+            vmhook::os::data_breakpoint_length::one_byte,
+            vmhook::os::data_breakpoint_length::two_bytes,
+            vmhook::os::data_breakpoint_length::eight_bytes,
+            vmhook::os::data_breakpoint_length::four_bytes,
+        } };
+
+        bool all_match_reference{ true };
+        bool local_enable_correct{ true };
+        bool global_enable_clear{ true };
+        bool rw_field_correct{ true };
+        bool len_field_correct{ true };
+        bool fields_disjoint{ true };
+        bool le_ge_clear{ true };
+        bool lib_matches_reference{ true };
+
+        for (int slot{ 0 }; slot < 4; ++slot)
+        {
+            for (std::size_t ki{ 0 }; ki < kinds.size(); ++ki)
+            {
+                for (std::size_t li{ 0 }; li < lengths.size(); ++li)
+                {
+                    const std::uint64_t rw_enc{ static_cast<std::uint64_t>(kinds[ki]) };
+                    const std::uint64_t len_enc{ static_cast<std::uint64_t>(lengths[li]) };
+                    const std::uint64_t expected{ expected_dr7(slot, rw_enc, len_enc) };
+
+                    // Reconstruct each sub-field independently and recompose.
+                    const std::uint64_t l_bit{ std::uint64_t{ 1 } << (slot * 2) };
+                    const std::uint64_t g_bit{ std::uint64_t{ 1 } << (slot * 2 + 1) };
+                    const std::uint64_t rw_shift{ static_cast<std::uint64_t>(16 + slot * 4) };
+                    const std::uint64_t len_shift{ static_cast<std::uint64_t>(18 + slot * 4) };
+                    const std::uint64_t rw_placed{ rw_enc << rw_shift };
+                    const std::uint64_t len_placed{ len_enc << len_shift };
+                    const std::uint64_t recomposed{ l_bit | rw_placed | len_placed };
+
+                    if (recomposed != expected) { all_match_reference = false; }
+
+                    // L-bit set; G-bit (2*slot+1) NEVER set.
+                    if ((expected & l_bit) == 0u) { local_enable_correct = false; }
+                    if ((expected & g_bit) != 0u) { global_enable_clear = false; }
+
+                    // R/W field reads back exactly the encoding.
+                    if (((expected >> rw_shift) & 0x3u) != rw_enc) { rw_field_correct = false; }
+                    // LEN field reads back exactly the encoding.
+                    if (((expected >> len_shift) & 0x3u) != len_enc) { len_field_correct = false; }
+
+                    // The three sub-fields are disjoint: OR popcount equals the
+                    // sum of the individual popcounts (no shared bits).
+                    const auto pc = [](std::uint64_t v) -> int
+                    {
+                        int n{ 0 };
+                        while (v) { v &= (v - 1u); ++n; }
+                        return n;
+                    };
+                    if (pc(expected) != pc(l_bit) + pc(rw_placed) + pc(len_placed))
+                    {
+                        fields_disjoint = false;
+                    }
+
+                    // DR7 LE (bit 8) and GE (bit 9) are never asserted.
+                    if ((expected & (std::uint64_t{ 1 } << 8)) != 0u) { le_ge_clear = false; }
+                    if ((expected & (std::uint64_t{ 1 } << 9)) != 0u) { le_ge_clear = false; }
+
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+                    // Where the function is compiled in (Windows x86_64), the
+                    // library result must equal the reference packing byte-for-byte.
+                    if (vmhook::os::detail_dr::build_dr7(slot, kinds[ki], lengths[li]) != expected)
+                    {
+                        lib_matches_reference = false;
+                    }
+#endif
+                }
+            }
+        }
+
+        check("D1_all_recomposed_match_reference", all_match_reference);
+        check("D1_local_enable_bit_set_per_slot", local_enable_correct);
+        check("D1_global_enable_bit_never_set", global_enable_clear);
+        check("D1_rw_field_reads_back_encoding", rw_field_correct);
+        check("D1_len_field_reads_back_encoding", len_field_correct);
+        check("D1_subfields_disjoint", fields_disjoint);
+        check("D1_le_ge_control_bits_clear", le_ge_clear);
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+        check("D1_build_dr7_matches_reference_all_combos", lib_matches_reference);
+        std::printf("[INFO] build_dr7 present (VMHOOK_HAS_HW_DATA_BREAKPOINTS=1): "
+                    "library result pinned byte-identical to the derived reference\n");
+#else
+        // build_dr7 is not compiled on this target; the pure-math reference still
+        // pinned the full layout above.  Reference the flag so it is not unused.
+        check("D1_lib_match_flag_untouched_when_absent", lib_matches_reference);
+        std::printf("[INFO] build_dr7 absent (VMHOOK_HAS_HW_DATA_BREAKPOINTS=0): "
+                    "DR7 layout pinned via the pure-integer reference only\n");
+#endif
+    }
+
+    // =====================================================================
+    // D2. build_dr7 — the per-slot L-bit base values and the per-slot field
+    // shift positions are EXACTLY the documented {0,2,4,6} / {16,20,24,28} /
+    // {18,22,26,30} ladders.  Pinned as a minimal-window write (LEN=one_byte=0,
+    // so only the L-bit and R/W field are set) so the L-bit position is read in
+    // isolation.  Pure shift math; no library call required (also cross-checked
+    // against build_dr7 where present).
+    // =====================================================================
+    {
+        constexpr std::array<std::uint64_t, 4> expected_l_base{ { 0x1u, 0x4u, 0x10u, 0x40u } };
+        constexpr std::array<std::uint64_t, 4> expected_rw_shift{ { 16u, 20u, 24u, 28u } };
+        constexpr std::array<std::uint64_t, 4> expected_len_shift{ { 18u, 22u, 26u, 30u } };
+        const std::uint64_t rw_write{
+            static_cast<std::uint64_t>(vmhook::os::data_breakpoint_kind::write) };
+        const std::uint64_t len_one{
+            static_cast<std::uint64_t>(vmhook::os::data_breakpoint_length::one_byte) };
+
+        bool l_base_ok{ true };
+        bool rw_shift_ok{ true };
+        bool len_shift_ok{ true };
+        for (int slot{ 0 }; slot < 4; ++slot)
+        {
+            const auto s{ static_cast<std::size_t>(slot) };
+            if ((std::uint64_t{ 1 } << (slot * 2)) != expected_l_base[s]) { l_base_ok = false; }
+            if (static_cast<std::uint64_t>(16 + slot * 4) != expected_rw_shift[s]) { rw_shift_ok = false; }
+            if (static_cast<std::uint64_t>(18 + slot * 4) != expected_len_shift[s]) { len_shift_ok = false; }
+
+            // With len_one (=0) the LEN field contributes nothing, so the value
+            // is purely L-bit | (write << rw_shift): a clean two-field check.
+            const std::uint64_t v{ expected_dr7(slot, rw_write, len_one) };
+            const std::uint64_t want{ expected_l_base[s] | (rw_write << expected_rw_shift[s]) };
+            check(("D2_slot_" + std::to_string(slot) + "_min_window_value").c_str(), v == want);
+        }
+        check("D2_l_bit_base_ladder", l_base_ok);
+        check("D2_rw_shift_ladder", rw_shift_ok);
+        check("D2_len_shift_ladder", len_shift_ok);
+    }
+
+    // =====================================================================
+    // J0. jni:: forwarder matrix — every forwarder that resolves its JNI slot
+    // through jni_function(current_jni_env) is null/no-op WITHOUT a JVM, because
+    // current_jni_env is a thread_local nullptr until ensure_current_java_thread
+    // attaches a thread (which fails with no JVM), so jni_function returns a null
+    // slot pointer and each forwarder bails BEFORE dereferencing its handle
+    // argument.  We therefore drive the full name/handle matrix with nullptr
+    // handles (and varied names), proving null-return + no-throw.  We do NOT
+    // pass a fabricated non-null handle to decode_object()/get_object_class():
+    // decode_object raw-derefs the handle BEFORE the env check, so only a null
+    // handle is contract-safe there (a fabricated pointer would SEGV on POSIX).
+    // =====================================================================
+    {
+        // jni::find_class — bails at ensure_current_java_thread() for any name
+        // shape (incl. embedded NUL via string_view), returns nullptr, no throw.
+        const std::string nul_name{ std::string("a\0b/C", 5) };
+        const std::array<std::string_view, 7> names{ {
+            std::string_view{ "" },
+            std::string_view{ "java/lang/Object" },
+            std::string_view{ "java/lang/String" },
+            std::string_view{ "[Ljava/lang/Object;" },
+            std::string_view{ "not.a.valid.name" },
+            std::string_view{ "com/example/Missing$Inner" },
+            std::string_view{ nul_name.data(), nul_name.size() },
+        } };
+        bool find_class_all_null{ true };
+        bool find_class_no_throw{ true };
+        bool ctx_loader_all_null{ true };
+        bool ctx_loader_no_throw{ true };
+        for (std::size_t i{ 0 }; i < names.size(); ++i)
+        {
+            try { if (vmhook::jni::find_class(names[i]) != nullptr) { find_class_all_null = false; } }
+            catch (...) { find_class_no_throw = false; }
+            try
+            {
+                if (vmhook::jni::find_class_with_context_loader(names[i]) != nullptr)
+                {
+                    ctx_loader_all_null = false;
+                }
+            }
+            catch (...) { ctx_loader_no_throw = false; }
+        }
+        check("J0_jni_find_class_all_names_null_no_jvm", find_class_all_null);
+        check("J0_jni_find_class_no_throw", find_class_no_throw);
+        check("J0_jni_find_class_with_context_loader_all_null_no_jvm", ctx_loader_all_null);
+        check("J0_jni_find_class_with_context_loader_no_throw", ctx_loader_no_throw);
+    }
+    {
+        // jni::new_string_utf — resolves a slot via current_jni_env (null), so
+        // it returns nullptr for every input shape and never throws.
+        const std::array<std::string_view, 4> values{ {
+            std::string_view{ "" },
+            std::string_view{ "hello" },
+            std::string_view{ "caf\xC3\xA9" },        // LATIN1-range UTF-8
+            std::string_view{ "\xF0\x9F\x98\x80" },   // astral code point
+        } };
+        bool all_null{ true };
+        bool no_throw{ true };
+        for (std::size_t i{ 0 }; i < values.size(); ++i)
+        {
+            try { if (vmhook::jni::new_string_utf(values[i]) != nullptr) { all_null = false; } }
+            catch (...) { no_throw = false; }
+        }
+        check("J0_jni_new_string_utf_all_null_no_jvm", all_null);
+        check("J0_jni_new_string_utf_no_throw", no_throw);
+    }
+    {
+        // jni::signature_for_arg<T> is the SAME compile-time table as
+        // detail::jni_signature_for_arg<T> (it forwards directly), so it is fully
+        // deterministic with no JVM.  Pin a representative spread of tokens and
+        // the wrapper forwarding identity for the read-side argument types.
+        check("J0_jni_sig_bool_Z", vmhook::jni::signature_for_arg<bool>() == "Z");
+        check("J0_jni_sig_int_I", vmhook::jni::signature_for_arg<std::int32_t>() == "I");
+        check("J0_jni_sig_long_J", vmhook::jni::signature_for_arg<std::int64_t>() == "J");
+        check("J0_jni_sig_double_D", vmhook::jni::signature_for_arg<double>() == "D");
+        check("J0_jni_sig_string", vmhook::jni::signature_for_arg<std::string>() == "Ljava/lang/String;");
+        check("J0_jni_sig_forwards_to_detail",
+              vmhook::jni::signature_for_arg<std::int32_t>()
+              == vmhook::detail::jni_signature_for_arg<std::int32_t>());
+        // An unregistered wrapper still falls back to Object through the forwarder.
+        check("J0_jni_sig_unregistered_wrapper_object",
+              vmhook::jni::signature_for_arg<registry_unmapped>() == "Ljava/lang/Object;");
+    }
+    {
+        // Handle-taking forwarders whose slot resolves through jni_function: with
+        // current_jni_env null the slot pointer is null, so each is null/no-op and
+        // NEVER dereferences the (null) handle / id we pass.  Drive them all with
+        // nullptr handles — the contract-safe degenerate input.
+        bool exc_clear_no_throw{ true };
+        try { vmhook::jni::exception_clear(); } catch (...) { exc_clear_no_throw = false; }
+        check("J0_jni_exception_clear_no_throw_no_jvm", exc_clear_no_throw);
+
+        bool ok{ true };
+        bool threw{ false };
+        try
+        {
+            if (vmhook::jni::get_object_class(nullptr) != nullptr) { ok = false; }
+            if (vmhook::jni::get_method_id(nullptr, std::string{ "m" }, std::string{ "()V" }) != nullptr) { ok = false; }
+            if (vmhook::jni::get_static_method_id(nullptr, std::string{ "m" }, std::string{ "()V" }) != nullptr) { ok = false; }
+            if (vmhook::jni::get_static_field_id(nullptr, std::string{ "f" }, std::string{ "I" }) != nullptr) { ok = false; }
+            if (vmhook::jni::get_static_object_field(nullptr, nullptr) != nullptr) { ok = false; }
+            if (vmhook::jni::call_object_method(nullptr, nullptr) != nullptr) { ok = false; }
+            if (vmhook::jni::call_static_object_method(nullptr, nullptr) != nullptr) { ok = false; }
+            if (vmhook::jni::klass_from_class_mirror(nullptr) != nullptr) { ok = false; }
+        }
+        catch (...) { threw = true; }
+        check("J0_jni_handle_forwarders_all_null_no_jvm", ok);
+        check("J0_jni_handle_forwarders_no_throw_no_jvm", threw == false);
+
+        // get_string_utf returns a std::string by value; with no JVM it must be
+        // the empty string and must not throw, for a null handle.
+        bool gsu_threw{ false };
+        std::string gsu{ "sentinel" };
+        try { gsu = vmhook::jni::get_string_utf(nullptr); } catch (...) { gsu_threw = true; }
+        check("J0_jni_get_string_utf_empty_no_jvm", gsu.empty());
+        check("J0_jni_get_string_utf_no_throw_no_jvm", !gsu_threw);
+    }
+    {
+        // jni::decode_object(nullptr) is the ONE contract-safe input for the
+        // raw-deref decoder (its `if (!handle) return nullptr;` guard runs before
+        // the deref).  Null in -> null out, no throw.  (A non-null fabricated
+        // handle is deliberately NOT exercised — it would deref a fake pointer.)
+        bool threw{ false };
+        void* decoded{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1)) };
+        try { decoded = vmhook::jni::decode_object(nullptr); } catch (...) { threw = true; }
+        check("J0_jni_decode_object_null_in_null_out", decoded == nullptr);
+        check("J0_jni_decode_object_no_throw", !threw);
+
+        // jni::oop_handle stores the oop into caller storage and returns a pointer
+        // to that storage — pure pointer assignment, no JVM, no deref.  Round-trip
+        // a null oop: storage becomes null and the returned handle points at it.
+        void* storage{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xFEED)) };
+        void* handle{ nullptr };
+        bool oh_threw{ false };
+        try { handle = vmhook::jni::oop_handle(nullptr, storage); } catch (...) { oh_threw = true; }
+        check("J0_jni_oop_handle_returns_storage_address", handle == static_cast<void*>(&storage));
+        check("J0_jni_oop_handle_stored_null_oop", storage == nullptr);
+        check("J0_jni_oop_handle_no_throw", !oh_threw);
+    }
+
+    // =====================================================================
+    // T0. Base traits / concept shapes the factory machinery relies on, beyond
+    // the static_assert block at file top — RUNTIME-observed via type traits so
+    // a regression surfaces as a [FAIL] line as well as (where applicable) a
+    // compile error.  All decided by the type system; no JVM, no allocation.
+    // =====================================================================
+    {
+        // The factory return type and map mapped_type are the documented raw
+        // function pointer object_base*(*)(void*) — observed at runtime.
+        check("T0_factory_fn_is_pointer", std::is_pointer_v<vmhook::type_factory_function_t>);
+        check("T0_factory_fn_exact_type",
+              std::is_same_v<vmhook::type_factory_function_t, vmhook::object_base* (*)(void*)>);
+
+        // Every wrapper -> object_base upcast (the factory's return) and the
+        // is_unique_ptr peel the read-side uses are consistent at runtime too.
+        check("T0_alpha_is_object_base", std::is_base_of_v<vmhook::object_base, registry_alpha>);
+        check("T0_delta_is_object_base", std::is_base_of_v<vmhook::object_base, registry_delta>);
+        check("T0_unique_ptr_peel_true", vmhook::detail::is_unique_ptr_v<std::unique_ptr<registry_beta>>);
+        check("T0_unique_ptr_peel_ref_true", vmhook::detail::is_unique_ptr_v<std::unique_ptr<registry_beta>&>);
+        check("T0_unique_ptr_peel_bare_false", !vmhook::detail::is_unique_ptr_v<registry_beta>);
+        check("T0_unique_ptr_peel_rawptr_false", !vmhook::detail::is_unique_ptr_v<registry_beta*>);
+
+        // oop_t IS void* (the factory body's brace-init argument type).
+        check("T0_oop_t_is_void_ptr", std::is_same_v<vmhook::oop_t, void*>);
+        // object_base is polymorphic with a virtual dtor (so `delete built;` via
+        // object_base* — used in R5/R18/R19 — is well-defined).
+        check("T0_object_base_polymorphic", std::is_polymorphic_v<vmhook::object_base>);
+        check("T0_object_base_virtual_dtor", std::has_virtual_destructor_v<vmhook::object_base>);
+
+        // The two registry maps' key/mapped types match the registry's contract.
+        check("T0_type_map_mapped_is_string",
+              std::is_same_v<decltype(vmhook::type_to_class_map)::mapped_type, std::string>);
+        check("T0_type_map_key_is_type_index",
+              std::is_same_v<decltype(vmhook::type_to_class_map)::key_type, std::type_index>);
+        check("T0_factory_map_key_is_string",
+              std::is_same_v<decltype(vmhook::g_type_factory_map)::key_type, std::string>);
+        check("T0_factory_map_mapped_is_factory_fn",
+              std::is_same_v<decltype(vmhook::g_type_factory_map)::mapped_type,
+                             vmhook::type_factory_function_t>);
+
+        // The factory entry points keep their documented return types at runtime.
+        check("T0_register_class_returns_bool",
+              std::is_same_v<decltype(vmhook::register_class<registry_alpha>(std::string_view{})), bool>);
+        check("T0_make_unique_returns_unique_ptr",
+              std::is_same_v<decltype(vmhook::make_unique<registry_alpha>()),
+                             std::unique_ptr<registry_alpha>>);
+        check("T0_make_java_string_returns_void_ptr",
+              std::is_same_v<decltype(vmhook::make_java_string(std::string_view{})), void*>);
+
+        // The jni forwarder return-type contract (observed): find_class -> void*,
+        // find_class_with_context_loader -> klass*, get_string_utf -> std::string,
+        // signature_for_arg -> std::string.
+        check("T0_jni_find_class_returns_void_ptr",
+              std::is_same_v<decltype(vmhook::jni::find_class(std::string_view{})), void*>);
+        check("T0_jni_ctx_loader_returns_klass_ptr",
+              std::is_same_v<decltype(vmhook::jni::find_class_with_context_loader(std::string_view{})),
+                             vmhook::hotspot::klass*>);
+        check("T0_jni_get_string_utf_returns_string",
+              std::is_same_v<decltype(vmhook::jni::get_string_utf(nullptr)), std::string>);
+        check("T0_jni_signature_for_arg_returns_string",
+              std::is_same_v<decltype(vmhook::jni::signature_for_arg<int>()), std::string>);
     }
 
     return failures == 0 ? 0 : 1;

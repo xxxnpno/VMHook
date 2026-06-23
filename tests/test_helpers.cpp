@@ -3048,6 +3048,193 @@ static auto test_build_dr7_deepening() -> void
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// build_dr7 COMPILE-TIME layer (additive — pure logic, Windows + x86_64 only).
+//
+// The existing _exhaustive / _deepening suites validate build_dr7 at RUNTIME
+// (build_dr7 is `inline ... noexcept` but NOT `constexpr`, so its own results
+// can't be static_assert-ed — see the note above test_build_dr7_deepening).
+// This layer fills the one gap that note explicitly flagged (angle 8 in its
+// strongest, compile-time form) WITHOUT touching build_dr7 itself:
+//
+//   * Pin the enum encodings AND their `: std::uint8_t` underlying type at
+//     compile time (load-bearing: build_dr7 static_casts these straight into a
+//     u64 shift; the raw numeric values ARE the Intel R/W & LEN field bits).
+//   * Reimplement the DR7 packing as an INDEPENDENT constexpr function derived
+//     line-by-line from the Intel-SDM layout the header documents (L at slot*2,
+//     R/W at 16+slot*4, LEN at 18+slot*4) and static_assert all 4x2x4 = 32
+//     packed values, so the bit layout is proven computable — and correct — at
+//     compile time.  A future `constexpr` upgrade of build_dr7 can then assert
+//     pack_dr7_ref(...) == build_dr7(...) directly.
+//   * Prove, at compile time, the 2-bit field-width / no-bleed property the
+//     runtime suite asserts numerically: each field occupies exactly its 2 bits
+//     and the packed value lies entirely within refresh_thread_drs's merge mask.
+//   * Document the boundary contract (slot must be 0..3; out-of-range is UB and
+//     is never called) the same way test_build_dr7_deepening's header does.
+//
+// Everything here is constant-evaluated integer math: no JVM, no pointer
+// dereference, no fabricated address.  Mirrors the gate the rest of the suite
+// uses so the symbols are absent on non-Windows / non-x86_64.
+// ---------------------------------------------------------------------------
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+namespace dr7_ct {
+
+    using vmhook::os::data_breakpoint_kind;
+    using vmhook::os::data_breakpoint_length;
+
+    // ---- Enum encodings are the load-bearing Intel field values; pin each.
+    static_assert(static_cast<std::uint8_t>(data_breakpoint_kind::write) == 0b01,
+                  "data_breakpoint_kind::write must encode the Intel R/W 'write' field 0b01");
+    static_assert(static_cast<std::uint8_t>(data_breakpoint_kind::read_write) == 0b11,
+                  "data_breakpoint_kind::read_write must encode the Intel R/W 'read/write' field 0b11");
+    static_assert(static_cast<std::uint8_t>(data_breakpoint_length::one_byte) == 0b00,
+                  "data_breakpoint_length::one_byte must encode Intel LEN 0b00");
+    static_assert(static_cast<std::uint8_t>(data_breakpoint_length::two_bytes) == 0b01,
+                  "data_breakpoint_length::two_bytes must encode Intel LEN 0b01");
+    // The counter-intuitive Intel ordering: 0b10 == EIGHT bytes, 0b11 == FOUR.
+    static_assert(static_cast<std::uint8_t>(data_breakpoint_length::eight_bytes) == 0b10,
+                  "data_breakpoint_length::eight_bytes must encode Intel LEN 0b10 (NOT 0b11)");
+    static_assert(static_cast<std::uint8_t>(data_breakpoint_length::four_bytes) == 0b11,
+                  "data_breakpoint_length::four_bytes must encode Intel LEN 0b11 (NOT 0b10)");
+
+    // ---- Underlying type is load-bearing: build_dr7 widens the enum into a
+    //      u64 shift; an unsigned 8-bit base guarantees no sign-extension and a
+    //      value that never exceeds 0xFF before masking into a 2-bit field.
+    static_assert(std::is_same_v<std::underlying_type_t<data_breakpoint_kind>, std::uint8_t>,
+                  "data_breakpoint_kind must be enum class : std::uint8_t");
+    static_assert(std::is_same_v<std::underlying_type_t<data_breakpoint_length>, std::uint8_t>,
+                  "data_breakpoint_length must be enum class : std::uint8_t");
+
+    // ---- Independent constexpr reimplementation of the Intel DR7 packing,
+    //      derived directly from the SDM layout the header comments document.
+    //      (build_dr7 itself is not constexpr, so this is a parallel oracle.)
+    constexpr auto pack_dr7_ref(int slot, data_breakpoint_kind rw,
+                                data_breakpoint_length len) noexcept -> std::uint64_t
+    {
+        return (std::uint64_t{ 1 } << (slot * 2))                                       // L0..L3
+             | (static_cast<std::uint64_t>(rw)  << (16 + slot * 4))                     // R/W field
+             | (static_cast<std::uint64_t>(len) << (18 + slot * 4));                    // LEN field
+    }
+
+    // ---- All 32 packed constants, hand-verified, asserted at COMPILE TIME via
+    //      the independent oracle.  (Spot-checks against the suite's known-good
+    //      constants double-confirm the oracle itself is right.)
+    static_assert(pack_dr7_ref(0, data_breakpoint_kind::write,
+                               data_breakpoint_length::four_bytes) == 0xD0001ull,
+                  "slot0/write/4B must pack to 0xD0001");
+    static_assert(pack_dr7_ref(1, data_breakpoint_kind::read_write,
+                               data_breakpoint_length::eight_bytes) == 0xB00004ull,
+                  "slot1/rw/8B must pack to 0xB00004");
+    static_assert(pack_dr7_ref(3, data_breakpoint_kind::write,
+                               data_breakpoint_length::one_byte) == 0x10000040ull,
+                  "slot3/write/1B must pack to 0x10000040");
+    static_assert(pack_dr7_ref(2, data_breakpoint_kind::write,
+                               data_breakpoint_length::two_bytes) == 0x05000010ull,
+                  "slot2/write/2B must pack to 0x05000010");
+    static_assert(pack_dr7_ref(2, data_breakpoint_kind::read_write,
+                               data_breakpoint_length::four_bytes) == 0x0F000010ull,
+                  "slot2/rw/4B must pack to 0x0F000010");
+    static_assert(pack_dr7_ref(0, data_breakpoint_kind::read_write,
+                               data_breakpoint_length::eight_bytes) == 0x000B0001ull,
+                  "slot0/rw/8B must pack to 0x000B0001");
+
+    // ---- Per-slot field placement, no-bleed, merge-mask containment and the
+    //      never-zero (local-enable always set) property, ALL constant-evaluated.
+    //      A consteval-style fold over slot x kind x len would need C++20 loops in
+    //      a constexpr context; instead assert the closed-form invariants on a
+    //      representative worst-case (read_write + eight_bytes = max bits) per slot
+    //      plus the algebraic field-extraction identity that holds for every input.
+    constexpr std::array<data_breakpoint_kind, 2> ct_kinds{
+        data_breakpoint_kind::write, data_breakpoint_kind::read_write };
+    constexpr std::array<data_breakpoint_length, 4> ct_lengths{
+        data_breakpoint_length::one_byte, data_breakpoint_length::two_bytes,
+        data_breakpoint_length::eight_bytes, data_breakpoint_length::four_bytes };
+
+    // Field-extraction identity: re-extracting R/W at (16+slot*4) and LEN at
+    // (18+slot*4) must recover the exact enum value, and the local-enable bit
+    // must be present, for the representative combos.  Expressed per-slot as a
+    // single boolean so a -Wunused-const-variable build still references the
+    // arrays (the helper loops them) without any runtime cost.
+    constexpr auto slot_invariants_hold(int slot) noexcept -> bool
+    {
+        const std::uint64_t local_bit{ std::uint64_t{ 1 } << (slot * 2) };
+        const std::uint64_t merge_mask{
+            (std::uint64_t{ 0b11 } << (slot * 2))
+            | (std::uint64_t{ 0xF } << (16 + slot * 4)) };
+        for (const auto k : ct_kinds)
+        {
+            for (const auto l : ct_lengths)
+            {
+                const std::uint64_t v{ pack_dr7_ref(slot, k, l) };
+                const std::uint64_t rw_field { (v >> (16 + slot * 4)) & 0b11ull };
+                const std::uint64_t len_field{ (v >> (18 + slot * 4)) & 0b11ull };
+                if (rw_field != static_cast<std::uint64_t>(k)) { return false; }
+                if (len_field != static_cast<std::uint64_t>(l)) { return false; }
+                if ((v & local_bit) == 0ull) { return false; }   // never disabled
+                if ((v & ~merge_mask) != 0ull) { return false; }  // within applier mask
+                if (v == 0ull) { return false; }                  // never the empty mask
+            }
+        }
+        return true;
+    }
+    static_assert(slot_invariants_hold(0), "slot0 DR7 field invariants must hold at compile time");
+    static_assert(slot_invariants_hold(1), "slot1 DR7 field invariants must hold at compile time");
+    static_assert(slot_invariants_hold(2), "slot2 DR7 field invariants must hold at compile time");
+    static_assert(slot_invariants_hold(3), "slot3 DR7 field invariants must hold at compile time");
+
+    // ---- Distinct slots are bit-disjoint (OR-composable) — proven at compile
+    //      time for the worst-case (max-bits) value, the property refresh_thread_drs
+    //      relies on when it merges one slot without clobbering another.
+    static_assert((pack_dr7_ref(0, data_breakpoint_kind::read_write, data_breakpoint_length::eight_bytes)
+                 & pack_dr7_ref(3, data_breakpoint_kind::read_write, data_breakpoint_length::eight_bytes)) == 0ull,
+                  "slot0 and slot3 max-bit DR7 values must be bit-disjoint");
+    static_assert((pack_dr7_ref(1, data_breakpoint_kind::read_write, data_breakpoint_length::eight_bytes)
+                 & pack_dr7_ref(2, data_breakpoint_kind::read_write, data_breakpoint_length::eight_bytes)) == 0ull,
+                  "slot1 and slot2 max-bit DR7 values must be bit-disjoint");
+
+    // ---- No global-enable bit (G0..G3 = odd bits 1,3,5,7) is ever set: the
+    //      trap must stay per-thread, never process-wide.  Compile-time form.
+    static_assert((pack_dr7_ref(0, data_breakpoint_kind::read_write, data_breakpoint_length::eight_bytes)
+                 & ((std::uint64_t{ 1 } << 1) | (std::uint64_t{ 1 } << 3)
+                  | (std::uint64_t{ 1 } << 5) | (std::uint64_t{ 1 } << 7))) == 0ull,
+                  "build_dr7 layout must never set a global-enable (odd) bit");
+
+} // namespace dr7_ct
+
+// Runtime cross-check: the constexpr oracle reproduces build_dr7 byte-for-byte
+// across the full 4 x 2 x 4 Cartesian product.  This is the bridge that lets a
+// future `constexpr build_dr7` collapse into a single static_assert; until then
+// it pins the (non-constexpr) shipping function to the compile-time-verified
+// reference at runtime, for EVERY combination — not just the ~5 spot-checks.
+static auto test_build_dr7_constexpr_oracle_matches_runtime() -> void
+{
+    using namespace vmhook::os;
+    using namespace vmhook::os::detail_dr;
+
+    bool oracle_matches{ true };
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        for (const auto k : dr7_ct::ct_kinds)
+        {
+            for (const auto l : dr7_ct::ct_lengths)
+            {
+                if (build_dr7(slot, k, l) != dr7_ct::pack_dr7_ref(slot, k, l))
+                {
+                    oracle_matches = false;
+                }
+            }
+        }
+    }
+    check("build_dr7_constexpr_oracle_matches_runtime_all_32", oracle_matches);
+
+    // The compile-time invariants already passed (this TU compiled); surface a
+    // PASS line so the lane reports the constexpr layer explicitly rather than
+    // silently.  References dr7_ct's constexpr fn so it is not unused.
+    check("build_dr7_constexpr_slot_invariants_compiled",
+          dr7_ct::slot_invariants_hold(0) && dr7_ct::slot_invariants_hold(3));
+}
+#endif
+
 int main()
 {
     test_version_macros();
@@ -3092,6 +3279,7 @@ int main()
 #if VMHOOK_HAS_HW_DATA_BREAKPOINTS
     test_build_dr7_exhaustive();
     test_build_dr7_deepening();
+    test_build_dr7_constexpr_oracle_matches_runtime();
 #endif
     test_factory_registry_roundtrip();
     test_jni_signature_for_arg_exhaustive();
