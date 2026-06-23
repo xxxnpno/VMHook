@@ -17267,6 +17267,20 @@ namespace vmhook
                         params[param_idx++] = v;
                     }
                 };
+            // The interpreter locals[] slot array (params[8]) caps at 8 entries,
+            // and the receiver consumes locals[0] for an instance dispatch, so the
+            // pack() guard above silently drops any argument past the cap.  Reject
+            // an over-cap arity at COMPILE time with a clear, slot-aware diagnostic
+            // anchored on the public call() entry, instead of letting those args
+            // vanish at runtime.  (The JNI fallback call_jni() already static-asserts
+            // the same <= 8 bound; this mirrors it on the call_stub fast path so the
+            // limit is reported identically regardless of which path a JDK takes.)
+            // It is a constant-expression check, so the warm 8-or-fewer path is
+            // byte-identical and no runtime code is emitted.
+            static_assert(sizeof...(args_t) <= 8,
+                          "method_proxy::call: max 8 arguments - the interpreter "
+                          "locals[] slot array caps at 8 (note: a long/double "
+                          "argument consumes two interpreter slots).");
             (pack(std::forward<args_t>(args)), ...);
 
             //  Call the stub
