@@ -1452,6 +1452,56 @@ int main()
     }
 
     // =====================================================================
+    // R16c. RESIDUAL CHAR-TYPE GAPS for the formerly-static_asserted extended
+    // character types.  R16/R16b pin the agreement and the canonical letters for
+    // char / char8_t / char16_t / char32_t / wchar_t, but leave three thin gaps
+    // this block closes — all ADDITIVE, all derived (no platform literal), and all
+    // exercising types that USED to hit the terminal dependent_false_v
+    // static_assert and fail to compile before the generic-width ladder landed:
+    //
+    //   (a) `signed char` / `unsigned char` absolute letter.  R16b only checks
+    //       these via the agreement helper; pin them to "B" outright so a future
+    //       regression that flips the sizeof-1 arm is caught even if the selector
+    //       mirror regresses in lockstep.
+    //   (b) cv / reference SPELLINGS of the new char types decay to the SAME token
+    //       as the bare type (the builder runs std::decay_t first).  R16b pins
+    //       only `const char16_t` / `wchar_t&`; extend to char8_t / char32_t / a
+    //       reference char16_t to lock the precedence under qualifier stripping.
+    //   (c) TOTALITY: every new char arm yields a non-empty, single-character
+    //       primitive token (R16 pins this only for bool / int64).
+    // =====================================================================
+    {
+        map_state_guard guard{};
+
+        // (a) The plain signed/unsigned char pair: Java `byte` is signed 8-bit,
+        // both 1-byte chars encode as "B" regardless of signedness.
+        check("R16c_signed_char_is_B", sig<signed char>() == "B");
+        check("R16c_unsigned_char_is_B", sig<unsigned char>() == "B");
+
+        // (b) cv / ref qualifier stripping reaches the identical canonical letter.
+        // char16_t stays "C" (the UTF-16 precedence claimed before the generic
+        // 2-byte arm — the backlog's flagged char16_t->"C" case), under both a
+        // reference and a top-level const spelling.
+        check("R16c_char16_t_ref_decays_C", sig<char16_t&>() == "C");
+        check("R16c_const_char16_t_decays_C", sig<const char16_t>() == "C");
+        // char8_t (1 byte -> "B") and char32_t (4 bytes -> "I") strip identically.
+        check("R16c_const_char8_t_decays_B", sig<const char8_t>() == "B");
+        check("R16c_char32_t_ref_decays_I", sig<char32_t&>() == "I");
+        check("R16c_const_volatile_char32_t_decays_I", sig<const volatile char32_t>() == "I");
+
+        // (c) Totality over the new char arms: each is a single-character,
+        // non-empty primitive token (never the empty string the static_assert
+        // path would have made impossible by failing to compile at all).
+        check("R16c_char_single_char", sig<char>().size() == 1u);
+        check("R16c_char8_t_single_char", sig<char8_t>().size() == 1u);
+        check("R16c_char16_t_single_char", sig<char16_t>().size() == 1u);
+        check("R16c_char32_t_single_char", sig<char32_t>().size() == 1u);
+        check("R16c_wchar_t_single_char", sig<wchar_t>().size() == 1u);
+        check("R16c_char_non_empty", !sig<char>().empty());
+        check("R16c_wchar_t_non_empty", !sig<wchar_t>().empty());
+    }
+
+    // =====================================================================
     // R17. register_class<T>() rejects EVERY class-name shape with no JVM.
     // find_class(name) fails before any insert, so the call is false / no-throw
     // / both-maps-untouched for the empty name, garbage, special characters, a
