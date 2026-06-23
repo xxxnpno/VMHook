@@ -5691,6 +5691,216 @@ namespace vmhook
         }
 
         /*
+            @brief Resolves a Klass* from the metadata slot of a HotSpot object header,
+                   choosing the compressed-vs-full layout from gHotSpotVMStructs.
+            @param oop  Decoded (full 64-bit) heap pointer to the Java object.
+            @return  klass* for oop's runtime type, or nullptr on any failure.
+            @details
+            The +8 header read that every klass_from_oop()/klass_from_object_header()
+            site used was hard-coded for the DEFAULT x64 layout: an 8-byte mark word at
+            +0 and a 4-byte narrow Klass (oopDesc::_metadata._compressed_klass) at +8,
+            decoded through decode_klass_pointer().  That is wrong under two
+            configurations this helper now distinguishes by inspecting the VMStruct
+            metadata layout instead of assuming it:
+
+              - -XX:-UseCompressedClassPointers : the +8 slot holds a FULL 64-bit
+                Klass* (oopDesc::_metadata._klass), not a narrow value.  gHotSpotVMStructs
+                then exposes _klass rather than _compressed_klass; we read 8 bytes and
+                use the pointer directly (no decode).
+
+              - -XX:+UseCompactObjectHeaders (Lilliput / JEP 450) : the klass is packed
+                INTO the mark word and the +8 slot is the first instance field.  There
+                is no compressed-klass field at offset 8 in VMStructs; rather than feed
+                an instance-field bit pattern to the decoder we FAIL CLOSED (nullptr).
+
+            Resolution rule (cached once per process via function-local statics):
+              * Prefer oopDesc::_metadata._compressed_klass when present AND its offset
+                is 8 -> read 4 bytes at +8, decode_klass_pointer().  This is the DEFAULT
+                config and is byte-identical to the previous hard-coded read.
+              * Else prefer oopDesc::_metadata._klass (full Klass*) -> read pointer-width
+                at its VMStruct offset, use directly.
+              * Else (compact headers, or metadata layout not exposed) -> nullptr.
+
+            The narrow-klass slot is a COLD read: a stale / GC-relocated oop can pass
+            is_valid_pointer's heuristic yet sit on an unmapped page.  On Windows
+            (no working SEH on MinGW / clang-cl) the read is routed through
+            os::safe_read (ReadProcessMemory — never faults); POSIX keeps the raw read
+            (a stray AV there is contained by the JVM's own signal handling, and gating
+            those reads regressed other oop walks).  For a normally-mapped header the
+            bytes are identical to the prior raw read on every toolchain.
+
+            Complexity: O(1) after the first call.  Exception safety: noexcept.
+        */
+        static auto klass_from_header_bytes(void* const oop) noexcept
+            -> vmhook::hotspot::klass*
+        {
+            if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+            {
+                return nullptr;
+            }
+
+            // VMStruct field for the narrow Klass slot.  Name drifted across JDKs the
+            // same way the codec base/shift fields did, so try the known spellings.
+            static constexpr vmhook::hotspot::struct_entry_candidate_t compressed_candidates[]{
+                { "oopDesc", "_metadata._compressed_klass" },
+                { "oopDesc", "_compressed_klass" },
+            };
+            // VMStruct field for the FULL Klass* slot (compressed class pointers OFF).
+            static constexpr vmhook::hotspot::struct_entry_candidate_t full_candidates[]{
+                { "oopDesc", "_metadata._klass" },
+                { "oopDesc", "_klass" },
+            };
+
+            static const vmhook::hotspot::vm_struct_entry_t* const compressed_entry{
+                vmhook::hotspot::resolve_struct_entry(compressed_candidates, std::size(compressed_candidates)) };
+            static const vmhook::hotspot::vm_struct_entry_t* const full_entry{
+                vmhook::hotspot::resolve_struct_entry(full_candidates, std::size(full_candidates)) };
+
+            // Compressed fast-path (DEFAULT config): a 4-byte narrow Klass at +8.
+            // Only take it when VMStructs confirms the field lives at offset 8 — under
+            // UseCompactObjectHeaders the field is absent / relocated, in which case we
+            // must NOT read +8 as a narrow klass (it would be an instance field).
+            // When the VMStruct is missing entirely (no JVM / unmapped) fall back to the
+            // historical assumption (offset 8) so default-config behaviour is preserved
+            // byte-for-byte even on JDKs that do not export oopDesc field offsets.
+            const bool compressed_known{ compressed_entry != nullptr };
+            const bool compressed_at_8{ compressed_known && compressed_entry->offset == 8 };
+            const bool full_known{ full_entry != nullptr };
+
+            // Fail closed for compact object headers: the compressed slot is gone (no
+            // VMStruct hit) AND there is no full Klass* slot either -> the klass is in
+            // the mark word, which this header read cannot recover.
+            if (compressed_known && !compressed_at_8 && !full_known)
+            {
+                return nullptr;
+            }
+
+            if (compressed_at_8 || (!compressed_known && !full_known))
+            {
+                // DEFAULT path — identical 4 bytes at +8 as the prior hard-coded read.
+#if defined(_WIN32)
+                std::uint32_t narrow{ 0 };
+                if (!vmhook::os::safe_read(&narrow,
+                                           reinterpret_cast<const std::uint8_t*>(oop) + 8,
+                                           sizeof(narrow)))
+                {
+                    return nullptr;
+                }
+#else
+                const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
+                    reinterpret_cast<const std::uint8_t*>(oop) + 8) };
+#endif
+                void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow) };
+                if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
+                {
+                    return nullptr;
+                }
+                return reinterpret_cast<vmhook::hotspot::klass*>(decoded);
+            }
+
+            // Uncompressed path: a full 64-bit Klass* at the VMStruct-reported offset
+            // (structurally added; no -XX:-UseCompressedClassPointers CI cell exercises
+            // it yet, so it is exercised only when a host actually disables the feature).
+            const std::uint64_t full_offset{ full_known ? full_entry->offset : 8 };
+            const std::uint8_t* const slot{ reinterpret_cast<const std::uint8_t*>(oop) + full_offset };
+#if defined(_WIN32)
+            void* full_klass{ nullptr };
+            if (!vmhook::os::safe_read(&full_klass, slot, sizeof(full_klass)))
+            {
+                return nullptr;
+            }
+#else
+            void* const full_klass{ *reinterpret_cast<void* const*>(slot) };
+#endif
+            void* const untagged{ const_cast<void*>(vmhook::hotspot::untag_pointer(full_klass)) };
+            if (!untagged || !vmhook::hotspot::is_valid_pointer(untagged))
+            {
+                return nullptr;
+            }
+            return reinterpret_cast<vmhook::hotspot::klass*>(untagged);
+        }
+
+        /*
+            @brief Layout-aware Klass* resolution from an ALREADY-COPIED header buffer.
+            @param header       Pointer to a local copy of the object header bytes
+                                (e.g. one stride of for_each_instance's chunk buffer).
+            @param readable     Number of valid bytes available at @p header.
+            @return  klass* for the runtime type, or nullptr.
+            @details
+            Twin of klass_from_header_bytes() for the conservative heap scan, which must
+            NOT raw-deref the live oop (it works off a fault-safe buffer copy and never
+            touches the real page until the visitor does).  Same compressed-vs-full
+            branch and same compact-header fail-closed rule; reads the narrow / full
+            slot out of the supplied buffer instead of the live header.  On the DEFAULT
+            config this is byte-identical to the prior `*(buffer + off + 8)` read.
+        */
+        static auto klass_from_header_buffer(const std::uint8_t* const header,
+                                             const std::size_t          readable) noexcept
+            -> vmhook::hotspot::klass*
+        {
+            if (!header)
+            {
+                return nullptr;
+            }
+
+            static constexpr vmhook::hotspot::struct_entry_candidate_t compressed_candidates[]{
+                { "oopDesc", "_metadata._compressed_klass" },
+                { "oopDesc", "_compressed_klass" },
+            };
+            static constexpr vmhook::hotspot::struct_entry_candidate_t full_candidates[]{
+                { "oopDesc", "_metadata._klass" },
+                { "oopDesc", "_klass" },
+            };
+            static const vmhook::hotspot::vm_struct_entry_t* const compressed_entry{
+                vmhook::hotspot::resolve_struct_entry(compressed_candidates, std::size(compressed_candidates)) };
+            static const vmhook::hotspot::vm_struct_entry_t* const full_entry{
+                vmhook::hotspot::resolve_struct_entry(full_candidates, std::size(full_candidates)) };
+
+            const bool compressed_known{ compressed_entry != nullptr };
+            const bool compressed_at_8{ compressed_known && compressed_entry->offset == 8 };
+            const bool full_known{ full_entry != nullptr };
+
+            if (compressed_known && !compressed_at_8 && !full_known)
+            {
+                return nullptr;  // compact object headers — klass is in the mark word.
+            }
+
+            if (compressed_at_8 || (!compressed_known && !full_known))
+            {
+                if (readable < 12)
+                {
+                    return nullptr;
+                }
+                std::uint32_t narrow{ 0 };
+                std::memcpy(&narrow, header + 8, sizeof(narrow));
+                if (narrow == 0)
+                {
+                    return nullptr;
+                }
+                void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow) };
+                if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
+                {
+                    return nullptr;
+                }
+                return reinterpret_cast<vmhook::hotspot::klass*>(decoded);
+            }
+
+            const std::uint64_t full_offset{ full_known ? full_entry->offset : 8 };
+            if (readable < full_offset + sizeof(void*))
+            {
+                return nullptr;
+            }
+            void* full_klass{ nullptr };
+            std::memcpy(&full_klass, header + full_offset, sizeof(full_klass));
+            void* const untagged{ const_cast<void*>(vmhook::hotspot::untag_pointer(full_klass)) };
+            if (!untagged || !vmhook::hotspot::is_valid_pointer(untagged))
+            {
+                return nullptr;
+            }
+            return reinterpret_cast<vmhook::hotspot::klass*>(untagged);
+        }
+
+        /*
             @brief Checks whether a memory region matches a given byte pattern.
             @details
             A pattern byte of 0x00 acts as a wildcard and always matches.
@@ -8863,19 +9073,18 @@ namespace vmhook
                 continue;
             }
 
-            // Walk the chunk at 8-byte stride; every potential
-            // object header has its mark word at +0 and a narrow
-            // klass pointer at +8.
+            // Walk the chunk at 8-byte stride; every potential object header has
+            // its mark word at +0 and (compressed-class-pointers, the default) a
+            // narrow klass at +8.  Route the buffer-copy klass read through the
+            // layout-aware helper so an -XX:-UseCompressedClassPointers heap (full
+            // 64-bit Klass* at +8) compares correctly and a compact-object-header
+            // heap fails closed instead of false-matching an instance-field word.
+            // On the DEFAULT config this resolves the same narrow klass as before.
             for (std::size_t off{ 0 }; off + 12 <= to_read && visits < max_visits; off += stride)
             {
-                const std::uint32_t narrow{
-                    *reinterpret_cast<const std::uint32_t*>(buffer + off + 8) };
-                if (narrow == 0)
-                {
-                    continue;
-                }
-                void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow) };
-                if (decoded != static_cast<void*>(target_klass))
+                vmhook::hotspot::klass* const decoded{
+                    vmhook::hotspot::klass_from_header_buffer(buffer + off, to_read - off) };
+                if (decoded != target_klass)
                 {
                     continue;
                 }
@@ -13525,14 +13734,19 @@ namespace vmhook
             // host code (Lunar's Adventure chat handler, Forge's GuiNewChat
             // wrapper) crash on "wrong" methods being dispatched.
             {
+                // Resolve the runtime klass through the layout-aware header reader
+                // (compressed @ +8 default / full Klass* when compressed class
+                // pointers are off / fail-closed under compact object headers).  The
+                // raw narrow word is still read for the diagnostic log only — it is
+                // meaningful in the compressed default; in other layouts the resolved
+                // name is the source of truth.
                 const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
                     reinterpret_cast<const std::uint8_t*>(oop) + 8) };
-                void* const decoded_klass{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
+                vmhook::hotspot::klass* const decoded_klass{ vmhook::hotspot::klass_from_header_bytes(oop) };
                 std::string returned_name{ "<unresolved>" };
-                if (decoded_klass && vmhook::hotspot::is_valid_pointer(decoded_klass))
+                if (decoded_klass)
                 {
-                    auto* const k{ reinterpret_cast<vmhook::hotspot::klass*>(decoded_klass) };
-                    if (auto* const sym{ k->get_name() }; sym && vmhook::hotspot::is_valid_pointer(sym))
+                    if (auto* const sym{ decoded_klass->get_name() }; sym && vmhook::hotspot::is_valid_pointer(sym))
                     {
                         returned_name = sym->to_string();
                     }
@@ -15204,20 +15418,27 @@ namespace vmhook
                 {
                     return true;
                 }
-                std::uint32_t narrow_klass{ 0u };
-                if (!vmhook::os::safe_read_fast(&narrow_klass,
+                // Cold-read probe: confirm the header page is mapped via the SEH-guarded
+                // fast read before the layout-aware resolution touches it.  A failed
+                // probe fails OPEN (a transiently-unreadable header must not reject a
+                // valid wrap), preserving the original defensive-guard contract.
+                std::uint32_t narrow_probe{ 0u };
+                if (!vmhook::os::safe_read_fast(&narrow_probe,
                                                 reinterpret_cast<const std::uint8_t*>(decoded_oop) + 8,
-                                                sizeof(narrow_klass)))
+                                                sizeof(narrow_probe)))
                 {
                     return true;
                 }
-                void* const decoded_klass_raw{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
-                if (!decoded_klass_raw || !vmhook::hotspot::is_valid_pointer(decoded_klass_raw))
-                {
-                    return true;
-                }
+                // Resolve through the layout-aware reader: compressed narrow @ +8
+                // (default), full Klass* (-XX:-UseCompressedClassPointers), or
+                // fail-closed under compact object headers.  A null result fails OPEN
+                // here too (this is a guard, not a hard gate).
                 vmhook::hotspot::klass* const runtime_klass{
-                    reinterpret_cast<vmhook::hotspot::klass*>(decoded_klass_raw) };
+                    vmhook::hotspot::klass_from_header_bytes(decoded_oop) };
+                if (!runtime_klass)
+                {
+                    return true;
+                }
 
                 // (4) Walk the runtime klass's SUPERCLASS chain; accept if the wrapper
                 // klass appears anywhere on it (IS-A), by pointer identity OR by name
@@ -17596,42 +17817,12 @@ namespace vmhook
         static auto klass_from_object_header(void* const oop) noexcept
             -> vmhook::hotspot::klass*
         {
-            if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
-            {
-                return nullptr;
-            }
-
-            // Cold read: the narrow-klass slot in the object header (oop + 8).  A
-            // detour can reach here with a stale / GC-relocated oop that passes
-            // is_valid_pointer's range/alignment HEURISTIC yet sits on an unmapped
-            // page; a raw `*(oop + 8)` then FAULTS, and on the no-SEH toolchains
-            // (MinGW / clang-on-windows) that hardware AV is uncontained and tears
-            // the JVM down.  Windows-gate the header read through os::safe_read
-            // (ReadProcessMemory — never faults), yielding a zeroed narrow klass
-            // (-> nullptr below) on a bad page.  POSIX keeps the raw read: a stray
-            // AV there is contained by the JVM's own signal handling and gating
-            // reads regressed other oop walks (see frame::get_method); for a
-            // normally-mapped oop the bytes are identical.  Verbatim twin of the
-            // klass_from_oop free function.
-#if defined(_WIN32)
-            std::uint32_t narrow_klass{ 0 };
-            if (!vmhook::os::safe_read(&narrow_klass,
-                                       reinterpret_cast<const std::uint8_t*>(oop) + 8,
-                                       sizeof(narrow_klass)))
-            {
-                return nullptr;
-            }
-#else
-            const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
-                reinterpret_cast<const std::uint8_t*>(oop) + 8) };
-#endif
-            void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
-            if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
-            {
-                return nullptr;
-            }
-
-            return reinterpret_cast<vmhook::hotspot::klass*>(decoded);
+            // Layout-aware header read: compressed (narrow @ +8, default), full Klass*
+            // (-XX:-UseCompressedClassPointers), or fail-closed under compact object
+            // headers.  See hotspot::klass_from_header_bytes for the branch + cold-read
+            // / Windows-safe-read details.  On the DEFAULT config this is byte-identical
+            // to the prior hard-coded +8 narrow-klass read.
+            return vmhook::hotspot::klass_from_header_bytes(oop);
         }
 
         /*
@@ -19145,40 +19336,12 @@ namespace vmhook
     */
     inline auto klass_from_oop(void* const oop) noexcept -> vmhook::hotspot::klass*
     {
-        if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
-        {
-            return nullptr;
-        }
-        // Cold read: the narrow-klass slot in the object header (oop + 8).  A
-        // detour can reach here with a stale / GC-relocated oop (e.g. a wrapper
-        // held across a System.gc(), or a collection/map element on a relocated
-        // page) that passes is_valid_pointer's range/alignment HEURISTIC yet
-        // sits on an unmapped page; a raw `*(oop + 8)` then FAULTS, and on the
-        // no-SEH toolchains (MinGW / clang-on-windows) that hardware AV is
-        // uncontained and tears the JVM down.  Windows-gate the header read
-        // through os::safe_read (ReadProcessMemory — never faults), yielding a
-        // zeroed narrow klass (-> nullptr below) on a bad page.  POSIX keeps the
-        // raw read: a stray AV there is contained by the JVM's own signal
-        // handling and gating reads regressed other oop walks (see
-        // frame::get_method); for a normally-mapped oop the bytes are identical.
-#if defined(_WIN32)
-        std::uint32_t narrow{ 0 };
-        if (!vmhook::os::safe_read(&narrow,
-                                   reinterpret_cast<const std::uint8_t*>(oop) + 8,
-                                   sizeof(narrow)))
-        {
-            return nullptr;
-        }
-#else
-        const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
-            reinterpret_cast<const std::uint8_t*>(oop) + 8) };
-#endif
-        void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow) };
-        if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
-        {
-            return nullptr;
-        }
-        return reinterpret_cast<vmhook::hotspot::klass*>(decoded);
+        // Layout-aware header read: compressed (narrow @ +8, default), full Klass*
+        // (-XX:-UseCompressedClassPointers), or fail-closed under compact object
+        // headers.  All the branch logic + the cold-read / Windows-safe-read
+        // handling lives in hotspot::klass_from_header_bytes; on the DEFAULT config
+        // this is byte-identical to the prior hard-coded +8 narrow-klass read.
+        return vmhook::hotspot::klass_from_header_bytes(oop);
     }
 
     /*
