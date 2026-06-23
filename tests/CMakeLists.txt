@@ -137,3 +137,4 @@ vmhook_add_test(compressed_oops_decode         SOURCES test_compressed_oops_deco
 vmhook_add_test(vmstructs_offset_resolution    SOURCES test_vmstructs_offset_resolution.cpp)
 vmhook_add_test(interpreter_frame_walk         SOURCES test_interpreter_frame_walk.cpp)
 vmhook_add_test(midi2i_trampoline_alloc        SOURCES test_midi2i_trampoline_alloc.cpp)
+vmhook_add_test(read_java_string_nul_astral    SOURCES test_read_java_string_nul_astral.cpp)
