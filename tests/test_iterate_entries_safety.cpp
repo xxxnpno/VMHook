@@ -3016,6 +3016,372 @@ static auto test_w5_clamp_and_validity_independence() -> void
     check("w5_clamp_count_in_range_independent_of_ptr_gate", independent);
 }
 
+// ===========================================================================
+// EXHAUSTIVE EXPANSION WAVE 6 (51+).
+//
+// WAVES 1-5 pinned the null-array contract, the clamp/cap arithmetic, the
+// entry-struct ABI, the walk loop (match/skip/terminator/exactness/offset
+// round-trip/first-wins), the is_valid_pointer / untag_pointer / is_readable_-
+// pointer bound-and-reject predicates, the offset<=type_size threshold, the
+// terminator/skip asymmetry, and clamp-vs-validity independence.  This wave
+// closes the gaps those left, ALL over memory THIS TEST OWNS or over PURE-LOGIC
+// predicates fed CONSTANTS -- never a fabricated/unmapped pointer dereference,
+// never a JVM, never the global-reading API driven over a fake array:
+//
+//   * The vm_struct_entry_t::type_string column (the 3rd char* member): WAVES
+//     2-5 only round-tripped type_name/field_name; type_string is the descriptor
+//     string a static-aware caller pairs with the resolved offset.  Pin that it
+//     round-trips bit-exact through the owned walk, honours first-NUL strcmp
+//     semantics, and is the member at the declared slot -- so a column shuffle is
+//     caught.
+//   * The COMPLETE static-field read DISCIPLINE end-to-end over OWNED storage:
+//     resolve -> is_static==1 -> read ->address -> untag_pointer -> is_valid_-
+//     pointer, with ->address pointing at a real owned object so the validity
+//     gate's ACCEPT branch is exercised on a MAPPED address (POSIX-safe; the
+//     pointer targets our own stack/static storage, never a fabricated one).
+//   * The resolved-offset + base ARITHMETIC (flaw #5): `(uintptr_t)base +
+//     entry->offset` computed as pure integer math over an owned base and the
+//     resolved uint64 offset, with the SUM gated by is_valid_pointer by VALUE
+//     only (never dereferenced) -- a plausible small offset lands in-window and
+//     is accepted; a corrupt huge offset drives the sum out of the user window
+//     (or wraps) and is rejected by the gate.  This is the choke-point flaw #5
+//     identifies, exercised without a single memory read of the computed address.
+//   * untag_pointer FULL high-word tag-bit sweep: WAVE 4 stripped one tag value;
+//     here every individual high bit above the 47-bit ceiling is set in turn and
+//     the mask is required to clear exactly the bits above the ceiling and keep
+//     exactly the low 47 -- a bit-exact mask proof over CONSTANTS.
+//   * is_valid_pointer low-3-bit residue lattice: WAVE 4/5 tested residues 2/4;
+//     here EVERY residue 0..7 off an in-window even/odd base is swept and the
+//     2-byte-alignment contract (reject iff low bit set; residues 2/4/6 accepted)
+//     is pinned exactly -- distinct from is_readable_pointer's 8-byte gate.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 51. vm_struct_entry_t::type_string round-trip through the owned walk.
+//
+// type_string is the JVM type-descriptor string the resolver carries alongside
+// the offset (vmhook.hpp:1895).  WAVES 2-5 never asserted it survives the walk.
+// Resolve owned entries and require type_string reads back bit-exact (pointer-
+// equal to the stored literal AND strcmp-equal), that it honours the same first-
+// NUL strcmp semantics as the keys, and that it is an independent slot from
+// type_name/field_name.  Owned string literals; no memory read beyond our array.
+// ---------------------------------------------------------------------------
+static auto test_w6_type_string_column_roundtrip() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+
+    static const char* const k_desc_int{ "int" };
+    static const char* const k_desc_ptr{ "ConstMethod*" };
+    static const vm_struct_entry_t table[]{
+        { "Symbol", "_length",      k_desc_int, 0,  8u, nullptr },
+        { "Method", "_constMethod", k_desc_ptr, 0, 16u, nullptr },
+        { nullptr,  nullptr,        nullptr,    0,  0u, nullptr },
+    };
+
+    const vm_struct_entry_t* const a{
+        wave3_offset_resolution::find_struct(table, "Symbol", "_length") };
+    const vm_struct_entry_t* const b{
+        wave3_offset_resolution::find_struct(table, "Method", "_constMethod") };
+
+    // Bit-exact (pointer-equal to the stored literal) and content-equal.
+    check("w6_type_string_pointer_equal_stored_literal",
+          a != nullptr && a->type_string == k_desc_int
+              && b != nullptr && b->type_string == k_desc_ptr);
+    check("w6_type_string_content_equal",
+          a != nullptr && std::strcmp(a->type_string, "int") == 0
+              && b != nullptr && std::strcmp(b->type_string, "ConstMethod*") == 0);
+
+    // type_string is an INDEPENDENT slot: the two resolved entries carry
+    // different type_string pointers (no column aliasing).
+    check("w6_type_string_distinct_per_entry",
+          a != nullptr && b != nullptr && a->type_string != b->type_string);
+
+    // The descriptor lives at a different address than the entry's other char*
+    // members -- a separate lane a caller can read after a successful resolve.
+    check("w6_type_string_slot_distinct_from_name_slots",
+          a != nullptr
+              && reinterpret_cast<const void*>(&a->type_string)
+                     != reinterpret_cast<const void*>(&a->type_name)
+              && reinterpret_cast<const void*>(&a->type_string)
+                     != reinterpret_cast<const void*>(&a->field_name));
+
+    // type_string is the 3rd char* member -- one pointer-width past field_name
+    // (re-pinning the column order from the resolved-entry side).
+    check("w6_type_string_is_third_pointer_member",
+          offsetof(vm_struct_entry_t, type_string)
+              == offsetof(vm_struct_entry_t, field_name) + sizeof(const char*));
+}
+
+// ---------------------------------------------------------------------------
+// 52. Complete STATIC-field read discipline end-to-end over OWNED storage.
+//
+// A static-aware caller, after resolving a static field, reads entry->address
+// (NOT base+offset), untag_pointers it, and is_valid_pointer-gates it before the
+// deref (flaw #1 territory).  Drive that exact pipeline over an owned entry whose
+// ->address points at a REAL owned object -- so the is_valid_pointer ACCEPT
+// branch runs against a MAPPED, readable address (POSIX-safe: the target is our
+// own static storage, never a fabricated pointer).  The instance-field entry's
+// is_static==0 selects the offset path instead; pin the discriminator drives the
+// member choice.
+// ---------------------------------------------------------------------------
+static auto test_w6_static_field_read_discipline_owned() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::is_valid_pointer;
+    using vmhook::hotspot::untag_pointer;
+
+    // Real owned storage the static entry's ->address points at.  Aligned (a
+    // static<std::uint64_t> is 8-aligned), mapped, readable -- a legitimately
+    // valid address the gate must ACCEPT after untagging.
+    static std::uint64_t owned_static_storage{ 0x1122334455667788ull };
+
+    static const vm_struct_entry_t entries[]{
+        // [0] instance field: located by ->offset, is_static == 0.
+        { "oopDesc",  "_mark",          "markWord", 0, 8u, nullptr },
+        // [1] static field: located by ->address, is_static == 1.
+        { "Universe", "_collectedHeap", "CollectedHeap*", 1, 0u,
+          static_cast<void*>(&owned_static_storage) },
+        { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+    };
+
+    const vm_struct_entry_t* const inst{
+        wave3_offset_resolution::find_struct(entries, "oopDesc", "_mark") };
+    const vm_struct_entry_t* const stat{
+        wave3_offset_resolution::find_struct(entries, "Universe", "_collectedHeap") };
+
+    // The discriminator selects the member: instance -> offset path, static ->
+    // address path.
+    check("w6_static_discipline_instance_selects_offset",
+          inst != nullptr && inst->is_static == 0 && inst->offset == 8u);
+    check("w6_static_discipline_static_selects_address",
+          stat != nullptr && stat->is_static == 1
+              && stat->address == static_cast<void*>(&owned_static_storage));
+
+    // The static caller's pipeline: untag the resolved ->address, then validate.
+    // The address is canonical (no tag bits) so untag is a no-op, and it is a
+    // mapped even in-window non-sentinel address -> is_valid_pointer ACCEPTS.
+    const void* const untagged{ untag_pointer(stat != nullptr ? stat->address : nullptr) };
+    check("w6_static_address_untag_is_noop_on_canonical",
+          stat != nullptr && untagged == stat->address);
+    check("w6_static_address_passes_validity_gate",
+          stat != nullptr && is_valid_pointer(untagged) == true);
+
+    // Reading THROUGH the validated owned address recovers the value we stored
+    // (the deref targets our own static storage -- mapped, POSIX-safe).
+    check("w6_static_address_deref_owned_storage_roundtrips",
+          stat != nullptr
+              && *static_cast<const std::uint64_t*>(stat->address)
+                     == 0x1122334455667788ull);
+
+    // The instance entry's ->address is null (its location is in ->offset); a
+    // caller that wrongly fed it to the gate would be refused -- the trap flaw #1
+    // describes, here proven to fail-closed.
+    check("w6_static_discipline_instance_address_is_null_failclosed",
+          inst != nullptr && inst->address == nullptr
+              && is_valid_pointer(inst->address) == false);
+}
+
+// ---------------------------------------------------------------------------
+// 53. Resolved-offset + base arithmetic, gated by is_valid_pointer BY VALUE
+//     (flaw #5 choke point).  An instance-field reader computes
+//     `(uintptr_t)base + entry->offset` and validates the result before any
+//     deref.  Reconstruct that as PURE integer math over an owned base and the
+//     resolved uint64 offset, then gate the SUM through is_valid_pointer by VALUE
+//     ONLY -- the computed address is NEVER dereferenced (HARD RULE 3).  A
+//     plausible small offset lands in-window and is accepted; a corrupt huge
+//     offset drives the sum out of the user window (or wraps low) and is
+//     rejected -- exactly the boundary a resolver-level offset ceiling guards.
+// ---------------------------------------------------------------------------
+static auto test_w6_resolved_offset_plus_base_value_gate() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::is_valid_pointer;
+
+    auto as_ptr = [](std::uintptr_t v) -> const void*
+    { return reinterpret_cast<const void*>(v); };
+
+    // An in-window, 8-aligned, non-sentinel base the gate accepts on its own.
+    constexpr std::uintptr_t base{ 0x0000100000000000ull };
+    check("w6_offadd_base_itself_valid", is_valid_pointer(as_ptr(base)) == true);
+
+    // Plausible small offsets: base + offset stays in-window and even -> accepted.
+    // (Even offsets keep the low bit clear so the 2-byte gate also passes.)
+    static const std::uint64_t plausible[]{ 0u, 8u, 16u, 24u, 0x1000u, 0x100000u };
+    bool plausible_all_valid{ true };
+    for (const std::uint64_t off : plausible)
+    {
+        const vm_struct_entry_t table[]{
+            { "T", "_f", "ty", 0, off, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+        };
+        const vm_struct_entry_t* const e{
+            wave3_offset_resolution::find_struct(table, "T", "_f") };
+        const std::uintptr_t sum{ base + (e != nullptr ? e->offset : 0u) };
+        if (is_valid_pointer(as_ptr(sum)) != true) { plausible_all_valid = false; }
+    }
+    check("w6_offadd_plausible_offsets_land_in_window", plausible_all_valid);
+
+    // A corrupt huge offset (>= the 47-bit window) drives base+offset past the
+    // ceiling -> rejected by the range branch.  0x0000800000000000 added to the
+    // base exceeds user_address_ceiling.
+    {
+        const vm_struct_entry_t table[]{
+            { "T", "_f", "ty", 0, 0x0000800000000000ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+        };
+        const vm_struct_entry_t* const e{
+            wave3_offset_resolution::find_struct(table, "T", "_f") };
+        const std::uintptr_t sum{ base + (e != nullptr ? e->offset : 0u) };
+        check("w6_offadd_corrupt_huge_offset_out_of_window_rejected",
+              e != nullptr && is_valid_pointer(as_ptr(sum)) == false);
+    }
+
+    // A UINT64_MAX offset WRAPS the sum low (base + 2^64-1 == base - 1), landing
+    // BELOW the floor (base-1 is odd AND in the low-noise region relative to the
+    // gate) -> rejected.  The computed value is never dereferenced.
+    {
+        const vm_struct_entry_t table[]{
+            { "T", "_f", "ty", 0, 0xFFFFFFFFFFFFFFFFull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+        };
+        const vm_struct_entry_t* const e{
+            wave3_offset_resolution::find_struct(table, "T", "_f") };
+        const std::uintptr_t sum{ base + (e != nullptr ? e->offset : 0u) };  // == base - 1
+        check("w6_offadd_uint64_max_offset_wraps_low_rejected",
+              e != nullptr && sum == base - 1u
+                  && is_valid_pointer(as_ptr(sum)) == false);
+    }
+
+    // An offset that makes the sum ODD is rejected by the 2-byte alignment gate
+    // even while in-window -- proving the gate catches a misaligned resolved add.
+    {
+        const vm_struct_entry_t table[]{
+            { "T", "_f", "ty", 0, 1u, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+        };
+        const vm_struct_entry_t* const e{
+            wave3_offset_resolution::find_struct(table, "T", "_f") };
+        const std::uintptr_t sum{ base + (e != nullptr ? e->offset : 0u) };  // odd
+        check("w6_offadd_odd_sum_rejected_in_window",
+              e != nullptr && (sum & 0x1u) != 0u
+                  && is_valid_pointer(as_ptr(sum)) == false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 54. untag_pointer FULL high-word tag-bit sweep over CONSTANTS.
+//
+// untag_pointer ANDs with user_address_ceiling (0x00007FFFFFFFFFFF), so it must
+// clear EXACTLY the bits at positions 47..63 and preserve EXACTLY bits 0..46.
+// WAVE 4 stripped a single tag value; here set each individual high bit (47..63)
+// in turn over a fixed canonical low payload and require the mask clears it while
+// the payload survives untouched -- a bit-exact mask proof.  The result is never
+// dereferenced (only its integer value is inspected), so POSIX-safe.
+// ---------------------------------------------------------------------------
+static auto test_w6_untag_full_high_bit_sweep() -> void
+{
+    using vmhook::hotspot::untag_pointer;
+
+    constexpr std::uintptr_t ceiling_v{ 0x00007FFFFFFFFFFFull };
+    auto as_ptr = [](std::uintptr_t v) -> const void* { return reinterpret_cast<const void*>(v); };
+    auto as_int = [](const void* p) -> std::uintptr_t { return reinterpret_cast<std::uintptr_t>(p); };
+
+    // A fixed canonical low payload (within the 47-bit window, even).
+    constexpr std::uintptr_t payload{ 0x0000123456789ABCull & ceiling_v };
+
+    bool sweep_ok{ true };
+    int bits_swept{ 0 };
+    for (int bit{ 47 }; bit <= 63; ++bit)
+    {
+        ++bits_swept;
+        const std::uintptr_t tag{ static_cast<std::uintptr_t>(1) << bit };
+        const std::uintptr_t tagged{ payload | tag };
+        const std::uintptr_t got{ as_int(untag_pointer(as_ptr(tagged))) };
+        // The mask must recover EXACTLY the payload: high tag bit cleared, low
+        // 47 bits preserved.
+        if (got != payload) { sweep_ok = false; }
+        // And the result is within the ceiling (no high bit survives).
+        if (got > ceiling_v) { sweep_ok = false; }
+    }
+    check("w6_untag_each_high_bit_47_to_63_cleared", sweep_ok);
+    check("w6_untag_high_bit_count_is_17", bits_swept == 17);
+
+    // ALL high bits set at once (0xFFFF800000000000 | payload) reduces to exactly
+    // the payload.
+    check("w6_untag_all_high_bits_set_reduces_to_payload",
+          as_int(untag_pointer(as_ptr(0xFFFF800000000000ull | payload))) == payload);
+
+    // The boundary bit 46 (the highest bit INSIDE the window) is PRESERVED, not
+    // cleared -- proving the mask boundary is exactly between bit 46 and bit 47.
+    constexpr std::uintptr_t bit46{ static_cast<std::uintptr_t>(1) << 46 };
+    check("w6_untag_preserves_bit_46_inside_window",
+          as_int(untag_pointer(as_ptr(bit46))) == bit46);
+    check("w6_untag_clears_bit_47_outside_window",
+          as_int(untag_pointer(as_ptr(static_cast<std::uintptr_t>(1) << 47))) == 0u);
+}
+
+// ---------------------------------------------------------------------------
+// 55. is_valid_pointer low-3-bit residue lattice (the 2-byte gate, exactly).
+//
+// is_valid_pointer rejects ONLY odd addresses (addr & 0x1) -- a 2-byte gate, NOT
+// the 8-byte gate is_readable_pointer / safe_read_pointer apply (vmhook.hpp:2059
+// vs 2025/2118).  WAVE 4/5 sampled residues 2 and 4; here sweep EVERY residue
+// 0..7 off an in-window, non-sentinel, 8-aligned base and pin the EXACT contract:
+// even residues {0,2,4,6} accepted, odd residues {1,3,5,7} rejected.  Then
+// contrast with is_readable_pointer's prefilter, which rejects ALL of {1..7}
+// (8-byte gate).  All over CONSTANTS; is_readable_pointer's rejected branch
+// never queries memory, so POSIX-safe (HARD RULE 3).
+// ---------------------------------------------------------------------------
+static auto test_w6_is_valid_pointer_residue_lattice() -> void
+{
+    using vmhook::hotspot::is_valid_pointer;
+    using vmhook::hotspot::is_readable_pointer;
+
+    auto as_ptr = [](std::uintptr_t v) -> const void*
+    { return reinterpret_cast<const void*>(v); };
+
+    constexpr std::uintptr_t base8{ 0x0000100000000000ull };  // in-window, 8-aligned
+
+    bool valid_lattice_ok{ true };
+    bool readable_lattice_ok{ true };
+    for (std::uintptr_t r{ 0 }; r <= 7u; ++r)
+    {
+        const std::uintptr_t addr{ base8 + r };
+        const bool even{ (r & 0x1u) == 0u };
+        // is_valid_pointer: accept iff even (2-byte gate).
+        if (is_valid_pointer(as_ptr(addr)) != even) { valid_lattice_ok = false; }
+        // is_readable_pointer prefilter: accept-branch only for the 8-aligned
+        // residue 0 would query memory, so we ONLY assert the REJECTED residues
+        // (1..7) here -- every non-zero residue is rejected by the 8-byte gate
+        // WITHOUT a region query (POSIX-safe).
+        if (r != 0u)
+        {
+            if (is_readable_pointer(as_ptr(addr)) != false) { readable_lattice_ok = false; }
+        }
+    }
+    check("w6_ivp_even_residues_accept_odd_reject", valid_lattice_ok);
+    check("w6_readable_all_nonzero_residues_rejected_8byte_gate", readable_lattice_ok);
+
+    // Spell out the four even residues explicitly so a failure names the residue:
+    // 0/2/4/6 are all accepted by is_valid_pointer (2-byte gate).
+    check("w6_ivp_residue_0_accept", is_valid_pointer(as_ptr(base8 + 0u)) == true);
+    check("w6_ivp_residue_2_accept", is_valid_pointer(as_ptr(base8 + 2u)) == true);
+    check("w6_ivp_residue_4_accept", is_valid_pointer(as_ptr(base8 + 4u)) == true);
+    check("w6_ivp_residue_6_accept", is_valid_pointer(as_ptr(base8 + 6u)) == true);
+    // 1/3/5/7 are all rejected (odd).
+    check("w6_ivp_residue_1_reject", is_valid_pointer(as_ptr(base8 + 1u)) == false);
+    check("w6_ivp_residue_3_reject", is_valid_pointer(as_ptr(base8 + 3u)) == false);
+    check("w6_ivp_residue_5_reject", is_valid_pointer(as_ptr(base8 + 5u)) == false);
+    check("w6_ivp_residue_7_reject", is_valid_pointer(as_ptr(base8 + 7u)) == false);
+
+    // The 2-byte vs 8-byte gate distinction at residue 2: valid accepts, readable
+    // rejects -- the tighter bound the readable check layers on, pinned again from
+    // the residue side.
+    check("w6_residue_2_valid_yes_readable_no",
+          is_valid_pointer(as_ptr(base8 + 2u)) == true
+              && is_readable_pointer(as_ptr(base8 + 2u)) == false);
+}
+
 int main()
 {
     test_getters_cache_no_jvm();
@@ -3068,6 +3434,11 @@ int main()
     test_w5_terminator_keys_on_type_name_only();
     test_w5_is_readable_pointer_prefilter_rejects();
     test_w5_clamp_and_validity_independence();
+    test_w6_type_string_column_roundtrip();
+    test_w6_static_field_read_discipline_owned();
+    test_w6_resolved_offset_plus_base_value_gate();
+    test_w6_untag_full_high_bit_sweep();
+    test_w6_is_valid_pointer_residue_lattice();
 
     return failures == 0 ? 0 : 1;
 }

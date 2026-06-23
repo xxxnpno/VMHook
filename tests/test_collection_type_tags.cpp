@@ -2504,6 +2504,346 @@ static auto test_narrow_codec_roundtrip() -> void
           vmhook::hotspot::decode_oop_pointer(0x0080'0000u) == nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// 22. [ADDITIVE] detail::function_traits<F>::args_tuple_t decomposition over the
+//     FULL callable-shape matrix the typed hook<T>() path feeds the collection
+//     wrappers through.
+//
+// function_traits is the compile-time helper hook<T>() uses to enumerate a
+// detour's argument list (vmhook.hpp function_traits): EVERY specialisation
+// exposes exactly `args_tuple_t = std::tuple<argument_types...>` and NOTHING
+// else (no return_type, no arity member — the args tuple IS the surface).  The
+// header enumerates a deliberately exhaustive set of specialisations —
+// free-fn ptr (plain + noexcept), std::function, lambda/functor via
+// operator(), member-fn (plain/const), and the full cv (none/const/volatile/
+// const volatile) x ref (none/& /&&) x noexcept (none/noexcept) matrix — so a
+// `noexcept`/ref-qualified/`const` detour decomposes correctly instead of
+// hitting the undefined primary template ("no member args_tuple_t").  These are
+// PURE compile-time traits (no JVM, no codegen), so pin the decomposition for a
+// representative point of every specialisation family: the args tuple's arity
+// (std::tuple_size_v) and per-element type (std::tuple_element_t).  A regression
+// that dropped a specialisation flips one of these to ill-formed at compile time.
+// ---------------------------------------------------------------------------
+namespace
+{
+    // Distinct argument/return types so a mis-decomposed tuple is detectable.
+    using ft_args0 = void(*)();
+    using ft_args1 = int(*)(double);
+    using ft_args3 = bool(*)(std::int8_t, std::uint16_t, void*);
+    using ft_args1_noexcept = int(*)(double) noexcept;
+    using ft_stdfun = std::function<long(char, float)>;
+
+    struct ft_functor_plain        { void operator()(int, int) {} };
+    struct ft_functor_const        { void operator()(int, int) const {} };
+    struct ft_functor_const_ne     { void operator()(double) const noexcept {} };
+    struct ft_functor_ref          { void operator()(std::int64_t) & {} };
+    struct ft_functor_const_ref_ne { void operator()(std::uint16_t, bool) const& noexcept {} };
+    struct ft_functor_rref         { void operator()() && {} };
+
+    template<typename function_type>
+    using ft_tuple = typename vmhook::detail::function_traits<function_type>::args_tuple_t;
+}
+
+static auto test_function_traits_decomposition() -> void
+{
+    // --- Free-function pointer (plain): arity + per-arg type. ---
+    static_assert(std::tuple_size_v<ft_tuple<ft_args0>> == 0,
+                  "nullary free-fn ptr -> empty args tuple.");
+    static_assert(std::tuple_size_v<ft_tuple<ft_args1>> == 1);
+    static_assert(std::is_same_v<std::tuple_element_t<0, ft_tuple<ft_args1>>, double>);
+    static_assert(std::tuple_size_v<ft_tuple<ft_args3>> == 3);
+    static_assert(std::is_same_v<std::tuple_element_t<0, ft_tuple<ft_args3>>, std::int8_t>);
+    static_assert(std::is_same_v<std::tuple_element_t<1, ft_tuple<ft_args3>>, std::uint16_t>);
+    static_assert(std::is_same_v<std::tuple_element_t<2, ft_tuple<ft_args3>>, void*>);
+
+    // --- noexcept free-fn ptr is a DISTINCT type (C++17): own specialisation,
+    //     same args tuple as the plain form. ---
+    static_assert(std::tuple_size_v<ft_tuple<ft_args1_noexcept>> == 1);
+    static_assert(std::is_same_v<std::tuple_element_t<0, ft_tuple<ft_args1_noexcept>>, double>);
+    static_assert(std::is_same_v<ft_tuple<ft_args1>, ft_tuple<ft_args1_noexcept>>,
+                  "noexcept is irrelevant to the decoded Java parameter list.");
+
+    // --- std::function specialisation. ---
+    static_assert(std::tuple_size_v<ft_tuple<ft_stdfun>> == 2);
+    static_assert(std::is_same_v<std::tuple_element_t<0, ft_tuple<ft_stdfun>>, char>);
+    static_assert(std::is_same_v<std::tuple_element_t<1, ft_tuple<ft_stdfun>>, float>);
+
+    // --- Functor / lambda via operator() across the cv/ref/noexcept matrix. ---
+    static_assert(std::tuple_size_v<ft_tuple<ft_functor_plain>> == 2);
+    static_assert(std::is_same_v<std::tuple_element_t<0, ft_tuple<ft_functor_plain>>, int>);
+    static_assert(std::tuple_size_v<ft_tuple<ft_functor_const>> == 2);
+    static_assert(std::tuple_size_v<ft_tuple<ft_functor_const_ne>> == 1);
+    static_assert(std::is_same_v<std::tuple_element_t<0, ft_tuple<ft_functor_const_ne>>, double>);
+    static_assert(std::tuple_size_v<ft_tuple<ft_functor_ref>> == 1);
+    static_assert(std::is_same_v<std::tuple_element_t<0, ft_tuple<ft_functor_ref>>, std::int64_t>);
+    static_assert(std::tuple_size_v<ft_tuple<ft_functor_const_ref_ne>> == 2);
+    static_assert(std::is_same_v<std::tuple_element_t<0, ft_tuple<ft_functor_const_ref_ne>>, std::uint16_t>);
+    static_assert(std::is_same_v<std::tuple_element_t<1, ft_tuple<ft_functor_const_ref_ne>>, bool>);
+    static_assert(std::tuple_size_v<ft_tuple<ft_functor_rref>> == 0);
+
+    // --- A real lambda (the common hook<T>() form) decomposes identically; a
+    //     noexcept lambda uses the const-noexcept member specialisation. ---
+    auto plain_lambda    = [](int, double) { return 0; };
+    auto noexcept_lambda = [](std::int8_t, void*) noexcept { return false; };
+    static_assert(std::tuple_size_v<ft_tuple<decltype(plain_lambda)>> == 2);
+    static_assert(std::is_same_v<std::tuple_element_t<1, ft_tuple<decltype(plain_lambda)>>, double>);
+    static_assert(std::tuple_size_v<ft_tuple<decltype(noexcept_lambda)>> == 2);
+    static_assert(std::is_same_v<std::tuple_element_t<0, ft_tuple<decltype(noexcept_lambda)>>, std::int8_t>);
+    static_assert(std::is_same_v<std::tuple_element_t<1, ft_tuple<decltype(noexcept_lambda)>>, void*>);
+    // Reference the lambdas at runtime so clang -Wunused-variable stays quiet.
+    check("function_traits_lambda_callable_plain", plain_lambda(1, 2.0) == 0);
+    check("function_traits_lambda_callable_noexcept", noexcept_lambda(std::int8_t{ 0 }, nullptr) == false);
+
+    // Runtime presence marker so the section contributes to the PASS count.
+    check("function_traits_decomposition_static_asserts_held", true);
+}
+
+// ---------------------------------------------------------------------------
+// 23. [ADDITIVE] jni::signature_for_arg<T>() — the C++ argument type -> JVM
+//     descriptor classifier the element type-tag mapping rides for reference
+//     element/key/value wrappers and primitive args.
+//
+// Contract (vmhook.hpp jni_signature_for_arg, public jni::signature_for_arg):
+//   string / string_view / char* / const char*  -> "Ljava/lang/String;"
+//   bool                                          -> "Z"   (claimed before sizeof==1)
+//   char16_t / std::uint16_t                      -> "C"   (claimed before sizeof==2)
+//   integral sizeof 1 / 2 / 4 / 8                 -> "B" / "S" / "I" / "J"
+//   float -> "F"   double -> "D"
+//   object_base-derived wrapper (or unique_ptr<W>) -> "Lname;" from the
+//                    register_class<W>() map, else "Ljava/lang/Object;".
+// This is PURE compile-time-ish string building (no JVM, no memory read): the
+// wrapper branch reads only the in-process type_to_class_map populated by the
+// register_class<T>() calls in main().  Every descriptor below is derived
+// verbatim from the header ladder; a regression that reordered the bool /
+// uint16 early claims (so bool encoded "B" or uint16 encoded "S") fails loudly.
+// ---------------------------------------------------------------------------
+static auto test_jni_signature_for_arg_mapping() -> void
+{
+    using vmhook::jni::signature_for_arg;
+
+    // --- String-like family all collapse to the String descriptor. ---
+    check("sig_string",        signature_for_arg<std::string>() == "Ljava/lang/String;");
+    check("sig_string_view",   signature_for_arg<std::string_view>() == "Ljava/lang/String;");
+    check("sig_cstr",          signature_for_arg<const char*>() == "Ljava/lang/String;");
+    check("sig_mutable_cstr",  signature_for_arg<char*>() == "Ljava/lang/String;");
+
+    // --- bool is claimed FIRST as "Z" (must NOT fall to the sizeof==1 "B"). ---
+    check("sig_bool_is_Z",     signature_for_arg<bool>() == "Z");
+
+    // --- char16_t / uint16_t claimed as "C" BEFORE the generic 2-byte "S". ---
+    check("sig_char16_is_C",   signature_for_arg<char16_t>() == "C");
+    check("sig_uint16_is_C",   signature_for_arg<std::uint16_t>() == "C");
+
+    // --- Fixed-width integral ladder by sizeof. ---
+    check("sig_i8_is_B",       signature_for_arg<std::int8_t>() == "B");
+    check("sig_u8_is_B",       signature_for_arg<std::uint8_t>() == "B");
+    check("sig_i16_is_S",      signature_for_arg<std::int16_t>() == "S");
+    check("sig_i32_is_I",      signature_for_arg<std::int32_t>() == "I");
+    check("sig_u32_is_I",      signature_for_arg<std::uint32_t>() == "I");
+    check("sig_i64_is_J",      signature_for_arg<std::int64_t>() == "J");
+    check("sig_u64_is_J",      signature_for_arg<std::uint64_t>() == "J");
+
+    // --- Floating point. ---
+    check("sig_float_is_F",    signature_for_arg<float>() == "F");
+    check("sig_double_is_D",   signature_for_arg<double>() == "D");
+
+    // --- Wrapper types resolve their "Lname;" descriptor from the register_class
+    //     map.  With NO JVM, register_class<T>() returns false WITHOUT populating
+    //     type_to_class_map (it early-returns when find_class() finds no klass —
+    //     vmhook.hpp register_class), so the map is empty here and the documented
+    //     "not registered -> Ljava/lang/Object;" fallback fires for EVERY wrapper.
+    //     This is the exact no-JVM fail-soft contract on the reference branch: an
+    //     object/wrapper arg never mis-encodes as a primitive, it degrades to the
+    //     generic Object descriptor. ---
+    check("sig_elem_w_wrapper_object_fallback",
+          signature_for_arg<elem_w>() == "Ljava/lang/Object;");
+    check("sig_key_w_wrapper_object_fallback",
+          signature_for_arg<key_w>() == "Ljava/lang/Object;");
+    check("sig_val_w_wrapper_object_fallback",
+          signature_for_arg<val_w>() == "Ljava/lang/Object;");
+    // unique_ptr<W> takes the SAME (unregistered) wrapper branch -> same fallback.
+    check("sig_unique_ptr_elem_w_object_fallback",
+          signature_for_arg<std::unique_ptr<elem_w>>() == "Ljava/lang/Object;");
+    check("sig_unique_ptr_val_w_object_fallback",
+          signature_for_arg<std::unique_ptr<val_w>>() == "Ljava/lang/Object;");
+
+    // --- cv/ref qualified args are decayed first, so they map identically. ---
+    check("sig_const_ref_int_is_I", signature_for_arg<const std::int32_t&>() == "I");
+    check("sig_rref_double_is_D",   signature_for_arg<double&&>() == "D");
+    check("sig_const_bool_is_Z",    signature_for_arg<const bool>() == "Z");
+
+    // --- The mapper is noexcept (built on a detour thread when wiring a hook). ---
+    check("sig_for_arg_noexcept", noexcept(signature_for_arg<std::int32_t>()));
+
+    // --- Every primitive descriptor produced is a recognised single-byte
+    //     BasicType in the primitive band [4,11] per sig_char_to_basic_type,
+    //     tying this classifier to the descriptor parser used by the walks. ---
+    {
+        const std::string prim_sigs[]{
+            signature_for_arg<bool>(),       signature_for_arg<std::int8_t>(),
+            signature_for_arg<std::int16_t>(), signature_for_arg<std::int32_t>(),
+            signature_for_arg<std::int64_t>(), signature_for_arg<float>(),
+            signature_for_arg<double>(),      signature_for_arg<char16_t>(),
+        };
+        bool all_primitive_band{ true };
+        for (const auto& s : prim_sigs)
+        {
+            if (s.size() != 1u) { all_primitive_band = false; continue; }
+            const int basic{ vmhook::detail::sig_char_to_basic_type(s.front()) };
+            if (basic < 4 || basic > 11) { all_primitive_band = false; }
+        }
+        check("sig_primitive_descriptors_in_basic_type_band", all_primitive_band);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 24. [ADDITIVE] Build-capability / platform macro CONSISTENCY — the compile-
+//     time configuration the whole single-header feature (and these tests) is
+//     gated by.  PURE preprocessor logic, no JVM, identical reasoning on every
+//     OS/compiler; this is exactly STEP 2's capability-macro-consistency angle.
+//
+// vmhook.hpp publishes mutually-exclusive OS macros (exactly one of WINDOWS /
+// LINUX / MACOS / IOS / ANDROID is 1) plus two aggregates (POSIX = LINUX|MACOS|
+// IOS|ANDROID, APPLE = MACOS|IOS), mutually-exclusive ARCH macros (exactly one
+// of X86_64 / ARM64), a derived RUNTIME_HOOKING_AVAILABLE gate, three compiler
+// flags (MSVC / CLANG / GCC, MSVC and GCC mutually exclusive with CLANG by
+// construction), and a packed VERSION integer.  Pin every invariant so a future
+// edit that set two OS macros, or mis-packed the version, fails here.
+// ---------------------------------------------------------------------------
+static auto test_capability_macro_consistency() -> void
+{
+    // --- Exactly ONE OS macro is set. ---
+    constexpr int os_sum{ VMHOOK_OS_WINDOWS + VMHOOK_OS_LINUX + VMHOOK_OS_MACOS
+                          + VMHOOK_OS_IOS + VMHOOK_OS_ANDROID };
+    static_assert(os_sum == 1, "exactly one VMHOOK_OS_* macro must be 1.");
+    check("exactly_one_os_macro", os_sum == 1);
+
+    // --- The POSIX / APPLE aggregates are the documented unions. ---
+    static_assert(VMHOOK_OS_POSIX == (VMHOOK_OS_LINUX | VMHOOK_OS_MACOS
+                                      | VMHOOK_OS_IOS | VMHOOK_OS_ANDROID),
+                  "POSIX aggregate must be LINUX|MACOS|IOS|ANDROID.");
+    static_assert(VMHOOK_OS_APPLE == (VMHOOK_OS_MACOS | VMHOOK_OS_IOS),
+                  "APPLE aggregate must be MACOS|IOS.");
+    // Windows is never POSIX; Apple is always POSIX.
+    static_assert(!(VMHOOK_OS_WINDOWS && VMHOOK_OS_POSIX),
+                  "Windows is mutually exclusive with the POSIX aggregate.");
+    static_assert(VMHOOK_OS_APPLE == 0 || VMHOOK_OS_POSIX == 1,
+                  "any Apple target is also POSIX.");
+    check("posix_apple_aggregates_consistent",
+          (VMHOOK_OS_POSIX == (VMHOOK_OS_LINUX | VMHOOK_OS_MACOS | VMHOOK_OS_IOS | VMHOOK_OS_ANDROID))
+          && (VMHOOK_OS_APPLE == (VMHOOK_OS_MACOS | VMHOOK_OS_IOS)));
+
+    // --- Exactly ONE arch macro is set. ---
+    constexpr int arch_sum{ VMHOOK_ARCH_X86_64 + VMHOOK_ARCH_ARM64 };
+    static_assert(arch_sum == 1, "exactly one VMHOOK_ARCH_* macro must be 1.");
+    check("exactly_one_arch_macro", arch_sum == 1);
+
+    // --- RUNTIME_HOOKING_AVAILABLE is the documented derived gate:
+    //     x86_64 AND not iOS.  (arm64 or iOS -> the runtime hook API no-ops.) ---
+    static_assert(VMHOOK_RUNTIME_HOOKING_AVAILABLE
+                      == (VMHOOK_ARCH_X86_64 && !VMHOOK_OS_IOS),
+                  "RUNTIME_HOOKING_AVAILABLE == X86_64 && !IOS.");
+    check("runtime_hooking_gate_derived",
+          VMHOOK_RUNTIME_HOOKING_AVAILABLE == (VMHOOK_ARCH_X86_64 && !VMHOOK_OS_IOS));
+
+    // --- Compiler flags: MSVC and GCC are each mutually exclusive with CLANG
+    //     by their definitions ( !__clang__ guards).  At most one of MSVC/GCC. ---
+    static_assert(!(VMHOOK_COMPILER_MSVC && VMHOOK_COMPILER_CLANG),
+                  "MSVC and CLANG flags are mutually exclusive.");
+    static_assert(!(VMHOOK_COMPILER_GCC && VMHOOK_COMPILER_CLANG),
+                  "GCC and CLANG flags are mutually exclusive.");
+    static_assert(!(VMHOOK_COMPILER_MSVC && VMHOOK_COMPILER_GCC),
+                  "MSVC and GCC flags are mutually exclusive.");
+    constexpr int real_compiler_sum{ VMHOOK_COMPILER_MSVC + VMHOOK_COMPILER_GCC
+                                     + VMHOOK_COMPILER_CLANG };
+    // This test is built by gcc / clang / msvc, so at least one is set.
+    static_assert(real_compiler_sum >= 1, "a recognised compiler must be detected.");
+    check("compiler_flags_mutually_exclusive_and_present",
+          real_compiler_sum >= 1
+          && !(VMHOOK_COMPILER_MSVC && VMHOOK_COMPILER_GCC)
+          && !(VMHOOK_COMPILER_GCC && VMHOOK_COMPILER_CLANG)
+          && !(VMHOOK_COMPILER_MSVC && VMHOOK_COMPILER_CLANG));
+
+    // --- Capability flags are strictly boolean (0/1). ---
+    static_assert(VMHOOK_HAS_STD_FORMAT == 0 || VMHOOK_HAS_STD_FORMAT == 1);
+    static_assert(VMHOOK_HAS_STD_PRINT == 0 || VMHOOK_HAS_STD_PRINT == 1);
+    static_assert(VMHOOK_HAS_DEDUCING_THIS == 0 || VMHOOK_HAS_DEDUCING_THIS == 1);
+    // std::print implies std::format (print is layered on format support).
+    static_assert(VMHOOK_HAS_STD_PRINT == 0 || VMHOOK_HAS_STD_FORMAT == 1,
+                  "std::print availability implies std::format availability.");
+    check("capability_flags_boolean_and_layered",
+          (VMHOOK_HAS_STD_FORMAT == 0 || VMHOOK_HAS_STD_FORMAT == 1)
+          && (VMHOOK_HAS_STD_PRINT == 0 || VMHOOK_HAS_STD_PRINT == 1)
+          && (VMHOOK_HAS_DEDUCING_THIS == 0 || VMHOOK_HAS_DEDUCING_THIS == 1)
+          && (VMHOOK_HAS_STD_PRINT == 0 || VMHOOK_HAS_STD_FORMAT == 1));
+
+    // --- Version macros pack/unpack via VMHOOK_MAKE_VERSION exactly. ---
+    static_assert(VMHOOK_VERSION
+                      == VMHOOK_MAKE_VERSION(VMHOOK_VERSION_MAJOR,
+                                             VMHOOK_VERSION_MINOR,
+                                             VMHOOK_VERSION_PATCH),
+                  "VMHOOK_VERSION must equal MAKE_VERSION of the three components.");
+    static_assert(VMHOOK_MAKE_VERSION(0, 5, 3) == ((0 * 1000000) + (5 * 1000) + 3),
+                  "MAKE_VERSION packs major*1e6 + minor*1e3 + patch.");
+    // Strictly monotone ordering across components (the gate consumers rely on).
+    static_assert(VMHOOK_MAKE_VERSION(0, 5, 3) < VMHOOK_MAKE_VERSION(0, 5, 4));
+    static_assert(VMHOOK_MAKE_VERSION(0, 5, 3) < VMHOOK_MAKE_VERSION(0, 6, 0));
+    static_assert(VMHOOK_MAKE_VERSION(0, 5, 3) < VMHOOK_MAKE_VERSION(1, 0, 0));
+    static_assert(VMHOOK_MAKE_VERSION(0, 5, 999) < VMHOOK_MAKE_VERSION(0, 6, 0),
+                  "patch field width must not bleed into the minor field.");
+    check("version_packs_correctly",
+          VMHOOK_VERSION == VMHOOK_MAKE_VERSION(VMHOOK_VERSION_MAJOR,
+                                                VMHOOK_VERSION_MINOR,
+                                                VMHOOK_VERSION_PATCH));
+    check("version_components_nonnegative",
+          VMHOOK_VERSION_MAJOR >= 0 && VMHOOK_VERSION_MINOR >= 0 && VMHOOK_VERSION_PATCH >= 0);
+}
+
+// ---------------------------------------------------------------------------
+// 25. [ADDITIVE] detail::is_unique_ptr_v — the trait jni_signature_for_arg uses
+//     to recognise a unique_ptr<W> element/value argument (the exact shape
+//     to_vector<E>() / to_entries<K,V>() PRODUCE).  PURE type trait, no JVM.
+//
+// Contract (vmhook.hpp is_unique_ptr / is_unique_ptr_v): true IFF the
+// cvref-stripped type is std::unique_ptr<...>; false for everything else
+// (raw pointers, the wrapped type itself, shared_ptr, plain values).  The
+// to_vector / to_entries return types are vector<unique_ptr<E>> /
+// vector<pair<unique_ptr<K>,unique_ptr<V>>>, so this trait is what lets a
+// produced element be passed straight back as a detour argument and encoded as
+// the right "Lname;" descriptor — pin its exact partition.
+// ---------------------------------------------------------------------------
+static auto test_is_unique_ptr_trait() -> void
+{
+    using vmhook::detail::is_unique_ptr_v;
+
+    // TRUE for unique_ptr of any element/key/value wrapper, with cvref noise.
+    static_assert(is_unique_ptr_v<std::unique_ptr<elem_w>>);
+    static_assert(is_unique_ptr_v<std::unique_ptr<key_w>>);
+    static_assert(is_unique_ptr_v<std::unique_ptr<val_w>>);
+    static_assert(is_unique_ptr_v<const std::unique_ptr<elem_w>&>,
+                  "cvref-qualified unique_ptr is still recognised (matches header doc).");
+    static_assert(is_unique_ptr_v<std::unique_ptr<elem_w>&&>);
+    static_assert(is_unique_ptr_v<std::unique_ptr<std::int32_t>>);
+
+    // FALSE for the wrapped type itself, raw pointers, and other smart pointers.
+    static_assert(!is_unique_ptr_v<elem_w>);
+    static_assert(!is_unique_ptr_v<elem_w*>);
+    static_assert(!is_unique_ptr_v<vmhook::oop_t>);
+    static_assert(!is_unique_ptr_v<std::shared_ptr<elem_w>>);
+    static_assert(!is_unique_ptr_v<int>);
+    static_assert(!is_unique_ptr_v<std::vector<std::unique_ptr<elem_w>>>,
+                  "a VECTOR of unique_ptr is not itself a unique_ptr.");
+
+    // The exact element type to_vector produces IS a unique_ptr; the vector that
+    // holds it is not — pin the relationship the return-type shape encodes.
+    using vec_t = decltype(std::declval<vmhook::collection>().to_vector<elem_w>());
+    static_assert(!is_unique_ptr_v<vec_t>);
+    static_assert(is_unique_ptr_v<vec_t::value_type>,
+                  "vector<unique_ptr<E>>::value_type is unique_ptr<E>.");
+
+    check("is_unique_ptr_trait_static_asserts_held", true);
+}
+
 int main()
 {
     // Registering the element wrappers mirrors real usage; harmless with no JVM.
@@ -2546,6 +2886,10 @@ int main()
     test_value_t_as_string_all_alternatives();
     test_value_t_aggregate_field_semantics();
     test_narrow_codec_roundtrip();
+    test_function_traits_decomposition();
+    test_jni_signature_for_arg_mapping();
+    test_capability_macro_consistency();
+    test_is_unique_ptr_trait();
 
     return failures == 0 ? 0 : 1;
 }

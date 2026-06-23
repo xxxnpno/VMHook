@@ -2529,5 +2529,187 @@ int main()
         }
     }
 
+    // =====================================================================
+    // SECTION Y -- ADDITIVE DEEPENING (this pass).  Three PUBLIC, no-JVM,
+    // pure-logic surfaces the suite never asserted, every value traced to
+    // vmhook.hpp:
+    //   (Y1) the DISPATCH TRAITS convert_jni_arg / jni_signature_for_arg
+    //        branch on -- is_unique_ptr / is_unique_ptr_v (vmhook.hpp:1787-
+    //        1813) and is_vector / is_vector_v (vmhook.hpp:1750-1775) -- the
+    //        compile-time predicates that decide the unique_ptr arm and that
+    //        std::vector is REJECTED.  Includes the cv-ref STRIPPING contract
+    //        of the _v variants and the value_type_t pointed-to extraction.
+    //        Pure static_asserts; one visible PASS.
+    //   (Y2) the PUBLIC re-export vmhook::jni::signature_for_arg<T>()
+    //        (vmhook.hpp:13711) for the categories X1 did not pin: char8_t->B,
+    //        char*/string_view->String, the platform-width long/size_t branch,
+    //        the unregistered-unique_ptr fallback, and exact value-EQUALITY to
+    //        the detail builder for those spellings (not merely "looks right").
+    //   (Y3) utf8_to_utf16 boundaries distinct from R/V/X: a 3-byte form whose
+    //        third byte is the LAST byte (the (i+2)<size strict-guard pass
+    //        edge), a 3-byte form FOLLOWED by a 2-byte form (two different
+    //        non-ASCII widths adjacent), an astral FOLLOWED by a 3-byte BMP,
+    //        the low-surrogate MAX boundary U+103FF -> ...DFFF and the
+    //        high-surrogate +1 boundary U+10400 -> D801..., a fresh CJK-Ext-B
+    //        astral U+2A6B2, and a 2-byte form whose continuation byte is
+    //        itself a lead-looking byte (masked to its low 6 bits, NOT re-led).
+    //        Pure decode, host-endian-agnostic (uint16 value compares).
+    // No live JVM: every string arm stays .l==null/tag false (Section H); the
+    // UTF-16 DECODE is the pure function these assertions pin.
+    // =====================================================================
+    {
+        // ---- (Y1) dispatch traits: is_unique_ptr / is_vector + _v + members --
+        // POSITIVE: a unique_ptr specialisation (any deleter) is detected, and
+        // value_type_t exposes the pointed-to type.
+        static_assert(vmhook::detail::is_unique_ptr<std::unique_ptr<fake_object>>::value,
+                      "is_unique_ptr must detect unique_ptr<fake_object>.");
+        static_assert(vmhook::detail::is_unique_ptr<std::unique_ptr<int>>::value,
+                      "is_unique_ptr must detect unique_ptr<int> (any pointee).");
+        static_assert(std::is_same_v<
+                          vmhook::detail::is_unique_ptr<std::unique_ptr<fake_object>>::value_type_t,
+                          fake_object>,
+                      "is_unique_ptr::value_type_t must be the pointed-to wrapper type.");
+        // NEGATIVE: non-unique_ptr types are not detected.
+        static_assert(!vmhook::detail::is_unique_ptr<fake_object>::value,
+                      "is_unique_ptr must reject a plain object.");
+        static_assert(!vmhook::detail::is_unique_ptr<int>::value,
+                      "is_unique_ptr must reject a plain int.");
+        static_assert(!vmhook::detail::is_unique_ptr<void*>::value,
+                      "is_unique_ptr must reject a raw pointer.");
+        // The _v convenience constant STRIPS cv-ref before testing (documented
+        // contract at vmhook.hpp:1809-1810): a const-ref unique_ptr still _v==true.
+        static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<fake_object>>,
+                      "is_unique_ptr_v on a bare unique_ptr.");
+        static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<fake_object>&>,
+                      "is_unique_ptr_v must strip const& (the dispatch arm relies on this).");
+        static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<fake_object>&&>,
+                      "is_unique_ptr_v must strip rvalue-ref.");
+        static_assert(!vmhook::detail::is_unique_ptr_v<fake_object>,
+                      "is_unique_ptr_v false for a plain object.");
+
+        // is_vector: the trait whose _v gates the REJECTED std::vector arg type
+        // (jni_arg_accepted_v<std::vector<int>> is false in Section O); pin the
+        // underlying trait + value_type_t + cv-ref stripping directly.
+        static_assert(vmhook::detail::is_vector<std::vector<int>>::value,
+                      "is_vector must detect vector<int>.");
+        static_assert(std::is_same_v<
+                          vmhook::detail::is_vector<std::vector<int>>::value_type_t, int>,
+                      "is_vector::value_type_t must be the element type.");
+        static_assert(!vmhook::detail::is_vector<int>::value,
+                      "is_vector must reject a plain int.");
+        static_assert(!vmhook::detail::is_vector<std::unique_ptr<int>>::value,
+                      "is_vector must reject a unique_ptr.");
+        static_assert(vmhook::detail::is_vector_v<const std::vector<int>&>,
+                      "is_vector_v must strip const& (documented at vmhook.hpp:1771-1772).");
+        static_assert(!vmhook::detail::is_vector_v<std::string>,
+                      "is_vector_v false for std::string (a string is NOT a vector arg).");
+
+        // Mutual exclusivity for the two specialisation arms the dispatch ladder
+        // checks in sequence: a unique_ptr is never a vector and vice versa.
+        static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<fake_object>>
+                          && !vmhook::detail::is_vector_v<std::unique_ptr<fake_object>>,
+                      "unique_ptr is detected as unique_ptr only.");
+        static_assert(vmhook::detail::is_vector_v<std::vector<int>>
+                          && !vmhook::detail::is_unique_ptr_v<std::vector<int>>,
+                      "vector is detected as vector only.");
+
+        check("Y1_dispatch_traits_hold", true);
+
+        // ---- (Y2) public re-export categories + value-equality to detail ------
+        // char8_t -> "B" via the public facade (X1 covered int8 but not char8_t).
+        check("Y2_pub_char8_B", vmhook::jni::signature_for_arg<char8_t>() == "B");
+        // string_view / char* spellings -> the String descriptor.
+        check("Y2_pub_string_view_String",
+              vmhook::jni::signature_for_arg<std::string_view>() == "Ljava/lang/String;");
+        check("Y2_pub_char_ptr_String",
+              vmhook::jni::signature_for_arg<char*>() == "Ljava/lang/String;");
+        // Unregistered unique_ptr<object> falls back to Ljava/lang/Object; through
+        // the public facade exactly as the detail builder does (fake_object is
+        // never mapped).
+        check("Y2_pub_unregistered_unique_ptr_fallback",
+              vmhook::jni::signature_for_arg<std::unique_ptr<fake_object>>()
+                  == "Ljava/lang/Object;");
+        // Registered unique_ptr -> Lname; via the public facade (registered_wrapper
+        // was inserted into type_to_class_map in Section F, which runs earlier).
+        check("Y2_pub_registered_unique_ptr_Lname",
+              vmhook::jni::signature_for_arg<std::unique_ptr<registered_wrapper>>()
+                  == "Lcom/example/Widget;");
+        // The platform-width integral branch (long / size_t) must agree between
+        // the public facade and the detail builder, whichever letter the target's
+        // sizeof selects (LP64 -> "J"; LLP64 long -> "I").
+        check("Y2_pub_long_matches_detail",
+              vmhook::jni::signature_for_arg<long>() == sig<long>());
+        check("Y2_pub_size_t_matches_detail",
+              vmhook::jni::signature_for_arg<std::size_t>() == sig<std::size_t>());
+        // VALUE-equality (not just shape) for the object-fallback and unique_ptr
+        // arms: the facade returns a std::string byte-equal to the detail builder.
+        check("Y2_pub_equals_detail_unregistered_object",
+              vmhook::jni::signature_for_arg<fake_object>() == sig<fake_object>());
+        check("Y2_pub_equals_detail_unregistered_unique_ptr",
+              vmhook::jni::signature_for_arg<std::unique_ptr<fake_object>>()
+                  == sig<std::unique_ptr<fake_object>>());
+
+        // ---- (Y3) utf8_to_utf16 width-advance + boundary cases ---------------
+        using vmhook::detail::utf8_to_utf16;
+
+        // 3-byte form whose THIRD byte is the final byte of the buffer: the
+        // (i+2)<size guard is strict, so for E2 82 AC at size 3, i=0, (i+2)=2<3
+        // is TRUE -> valid U+20AC.  (Pairs with V_3byte_missing_third which has
+        // the guard FAIL one byte earlier.)
+        check("Y3_3byte_third_byte_at_exact_end",
+              units_eq(utf8_to_utf16(std::string_view{ "\xE2\x82\xAC" }), { 0x20AC }));
+
+        // 3-byte form FOLLOWED by a 2-byte form (two different non-ASCII widths
+        // adjacent): euro (E2 82 AC, adv 3) then cent (C2 A2, adv 2) -> 20AC,00A2.
+        // A wrong adv would mis-align the cent sequence.
+        check("Y3_3byte_then_2byte_advances",
+              units_eq(utf8_to_utf16(std::string_view{ "\xE2\x82\xAC\xC2\xA2" }),
+                       { 0x20AC, 0x00A2 }));
+
+        // ASTRAL form FOLLOWED by a 3-byte BMP: emoji (F0 9F 98 80, adv 4) then
+        // CJK 中 (E4 B8 AD, adv 3) -> surrogate pair then 4E2D.  Proves adv=4
+        // lands the next 3-byte lead correctly (a drift would corrupt 中).
+        check("Y3_astral_then_3byte_advances",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF0\x9F\x98\x80\xE4\xB8\xAD" }),
+                       { 0xD83D, 0xDE00, 0x4E2D }));
+
+        // LOW-surrogate MAX boundary: U+103FF (F0 90 8F BF) has (cp-0x10000)&0x3FF
+        // == 0x3FF, so the trailing surrogate is the maximum 0xDFFF; high stays
+        // 0xD800 (cp-0x10000 == 0x3FF, >>10 == 0).  Pins the &0x3FF mask edge.
+        check("Y3_low_surrogate_max_103FF",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF0\x90\x8F\xBF" }),
+                       { 0xD800, 0xDFFF }));
+
+        // HIGH-surrogate +1 boundary: U+10400 (F0 90 90 80) -> cp-0x10000 ==
+        // 0x400, >>10 == 1 so high == 0xD801, low == 0xDC00.  Pins the >>10
+        // increment just past the minimum astral.
+        check("Y3_high_surrogate_plus_one_10400",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF0\x90\x90\x80" }),
+                       { 0xD801, 0xDC00 }));
+
+        // A fresh CJK-Ext-B astral U+2A6B2 (F0 AA 9A B2): payload
+        // (0x00<<18)|(0x2A<<12)|(0x1A<<6)|0x32 = 0x2A6B2; cp-0x10000 = 0x1A6B2;
+        // high = 0xD800+(0x1A6B2>>10)=0xD800+0x69=0xD869; low = 0xDC00+(0x1A6B2&
+        // 0x3FF)=0xDC00+0x2B2=0xDEB2.  A distinct mid-high-surrogate value from
+        // the X3 cases.
+        check("Y3_astral_2A6B2_surrogate_pair",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF0\xAA\x9A\xB2" }),
+                       { 0xD869, 0xDEB2 }));
+
+        // 2-byte form whose CONTINUATION byte is itself a lead-LOOKING byte: the
+        // decoder masks the second byte to its low 6 bits unconditionally (it does
+        // NOT re-interpret 0xE2 as a fresh lead): C2 E2 -> (0x02<<6)|(0xE2&0x3F)
+        // = 0x80|0x22 = 0xA2, single unit, adv 2.  Pins the "mask, don't re-lead"
+        // behaviour of the 2-byte arm.
+        check("Y3_2byte_continuation_lead_looking_masked",
+              units_eq(utf8_to_utf16(std::string_view{ "\xC2\xE2", 2 }), { 0x00A2 }));
+
+        // The mixed 3+2 buffer decodes to exactly TWO units (one per non-ASCII
+        // code point), so the count the packer would hand NewString is 2 -- pins
+        // the unit count for a no-astral multi-width string.
+        check("Y3_3byte_2byte_count_is_two",
+              utf8_to_utf16(std::string_view{ "\xE2\x82\xAC\xC2\xA2" }).size() == 2);
+    }
+
     return failures == 0 ? 0 : 1;
 }

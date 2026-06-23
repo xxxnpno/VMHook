@@ -2075,6 +2075,216 @@ int main()
             std::uint64_t>,
         "extract_frame_arg strips top-level cv/ref from a uint64_t Java-long arg");
 
+    // =========================================================================
+    // WAVE (additive, pure logic): EXHAUSTIVE direct member-function-pointer
+    // cv x ref x noexcept matrix.
+    //
+    // function_traits emits a member-function-pointer specialisation for EVERY
+    // qualifier combination via the VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC macro
+    // (vmhook.hpp:9390-9418) plus the four hand-written plain/const/noexcept
+    // forms (9347-9376).  In EVERY case args_tuple_t is the SAME
+    // std::tuple<argument_types...> — the cv/ref/noexcept qualifier is part of
+    // the member-function TYPE but is irrelevant to the argument list.  The
+    // earlier waves exercise a SUBSET of these (and several only via a functor's
+    // operator()); this wave pins every one of the 20 macro-generated specs in
+    // ISOLATION as a direct &host::method decomposition, so a regression that
+    // dropped or mis-wrote any single macro line is caught precisely.  Pure type
+    // algebra — no JVM, no frame, no member-pointer is ever dereferenced.
+    // =========================================================================
+    {
+        // One host carrying operator-less member functions in every qualifier
+        // shape the trait specialises on.  Bodies are empty; only their TYPES
+        // (taken via decltype(&host::m)) are ever inspected.
+        struct qual_host
+        {
+            void m_plain(std::int32_t, std::int64_t) {}
+            void m_const(std::int32_t, std::int64_t) const {}
+            void m_volatile(std::int32_t, std::int64_t) volatile {}
+            void m_const_volatile(std::int32_t, std::int64_t) const volatile {}
+            void m_lref(std::int32_t, std::int64_t) & {}
+            void m_const_lref(std::int32_t, std::int64_t) const& {}
+            void m_volatile_lref(std::int32_t, std::int64_t) volatile& {}
+            void m_const_volatile_lref(std::int32_t, std::int64_t) const volatile& {}
+            void m_rref(std::int32_t, std::int64_t) && {}
+            void m_const_rref(std::int32_t, std::int64_t) const&& {}
+            void m_volatile_rref(std::int32_t, std::int64_t) volatile&& {}
+            void m_const_volatile_rref(std::int32_t, std::int64_t) const volatile&& {}
+            void m_plain_ne(std::int32_t, std::int64_t) noexcept {}
+            void m_const_ne(std::int32_t, std::int64_t) const noexcept {}
+            void m_volatile_ne(std::int32_t, std::int64_t) volatile noexcept {}
+            void m_const_volatile_ne(std::int32_t, std::int64_t) const volatile noexcept {}
+            void m_lref_ne(std::int32_t, std::int64_t) & noexcept {}
+            void m_const_lref_ne(std::int32_t, std::int64_t) const& noexcept {}
+            void m_volatile_lref_ne(std::int32_t, std::int64_t) volatile& noexcept {}
+            void m_const_volatile_lref_ne(std::int32_t, std::int64_t) const volatile& noexcept {}
+            void m_rref_ne(std::int32_t, std::int64_t) && noexcept {}
+            void m_const_rref_ne(std::int32_t, std::int64_t) const&& noexcept {}
+            void m_volatile_rref_ne(std::int32_t, std::int64_t) volatile&& noexcept {}
+            void m_const_volatile_rref_ne(std::int32_t, std::int64_t) const volatile&& noexcept {}
+        };
+        // args_tuple_t for every shape is exactly (int, long); function_traits
+        // reads the argument list verbatim and the qualifier never leaks.
+        using expected = std::tuple<std::int32_t, std::int64_t>;
+
+        // --- no-noexcept half: cv x ref ------------------------------------
+        check("qmatrix_plain_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_plain)>, expected>);
+        check("qmatrix_const_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const)>, expected>);
+        check("qmatrix_volatile_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_volatile)>, expected>);
+        check("qmatrix_const_volatile_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_volatile)>, expected>);
+        check("qmatrix_lref_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_lref)>, expected>);
+        check("qmatrix_const_lref_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_lref)>, expected>);
+        check("qmatrix_volatile_lref_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_volatile_lref)>, expected>);
+        check("qmatrix_const_volatile_lref_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_volatile_lref)>, expected>);
+        check("qmatrix_rref_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_rref)>, expected>);
+        check("qmatrix_const_rref_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_rref)>, expected>);
+        check("qmatrix_volatile_rref_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_volatile_rref)>, expected>);
+        check("qmatrix_const_volatile_rref_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_volatile_rref)>, expected>);
+
+        // --- noexcept half: cv x ref x noexcept ----------------------------
+        check("qmatrix_plain_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_plain_ne)>, expected>);
+        check("qmatrix_const_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_ne)>, expected>);
+        check("qmatrix_volatile_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_volatile_ne)>, expected>);
+        check("qmatrix_const_volatile_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_volatile_ne)>, expected>);
+        check("qmatrix_lref_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_lref_ne)>, expected>);
+        check("qmatrix_const_lref_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_lref_ne)>, expected>);
+        check("qmatrix_volatile_lref_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_volatile_lref_ne)>, expected>);
+        check("qmatrix_const_volatile_lref_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_volatile_lref_ne)>, expected>);
+        check("qmatrix_rref_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_rref_ne)>, expected>);
+        check("qmatrix_const_rref_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_rref_ne)>, expected>);
+        check("qmatrix_volatile_rref_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_volatile_rref_ne)>, expected>);
+        check("qmatrix_const_volatile_rref_ne_args_int_long",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_volatile_rref_ne)>, expected>);
+
+        // Cross-shape convergence: a representative pick from each macro group
+        // yields the IDENTICAL args tuple, proving no qualifier perturbs it.
+        check("qmatrix_all_shapes_converge_to_one_args_tuple",
+              std::is_same_v<all_args_of<decltype(&qual_host::m_const_volatile_rref_ne)>,
+                             all_args_of<decltype(&qual_host::m_plain)>>
+              && std::is_same_v<all_args_of<decltype(&qual_host::m_volatile_lref)>,
+                                all_args_of<decltype(&qual_host::m_plain)>>
+              && std::is_same_v<all_args_of<decltype(&qual_host::m_const_rref)>,
+                                all_args_of<decltype(&qual_host::m_plain)>>);
+    }
+
+    // -------------------------------------------------------------------------
+    // A const&&-qualified functor reached THROUGH the void_t functor probe
+    // (vmhook.hpp:9341-9345 forwarding to the const&& member-ptr spec at the
+    // VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const&&) line 9405).  &F::operator() is
+    // a single, addressable member pointer here (one non-overloaded, non-template
+    // call operator), so the functor spec selects it and inherits args_tuple_t
+    // from the const&& member specialisation.  This is the only path that pins
+    // the const&& functor case (the earlier ref/volatile functor wave used &,
+    // const&, &&, volatile, const volatile, & noexcept, && noexcept).
+    // -------------------------------------------------------------------------
+    {
+        struct const_rref_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) const&& {}
+        };
+        struct volatile_lref_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) volatile& {}
+        };
+        check("const_rref_functor_has_args_tuple",
+              has_args_tuple<const_rref_functor>::value);
+        check("volatile_lref_functor_has_args_tuple",
+              has_args_tuple<volatile_lref_functor>::value);
+        check("const_rref_functor_method_tuple_int_long",
+              std::is_same_v<method_args_of<const_rref_functor>,
+                             std::tuple<std::int32_t, std::int64_t>>);
+        check("const_rref_and_volatile_lref_functors_match_plain_const",
+              std::is_same_v<method_args_of<const_rref_functor>, method_args_of<const_call_functor>>
+              && std::is_same_v<method_args_of<volatile_lref_functor>, method_args_of<const_call_functor>>);
+    }
+
+    // -------------------------------------------------------------------------
+    // java_slot_offsets::value is a std::array<std::int32_t, N> BY TYPE, where N
+    // is the tuple arity (vmhook.hpp:9525 / 9536), and the empty-tuple
+    // specialisation's value is std::array<std::int32_t, 0> (9542).  The earlier
+    // waves compare value against a literal std::array but never pin its EXACT
+    // static type, nor that the element type is std::int32_t (not std::size_t /
+    // int).  A regression that changed the offset element width would still
+    // compare-equal in some places but is caught here by type identity.
+    // -------------------------------------------------------------------------
+    check("jso_value_type_is_array_int32_3",
+          std::is_same_v<
+              std::remove_cv_t<decltype(vmhook::detail::java_slot_offsets<
+                  std::tuple<std::int32_t, std::int64_t, std::int32_t>>::value)>,
+              std::array<std::int32_t, 3>>);
+    check("jso_value_type_is_array_int32_1_for_single_long",
+          std::is_same_v<
+              std::remove_cv_t<decltype(vmhook::detail::java_slot_offsets<
+                  std::tuple<std::int64_t>>::value)>,
+              std::array<std::int32_t, 1>>);
+    check("jso_empty_value_type_is_array_int32_0",
+          std::is_same_v<
+              std::remove_cv_t<decltype(vmhook::detail::java_slot_offsets<std::tuple<>>::value)>,
+              std::array<std::int32_t, 0>>);
+    // The array element type is exactly std::int32_t (not int / std::size_t).
+    check("jso_value_element_type_is_int32",
+          std::is_same_v<
+              std::remove_cvref_t<decltype(vmhook::detail::java_slot_offsets<
+                  std::tuple<std::int32_t>>::value[0])>,
+              std::int32_t>);
+    // Per-index value[k] derived from the +2(J/D)/+1(other) rule for a fresh
+    // shape (int, double, long): int@0(+1), double@1(+2), long@3.  Pin each k.
+    {
+        using m = std::tuple<std::int32_t, double, std::int64_t>;
+        check("jso_index_k0_is_0", vmhook::detail::java_slot_offsets<m>::value[0] == 0);
+        check("jso_index_k1_is_1", vmhook::detail::java_slot_offsets<m>::value[1] == 1);
+        check("jso_index_k2_is_3", vmhook::detail::java_slot_offsets<m>::value[2] == 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // Compile-time enforcement for this additive wave (build breaks first on a
+    // regression).  One load-bearing fact per sub-block above.
+    // -------------------------------------------------------------------------
+    {
+        struct enf_host
+        {
+            void m_cv_rref_ne(std::int32_t, std::int64_t) const volatile&& noexcept {}
+        };
+        static_assert(
+            std::is_same_v<all_args_of<decltype(&enf_host::m_cv_rref_ne)>,
+                           std::tuple<std::int32_t, std::int64_t>>,
+            "the const-volatile-rvalue-ref-noexcept member-ptr spec must yield (int, long) "
+            "(VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const volatile&& noexcept), vmhook.hpp:9417)");
+    }
+    static_assert(
+        std::is_same_v<
+            std::remove_cv_t<decltype(vmhook::detail::java_slot_offsets<std::tuple<>>::value)>,
+            std::array<std::int32_t, 0>>,
+        "java_slot_offsets<std::tuple<>>::value must be std::array<std::int32_t, 0> by type");
+    static_assert(
+        std::is_same_v<
+            std::remove_cv_t<decltype(vmhook::detail::java_slot_offsets<
+                std::tuple<std::int32_t, double, std::int64_t>>::value)>,
+            std::array<std::int32_t, 3>>,
+        "java_slot_offsets::value is std::array<std::int32_t, arity> by type");
+
     std::printf("vmhook traits-extra: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

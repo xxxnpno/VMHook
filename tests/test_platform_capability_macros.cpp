@@ -1553,5 +1553,172 @@ int main()
 #endif
     }
 
+    // =======================================================================
+    // ADDITIVE WAVE 3: source-derived surfaces NOT pinned by waves 1-2.  Pure
+    // value / compile-time logic only -- no memory is ever dereferenced.
+    //   - is_valid_pointer's gate ORDERING and the low32 TRUNCATION semantics
+    //     (vmhook.hpp:2047-2084): the alignment gate (addr & 1) runs BEFORE the
+    //     sentinel switch, and the switch matches only the LOW 32 bits, so a
+    //     high-half-tagged address whose low32 hits a sentinel is matched by
+    //     truncation alone.  These all inspect the numeric VALUE; no read.
+    //   - safe_read_pointer's PURE pre-filter (vmhook.hpp:2106-2130): null,
+    //     addr<=floor, addr>=ceiling, or (addr & 0x7) all return nullptr BEFORE
+    //     os::safe_read is ever called -- so feeding ONLY pre-filter-rejected
+    //     values never crosses the OS boundary (POSIX-safe, no SEGV).  This is
+    //     the no-JVM fail-closed contract for a fn this feature's constants gate.
+    //   - page_size / allocation_granularity call-to-call self-consistency.
+    // Distinct names (suffix "_w3"); strictly additive.
+    // =======================================================================
+    {
+        namespace hs3 = vmhook::hotspot;
+        using vmhook::os::user_address_floor;
+        using vmhook::os::user_address_ceiling;
+
+        // -- (1) is_valid_pointer gate ORDER: alignment precedes the switch ---
+        // An ODD address whose low32 is NOT a sentinel is rejected purely by the
+        // (addr & 1) gate, which runs before the switch (vmhook.hpp:2059).  Pick
+        // a low32 that is not in the sentinel list and is odd: 0x00020003 is in
+        // (floor, ceiling), odd, low32 = 0x00020003 (not a sentinel) -> rejected.
+        check("ivp_odd_nonsentinel_rejected_by_alignment_w3",
+              hs3::is_valid_pointer(reinterpret_cast<const void*>(
+                  std::uintptr_t{ 0x00020003ull })) == false);
+        // The even neighbour 0x00020002 (in range, even, non-sentinel) -> ACCEPTED,
+        // proving it was the LOW BIT, not the value, that rejected the odd case.
+        check("ivp_even_neighbour_of_odd_accepted_w3",
+              hs3::is_valid_pointer(reinterpret_cast<const void*>(
+                  std::uintptr_t{ 0x00020002ull })) == true);
+
+        // -- (2) is_valid_pointer low32 TRUNCATION: switch matches low 32 bits --
+        // The switch keys on static_cast<std::uint32_t>(addr) (vmhook.hpp:2067),
+        // so an address with ARBITRARY high bits (still in range, even) whose LOW
+        // 32 bits equal an EVEN sentinel is rejected by truncation alone.  Build
+        // it in the canonical low-half window (high32 = 0x00001234, < ceiling) so
+        // the only reason for rejection is the truncated low32 sentinel match.
+        // 0xCAFEBABE is even, so it survives the alignment gate and reaches the
+        // switch -- the truncation is what makes it match.
+        check("ivp_low32_truncation_matches_even_sentinel_w3",
+              hs3::is_valid_pointer(reinterpret_cast<const void*>(
+                  (std::uintptr_t{ 0x00001234ull } << 32) | 0xCAFEBABEu)) == false);
+        // Same high32 but a NON-sentinel even low32 (0xCAFEBABE with low nibble
+        // cleared -> 0xCAFEBAB0) -> ACCEPTED: confirms ONLY the low32 governs the
+        // switch arm, the high bits are irrelevant to the sentinel test.
+        check("ivp_low32_nonsentinel_high_bits_irrelevant_w3",
+              hs3::is_valid_pointer(reinterpret_cast<const void*>(
+                  (std::uintptr_t{ 0x00001234ull } << 32) | 0xCAFEBAB0u)) == true);
+
+        // -- (3) is_valid_pointer: every EVEN sentinel is matched by low32 even
+        // when carrying high tag bits (the union of (2) over all even sentinels).
+        // Odd sentinels are excluded here because the alignment gate would reject
+        // them first regardless of the switch; only the even ones isolate the
+        // switch's low32 behaviour.  Even sentinels: 0xCAFEBABE, 0xCCCCCCCC,
+        // 0xFEEEFEEE (low bit 0).
+        {
+            const std::uint32_t even_sentinels[]{ 0xCAFEBABEu, 0xCCCCCCCCu, 0xFEEEFEEEu };
+            bool all_rejected_with_high_tag{ true };
+            for (const std::uint32_t s : even_sentinels)
+            {
+                // high32 = 0x00007FFF keeps the full address < ceiling and even.
+                const std::uintptr_t addr{ (std::uintptr_t{ 0x00007FFFull } << 32) | s };
+                if (hs3::is_valid_pointer(reinterpret_cast<const void*>(addr)) != false)
+                {
+                    all_rejected_with_high_tag = false;
+                }
+            }
+            check("ivp_even_sentinels_rejected_under_high_tag_w3",
+                  all_rejected_with_high_tag);
+        }
+
+        // -- (4) safe_read_pointer PURE pre-filter (no OS boundary crossed) ----
+        // From source (vmhook.hpp:2106-2130): the function returns nullptr WITHOUT
+        // calling os::safe_read when the pointer is null, <= floor, >= ceiling, or
+        // not 8-byte aligned.  We feed ONLY such pre-filter-rejected values, so no
+        // read of a fabricated page ever happens (POSIX-safe).  Each must yield
+        // nullptr -- the fail-closed contract for invalid inputs.
+        // (a) null input.
+        check("srp_null_returns_null_w3",
+              hs3::safe_read_pointer(nullptr) == nullptr);
+        // (b) addr == floor (0xFFFF): <= floor -> nullptr (no boundary crossed).
+        check("srp_floor_returns_null_w3",
+              hs3::safe_read_pointer(reinterpret_cast<const void*>(user_address_floor)) == nullptr);
+        // (c) addr == 1: <= floor -> nullptr.
+        check("srp_addr_one_returns_null_w3",
+              hs3::safe_read_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 1 })) == nullptr);
+        // (d) addr == ceiling: >= ceiling -> nullptr.
+        check("srp_ceiling_returns_null_w3",
+              hs3::safe_read_pointer(reinterpret_cast<const void*>(user_address_ceiling)) == nullptr);
+        // (e) addr above ceiling (every bit set): >= ceiling -> nullptr.
+        check("srp_all_ones_returns_null_w3",
+              hs3::safe_read_pointer(reinterpret_cast<const void*>(~std::uintptr_t{ 0 })) == nullptr);
+        // (f) safe_read_pointer's alignment requirement is 8 (stricter than
+        // is_valid_pointer's 2): an in-range address that is 2-aligned but NOT
+        // 8-aligned hits the (addr & 0x7) gate and returns nullptr before any
+        // read.  0x10002 is > floor, < ceiling, even, but 0x10002 & 0x7 == 2.
+        check("srp_misaligned_in_range_returns_null_w3",
+              hs3::safe_read_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x10002ull })) == nullptr);
+        // The SAME address passes is_valid_pointer (which only requires 2-byte
+        // alignment) -- pinning that the two helpers use DIFFERENT alignment
+        // thresholds (2 vs 8), both source-derived.  Pure value test, no read.
+        check("ivp_accepts_2aligned_that_srp_rejects_w3",
+              hs3::is_valid_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x10002ull })) == true);
+        // Each of the four sub-words of an 8-aligned-failing address: 2,4,6 are
+        // all rejected by safe_read_pointer's & 0x7 gate; 0 (8-aligned) would NOT
+        // be rejected by alignment, so we keep that one OUT (it would reach the OS
+        // boundary).  Confirm the three non-zero low-3-bit offsets fail-close.
+        {
+            const std::uintptr_t misaligned_offsets[]{ 2, 4, 6 };
+            bool all_misaligned_rejected{ true };
+            for (const std::uintptr_t off : misaligned_offsets)
+            {
+                // base 0x40000 is 8-aligned and in range; add the offset to break
+                // 8-alignment while staying in (floor, ceiling).
+                const std::uintptr_t addr{ std::uintptr_t{ 0x40000ull } + off };
+                if (hs3::safe_read_pointer(reinterpret_cast<const void*>(addr)) != nullptr)
+                {
+                    all_misaligned_rejected = false;
+                }
+            }
+            check("srp_all_sub8_misalignments_fail_closed_w3", all_misaligned_rejected);
+        }
+
+        // -- (5) untag_pointer THEN safe_read_pointer fail-closed on a tagged
+        // high-half pointer whose BASE is out of range.  untag masks to the low
+        // 47 bits; if the masked base is itself <= floor it is pre-filter-rejected
+        // by safe_read_pointer.  base = 0x8 (<= floor after masking) OR'd with a
+        // high tag -> untag yields 0x8 -> safe_read_pointer returns nullptr (no
+        // read).  Pure value composition of two feature helpers.
+        {
+            const std::uintptr_t low_base{ 0x8ull };  // <= floor (0xFFFF)
+            const std::uintptr_t tagged{ low_base | (std::uintptr_t{ 0xDEADull } << 48) };
+            const void* untagged{ hs3::untag_pointer(reinterpret_cast<const void*>(tagged)) };
+            check("untag_then_srp_low_base_fail_closed_w3",
+                  reinterpret_cast<std::uintptr_t>(untagged) == low_base
+                  && hs3::safe_read_pointer(untagged) == nullptr);
+        }
+
+        // -- (6) page_size / allocation_granularity call-to-call stability -----
+        // Both wrap a single GetSystemInfo / sysconf snapshot of an immutable host
+        // property, so successive calls must return identical values (no waves
+        // pinned determinism).  Pure host-property reads, no JVM.
+        check("page_size_is_stable_across_calls_w3",
+              vmhook::os::page_size() == vmhook::os::page_size());
+        check("allocation_granularity_is_stable_across_calls_w3",
+              vmhook::os::allocation_granularity() == vmhook::os::allocation_granularity());
+        // allocation_granularity / page_size is an exact integer (granularity is a
+        // whole number of pages) AND that quotient is itself >= 1 -- the scan
+        // allocator's clamp relies on granularity being a page multiple, never a
+        // fraction.  (Wave 1 checked the remainder is 0; this pins the quotient.)
+        {
+            const std::size_t ps3{ vmhook::os::page_size() };
+            const std::size_t gran3{ vmhook::os::allocation_granularity() };
+            check("granularity_over_page_size_is_integer_ge_1_w3",
+                  ps3 != 0 && (gran3 % ps3) == 0 && (gran3 / ps3) >= 1);
+            // gran is a power of two as well (it is a power-of-two multiple of the
+            // power-of-two page size on every supported host: 4K page, 4K POSIX
+            // granularity or 64K Windows granularity).  Pin power-of-two-ness.
+            check("granularity_is_power_of_two_w3",
+                  gran3 != 0 && (gran3 & (gran3 - 1)) == 0);
+        }
+    }
+
     return failures == 0 ? 0 : 1;
 }

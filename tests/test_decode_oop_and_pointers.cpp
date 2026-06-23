@@ -3097,5 +3097,303 @@ int main()
         }
     }
 
+    // ===================================================================
+    // UU. (ADDITIVE deepening pass) Pure-logic inputs the A..TT sections do
+    //     NOT reach.  Every expected value is recomputed from the confirmed
+    //     primitive bodies (vmhook/ext/vmhook/vmhook.hpp:5459-5463 narrow_decode
+    //     = base + (uint64(c) << shift); :5480-5484 narrow_encode =
+    //     uint32((addr - base) >> shift)), the is_valid_pointer gate
+    //     (:2050-2083: <= floor, >= ceiling, & 0x1, 9-case poison switch), and
+    //     the untag mask (:2092-2097: & user_address_ceiling).  No memory read
+    //     of any fabricated address, no value_t->container cast, no vector
+    //     byte-buffer resize (fixed C arrays / std::array / scalars only), no
+    //     signed/unsigned narrowing, no raw NUL / non-ASCII in literals.
+    // ===================================================================
+
+    // -- UU1. TRANSLATION-INVARIANCE of decode under a base change.  For a fixed
+    //    shift and compressed value, sliding the base by delta slides the decoded
+    //    pointer by exactly delta:  decode(base+delta, shift, c) ==
+    //    decode(base, shift, c) + delta.  This is the algebraic law the OOP/KLASS
+    //    codecs rely on when the same compressed id is resolved against a relocated
+    //    heap base, and no earlier section states it.  Pure arithmetic.
+    {
+        const std::uint32_t shifts[]{ 0u, 1u, 2u, 3u, 4u };
+        const std::uint64_t base{ 0x1'0000'0000ull };
+        const std::uint64_t deltas[]{
+            0u, 8u, 0x1000u, 0x10'0000u, std::uint64_t{ 0x4'0000'0000ull },
+        };
+        const std::uint32_t comps[]{ 0u, 1u, 0x40u, 0x1234u, 0xFFFFu, 0xFFFF'FFFFu };
+        bool translation_invariant{ true };
+        for (const std::uint32_t sh : shifts)
+        {
+            for (const std::uint64_t d : deltas)
+            {
+                for (const std::uint32_t c : comps)
+                {
+                    const std::uintptr_t at_base{ as_uptr(narrow_decode(base, sh, c)) };
+                    const std::uintptr_t at_shifted{
+                        as_uptr(narrow_decode(base + d, sh, c)) };
+                    if (at_shifted - at_base != static_cast<std::uintptr_t>(d))
+                    {
+                        translation_invariant = false;
+                    }
+                }
+            }
+        }
+        check("narrow_decode_translation_invariant_under_base_delta",
+              translation_invariant);
+    }
+
+    // -- UU2. ENCODE DIFFERENCE LAW: for two addresses on the same grid above a
+    //    common base, the difference of their encodes equals the difference of
+    //    their grid indices.  encode(base,sh,base+(c2<<sh)) -
+    //    encode(base,sh,base+(c1<<sh)) == c2 - c1 (mod 2^32).  Pins that encode is
+    //    an affine map (subtract base, divide by 2^sh) on the representable set.
+    {
+        const std::uint32_t shifts[]{ 0u, 3u, 4u };
+        const std::uint64_t base{ 0x8'0000'0000ull };
+        const std::uint32_t c1s[]{ 0u, 1u, 0x100u, 0x1'0000u };
+        const std::uint32_t c2s[]{ 0u, 7u, 0x101u, 0x2'0000u };
+        bool difference_law{ true };
+        for (const std::uint32_t sh : shifts)
+        {
+            for (const std::uint32_t c1 : c1s)
+            {
+                for (const std::uint32_t c2 : c2s)
+                {
+                    const std::uint64_t a1{ base + (static_cast<std::uint64_t>(c1) << sh) };
+                    const std::uint64_t a2{ base + (static_cast<std::uint64_t>(c2) << sh) };
+                    const std::uint32_t e1{ narrow_encode(base, sh, a1) };
+                    const std::uint32_t e2{ narrow_encode(base, sh, a2) };
+                    if (static_cast<std::uint32_t>(e2 - e1)
+                        != static_cast<std::uint32_t>(c2 - c1))
+                    {
+                        difference_law = false;
+                    }
+                }
+            }
+        }
+        check("narrow_encode_difference_equals_index_difference", difference_law);
+    }
+
+    // -- UU3. untag_pointer is a CLOSURE / fixed-point map: for ANY input the
+    //    masked result is already in [0, ceiling], so untagging it again is a
+    //    no-op, AND every value already <= ceiling is its own image (a fixed
+    //    point).  Section H pinned a single idempotent example; this states the
+    //    fixed-point law over a structured bit-spread, deriving each expectation
+    //    from the mask identity p & user_address_ceiling.
+    {
+        const std::uintptr_t inputs[]{
+            0x0u, 0x1u, 0x2u, 0xFFFFu, 0x1'0000u,
+            std::uintptr_t{ 0x0000'7FFF'FFFF'FFFEull },   // ceiling-1 (even, in range)
+            ceiling,                                       // exactly the mask
+            std::uintptr_t{ 0x0000'8000'0000'0000ull },    // bit 47 only
+            std::uintptr_t{ 0xFFFF'8000'0040'0000ull },    // kernel half + low payload
+            std::uintptr_t{ 0xDEAD'BEEF'CAFE'BABEull },    // arbitrary high junk
+            std::uintptr_t{ 0u } - std::uintptr_t{ 1u },   // all ones
+        };
+        bool untag_is_idempotent{ true };
+        bool masked_is_fixed_point{ true };
+        for (const std::uintptr_t v : inputs)
+        {
+            const void* const once{ untag_pointer(reinterpret_cast<const void*>(v)) };
+            const void* const twice{ untag_pointer(once) };
+            if (once != twice) { untag_is_idempotent = false; }
+            // The masked value, re-fed, must equal itself (it is <= ceiling).
+            const std::uintptr_t once_u{ reinterpret_cast<std::uintptr_t>(once) };
+            if (once_u != (v & ceiling)) { masked_is_fixed_point = false; }
+            if (once_u > ceiling) { masked_is_fixed_point = false; }
+        }
+        check("untag_pointer_is_idempotent_over_bit_spread", untag_is_idempotent);
+        check("untag_pointer_masked_value_is_fixed_point", masked_is_fixed_point);
+    }
+
+    // -- UU4. is_valid_pointer POISON switch is positionally exact: each of the
+    //    nine sentinels, placed at the low 32 bits under an in-range even high
+    //    prefix, is rejected; the SAME sentinel placed in the HIGH 32 bits (so the
+    //    low 32 bits are a benign even value) is ACCEPTED -- proving the switch
+    //    examines only the low 32 bits (vmhook.hpp:2067 `low32 = (uint32)addr`),
+    //    never the high half.  All nine derived directly from the switch cases
+    //    (:2070-2078).  The high-prefix-placed sentinels keep an even, in-range,
+    //    non-poison low half so the only thing under test is WHERE the bytes sit.
+    {
+        constexpr std::uintptr_t even_low_payload{ 0x0000'4000u };  // in-range-friendly, even, not poison
+        const std::uint32_t sentinels[]{
+            0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+            0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu,
+        };
+        // High prefix used when the sentinel sits in the LOW 32 bits: must be
+        // in-range and even.  0x2200 in bits 32+ keeps addr < ceiling.
+        constexpr std::uintptr_t low_test_prefix{ 0x0000'2200'0000'0000ull };
+        bool low_placed_all_rejected{ true };
+        bool high_placed_all_accepted{ true };
+        for (const std::uint32_t s : sentinels)
+        {
+            // Sentinel in the low 32 bits -> rejected (alignment for odd ones,
+            // poison switch for even ones; either way false end-to-end).
+            const std::uintptr_t low_addr{ low_test_prefix | s };
+            if (is_valid_pointer(reinterpret_cast<void*>(low_addr)))
+            {
+                low_placed_all_rejected = false;
+            }
+            // Same sentinel bits in the HIGH 32 bits, with a benign even low half
+            // and a high half kept under the ceiling.  The poison switch must not
+            // fire (it only reads low32), and the address stays in range because
+            // the sentinel is masked to the low 15 bits of the high word so the
+            // overall value never reaches the ceiling.
+            const std::uintptr_t high_word{
+                static_cast<std::uintptr_t>(s & 0x7FFFu) << 32 };
+            const std::uintptr_t high_addr{ high_word | even_low_payload };
+            // Premise guard: this constructed address is genuinely in range and
+            // even (so only the low32-vs-high32 placement is under test).
+            const bool premise_ok{
+                high_addr > floor && high_addr < ceiling
+                && (high_addr & 0x1u) == 0u };
+            if (!premise_ok
+                || !is_valid_pointer(reinterpret_cast<void*>(high_addr)))
+            {
+                high_placed_all_accepted = false;
+            }
+        }
+        check("is_valid_pointer_poison_low32_placed_all_rejected",
+              low_placed_all_rejected);
+        check("is_valid_pointer_poison_high32_placed_all_accepted",
+              high_placed_all_accepted);
+    }
+
+    // -- UU5. is_valid_pointer is MONOTONE-FREE of the high bits across the floor
+    //    and ceiling but a strict gate at each: a contiguous descending walk from
+    //    just above the floor and a contiguous walk just below the ceiling, even
+    //    values only (so alignment never fires) and chosen so no low-32 hits a
+    //    sentinel, are ALL accepted; the floor and ceiling endpoints themselves
+    //    are rejected.  Pins the two boundaries are exactly `<= floor` and
+    //    `>= ceiling` over a run, complementing the single-point checks in B.
+    {
+        bool low_run_accepted{ true };
+        bool high_run_accepted{ true };
+        // Low run: floor+2, floor+4, ... floor+64 (all even, all in range, none a
+        // poison low-32 since these are tiny values like 0x10001.. -> wait, must
+        // stay even: floor is 0xFFFF (odd), floor+1 = 0x10000 even).  Use
+        // floor+1, +3, +5.. which are the EVEN addresses (floor+odd == even).
+        for (std::uintptr_t k{ 1 }; k <= 64u; k += 2u)   // floor+k is even for odd k
+        {
+            const std::uintptr_t addr{ floor + k };
+            if ((addr & 0x1u) != 0u) { low_run_accepted = false; }   // premise
+            if (!is_valid_pointer(reinterpret_cast<void*>(addr)))
+            {
+                low_run_accepted = false;
+            }
+        }
+        // High run: ceiling-2, ceiling-4, ... ceiling-64 (ceiling is odd, so
+        // ceiling-odd is even).
+        for (std::uintptr_t k{ 1 }; k <= 64u; k += 2u)   // ceiling-k is even for odd k
+        {
+            const std::uintptr_t addr{ ceiling - k };
+            if ((addr & 0x1u) != 0u) { high_run_accepted = false; }  // premise
+            if (!is_valid_pointer(reinterpret_cast<void*>(addr)))
+            {
+                high_run_accepted = false;
+            }
+        }
+        check("is_valid_pointer_low_even_run_above_floor_accepted",
+              low_run_accepted);
+        check("is_valid_pointer_high_even_run_below_ceiling_accepted",
+              high_run_accepted);
+        // The exact endpoints stay rejected (re-pinned in this run's context).
+        check("is_valid_pointer_floor_endpoint_rejected_in_run",
+              !is_valid_pointer(reinterpret_cast<void*>(floor)));
+        check("is_valid_pointer_ceiling_endpoint_rejected_in_run",
+              !is_valid_pointer(reinterpret_cast<void*>(ceiling)));
+    }
+
+    // -- UU6. CONSTANT-VALUE pins, derived from source, asserted so they cannot be
+    //    silently changed.  user_address_floor == 0xFFFF and user_address_ceiling
+    //    == 0x00007FFFFFFFFFFF (vmhook.hpp:515/520).  The ceiling has exactly bits
+    //    0..46 set and 47..63 clear, and floor+1 is the first power-of-two-aligned
+    //    in-range address.  Each constant is referenced (no unused-const).
+    {
+        check("const_user_address_floor_is_0xFFFF",
+              floor == std::uintptr_t{ 0xFFFFu });
+        check("const_user_address_ceiling_is_47_bit_mask",
+              ceiling == std::uintptr_t{ 0x0000'7FFF'FFFF'FFFFull });
+        // ceiling is (1<<47) - 1: bit 47 is the lowest CLEARED bit.
+        check("const_ceiling_is_one_below_bit47",
+              ceiling == ((std::uintptr_t{ 1ull } << 47) - 1u));
+        // floor is (1<<16) - 1: the first in-range even address is exactly 1<<16.
+        check("const_floor_is_one_below_bit16",
+              floor == ((std::uintptr_t{ 1ull } << 16) - 1u));
+        check("const_floor_plus_1_is_bit16",
+              (floor + 1u) == (std::uintptr_t{ 1ull } << 16));
+    }
+
+    // -- UU7. FULL-WIDTH structured decode/encode bijection at the 32-bit
+    //    extremes that section U's low-16 sweep cannot reach: the values
+    //    {0x7FFF'FFFE, 0x7FFF'FFFF, 0x8000'0000, 0x8000'0001, 0xFFFF'FFFE,
+    //    0xFFFF'FFFF} straddle the narrow sign bit and the all-ones top.  For each
+    //    canonical (base, shift) the decode must equal the widened closed form and
+    //    re-encode to the same value -- the most overflow-sensitive narrow inputs,
+    //    attributed to BOTH the generic primitive and re-checked at shift 4 (the
+    //    widest object alignment) where (c<<4) reaches highest.
+    {
+        struct mode { std::uint64_t base; std::uint32_t shift; };
+        const mode modes[]{
+            { 0u, 0u }, { 0u, 3u }, { 0u, 4u },
+            { std::uint64_t{ 0x8'0000'0000ull }, 3u },
+            { std::uint64_t{ 0x7000'0000'0000ull }, 4u },
+        };
+        const std::uint32_t extremes[]{
+            0x7FFF'FFFEu, 0x7FFF'FFFFu, 0x8000'0000u,
+            0x8000'0001u, 0xFFFF'FFFEu, 0xFFFF'FFFFu,
+        };
+        bool decode_extreme_ok{ true };
+        bool encode_extreme_ok{ true };
+        for (const mode m : modes)
+        {
+            for (const std::uint32_t c : extremes)
+            {
+                const std::uintptr_t got{ as_uptr(narrow_decode(m.base, m.shift, c)) };
+                const std::uintptr_t want{ static_cast<std::uintptr_t>(
+                    m.base + (static_cast<std::uint64_t>(c) << m.shift)) };
+                if (got != want) { decode_extreme_ok = false; }
+                if (narrow_encode(m.base, m.shift,
+                        static_cast<std::uint64_t>(got)) != c)
+                {
+                    encode_extreme_ok = false;
+                }
+            }
+        }
+        check("narrow_decode_sign_and_top_extremes_all_modes", decode_extreme_ok);
+        check("narrow_roundtrip_sign_and_top_extremes_all_modes", encode_extreme_ok);
+        // Explicit human-readable pin: 0xFFFF'FFFF at shift 4 widens to
+        // 0xF'FFFF'FFF0 (not truncated to 32 bits) -- the widest single-value
+        // overflow case in the suite.
+        check("narrow_decode_all_ones_shift4_widens_to_0xF_FFFF_FFF0",
+              as_uptr(narrow_decode(0u, 4u, 0xFFFF'FFFFu)) == 0xF'FFFF'FFF0ull);
+    }
+
+    // -- UU8. decode_oop_pointer(0) / decode_klass_pointer(0) feed cleanly through
+    //    the WHOLE pointer-hygiene chain to a benign result with no JVM: the null
+    //    sentinel survives untag, is rejected by is_valid_pointer, is rejected by
+    //    safe_read_pointer (null short-circuit), and is rejected by
+    //    is_readable_pointer -- so a decoded-null oop/klass can never be mistaken
+    //    for a live pointer at any stage.  Composes the four hygiene helpers on the
+    //    one input that is fully determined with no heap.
+    {
+        void* const dnull_oop{ decode_oop_pointer(0u) };
+        void* const dnull_klass{ decode_klass_pointer(0u) };
+        check("decoded_null_oop_survives_untag_as_null",
+              untag_pointer(dnull_oop) == nullptr);
+        check("decoded_null_klass_survives_untag_as_null",
+              untag_pointer(dnull_klass) == nullptr);
+        check("decoded_null_oop_rejected_by_all_hygiene_gates",
+              !is_valid_pointer(dnull_oop)
+              && safe_read_pointer(dnull_oop) == nullptr
+              && !is_readable_pointer(dnull_oop));
+        check("decoded_null_klass_rejected_by_all_hygiene_gates",
+              !is_valid_pointer(dnull_klass)
+              && safe_read_pointer(dnull_klass) == nullptr
+              && !is_readable_pointer(dnull_klass));
+    }
+
     return failures == 0 ? 0 : 1;
 }
