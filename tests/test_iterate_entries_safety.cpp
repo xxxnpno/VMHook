@@ -2523,6 +2523,499 @@ static auto test_w3_alignment_and_pointer_sizes() -> void
     }
 }
 
+// ===========================================================================
+// EXHAUSTIVE EXPANSION WAVE 4 (44+).
+//
+// WAVES 1-3 pinned the null-array contract, the clamp/cap arithmetic, the
+// entry-struct ABI, and the walk loop (match/skip/terminator/exactness/offset
+// round-trip) over OWNED arrays.  This wave closes the bounds/structure cases
+// those left untouched, ALL over memory THIS TEST OWNS or over PURE-LOGIC
+// predicates fed CONSTANTS -- never a fabricated/unmapped pointer dereference,
+// never a JVM, never the global-reading API driven over a fake array:
+//
+//   * The is_valid_pointer / untag_pointer bound-and-REJECT predicates that gate
+//     EVERY offset-resolution path bottoming out in iterate_* (a resolved
+//     entry->offset is added to a base, and the result is is_valid_pointer-gated
+//     before any deref).  These are pure address arithmetic: drive them with the
+//     EXACT boundary constants from source (user_address_floor == 0xFFFF,
+//     user_address_ceiling == 0x00007FFFFFFFFFFF, odd-address & sentinel
+//     rejection) -- NEVER passing a high pointer to anything that reads memory.
+//   * offset/length JUST-IN / JUST-OUT bound thresholds: a resolved field offset
+//     validated against the owning type's size (offset + member_width <= size),
+//     reconstructed as pure arithmetic over OWNED entry/type values at the exact
+//     in/out boundary -- the plausibility check a static-aware caller applies.
+//   * flags-width EXTRACTION: the int32 classification columns read back as a
+//     packed discriminator from an owned entry (distinct from WAVE 2/3 which only
+//     compared equality).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 44. is_valid_pointer bound-and-reject over CONSTANTS (the offset-resolution
+//     gate).  Every reader that resolves a field via iterate_struct_entries adds
+//     entry->offset to a base and gates the candidate address through
+//     is_valid_pointer before dereferencing.  is_valid_pointer is pure address
+//     arithmetic (vmhook.hpp:2047): it REJECTS addr <= user_address_floor
+//     (0xFFFF), addr >= user_address_ceiling (0x00007FFFFFFFFFFF), odd addresses,
+//     null, and nine debug-sentinel low32 patterns; ACCEPTS an aligned canonical
+//     user-space address.  Drive it with literal CONSTANTS only -- no memory is
+//     ever read, so this is fully POSIX-safe (no fabricated pointer is
+//     dereferenced; the predicate inspects the integer value, not the target).
+// ---------------------------------------------------------------------------
+static auto test_w4_is_valid_pointer_bounds_over_constants() -> void
+{
+    using vmhook::hotspot::is_valid_pointer;
+
+    // Exact boundary constants, derived from vmhook.hpp:515/520.
+    constexpr std::uintptr_t floor_v{ 0xFFFFull };               // user_address_floor
+    constexpr std::uintptr_t ceiling_v{ 0x00007FFFFFFFFFFFull };  // user_address_ceiling
+
+    auto as_ptr = [](std::uintptr_t v) -> const void*
+    { return reinterpret_cast<const void*>(v); };
+
+    // --- null and the low-noise floor: REJECT (addr <= floor).
+    check("w4_ivp_null_rejected", is_valid_pointer(nullptr) == false);
+    check("w4_ivp_one_rejected", is_valid_pointer(as_ptr(1u)) == false);
+    check("w4_ivp_floor_value_rejected", is_valid_pointer(as_ptr(floor_v)) == false);
+    // floor is odd (0xFFFF); use the even value just below to isolate the
+    // <=floor branch from the odd-reject branch -- 0xFFFE is even AND <= floor.
+    check("w4_ivp_just_below_floor_even_rejected",
+          is_valid_pointer(as_ptr(floor_v - 1u)) == false);
+
+    // --- JUST ABOVE the floor: the first even address strictly greater than
+    //     floor is 0x10000 (floor+1 == 0x10000, already even) -- ACCEPT.
+    check("w4_ivp_just_above_floor_accepted",
+          is_valid_pointer(as_ptr(floor_v + 1u)) == true);   // 0x10000, even, in range
+
+    // --- the ceiling and above: REJECT (addr >= ceiling).
+    check("w4_ivp_ceiling_value_rejected", is_valid_pointer(as_ptr(ceiling_v)) == false);
+    check("w4_ivp_above_ceiling_rejected",
+          is_valid_pointer(as_ptr(ceiling_v + 1u)) == false);
+    // JUST BELOW the ceiling: ceiling is odd (...FFF), ceiling-1 is even and in
+    // range -- ACCEPT (the highest accepted address).
+    check("w4_ivp_just_below_ceiling_even_accepted",
+          is_valid_pointer(as_ptr(ceiling_v - 1u)) == true);
+
+    // --- odd-address rejection (addr & 0x1) for an otherwise in-range value.
+    check("w4_ivp_odd_in_range_rejected",
+          is_valid_pointer(as_ptr(0x100001u)) == false);   // odd, in range -> reject
+    check("w4_ivp_even_in_range_accepted",
+          is_valid_pointer(as_ptr(0x100000u)) == true);    // even sibling -> accept
+
+    // --- the nine debug-sentinel low32 patterns (vmhook.hpp:2070-2078): a pointer
+    //     whose low32 equals any of these is NEVER valid.  Each is placed in the
+    //     low 32 bits of an otherwise in-range address (high word 0x1000 keeps it
+    //     between floor and ceiling); every one MUST be rejected.
+    static const std::uint32_t sentinels[]{
+        0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+        0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu,
+    };
+    bool all_sentinels_rejected{ true };
+    bool even_sentinels_via_switch{ true };
+    int sentinel_count{ 0 };
+    int even_sentinel_count{ 0 };
+    for (const std::uint32_t s : sentinels)
+    {
+        ++sentinel_count;
+        // Compose 0x0000'1000'<sentinel>: in range, low32 == the sentinel exactly.
+        const std::uintptr_t composed{
+            (static_cast<std::uintptr_t>(0x1000u) << 32) | s };
+        // The true contract: a sentinel-low32 pointer is never valid (whether it
+        // is the odd-bit gate or the sentinel switch that rejects it).
+        if (is_valid_pointer(as_ptr(composed)) != false) { all_sentinels_rejected = false; }
+
+        // For EVEN sentinels the odd-bit gate passes, so ONLY the sentinel switch
+        // can be responsible for the rejection -- the strongest proof the switch
+        // fires.  (Odd sentinels are rejected earlier by the alignment gate and
+        // can never reach the switch, by construction of is_valid_pointer.)
+        if ((s & 0x1u) == 0u)
+        {
+            ++even_sentinel_count;
+            if (is_valid_pointer(as_ptr(composed)) != false) { even_sentinels_via_switch = false; }
+        }
+    }
+    check("w4_ivp_all_sentinel_low32_rejected", all_sentinels_rejected);
+    check("w4_ivp_even_sentinels_rejected_via_switch", even_sentinels_via_switch);
+    check("w4_ivp_sentinel_count_is_9", sentinel_count == 9);
+    check("w4_ivp_even_sentinel_count_is_3", even_sentinel_count == 3);
+
+    // A plain even in-range address that shares the high word but NOT a sentinel
+    // low32 is accepted -- proving the sentinel switch, not the range, is what
+    // rejects the patterns above.
+    check("w4_ivp_non_sentinel_high_word_accepted",
+          is_valid_pointer(as_ptr((static_cast<std::uintptr_t>(0x1000u) << 32) | 0x2000u))
+              == true);
+}
+
+// ---------------------------------------------------------------------------
+// 45. untag_pointer masks with the user_address_ceiling (vmhook.hpp:2092).
+//
+// A resolved oop pointer can carry high GC tag bits; untag_pointer ANDs the raw
+// value with user_address_ceiling (0x00007FFFFFFFFFFF) to recover the canonical
+// address before it is fed back through is_valid_pointer.  Pure bitmask logic
+// over CONSTANTS -- the result is never dereferenced, only its integer value is
+// checked, so this is POSIX-safe.
+// ---------------------------------------------------------------------------
+static auto test_w4_untag_pointer_mask_over_constants() -> void
+{
+    using vmhook::hotspot::untag_pointer;
+    using vmhook::hotspot::is_valid_pointer;
+
+    constexpr std::uintptr_t ceiling_v{ 0x00007FFFFFFFFFFFull };
+
+    auto as_ptr = [](std::uintptr_t v) -> const void* { return reinterpret_cast<const void*>(v); };
+    auto as_int = [](const void* p) -> std::uintptr_t { return reinterpret_cast<std::uintptr_t>(p); };
+
+    // An already-canonical address is unchanged by the mask.
+    check("w4_untag_canonical_unchanged",
+          as_int(untag_pointer(as_ptr(0x100000u))) == 0x100000u);
+
+    // High tag bits ABOVE the ceiling are stripped: 0xFFFF'<low> & ceiling keeps
+    // only the low 47 bits.  Compose tag bits in the top word that the mask drops.
+    const std::uintptr_t tagged{ 0xFFFF800000100000ull };   // high tag + low 0x100000
+    check("w4_untag_strips_high_tag_bits",
+          as_int(untag_pointer(as_ptr(tagged))) == (tagged & ceiling_v));
+    check("w4_untag_result_within_ceiling",
+          as_int(untag_pointer(as_ptr(tagged))) <= ceiling_v);
+
+    // Masking is idempotent: untag(untag(x)) == untag(x) (the second AND with the
+    // ceiling is a no-op on an already-masked value).
+    const void* once{ untag_pointer(as_ptr(tagged)) };
+    const void* twice{ untag_pointer(once) };
+    check("w4_untag_idempotent", once == twice);
+
+    // The untagged canonical address (here even and in range) is is_valid_pointer
+    // -- proving the untag -> validate handoff the readers rely on, all over a
+    // value that is NEVER dereferenced.
+    const std::uintptr_t untagged_int{ as_int(untag_pointer(as_ptr(0xFFFF800000100000ull))) };
+    check("w4_untag_then_validate_accepts_canonical",
+          (untagged_int == 0x100000u) && is_valid_pointer(as_ptr(untagged_int)) == true);
+}
+
+// ---------------------------------------------------------------------------
+// 46. Resolved-offset JUST-IN / JUST-OUT bound threshold against the owning
+//     type's size.  A static-aware caller that resolves a field offset via
+//     iterate_struct_entries validates `offset + member_width <= type_size`
+//     before computing `base + offset` -- so an offset that would read past the
+//     declared object size is rejected.  Reconstruct that arithmetic over OWNED
+//     vm_struct_entry_t / vm_type_entry_t VALUES at the EXACT in/out boundary; no
+//     memory is read, the offset is never used as a pointer.
+// ---------------------------------------------------------------------------
+static auto test_w4_offset_within_type_size_threshold() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::vm_type_entry_t;
+
+    // An owned type of declared size 24 bytes, and field entries whose offset +
+    // a member width straddle that size.  The member width is taken from the
+    // entry's own type_string sense via an explicit width we control.
+    const vm_type_entry_t owning_type{ "T", nullptr, 0, 0, 0, 24u };
+
+    // The plausibility predicate the caller applies (pure arithmetic).
+    auto fits = [](std::uint64_t offset, std::uint64_t width, std::uint64_t size) -> bool
+    { return offset + width <= size; };
+
+    // member width 8 (a pointer/long field): the last in-bounds offset is 16
+    // (16 + 8 == 24 == size), and 17.. is out.
+    const vm_struct_entry_t just_in{ "T", "_last", "void*", 0, 16u, nullptr };
+    const vm_struct_entry_t just_out{ "T", "_over", "void*", 0, 17u, nullptr };
+    check("w4_offset_just_in_fits",
+          fits(just_in.offset, 8u, owning_type.size) == true);   // 16+8==24
+    check("w4_offset_just_out_rejected",
+          fits(just_out.offset, 8u, owning_type.size) == false); // 17+8==25 > 24
+
+    // Offset exactly at the size with zero width is the empty tail (allowed); one
+    // past the size is rejected even for a zero-width read.
+    check("w4_offset_at_size_zero_width_fits",
+          fits(24u, 0u, owning_type.size) == true);
+    check("w4_offset_past_size_rejected",
+          fits(25u, 0u, owning_type.size) == false);
+
+    // The exact in/out boundary for a 4-byte field: offset 20 fits (20+4==24),
+    // offset 21 does not (21+4==25).
+    check("w4_offset_4byte_just_in",
+          fits(20u, 4u, owning_type.size) == true);
+    check("w4_offset_4byte_just_out",
+          fits(21u, 4u, owning_type.size) == false);
+
+    // A corrupt huge offset: `offset + width` WRAPS in uint64 (UINT64_MAX + 8 == 7),
+    // so a NAIVE `offset + width <= size` test would wrongly accept it -- this is
+    // exactly why a robust caller compares the offset ALONE against the size FIRST.
+    // Demonstrate both: the naive predicate is fooled by the wrap, and the robust
+    // offset-first guard rejects the corrupt offset.
+    check("w4_offset_naive_fits_is_fooled_by_wrap",
+          fits(0xFFFFFFFFFFFFFFFFull, 8u, owning_type.size) == true);   // wrap -> 7 <= 24
+    check("w4_offset_robust_compares_offset_first",
+          (0xFFFFFFFFFFFFFFFFull > owning_type.size) == true);          // offset alone rejects
+
+    // Sanity: a real small instance offset (8, an oop._mark-like slot) is well
+    // within a 16-byte object and fits.
+    const vm_type_entry_t oopdesc_like{ "oopDesc", nullptr, 1, 0, 0, 16u };
+    check("w4_offset_mark_within_oopdesc",
+          fits(8u, 8u, oopdesc_like.size) == true);   // 8+8==16
+}
+
+// ---------------------------------------------------------------------------
+// 47. Flags-width EXTRACTION: read the int32 classification columns of an owned
+//     entry back as a packed 3-bit discriminator.  WAVE 2/3 compared the flags
+//     for equality; here we EXTRACT them bit-by-bit into a composite to prove
+//     each column is an independent, full-width int32 lane that a classifier can
+//     pack -- the operation a type-classification helper performs on a resolved
+//     type entry.  Owned VALUES; no memory read.
+// ---------------------------------------------------------------------------
+static auto test_w4_flags_width_extraction() -> void
+{
+    using vmhook::hotspot::vm_type_entry_t;
+
+    // Pack (is_oop, is_integer, is_unsigned) into a 3-bit code for all 8 combos
+    // and confirm extraction recovers exactly the stored lane in each position.
+    bool extract_ok{ true };
+    for (int code{ 0 }; code <= 7; ++code)
+    {
+        const std::int32_t oop{ (code >> 2) & 1 };
+        const std::int32_t integer{ (code >> 1) & 1 };
+        const std::int32_t uns{ code & 1 };
+        const vm_type_entry_t e{ "T", nullptr, oop, integer, uns, 8u };
+
+        const int recomposed{
+            (static_cast<int>(e.is_oop_type_type) << 2)
+            | (static_cast<int>(e.is_integer_type) << 1)
+            | static_cast<int>(e.is_unsigned) };
+        if (recomposed != code) { extract_ok = false; }
+        // Each lane independently equals the bit we stored.
+        if (e.is_oop_type_type != oop || e.is_integer_type != integer
+            || e.is_unsigned != uns)
+        {
+            extract_ok = false;
+        }
+    }
+    check("w4_flags_3bit_extraction_all_8_codes", extract_ok);
+
+    // The flag lanes are full int32: a column set to a wide non-{0,1} value (a
+    // non-standard JVM could) reads back at full width, not narrowed to a bit.
+    const vm_type_entry_t wide{ "T", nullptr, 0x40000000, 0x1F, -1, 8u };
+    check("w4_flags_full_int32_oop_lane", wide.is_oop_type_type == 0x40000000);
+    check("w4_flags_full_int32_integer_lane", wide.is_integer_type == 0x1F);
+    check("w4_flags_full_int32_unsigned_lane_negative", wide.is_unsigned == -1);
+    // is_static on the struct entry is the same full-width int32 lane.
+    const vmhook::hotspot::vm_struct_entry_t s{ "T", "_f", "ty", 0x7FFFFFFF, 8u, nullptr };
+    check("w4_flags_struct_is_static_full_int32", s.is_static == 0x7FFFFFFF);
+}
+
+// ===========================================================================
+// EXHAUSTIVE EXPANSION WAVE 5 (48+).
+//
+// WAVE 4 (44-47) pinned the is_valid_pointer / untag_pointer bound-and-reject
+// predicates, the offset<=type_size plausibility threshold, and flags-width
+// extraction.  This wave closes three bounds/structure cases NONE of waves 1-4
+// touched, ALL over memory THIS TEST OWNS or over PURE-LOGIC predicates fed
+// CONSTANTS -- never a fabricated/unmapped pointer dereference, never a JVM,
+// never the global-reading API driven over a fake array:
+//
+//   * The terminator/skip ASYMMETRY: the walk loop guard is `entry &&
+//     entry->type_name` and the skip is `if (!entry->field_name) continue;`
+//     (vmhook.hpp:1997-2002).  So a NULL type_name TERMINATES the walk even when
+//     field_name is non-null (a later well-formed entry becomes UNREACHABLE),
+//     while a NULL field_name only SKIPS and the walk continues.  WAVE 2/3
+//     tested the standard terminator and the standalone skip, but never this
+//     asymmetry -- a guard that accidentally keyed termination on field_name (or
+//     the skip on type_name) would mis-walk a real array and is caught here.
+//   * is_readable_pointer's pure-arithmetic PREFILTER (vmhook.hpp:2018-2028):
+//     it returns false for addr <= floor, addr >= ceiling, OR non-8-byte-aligned
+//     addr BEFORE it ever calls query_region.  Drive ONLY the rejected branch
+//     with constants (those return false without touching memory -- POSIX-safe);
+//     never the accept branch (which would query a fabricated region).  This
+//     pins that is_readable_pointer's alignment gate is STRICTER (8-byte) than
+//     is_valid_pointer's (2-byte) -- the tighter bound the readable check adds.
+//   * clamp-count vs validity-gate INDEPENDENCE: the two bound disciplines a
+//     walk uses together (clamp the trip count, validity-gate each address) are
+//     disjoint predicates over disjoint domains; a walk bounded by BOTH is
+//     doubly safe and neither gate interferes with the other.  Pure arithmetic.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 48. Struct/type walk terminator keys on type_name ONLY (not field_name).
+//
+// The loop guard `entry && entry->type_name` ends the walk on a NULL type_name
+// regardless of the other columns; the `if (!entry->field_name) continue;` skip
+// only removes a single entry and does NOT end the walk.  Pin both halves of
+// this asymmetry over OWNED arrays (every char* is a string literal or nullptr):
+// a null-type_name entry with a NON-null field_name terminates (a later real
+// entry is unreachable), while a null-field_name entry merely skips and the walk
+// reaches the later real entry.  The type walk (no field column) terminates on a
+// null type_name even when superclass_name is non-null.
+// ---------------------------------------------------------------------------
+static auto test_w5_terminator_keys_on_type_name_only() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::vm_type_entry_t;
+
+    // [1] has NULL type_name but a NON-null field_name -> the guard terminates
+    // the walk at [1], so the well-formed entry [2] AFTER it is UNREACHABLE.
+    static const vm_struct_entry_t early_term[]{
+        { "Symbol", "_length", "int",     0,  8u, nullptr },  // [0] match (before term)
+        { nullptr,  "_field",  "ty",      0,  0u, nullptr },  // [1] terminator (null type)
+        { "Klass",  "_name",   "Symbol*", 1, 16u, nullptr },  // [2] UNREACHABLE
+        { nullptr,  nullptr,   nullptr,   0,  0u, nullptr },
+    };
+    check("w5_term_entry_before_null_type_found",
+          wave3_offset_resolution::find_struct(early_term, "Symbol", "_length")
+              == &early_term[0]);
+    // [2] is past the null-type_name terminator -> never found despite being
+    // a perfectly well-formed (type,field) pair.
+    check("w5_term_null_type_with_field_ends_walk",
+          wave3_offset_resolution::find_struct(early_term, "Klass", "_name") == nullptr);
+
+    // Contrast: a null-FIELD entry only SKIPS; the walk continues past it and
+    // reaches the later real entry (the skip is NOT a terminator).
+    static const vm_struct_entry_t skip_not_term[]{
+        { "A", nullptr, "ty",  0,  0u, nullptr },  // [0] skipped (null field)
+        { "B", "_b",    "int", 0, 24u, nullptr },  // [1] reachable past the skip
+        { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+    };
+    check("w5_term_null_field_only_skips_not_terminates",
+          wave3_offset_resolution::find_struct(skip_not_term, "B", "_b")
+              == &skip_not_term[1]);
+    // The skipped entry's own type is unmatchable for ANY field (it is removed
+    // from the matchable set, never terminating the walk).
+    check("w5_term_skipped_entry_type_unmatchable",
+          wave3_offset_resolution::find_struct(skip_not_term, "A", "_b") == nullptr);
+
+    // Type walk: terminator is a null type_name even with a non-null
+    // superclass_name; the entry after it is unreachable.
+    static const vm_type_entry_t t_term[]{
+        { "oopDesc", "Base", 1, 0, 0, 16u },  // [0] match
+        { nullptr,   "Base", 0, 0, 0,  0u },  // [1] terminator (null type)
+        { "Klass",   "Base", 0, 0, 0, 64u },  // [2] UNREACHABLE
+        { nullptr,   nullptr, 0, 0, 0, 0u },
+    };
+    check("w5_type_term_entry_before_null_found",
+          wave3_offset_resolution::find_type(t_term, "oopDesc") == &t_term[0]);
+    check("w5_type_term_null_type_with_superclass_ends_walk",
+          wave3_offset_resolution::find_type(t_term, "Klass") == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 49. is_readable_pointer pure-arithmetic PREFILTER -- REJECTED branch only.
+//
+// is_readable_pointer (vmhook.hpp:2018-2028) short-circuits to false when
+// addr <= user_address_floor (0xFFFF), addr >= user_address_ceiling
+// (0x00007FFFFFFFFFFF), OR (addr & 0x7) != 0 -- BEFORE it ever calls
+// query_region.  Drive ONLY those rejected cases with literal CONSTANTS: each
+// returns false without touching memory, so this is fully POSIX-safe (HARD RULE
+// 2 -- we never reach the accept branch, which would query a fabricated region).
+// The 8-byte-alignment gate is STRICTER than is_valid_pointer's 2-byte gate: an
+// address accepted by is_valid_pointer (even, in-window) but only 2-/4-aligned
+// is still REJECTED by is_readable_pointer -- the tighter bound it adds.
+// ---------------------------------------------------------------------------
+static auto test_w5_is_readable_pointer_prefilter_rejects() -> void
+{
+    using vmhook::hotspot::is_readable_pointer;
+    using vmhook::hotspot::is_valid_pointer;
+
+    constexpr std::uintptr_t floor_v{ 0xFFFFull };
+    constexpr std::uintptr_t ceiling_v{ 0x00007FFFFFFFFFFFull };
+    auto as_ptr = [](std::uintptr_t v) -> const void*
+    { return reinterpret_cast<const void*>(v); };
+
+    // --- null and the low-noise floor: rejected by `addr <= floor` (no query).
+    check("w5_readable_null_rejected", is_readable_pointer(nullptr) == false);
+    check("w5_readable_floor_rejected", is_readable_pointer(as_ptr(floor_v)) == false);
+    // An 8-aligned value below the floor still rejected by the <=floor branch.
+    check("w5_readable_below_floor_aligned_rejected",
+          is_readable_pointer(as_ptr(0x8000u)) == false);   // 0x8000 <= 0xFFFF, 8-aligned
+
+    // --- the ceiling and above: rejected by `addr >= ceiling` (no query).
+    check("w5_readable_ceiling_rejected", is_readable_pointer(as_ptr(ceiling_v)) == false);
+    // An 8-aligned value at/above the ceiling: 0x0000800000000000 > ceiling.
+    check("w5_readable_above_ceiling_aligned_rejected",
+          is_readable_pointer(as_ptr(0x0000800000000000ull)) == false);
+
+    // --- the 8-byte-alignment gate: an in-window address whose low 3 bits are
+    //     non-zero is rejected BEFORE any region query.  Sweep offsets 1..7 off
+    //     an 8-aligned in-window base; every misaligned one is rejected.
+    const std::uintptr_t base8{ 0x0000100000000000ull };   // in-window, 8-aligned
+    bool misaligned_all_rejected{ true };
+    for (std::uintptr_t off{ 1 }; off <= 7u; ++off)
+    {
+        if (is_readable_pointer(as_ptr(base8 + off)) != false)
+        {
+            misaligned_all_rejected = false;
+        }
+    }
+    check("w5_readable_misaligned_1_to_7_all_rejected", misaligned_all_rejected);
+
+    // --- the alignment gate is STRICTER than is_valid_pointer's: a 4-aligned
+    //     (but not 8-aligned), even, in-window, non-sentinel address is ACCEPTED
+    //     by is_valid_pointer yet REJECTED by is_readable_pointer's prefilter
+    //     (its `addr & 0x7` is non-zero).  base8+4 == ...0004: even -> valid
+    //     accepts; low 3 bits 0b100 -> readable rejects (no query reached).
+    const std::uintptr_t four_aligned{ base8 + 4u };
+    check("w5_valid_accepts_4aligned_even",
+          is_valid_pointer(as_ptr(four_aligned)) == true);
+    check("w5_readable_rejects_4aligned_stricter",
+          is_readable_pointer(as_ptr(four_aligned)) == false);
+
+    // base8+2 (2-aligned only): same story -- valid accepts, readable rejects.
+    check("w5_valid_accepts_2aligned_even",
+          is_valid_pointer(as_ptr(base8 + 2u)) == true);
+    check("w5_readable_rejects_2aligned_stricter",
+          is_readable_pointer(as_ptr(base8 + 2u)) == false);
+}
+
+// ---------------------------------------------------------------------------
+// 50. clamp-count vs validity-gate INDEPENDENCE (two disjoint bound disciplines).
+//
+// A walk bounds its trip COUNT with clamp_safe_container_count and its each
+// ADDRESS with is_valid_pointer.  The two predicates operate on disjoint domains
+// (a signed count vs a pointer's integer value) and never interfere: an honest
+// count + a valid base are both admitted, a corrupt count saturates while a
+// sentinel base is independently rejected, and the degenerate inputs (negative
+// count, null pointer) are each refused by their own gate.  Pure arithmetic; no
+// address is ever dereferenced.
+// ---------------------------------------------------------------------------
+static auto test_w5_clamp_and_validity_independence() -> void
+{
+    using vmhook::clamp_safe_container_count;
+    using vmhook::hotspot::is_valid_pointer;
+    auto as_ptr = [](std::uintptr_t v) -> const void*
+    { return reinterpret_cast<const void*>(v); };
+
+    // Honest count clamps to itself AND a valid (even, in-window, non-sentinel)
+    // base passes -- a well-formed walk of clamp(n) elements over a valid base is
+    // admitted by both gates.
+    const std::int32_t honest_n{ 4096 };
+    check("w5_honest_count_and_valid_ptr_both_admitted",
+          clamp_safe_container_count(honest_n) == honest_n
+              && is_valid_pointer(as_ptr(0x0000100000000000ull)) == true);
+
+    // Corrupt count saturates to the cap AND a debug-sentinel base is rejected --
+    // a corrupt walk is stopped by EITHER gate independently.  Sentinel composed
+    // as in-window high word | DEADBEEF low32 (the value is never dereferenced).
+    const std::uintptr_t sentinel{ (static_cast<std::uintptr_t>(0x1000u) << 32)
+                                    | 0xDEADBEEFu };
+    check("w5_corrupt_count_saturates_and_sentinel_ptr_rejected",
+          clamp_safe_container_count((std::numeric_limits<std::int32_t>::max)()) == k_cap
+              && is_valid_pointer(as_ptr(sentinel)) == false);
+
+    // Degenerate inputs: a negative count clamps to 0 (no walk) and a null
+    // pointer is invalid (no deref) -- each gate refuses its own degenerate case.
+    check("w5_negative_count_zero_and_null_ptr_invalid",
+          clamp_safe_container_count(-1) == 0
+              && is_valid_pointer(nullptr) == false);
+
+    // The clamp result is ALWAYS a legal trip count in [0, cap] regardless of the
+    // pointer gate's verdict -- the two bounds are computed independently.
+    bool independent{ true };
+    static const std::int32_t counts[]{ -100, -1, 0, 1, 7, 4096, k_cap, k_cap + 1,
+                                        (std::numeric_limits<std::int32_t>::max)() };
+    for (const std::int32_t n : counts)
+    {
+        const std::int32_t c{ clamp_safe_container_count(n) };
+        if (c < 0 || c > k_cap) { independent = false; }
+    }
+    check("w5_clamp_count_in_range_independent_of_ptr_gate", independent);
+}
+
 int main()
 {
     test_getters_cache_no_jvm();
@@ -2568,6 +3061,13 @@ int main()
     test_w3_embedded_nul_key_stops_at_first_nul();
     test_w3_walk_determinism_populated();
     test_w3_alignment_and_pointer_sizes();
+    test_w4_is_valid_pointer_bounds_over_constants();
+    test_w4_untag_pointer_mask_over_constants();
+    test_w4_offset_within_type_size_threshold();
+    test_w4_flags_width_extraction();
+    test_w5_terminator_keys_on_type_name_only();
+    test_w5_is_readable_pointer_prefilter_rejects();
+    test_w5_clamp_and_validity_independence();
 
     return failures == 0 ? 0 : 1;
 }

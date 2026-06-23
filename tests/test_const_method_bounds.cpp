@@ -73,7 +73,9 @@
 // iOS where there is no fault-safe probe).
 #include <vmhook/vmhook.hpp>
 
+#include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -2312,6 +2314,609 @@ int main()
             check("dw_getbase_8aligned_this_and_header_yields_8aligned_slots",
                   ptr_size != 8u || all_slots_8aligned);
         }
+    }
+
+    // =====================================================================
+    // DEEPEN-DX.  (ADDITIVE, "dx_" namespace.)  The VMStruct ENTRY ABI the
+    //    whole feature reads through.  get_base() crosses entry->size of a
+    //    vmhook::hotspot::vm_type_entry_t (vmhook.hpp :2334/:2343) and
+    //    get_length()/get_constants()/get_name()/get_signature() cross
+    //    entry->offset of a vmhook::hotspot::vm_struct_entry_t
+    //    (:2365/:2379, :2402, :2441, :2520).  The C++ structs MUST match the
+    //    gHotSpotVMTypes / gHotSpotVMStructs C ABI member-for-member or every
+    //    offset/size read lands on the wrong field.  These structs are
+    //    declared at :1880-1899; we pin their member ORDER, member WIDTHS,
+    //    standard-layout-ness, and the byte offset of the two members the
+    //    feature actually dereferences (vm_type_entry_t::size,
+    //    vm_struct_entry_t::offset).  Pure offsetof/sizeof/type_traits over a
+    //    qualified type - no JVM, no memory read, no fabricated address.
+    // =====================================================================
+    {
+        using vmhook::hotspot::vm_type_entry_t;
+        using vmhook::hotspot::vm_struct_entry_t;
+
+        // DX1. Both entry structs must be standard-layout so offsetof is
+        // well-defined and the C++ mirror is bit-compatible with the C struct
+        // HotSpot exports (the library reinterpret_casts gHotSpotVMTypes /
+        // gHotSpotVMStructs straight into these, :1933/:1956).
+        check("dx_vm_type_entry_is_standard_layout",
+              std::is_standard_layout_v<vm_type_entry_t>);
+        check("dx_vm_struct_entry_is_standard_layout",
+              std::is_standard_layout_v<vm_struct_entry_t>);
+
+        // DX2. vm_type_entry_t member ORDER and WIDTHS, exactly as declared
+        // (:1882-1887):
+        //   const char* type_name; const char* superclass_name;
+        //   int32 is_oop_type_type; int32 is_integer_type; int32 is_unsigned;
+        //   uint64 size;
+        check("dx_type_entry_type_name_is_charptr",
+              std::is_same_v<decltype(vm_type_entry_t::type_name), const char*>);
+        check("dx_type_entry_superclass_name_is_charptr",
+              std::is_same_v<decltype(vm_type_entry_t::superclass_name), const char*>);
+        check("dx_type_entry_is_oop_is_int32",
+              std::is_same_v<decltype(vm_type_entry_t::is_oop_type_type), std::int32_t>);
+        check("dx_type_entry_is_integer_is_int32",
+              std::is_same_v<decltype(vm_type_entry_t::is_integer_type), std::int32_t>);
+        check("dx_type_entry_is_unsigned_is_int32",
+              std::is_same_v<decltype(vm_type_entry_t::is_unsigned), std::int32_t>);
+        check("dx_type_entry_size_is_uint64",
+              std::is_same_v<decltype(vm_type_entry_t::size), std::uint64_t>);
+
+        // The `size` member - the one get_base() reads - must come AFTER the
+        // two pointers and three int32s.  Pin its offset by the declared order
+        // (member offsets are monotonic in declaration order for a
+        // standard-layout type, [class.mem]).
+        check("dx_type_entry_size_after_type_name",
+              offsetof(vm_type_entry_t, size) > offsetof(vm_type_entry_t, type_name));
+        check("dx_type_entry_size_after_superclass",
+              offsetof(vm_type_entry_t, size) > offsetof(vm_type_entry_t, superclass_name));
+        check("dx_type_entry_size_after_is_unsigned",
+              offsetof(vm_type_entry_t, size) > offsetof(vm_type_entry_t, is_unsigned));
+        check("dx_type_entry_members_in_declared_order",
+              offsetof(vm_type_entry_t, type_name) < offsetof(vm_type_entry_t, superclass_name)
+                  && offsetof(vm_type_entry_t, superclass_name) < offsetof(vm_type_entry_t, is_oop_type_type)
+                  && offsetof(vm_type_entry_t, is_oop_type_type) < offsetof(vm_type_entry_t, is_integer_type)
+                  && offsetof(vm_type_entry_t, is_integer_type) < offsetof(vm_type_entry_t, is_unsigned)
+                  && offsetof(vm_type_entry_t, is_unsigned) < offsetof(vm_type_entry_t, size));
+        // type_name is the FIRST member, so its offset is 0 (the iterate loop
+        // reads entry->type_name first, :1973).
+        check("dx_type_entry_type_name_offset_is_zero",
+              offsetof(vm_type_entry_t, type_name) == 0u);
+
+        // DX3. vm_struct_entry_t member ORDER and WIDTHS, exactly as declared
+        // (:1893-1898):
+        //   const char* type_name; const char* field_name; const char* type_string;
+        //   int32 is_static; uint64 offset; void* address;
+        check("dx_struct_entry_type_name_is_charptr",
+              std::is_same_v<decltype(vm_struct_entry_t::type_name), const char*>);
+        check("dx_struct_entry_field_name_is_charptr",
+              std::is_same_v<decltype(vm_struct_entry_t::field_name), const char*>);
+        check("dx_struct_entry_type_string_is_charptr",
+              std::is_same_v<decltype(vm_struct_entry_t::type_string), const char*>);
+        check("dx_struct_entry_is_static_is_int32",
+              std::is_same_v<decltype(vm_struct_entry_t::is_static), std::int32_t>);
+        check("dx_struct_entry_offset_is_uint64",
+              std::is_same_v<decltype(vm_struct_entry_t::offset), std::uint64_t>);
+        check("dx_struct_entry_address_is_voidptr",
+              std::is_same_v<decltype(vm_struct_entry_t::address), void*>);
+        // type_name then field_name are the first two members - the iterate
+        // loop reads both for the strcmp match (:2003) and the field_name-null
+        // skip (:1999); pin their relative order and that type_name is offset 0.
+        check("dx_struct_entry_type_name_offset_is_zero",
+              offsetof(vm_struct_entry_t, type_name) == 0u);
+        check("dx_struct_entry_field_name_after_type_name",
+              offsetof(vm_struct_entry_t, field_name) > offsetof(vm_struct_entry_t, type_name));
+        check("dx_struct_entry_members_in_declared_order",
+              offsetof(vm_struct_entry_t, type_name) < offsetof(vm_struct_entry_t, field_name)
+                  && offsetof(vm_struct_entry_t, field_name) < offsetof(vm_struct_entry_t, type_string)
+                  && offsetof(vm_struct_entry_t, type_string) < offsetof(vm_struct_entry_t, is_static)
+                  && offsetof(vm_struct_entry_t, is_static) < offsetof(vm_struct_entry_t, offset)
+                  && offsetof(vm_struct_entry_t, offset) < offsetof(vm_struct_entry_t, address));
+        // The `offset` member - the one get_length()/get_constants() read -
+        // must follow the three pointers and the int32.
+        check("dx_struct_entry_offset_after_type_string",
+              offsetof(vm_struct_entry_t, offset) > offsetof(vm_struct_entry_t, type_string));
+        check("dx_struct_entry_offset_after_is_static",
+              offsetof(vm_struct_entry_t, offset) > offsetof(vm_struct_entry_t, is_static));
+    }
+
+    // =====================================================================
+    // DEEPEN-DY.  (ADDITIVE, "dy_" namespace.)  The VMStruct TABLE-WALK
+    //    find-and-reject logic of iterate_type_entries (vmhook.hpp :1964-1979)
+    //    and iterate_struct_entries (:1990-2009).  These are the bound-and-
+    //    reject lookups every accessor in the feature funnels through to turn
+    //    a type/field name into an entry.  With no JVM the real functions take
+    //    their null-table branch (covered in DY3); the DECISION LOGIC of the
+    //    walk - terminator-stops, the documented field_name-null SKIP guard
+    //    (:1999, a real partial-entry crash-fix), the name-arg null early-out
+    //    (:1967 / :1993), and the strcmp match/miss - is exercised here as a
+    //    faithful re-implementation swept over a STUBBED, OWNED std::array of
+    //    entries (the spec written twice, exactly as section A does for the
+    //    length bound).  NOTHING dereferences a fabricated address: the table
+    //    is a real std::array we own; the c-strings are real string literals.
+    // =====================================================================
+    {
+        using vmhook::hotspot::vm_type_entry_t;
+        using vmhook::hotspot::vm_struct_entry_t;
+
+        // Faithful local re-implementation of iterate_type_entries' walk
+        // (:1964-1979): null name -> nullptr; else scan until a null type_name
+        // terminator, returning the first strcmp-equal entry, nullptr on miss.
+        auto find_type = [](vm_type_entry_t* table, const char* type_name) -> vm_type_entry_t*
+        {
+            if (!type_name) { return nullptr; }                                   // :1967
+            for (vm_type_entry_t* e{ table }; e && e->type_name; ++e)             // :1971 terminator
+            {
+                if (!std::strcmp(e->type_name, type_name)) { return e; }          // :1973 match
+            }
+            return nullptr;                                                       // :1978 miss
+        };
+        // Faithful local re-implementation of iterate_struct_entries' walk
+        // (:1990-2009): null type OR null field -> nullptr; scan to terminator,
+        // SKIP any entry whose field_name is null (:1999 partial-entry guard),
+        // return the first (type,field) strcmp-equal entry, nullptr on miss.
+        auto find_struct = [](vm_struct_entry_t* table, const char* type_name, const char* field_name) -> vm_struct_entry_t*
+        {
+            if (!type_name || !field_name) { return nullptr; }                    // :1993
+            for (vm_struct_entry_t* e{ table }; e && e->type_name; ++e)           // :1997 terminator
+            {
+                if (!e->field_name) { continue; }                                 // :1999 SKIP null field
+                if (!std::strcmp(e->type_name, type_name)
+                    && !std::strcmp(e->field_name, field_name)) { return e; }     // :2003 match
+            }
+            return nullptr;                                                       // :2008 miss
+        };
+
+        // DY1. find_type over an OWNED, terminated type table.  Entries mirror
+        // the real ConstantPool type entry get_base() looks up (size is the
+        // member it reads, :2343).  Last entry is the {nullptr,...} terminator.
+        {
+            std::array<vm_type_entry_t, 4> types{ {
+                { "InstanceKlass", nullptr, 0, 0, 0, 296u },
+                { "ConstantPool",  nullptr, 0, 0, 0,  80u }, // header size get_base() adds
+                { "Method",        nullptr, 0, 0, 0,  64u },
+                { nullptr,         nullptr, 0, 0, 0,   0u }, // terminator
+            } };
+
+            vm_type_entry_t* const cp{ find_type(types.data(), "ConstantPool") };
+            check("dy_find_type_hits_constantpool", cp != nullptr);
+            check("dy_find_type_returns_correct_entry",
+                  cp != nullptr && cp->size == 80u); // the size get_base() crosses
+            check("dy_find_type_first_entry_match",
+                  find_type(types.data(), "InstanceKlass") == &types[0]);
+            check("dy_find_type_middle_entry_match",
+                  find_type(types.data(), "ConstantPool") == &types[1]);
+
+            // Miss: a name not present stops at the terminator -> nullptr.
+            check("dy_find_type_miss_returns_null",
+                  find_type(types.data(), "NoSuchType") == nullptr);
+            // Null name -> early-out nullptr (:1967), never walks the table.
+            check("dy_find_type_null_name_returns_null",
+                  find_type(types.data(), nullptr) == nullptr);
+            // A case-different name does NOT match (strcmp is exact).
+            check("dy_find_type_case_sensitive_miss",
+                  find_type(types.data(), "constantpool") == nullptr);
+            // An EMPTY table (just the terminator) -> nullptr for any name, no
+            // out-of-bounds read (the loop never enters past entry[0]).
+            {
+                std::array<vm_type_entry_t, 1> empty{ { { nullptr, nullptr, 0, 0, 0, 0u } } };
+                check("dy_find_type_empty_table_returns_null",
+                      find_type(empty.data(), "ConstantPool") == nullptr);
+            }
+        }
+
+        // DY2. find_struct over an OWNED, terminated struct table, INCLUDING a
+        // partial entry whose field_name is null (the exact corruption the
+        // :1999 guard was added for: a custom JVM/JVMTI agent publishing
+        // type_name set, field_name null - strcmp(nullptr,x) would crash).
+        {
+            std::array<vm_struct_entry_t, 6> structs{ {
+                { "ConstantPool", "_length",          "int",  0,  16u, nullptr },
+                { "ConstantPool", nullptr,            "int",  0,  20u, nullptr }, // partial: SKIP
+                { "ConstMethod",  "_constants",       "ptr",  0,   8u, nullptr },
+                { "ConstMethod",  "_name_index",      "u2",   0,  40u, nullptr },
+                { "ConstMethod",  "_signature_index", "u2",   0,  42u, nullptr },
+                { nullptr,        nullptr,            nullptr, 0,  0u, nullptr }, // terminator
+            } };
+
+            // The exact field get_length() looks up (:2365) -> entry with the
+            // offset (16) it then reads from (:2379).
+            vm_struct_entry_t* const len{ find_struct(structs.data(), "ConstantPool", "_length") };
+            check("dy_find_struct_hits_cp_length", len != nullptr);
+            check("dy_find_struct_returns_correct_offset",
+                  len != nullptr && len->offset == 16u);
+            check("dy_find_struct_cp_length_is_first_entry",
+                  find_struct(structs.data(), "ConstantPool", "_length") == &structs[0]);
+
+            // The field get_constants() looks up (:2402).
+            check("dy_find_struct_hits_constmethod_constants",
+                  find_struct(structs.data(), "ConstMethod", "_constants") == &structs[2]);
+            // The fields get_name()/get_signature() look up (:2441/:2520).
+            check("dy_find_struct_hits_name_index",
+                  find_struct(structs.data(), "ConstMethod", "_name_index") == &structs[3]);
+            check("dy_find_struct_hits_signature_index",
+                  find_struct(structs.data(), "ConstMethod", "_signature_index") == &structs[4]);
+
+            // The PARTIAL entry (structs[1], field_name == nullptr) is SKIPPED,
+            // not matched and not crashed-on.  A lookup for a field that only
+            // the partial entry's type carries must still resolve via the real
+            // entries and must NEVER strcmp the null field_name.  Reaching this
+            // assertion at all proves the null field_name did not fault.
+            check("dy_find_struct_skips_null_field_name_entry_no_fault", true);
+            // A field that does not exist on ConstantPool (only the skipped
+            // partial shares its type) -> miss, having safely stepped over the
+            // null field_name entry.
+            check("dy_find_struct_miss_past_partial_entry_returns_null",
+                  find_struct(structs.data(), "ConstantPool", "_tags") == nullptr);
+
+            // Both-name and field-mismatch cases:
+            check("dy_find_struct_wrong_type_right_field_miss",
+                  find_struct(structs.data(), "Method", "_length") == nullptr);
+            check("dy_find_struct_right_type_wrong_field_miss",
+                  find_struct(structs.data(), "ConstantPool", "_nope") == nullptr);
+
+            // Null-arg early-outs (:1993): EITHER null short-circuits to nullptr
+            // before the walk - so a null field_name argument never reaches the
+            // strcmp, distinct from a table entry whose field_name is null.
+            check("dy_find_struct_null_type_arg_returns_null",
+                  find_struct(structs.data(), nullptr, "_length") == nullptr);
+            check("dy_find_struct_null_field_arg_returns_null",
+                  find_struct(structs.data(), "ConstantPool", nullptr) == nullptr);
+            check("dy_find_struct_both_null_args_returns_null",
+                  find_struct(structs.data(), nullptr, nullptr) == nullptr);
+
+            // A table that is ONLY a leading partial entry then the terminator:
+            // the walk skips the partial and stops -> nullptr, no fault.
+            {
+                std::array<vm_struct_entry_t, 2> only_partial{ {
+                    { "ConstantPool", nullptr, "int", 0, 99u, nullptr }, // SKIP
+                    { nullptr,        nullptr, nullptr, 0, 0u, nullptr }, // terminator
+                } };
+                check("dy_find_struct_only_partial_then_term_returns_null",
+                      find_struct(only_partial.data(), "ConstantPool", "_length") == nullptr);
+            }
+        }
+
+        // DY3. The REAL library walk under no-JVM: gHotSpotVMStructs /
+        // gHotSpotVMTypes are unresolved, so get_vm_types()/get_vm_structs()
+        // return nullptr and the loop never enters (entry starts null).  Pin
+        // the documented null-table contract AND the null-arg early-outs on the
+        // genuine entry points, plus cache-stability over many calls (the
+        // resolved pointer is a function-local static, :1924/:1947).
+        check("dy_real_iterate_type_constantpool_no_jvm_null",
+              vmhook::hotspot::iterate_type_entries("ConstantPool") == nullptr);
+        check("dy_real_iterate_type_null_arg_null",
+              vmhook::hotspot::iterate_type_entries(nullptr) == nullptr);
+        check("dy_real_iterate_struct_cp_length_no_jvm_null",
+              vmhook::hotspot::iterate_struct_entries("ConstantPool", "_length") == nullptr);
+        check("dy_real_iterate_struct_null_type_arg_null",
+              vmhook::hotspot::iterate_struct_entries(nullptr, "_length") == nullptr);
+        check("dy_real_iterate_struct_null_field_arg_null",
+              vmhook::hotspot::iterate_struct_entries("ConstantPool", nullptr) == nullptr);
+        // Cache-stable + no-fault across many calls (the no-JVM table miss must
+        // be deterministic, never opportunistically resolve to garbage).
+        {
+            bool type_stable{ true };
+            bool struct_stable{ true };
+            for (int i{ 0 }; i < 1000; ++i)
+            {
+                if (vmhook::hotspot::iterate_type_entries("ConstantPool") != nullptr) { type_stable = false; }
+                if (vmhook::hotspot::iterate_struct_entries("ConstantPool", "_length") != nullptr) { struct_stable = false; }
+            }
+            check("dy_real_iterate_type_cache_stable_1000_calls", type_stable);
+            check("dy_real_iterate_struct_cache_stable_1000_calls", struct_stable);
+        }
+        // Signatures: the find primitives return the entry-pointer types the
+        // feature's accessors consume.
+        check("dy_real_iterate_type_returns_type_entry_ptr",
+              std::is_same_v<decltype(vmhook::hotspot::iterate_type_entries("ConstantPool")),
+                             vmhook::hotspot::vm_type_entry_t*>);
+        check("dy_real_iterate_struct_returns_struct_entry_ptr",
+              std::is_same_v<decltype(vmhook::hotspot::iterate_struct_entries("ConstantPool", "_length")),
+                             vmhook::hotspot::vm_struct_entry_t*>);
+        check("dy_real_iterate_type_is_noexcept",
+              noexcept(vmhook::hotspot::iterate_type_entries("ConstantPool")));
+        check("dy_real_iterate_struct_is_noexcept",
+              noexcept(vmhook::hotspot::iterate_struct_entries("ConstantPool", "_length")));
+    }
+
+    // =====================================================================
+    // DEEPEN-DZ.  (ADDITIVE, "dz_" namespace.)  The OFFSET/SIZE-RESOLUTION
+    //    arithmetic the two accessors apply once an entry is found, and the
+    //    JDK-8 FieldInfo Array<u2> RECORD-ABI / flags-width extraction that
+    //    feeds the field-path CP reads.  All derived from source; all over
+    //    OWNED buffers or pure arithmetic on synthetic aligned addresses (no
+    //    deref of any fabricated pointer).
+    //
+    //    get_base():  reinterpret_cast<void**>((uint8_t*)this + entry->size)  (:2343)
+    //    get_length(): safe_read of int32 at (uint8_t*)this + entry->offset   (:2379)
+    //    The Array<u2> record (JDK 8..20, :4121-4165):
+    //      header int32 _length at +0, u2 data at +4 (:4125 - the LIVE offset,
+    //         NOT the +8 a stale comment at :4099 mentions);
+    //      6 slots/record: 0 access_flags, 1 name_index, 2 signature_index,
+    //         3 initval_index, 4 low_packed, 5 high_packed (:4128-4133);
+    //      offset = ((high_packed<<16)|low_packed) >> 2  (FIELDINFO_TAG_SIZE=2, :4162-4163);
+    //      is_static = (access_flags & 0x0008) != 0  (:4165).
+    // =====================================================================
+    {
+        // DZ1. get_base() size-resolution: base == this + entry->size, computed
+        // through a STUBBED vm_type_entry_t (the real struct, with size set to
+        // the planted header size) exactly as :2343 does, over an OWNED buffer.
+        {
+            std::array<std::uint8_t, 256> buf{};
+            std::uint8_t* const self{ buf.data() };
+            const std::uint64_t header_sizes[]{ 56u, 64u, 80u, 96u, 112u, 128u };
+            bool base_offset_exact{ true };
+            for (const std::uint64_t H : header_sizes)
+            {
+                vmhook::hotspot::vm_type_entry_t entry{ "ConstantPool", nullptr, 0, 0, 0, H };
+                // The library expression at :2343, verbatim.
+                void** const base{ reinterpret_cast<void**>(self + entry.size) };
+                const std::uintptr_t base_addr{ reinterpret_cast<std::uintptr_t>(base) };
+                const std::uintptr_t self_addr{ reinterpret_cast<std::uintptr_t>(self) };
+                if (base_addr != self_addr + H) { base_offset_exact = false; }
+            }
+            check("dz_getbase_size_resolution_matches_this_plus_entry_size", base_offset_exact);
+        }
+
+        // DZ2. get_length() offset-resolution: the int32 _length lives at
+        // this + entry->offset (:2379).  Build an OWNED buffer with a known
+        // int32 planted at a chosen offset, set a stubbed vm_struct_entry_t's
+        // offset to match, and confirm reading at (uint8_t*)buf + entry.offset
+        // recovers the planted value - the arithmetic get_length() performs.
+        {
+            std::array<std::uint8_t, 64> buf{};
+            const std::uint64_t cp_length_offset{ 16u };
+            const std::int32_t planted_length{ 0x0001'2345 };
+            std::memcpy(buf.data() + cp_length_offset, &planted_length, sizeof(planted_length));
+
+            vmhook::hotspot::vm_struct_entry_t entry{ "ConstantPool", "_length", "int", 0, cp_length_offset, nullptr };
+            std::int32_t read_back{ -1 };
+            std::memcpy(&read_back, buf.data() + entry.offset, sizeof(read_back));
+            check("dz_getlength_offset_resolution_recovers_planted_int32",
+                  read_back == planted_length);
+            // And the recovered length feeds the bound exactly as get_length()'s
+            // return does: a planted length of 0x12345 admits index 0x12344 and
+            // rejects index 0x12345 (the field-path u32 compare, :3905).
+            check("dz_getlength_planted_length_admits_last_valid_index",
+                  read_back > 0 && static_cast<std::uint32_t>(planted_length - 1) < static_cast<std::uint32_t>(read_back));
+            check("dz_getlength_planted_length_rejects_edge_index",
+                  static_cast<std::uint32_t>(planted_length) >= static_cast<std::uint32_t>(read_back));
+        }
+
+        // DZ3. Array<u2> FieldInfo RECORD ABI (JDK 8..20).  Build an OWNED
+        // u2 buffer laid out exactly as :4121-4133: int32 _length header at +0,
+        // u2 records at +4, 6 slots each.  Read the name_index / sig_index the
+        // field-path feeds to resolve_constant_pool_symbol, the access_flags
+        // static bit, and the packed offset reconstruction - all at the exact
+        // slot indices and with the exact shifts the source uses.
+        {
+            // Two field records.  Slot layout per record:
+            //   [0]=access_flags [1]=name_index [2]=sig_index
+            //   [3]=initval_index [4]=low_packed [5]=high_packed
+            // Record 0: a static field (flags bit 3 set), name 7, sig 9,
+            //           packed offset value 0x40 (so low/high encode 0x40<<2).
+            // Record 1: an instance field (flags bit 3 clear), name 11, sig 13,
+            //           packed offset value 0x108.
+            const std::uint32_t want_offset_0{ 0x40u };
+            const std::uint32_t want_offset_1{ 0x108u };
+            const std::uint32_t packed_0{ want_offset_0 << 2 };  // inverse of >>2 (:4163)
+            const std::uint32_t packed_1{ want_offset_1 << 2 };
+
+            const std::uint16_t records[2][6]{
+                // flags(static=0x0008), name, sig, initval, low_packed, high_packed
+                { 0x0009u, 7u, 9u, 0u,
+                  static_cast<std::uint16_t>(packed_0 & 0xFFFFu),
+                  static_cast<std::uint16_t>((packed_0 >> 16) & 0xFFFFu) },
+                { 0x0001u, 11u, 13u, 0u,
+                  static_cast<std::uint16_t>(packed_1 & 0xFFFFu),
+                  static_cast<std::uint16_t>((packed_1 >> 16) & 0xFFFFu) },
+            };
+
+            // Backing buffer: 4 header bytes + 12 u2 slots (two 6-slot records).
+            std::array<std::uint8_t, 4u + 12u * sizeof(std::uint16_t)> fields_array{};
+            const std::int32_t array_length{ 2 * 6 }; // 12 u2 slots, no trailing count
+            std::memcpy(fields_array.data(), &array_length, sizeof(array_length));
+            std::memcpy(fields_array.data() + 4, records, sizeof(records)); // data at +4 (:4125)
+
+            // The library's data pointer (:4125): (uint8_t*)fields_array + 4.
+            const std::uint16_t* const data{
+                reinterpret_cast<const std::uint16_t*>(fields_array.data() + 4) };
+
+            static const std::int32_t field_slots{ 6 }; // :4111
+            const std::int32_t records_iterated{ array_length / field_slots }; // :4134 loop bound
+            check("dz_array_u2_loop_iterates_two_records", records_iterated == 2);
+
+            // Record 0: pull each slot at the EXACT index the source uses.
+            {
+                const std::int32_t r{ 0 };
+                const std::uint16_t access_flags{ data[r * field_slots + 0] }; // :4153
+                const std::uint16_t name_index{ data[r * field_slots + 1] };   // :4136
+                const std::uint16_t sig_index{ data[r * field_slots + 2] };    // :4154
+                const std::uint16_t low_packed{ data[r * field_slots + 4] };   // :4155
+                const std::uint16_t high_packed{ data[r * field_slots + 5] };  // :4156
+                const std::uint32_t packed{ (static_cast<std::uint32_t>(high_packed) << 16) | low_packed }; // :4162
+                const std::uint32_t offset{ packed >> 2 };                     // :4163
+                const bool is_static{ (access_flags & 0x0008u) != 0u };        // :4165
+
+                check("dz_record0_name_index_at_slot1", name_index == 7u);
+                check("dz_record0_sig_index_at_slot2", sig_index == 9u);
+                check("dz_record0_packed_offset_reconstructs", offset == want_offset_0);
+                check("dz_record0_static_flag_bit3_set", is_static);
+                // The name/sig indices are exactly what the field path hands to
+                // resolve_constant_pool_symbol; both are non-zero (real fields),
+                // so guard (0) admits them and a length bound > 9 keeps them in.
+                check("dz_record0_indices_pass_field_helper_guard0",
+                      name_index != 0u && sig_index != 0u);
+            }
+            // Record 1: instance field, different indices/offset.
+            {
+                const std::int32_t r{ 1 };
+                const std::uint16_t access_flags{ data[r * field_slots + 0] };
+                const std::uint16_t name_index{ data[r * field_slots + 1] };
+                const std::uint16_t sig_index{ data[r * field_slots + 2] };
+                const std::uint16_t low_packed{ data[r * field_slots + 4] };
+                const std::uint16_t high_packed{ data[r * field_slots + 5] };
+                const std::uint32_t packed{ (static_cast<std::uint32_t>(high_packed) << 16) | low_packed };
+                const std::uint32_t offset{ packed >> 2 };
+                const bool is_static{ (access_flags & 0x0008u) != 0u };
+
+                check("dz_record1_name_index_at_slot1", name_index == 11u);
+                check("dz_record1_sig_index_at_slot2", sig_index == 13u);
+                check("dz_record1_packed_offset_reconstructs", offset == want_offset_1);
+                check("dz_record1_instance_flag_bit3_clear", !is_static);
+            }
+
+            // DZ4. The record-walk loop bound (:4134, field_slot_index <
+            // array_length / field_slots) never reads past the buffer: the
+            // highest slot the LAST iterated record touches is
+            // (records_iterated-1)*6 + 5, which must be < array_length.
+            const std::int32_t highest_slot{ (records_iterated - 1) * field_slots + 5 };
+            check("dz_array_u2_last_record_highest_slot_in_bounds",
+                  highest_slot < array_length);
+            // And the data pointer sits at +4, so the byte span the last slot
+            // touches is within our OWNED backing buffer.
+            const std::size_t last_slot_byte_end{
+                4u + static_cast<std::size_t>(highest_slot + 1) * sizeof(std::uint16_t) };
+            check("dz_array_u2_last_slot_within_owned_buffer",
+                  last_slot_byte_end <= fields_array.size());
+
+            // DZ5. The JDK-8 trailing _java_fields_count case: array_length =
+            // records*6 + 1; integer division floors the partial trailing slot
+            // away so the loop iterates exactly `records` records (:4115/:4134).
+            {
+                const std::int32_t with_trailing{ 2 * field_slots + 1 }; // 13
+                check("dz_array_u2_trailing_count_floored_by_division",
+                      (with_trailing / field_slots) == 2);
+                const std::int32_t last_touched{ (with_trailing / field_slots - 1) * field_slots + 5 };
+                check("dz_array_u2_trailing_count_last_record_in_bounds",
+                      last_touched < with_trailing);
+            }
+        }
+
+        // DZ6. The static-flag mask (0x0008 = ACC_STATIC, bit 3) extraction
+        // width: it is read out of a u2 access_flags slot, so only the low 16
+        // bits matter and the test `(flags & 0x0008) != 0` is a pure bit test.
+        // Pin the mask value and the extraction across the bit-3 boundary.
+        {
+            check("dz_acc_static_mask_is_bit3", (0x0008u == (1u << 3)));
+            // bit 3 set in various surrounding flag words -> static.
+            const std::uint16_t static_words[]{ 0x0008u, 0x0009u, 0x000Au, 0x0018u, 0xFFFFu };
+            bool all_static{ true };
+            for (const std::uint16_t w : static_words)
+            {
+                if ((w & 0x0008u) == 0u) { all_static = false; }
+            }
+            check("dz_acc_static_bit3_set_words_are_static", all_static);
+            // bit 3 clear -> instance, even with every OTHER low bit set.
+            const std::uint16_t instance_words[]{ 0x0000u, 0x0001u, 0x0002u, 0x0004u, 0x0007u, 0xFFF7u };
+            bool none_static{ true };
+            for (const std::uint16_t w : instance_words)
+            {
+                if ((w & 0x0008u) != 0u) { none_static = false; }
+            }
+            check("dz_acc_static_bit3_clear_words_are_instance", none_static);
+            // 0xFFF7 == ~0x0008 in 16 bits: every flag bit EXCEPT static set,
+            // so the mask isolates exactly bit 3 and nothing else.
+            check("dz_acc_static_mask_isolates_only_bit3",
+                  static_cast<std::uint16_t>(0xFFFFu & ~0x0008u) == 0xFFF7u
+                      && (0xFFF7u & 0x0008u) == 0u);
+        }
+    }
+
+    // =====================================================================
+    // DEEPEN-EA.  (ADDITIVE, "ea_" namespace.)  The OTHER access-flags width
+    //    the feature surface depends on: the JIT-inhibit mask NO_COMPILE
+    //    (vmhook.hpp :7579-7583) and the mask-equality predicate
+    //    safe_access_flags_test/or/and apply (`(flags & mask) == mask`,
+    //    :2796 / :2836 / :2884).  DZ6 pinned the u2 ACC_STATIC bit (0x0008)
+    //    the FIELD path reads; this pins the u4 high-byte compile-control bits
+    //    the METHOD path's deopt/re-arm/teardown read-modify-write, which DZ
+    //    does not touch.  All pure integer arithmetic over the REAL library
+    //    constant vmhook::hotspot::NO_COMPILE - no JVM, no memory read, no
+    //    fabricated address; the constant is consumed straight from source so
+    //    a value/width drift reddens a NAMED check here.
+    // =====================================================================
+    {
+        const std::uint32_t no_compile{ static_cast<std::uint32_t>(vmhook::hotspot::NO_COMPILE) };
+
+        // EA1. NO_COMPILE is exactly the OR of the four documented bits
+        //   (:7558-7561): JVM_ACC_NOT_C2_COMPILABLE (0x02000000),
+        //   JVM_ACC_NOT_C1_COMPILABLE (0x04000000),
+        //   JVM_ACC_NOT_C2_OSR_COMPILABLE (0x08000000), JVM_ACC_QUEUED (0x01000000).
+        constexpr std::uint32_t NOT_C2{ 0x02000000u };
+        constexpr std::uint32_t NOT_C1{ 0x04000000u };
+        constexpr std::uint32_t NOT_C2_OSR{ 0x08000000u };
+        constexpr std::uint32_t QUEUED{ 0x01000000u };
+        check("ea_no_compile_is_or_of_four_compile_control_bits",
+              no_compile == (NOT_C2 | NOT_C1 | NOT_C2_OSR | QUEUED));
+        check("ea_no_compile_value_is_0x0F000000", no_compile == 0x0F000000u);
+        // The constant is declared `const std::int32_t` (:7579) and is a positive
+        // value (high bit 31 clear), so the static_cast to u32 is value-preserving.
+        check("ea_no_compile_decl_type_is_int32",
+              std::is_same_v<decltype(vmhook::hotspot::NO_COMPILE), const std::int32_t>);
+        check("ea_no_compile_is_positive", vmhook::hotspot::NO_COMPILE > 0);
+
+        // EA2. Bit POSITIONS: the four bits are 24..27 (the high byte of the
+        //   historical u4 AccessFlags, :7564); none below bit 24.
+        check("ea_no_compile_bits_are_24_through_27",
+              no_compile == ((std::uint32_t{ 1u } << 24) | (std::uint32_t{ 1u } << 25)
+                             | (std::uint32_t{ 1u } << 26) | (std::uint32_t{ 1u } << 27)));
+        // EA3. The whole mask lives in the HIGH u2 of the u4 word: AND with the
+        //   low 16 bits is zero.  This is why a JDK 24+ build that shrank
+        //   _access_flags to u2 (:7566-7568) sees NONE of these bits - the OR
+        //   lands in the alignment padding above the surviving u2 (a no-op, not
+        //   corruption).  Pin the "entirely in the high half" property.
+        check("ea_no_compile_disjoint_from_low_u2", (no_compile & 0x0000FFFFu) == 0u);
+        // EA4. NO_COMPILE is DISJOINT from the field path's ACC_STATIC (0x0008,
+        //   bit 3): the two flag families never alias, so ORing NO_COMPILE on a
+        //   method can never flip a static-modifier bit and vice versa.
+        check("ea_no_compile_disjoint_from_acc_static",
+              (no_compile & 0x0008u) == 0u);
+
+        // EA5. The mask-equality predicate `(flags & mask) == mask` the three
+        //   safe_access_flags_* helpers share (:2796/:2836/:2884): it returns
+        //   true IFF EVERY bit of mask is present in flags.  Model it and pin the
+        //   accept/reject cases the watchdog drift check and teardown rely on.
+        auto all_bits_set = [](std::uint32_t flags, std::uint32_t mask) -> bool
+        {
+            return (flags & mask) == mask;
+        };
+        // Exactly the four bits set -> all present -> true.
+        check("ea_flags_all_no_compile_bits_set_passes",
+              all_bits_set(no_compile, no_compile));
+        // A superset (NO_COMPILE plus unrelated bits) still passes - the test is
+        // "are these bits set", not "are ONLY these bits set".
+        check("ea_flags_superset_passes",
+              all_bits_set(no_compile | 0x0008u | 0x0001u, no_compile));
+        // Missing ANY single one of the four bits -> fails (the drift check then
+        // treats NO_COMPILE as not-fully-set and re-arms).
+        check("ea_flags_missing_not_c2_fails",   !all_bits_set(no_compile & ~NOT_C2, no_compile));
+        check("ea_flags_missing_not_c1_fails",   !all_bits_set(no_compile & ~NOT_C1, no_compile));
+        check("ea_flags_missing_osr_fails",      !all_bits_set(no_compile & ~NOT_C2_OSR, no_compile));
+        check("ea_flags_missing_queued_fails",   !all_bits_set(no_compile & ~QUEUED, no_compile));
+        // A word with only unrelated bits (no NO_COMPILE bits at all) -> fails.
+        check("ea_flags_only_unrelated_bits_fails",
+              !all_bits_set(0x0008u | 0x0001u, no_compile));
+        // Zero flags -> fails for any non-zero mask.
+        check("ea_flags_zero_fails", !all_bits_set(0u, no_compile));
+
+        // EA6. The teardown AND-clear mask `~NO_COMPILE` (used by
+        //   safe_access_flags_and via the library's `~vmhook::hotspot::NO_COMPILE`
+        //   call sites, :11294 / :11391): clearing it from a word that has NONE of
+        //   its bits is a no-op (the masked word equals the original); from a word
+        //   WITH them, it drops exactly those bits and preserves the rest.
+        const std::uint32_t clear_mask{ static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE) };
+        // A word with NO NO_COMPILE bits: AND with ~NO_COMPILE is identity.
+        check("ea_clear_mask_noop_when_bits_absent",
+              (0x0008u & clear_mask) == 0x0008u);
+        // A word WITH NO_COMPILE bits: AND with ~NO_COMPILE drops exactly them.
+        check("ea_clear_mask_drops_exactly_no_compile",
+              ((no_compile | 0x0008u) & clear_mask) == 0x0008u);
+        // ~NO_COMPILE preserves the entire low u2 (the static modifier survives a
+        // compile-control teardown).
+        check("ea_clear_mask_preserves_low_u2",
+              (clear_mask & 0x0000FFFFu) == 0x0000FFFFu);
     }
 
     if (failures == 0)

@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -2200,6 +2201,403 @@ static auto test_mfw_deep_precedence_truth_table() -> void
     }
 }
 
+// =========================================================================
+//  DEEPENING WAVE 2 -- namespaced additive section (mfw_deep2).
+//
+//  ADDITIVE ONLY: touches none of the functions above.  Covers bounds /
+//  structure-logic cases the prior passes did not reach, all values traced
+//  directly from vmhook.hpp source:
+//    * iterate_struct_entries(type,field)  (vmhook.hpp:1990-2008) -- null-arg
+//      rejects + no-JVM (gHotSpotVMStructs null) -> ALWAYS nullptr.
+//    * iterate_type_entries(type)           (vmhook.hpp:1964-1979) -- same.
+//    * resolve_method_flags_slot(method*)   (vmhook.hpp:7510-7552) -- null/invalid
+//      this -> default slot; no JVM -> entries null -> evidence empty ->
+//      derive !confident -> default slot.
+//    * resolve_constant_pool_symbol(base,index,cp_length) (vmhook.hpp:3898-3919)
+//      -- EARLY rejects (index==0 OR !is_valid_pointer(base)) BEFORE any read,
+//      then the in-bounds reject (cp_length>=0 && index>=cp_length).
+//    * vm_struct_entry_t / vm_type_entry_t ABI (vmhook.hpp:1880-1899) --
+//      standard-layout, member offsetof ordering, sizeof relationships.
+//    * is_valid_pointer floor=0xFFFF / ceiling=0x00007FFFFFFFFFFF
+//      (vmhook.os::user_address_floor / _ceiling, vmhook.hpp:515/520).
+//
+//  POSIX-safety: NO fabricated mapped address is ever dereferenced.  Pointer
+//  inputs go ONLY to (a) is_valid_pointer / the iterate_* + resolve_* guards
+//  that decide on the integer value or a null gHotSpotVMStructs BEFORE any
+//  read, or (b) resolve_constant_pool_symbol's EARLY reject path (index==0 or
+//  an is_valid_pointer-rejected base) which returns before the line-3909
+//  is_readable_pointer/raw-read.  We NEVER hand it a valid base + nonzero
+//  in-range index (that would reach the raw read).  Everything else is pure
+//  arithmetic / offsetof / std::is_standard_layout / owned-buffer.
+// =========================================================================
+namespace mfw_deep2
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::vm_type_entry_t;
+
+    // OWNED, fully-initialised stub tables (NOT the JVM global).  Used only for
+    // ABI/layout assertions and for proving the struct shape the linear scan in
+    // iterate_struct_entries walks; never passed to any accessor that reads the
+    // JVM symbol.  Terminator = all-zero entry (matches HotSpot's convention).
+    constexpr vm_struct_entry_t make_struct_entry(const char* t, const char* f,
+                                                  const char* ts, std::uint64_t off)
+    {
+        return vm_struct_entry_t{ t, f, ts, /*is_static*/ 0, off, /*address*/ nullptr };
+    }
+}
+
+// -- E1. iterate_struct_entries: NULL-ARG + NO-JVM nullptr contract. ---------
+//  Both args are guarded (vmhook.hpp:1993).  With no JVM the global is null so
+//  EVERY well-formed lookup also yields nullptr.  Pure: decided before deref.
+static auto test_mfw_deep2_iterate_struct_null_and_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+
+    // (a) null type / null field / both null -> nullptr (the explicit guard).
+    check("mfw_deep2_iterate_struct_null_type_returns_null",
+          iterate_struct_entries(nullptr, "_flags") == nullptr);
+    check("mfw_deep2_iterate_struct_null_field_returns_null",
+          iterate_struct_entries("Method", nullptr) == nullptr);
+    check("mfw_deep2_iterate_struct_both_null_returns_null",
+          iterate_struct_entries(nullptr, nullptr) == nullptr);
+
+    // (b) Well-formed lookups with NO JVM: gHotSpotVMStructs is null -> nullptr
+    //     for the two fields THIS feature owns and a representative neighbour.
+    check("mfw_deep2_iterate_struct_method_flags_no_jvm_null",
+          iterate_struct_entries("Method", "_flags") == nullptr);
+    check("mfw_deep2_iterate_struct_method_intrinsic_id_no_jvm_null",
+          iterate_struct_entries("Method", "_intrinsic_id") == nullptr);
+    check("mfw_deep2_iterate_struct_method_access_flags_no_jvm_null",
+          iterate_struct_entries("Method", "_access_flags") == nullptr);
+
+    // (c) An empty type/field string is NOT the null guard -- it is searched and,
+    //     with no JVM, still resolves to nullptr (no entry has empty names).
+    check("mfw_deep2_iterate_struct_empty_strings_no_jvm_null",
+          iterate_struct_entries("", "") == nullptr);
+}
+
+// -- E2. iterate_type_entries: NULL-ARG + NO-JVM nullptr contract. -----------
+static auto test_mfw_deep2_iterate_type_null_and_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_type_entries;
+    check("mfw_deep2_iterate_type_null_returns_null",
+          iterate_type_entries(nullptr) == nullptr);
+    check("mfw_deep2_iterate_type_method_no_jvm_null",
+          iterate_type_entries("Method") == nullptr);
+    check("mfw_deep2_iterate_type_constantpool_no_jvm_null",
+          iterate_type_entries("ConstantPool") == nullptr);
+    check("mfw_deep2_iterate_type_empty_string_no_jvm_null",
+          iterate_type_entries("") == nullptr);
+}
+
+// -- E3. resolve_method_flags_slot: OFFSET-RESOLUTION null-when-no-JVM. -------
+//  The live bridge.  null/invalid this -> default slot (before any VMStruct
+//  read).  An in-range OWNED buffer this -> entries null (no JVM) -> evidence
+//  empty -> derive !confident -> default slot.  Every return is the all-zero
+//  default {nullptr,0,0,false}; the address is NEVER buffer-derived here.
+static auto test_mfw_deep2_resolve_slot_no_jvm() -> void
+{
+    using vmhook::hotspot::resolve_method_flags_slot;
+
+    auto is_default = [](const vmhook::hotspot::method_flags_slot& s) -> bool
+    {
+        return s.address == nullptr && s.width_bytes == 0
+            && s.dont_inline_bit == 0 && !s.confident;
+    };
+
+    // (a) null this -> default slot (the !method_pointer guard, vmhook.hpp:7513).
+    check("mfw_deep2_resolve_slot_null_this_default",
+          is_default(resolve_method_flags_slot(nullptr)));
+
+    // (b) invalid this (odd, in-range) -> rejected by is_valid_pointer -> default.
+    {
+        auto* const bogus{ reinterpret_cast<const vmhook::hotspot::method*>(
+            static_cast<std::uintptr_t>(0x10001ull)) };  // >floor, <ceiling, ODD
+        check("mfw_deep2_resolve_slot_invalid_odd_this_default",
+              is_default(resolve_method_flags_slot(bogus)));
+    }
+
+    // (c) below-floor this -> rejected by is_valid_pointer -> default (no deref).
+    {
+        auto* const low{ reinterpret_cast<const vmhook::hotspot::method*>(
+            static_cast<std::uintptr_t>(0x100ull)) };
+        check("mfw_deep2_resolve_slot_below_floor_this_default",
+              is_default(resolve_method_flags_slot(low)));
+    }
+
+    // (d) in-range OWNED buffer this (VALID pointer) -> no JVM -> entries null ->
+    //     evidence empty -> derive !confident -> default slot; the address is the
+    //     all-zero default (NOT base+offset) because the slot was refused.
+    {
+        alignas(16) std::array<std::uint8_t, 64> owned{};
+        owned.fill(0x00);
+        auto* const as_method{ reinterpret_cast<const vmhook::hotspot::method*>(owned.data()) };
+        const vmhook::hotspot::method_flags_slot slot{ resolve_method_flags_slot(as_method) };
+        check("mfw_deep2_resolve_slot_valid_this_no_jvm_default", is_default(slot));
+        // Specifically: the refused slot's address is NULL, never owned.data()+off.
+        check("mfw_deep2_resolve_slot_refused_address_is_null_not_base",
+              slot.address == nullptr);
+    }
+}
+
+// -- E4. resolve_constant_pool_symbol: EARLY-REJECT bound paths (POSIX-safe). -
+//  Source order (vmhook.hpp:3901-3905):
+//    1. index==0 OR !is_valid_pointer(base) -> nullptr  (BEFORE any deref)
+//    2. cp_length>=0 && index>=cp_length    -> nullptr
+//  We exercise ONLY paths that return at step 1 (no read crosses to step 3).
+static auto test_mfw_deep2_cp_symbol_early_rejects() -> void
+{
+    using vmhook::hotspot::klass;
+
+    // (a) index==0 short-circuits regardless of base -> nullptr.  Pass null base
+    //     so even if the guard order changed it stays POSIX-safe.
+    check("mfw_deep2_cp_symbol_index0_null_base_null",
+          klass::resolve_constant_pool_symbol(nullptr, /*index*/ 0u, /*cp_len*/ 100) == nullptr);
+
+    // (a') index==0 with an is_valid_pointer-REJECTED base: still returns at the
+    //      index==0 clause; the base is never dereferenced.
+    {
+        auto* const bad_base{ reinterpret_cast<void**>(static_cast<std::uintptr_t>(0x10001ull)) }; // odd
+        check("mfw_deep2_cp_symbol_index0_bad_base_null",
+              klass::resolve_constant_pool_symbol(bad_base, 0u, 100) == nullptr);
+    }
+
+    // (b) nonzero index but NULL base -> is_valid_pointer(nullptr)==false ->
+    //     nullptr at step 1, no deref.
+    check("mfw_deep2_cp_symbol_nonzero_index_null_base_null",
+          klass::resolve_constant_pool_symbol(nullptr, /*index*/ 5u, /*cp_len*/ 100) == nullptr);
+
+    // (c) nonzero index but INVALID (odd / below-floor / sentinel) base -> step-1
+    //     reject via is_valid_pointer, no deref.  Each base is decided purely on
+    //     its integer value.
+    {
+        const std::uintptr_t bad_bases[]{
+            0x1ull,                                   // below floor
+            0xFFFFull,                                // == floor (rejected by <=)
+            0x10001ull,                               // in-range but ODD
+            (std::uintptr_t{ 0x1ull } << 32) | 0xDEADBEEFull, // in-range even, low32 sentinel
+            0x0000800000000000ull,                    // == ceiling (rejected by >=)
+        };
+        bool all_reject{ true };
+        for (const std::uintptr_t b : bad_bases)
+        {
+            auto* const base{ reinterpret_cast<void**>(b) };
+            if (klass::resolve_constant_pool_symbol(base, /*index*/ 3u, /*cp_len*/ 100) != nullptr)
+            {
+                all_reject = false;
+                break;
+            }
+        }
+        check("mfw_deep2_cp_symbol_invalid_bases_all_reject_no_deref", all_reject);
+    }
+}
+
+// -- E5. resolve_constant_pool_symbol: IN-BOUNDS THRESHOLD logic (pure model). -
+//  The bound clause is `cp_length>=0 && index>=cp_length` -> reject.  We cannot
+//  drive the live function past step 1 without a real base (POSIX), so pin the
+//  EXACT threshold arithmetic the source uses as a standalone predicate, plus
+//  the just-in / just-out edges and the negative-cp_length "unbounded" case.
+static auto test_mfw_deep2_cp_bound_threshold_logic() -> void
+{
+    // Mirror of the source predicate (vmhook.hpp:3905): the index is OUT OF
+    // BOUNDS (rejected) iff cp_length is non-negative AND index >= cp_length.
+    auto out_of_bounds = [](std::uint32_t index, std::int32_t cp_length) -> bool
+    {
+        return cp_length >= 0 && index >= static_cast<std::uint32_t>(cp_length);
+    };
+
+    // Threshold sweep around cp_length == 8: indices 0..7 in-bounds, 8.. out.
+    constexpr std::int32_t cp_length{ 8 };
+    bool sweep_ok{ true };
+    for (std::uint32_t i{ 1u }; i <= 12u; ++i)  // index 0 never reaches this clause
+    {
+        const bool expect_oob{ i >= 8u };
+        if (out_of_bounds(i, cp_length) != expect_oob) { sweep_ok = false; break; }
+    }
+    check("mfw_deep2_cp_bound_threshold_sweep_around_8", sweep_ok);
+
+    // Just-in (index == cp_length-1) accepted; just-out (index == cp_length) rejected.
+    check("mfw_deep2_cp_bound_just_in_accepted", !out_of_bounds(7u, 8));
+    check("mfw_deep2_cp_bound_just_out_rejected", out_of_bounds(8u, 8));
+    check("mfw_deep2_cp_bound_one_past_rejected", out_of_bounds(9u, 8));
+
+    // cp_length == 0: every nonzero index is out of bounds (0 >= 0 is the edge,
+    // but index reaching this clause is always >= 1 since index==0 short-circuits).
+    check("mfw_deep2_cp_bound_zero_length_rejects_index1", out_of_bounds(1u, 0));
+
+    // Negative cp_length == "length unknown / unbounded": the clause is SKIPPED
+    // (cp_length>=0 is false), so NO index is rejected by the bound check.
+    check("mfw_deep2_cp_bound_negative_length_skips_bound_check",
+          !out_of_bounds(1u, -1) && !out_of_bounds(0xFFFFFFFFu, -1));
+
+    // The maximum representable index never wraps the comparison (unsigned domain).
+    check("mfw_deep2_cp_bound_max_index_out_of_bounds_when_bounded",
+          out_of_bounds(0xFFFFFFFFu, 100));
+}
+
+// -- E6. vm_struct_entry_t / vm_type_entry_t ABI + MEMBER-ORDER LAYOUT. -------
+//  The linear scan in iterate_struct_entries advances by `++entry` over an array
+//  of these PODs and reads ->type_name / ->field_name / ->type_string / ->offset.
+//  Pin the standard-layout property + the exact member ordering (offsetof) the
+//  scan and the offset-arithmetic rely on.  All compile-time / qualified-type.
+static auto test_mfw_deep2_vmstruct_abi_layout() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::vm_type_entry_t;
+
+    // Standard-layout is what makes ++entry over the JVM-exported C array legal.
+    check("mfw_deep2_vmstruct_is_standard_layout",
+          std::is_standard_layout<vm_struct_entry_t>::value);
+    check("mfw_deep2_vmtype_is_standard_layout",
+          std::is_standard_layout<vm_type_entry_t>::value);
+
+    // Member ORDER (vmhook.hpp:1891-1899): type_name, field_name, type_string,
+    // is_static, offset, address -- strictly increasing offsetof.
+    check("mfw_deep2_vmstruct_member_order",
+          offsetof(vm_struct_entry_t, type_name)   < offsetof(vm_struct_entry_t, field_name)
+          && offsetof(vm_struct_entry_t, field_name)  < offsetof(vm_struct_entry_t, type_string)
+          && offsetof(vm_struct_entry_t, type_string) < offsetof(vm_struct_entry_t, is_static)
+          && offsetof(vm_struct_entry_t, is_static)   < offsetof(vm_struct_entry_t, offset)
+          && offsetof(vm_struct_entry_t, offset)      < offsetof(vm_struct_entry_t, address));
+
+    // The first three members are the const char* trio strcmp walks; pin their type.
+    check("mfw_deep2_vmstruct_name_members_are_const_char_ptr",
+          std::is_same<decltype(vm_struct_entry_t::type_name), const char*>::value
+          && std::is_same<decltype(vm_struct_entry_t::field_name), const char*>::value
+          && std::is_same<decltype(vm_struct_entry_t::type_string), const char*>::value);
+
+    // offset is u64 (the value resolve_method_flags_slot feeds into base+offset and
+    // the derivation does intrinsic-4 on); address is void*.
+    check("mfw_deep2_vmstruct_offset_is_u64_address_is_voidptr",
+          std::is_same<decltype(vm_struct_entry_t::offset), std::uint64_t>::value
+          && std::is_same<decltype(vm_struct_entry_t::address), void*>::value);
+
+    // vm_type_entry_t order (vmhook.hpp:1880-1888): type_name, superclass_name,
+    // is_oop_type_type, is_integer_type, is_unsigned, size -- and size is u64.
+    check("mfw_deep2_vmtype_member_order",
+          offsetof(vm_type_entry_t, type_name)       < offsetof(vm_type_entry_t, superclass_name)
+          && offsetof(vm_type_entry_t, superclass_name) < offsetof(vm_type_entry_t, is_oop_type_type)
+          && offsetof(vm_type_entry_t, is_oop_type_type) < offsetof(vm_type_entry_t, is_integer_type)
+          && offsetof(vm_type_entry_t, is_integer_type)  < offsetof(vm_type_entry_t, is_unsigned)
+          && offsetof(vm_type_entry_t, is_unsigned)      < offsetof(vm_type_entry_t, size));
+    check("mfw_deep2_vmtype_size_is_u64",
+          std::is_same<decltype(vm_type_entry_t::size), std::uint64_t>::value);
+
+    // The whole struct is at least large enough to hold its members contiguously
+    // (a single entry stride for the ++entry walk must cover the last member).
+    check("mfw_deep2_vmstruct_size_covers_last_member",
+          sizeof(vm_struct_entry_t) >= offsetof(vm_struct_entry_t, address) + sizeof(void*));
+    check("mfw_deep2_vmtype_size_covers_last_member",
+          sizeof(vm_type_entry_t) >= offsetof(vm_type_entry_t, size) + sizeof(std::uint64_t));
+}
+
+// -- E7. OWNED stub-table linear-scan MODEL (the strcmp scan, no JVM symbol). --
+//  iterate_struct_entries walks gHotSpotVMStructs with ++entry until a null
+//  type_name terminator, skipping null field_name entries, matching on BOTH
+//  type_name and field_name by strcmp.  We CANNOT redirect the real function to
+//  our array (it reads the JVM global), so we model the IDENTICAL scan over an
+//  OWNED std::array and pin the match / skip / terminate / bound behaviour --
+//  the structure logic the real scan implements, with no fabricated address.
+namespace
+{
+    // Re-implementation of iterate_struct_entries's scan body over an OWNED,
+    // null-terminated table (byte-for-byte the same predicate as vmhook.hpp:1997).
+    const vmhook::hotspot::vm_struct_entry_t*
+    scan_owned_table(const vmhook::hotspot::vm_struct_entry_t* table,
+                     const char* type_name, const char* field_name)
+    {
+        if (!type_name || !field_name) { return nullptr; }
+        for (const vmhook::hotspot::vm_struct_entry_t* e{ table }; e && e->type_name; ++e)
+        {
+            if (!e->field_name) { continue; }
+            if (!std::strcmp(e->type_name, type_name) && !std::strcmp(e->field_name, field_name))
+            {
+                return e;
+            }
+        }
+        return nullptr;
+    }
+}
+
+static auto test_mfw_deep2_owned_table_scan_model() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+
+    // An owned table with: a matching Method::_flags entry, a Method::_access_flags
+    // entry, a PARTIAL entry (type set, field_name null -> must be SKIPPED), and a
+    // zero terminator.  Index [2] deliberately precedes the real target to prove
+    // the null-field_name skip does not abort the scan.
+    const std::array<vm_struct_entry_t, 5> table{ {
+        mfw_deep2::make_struct_entry("Method", "_access_flags", "AccessFlags", 32),
+        mfw_deep2::make_struct_entry("ConstMethod", "_constants", "ConstantPool*", 16),
+        mfw_deep2::make_struct_entry("Method", nullptr, "u2", 44),   // partial -> skip
+        mfw_deep2::make_struct_entry("Method", "_flags", "u2", 44),  // the real target
+        vm_struct_entry_t{ nullptr, nullptr, nullptr, 0, 0, nullptr }, // terminator
+    } };
+
+    // Match on BOTH type and field: returns the right entry, with the right offset.
+    {
+        const vm_struct_entry_t* hit{ scan_owned_table(table.data(), "Method", "_flags") };
+        check("mfw_deep2_scan_finds_method_flags",
+              hit != nullptr && hit->offset == 44u
+              && std::strcmp(hit->type_string, "u2") == 0);
+    }
+    {
+        const vm_struct_entry_t* hit{ scan_owned_table(table.data(), "Method", "_access_flags") };
+        check("mfw_deep2_scan_finds_method_access_flags",
+              hit != nullptr && hit->offset == 32u);
+    }
+
+    // The null-field_name partial entry [2] is SKIPPED, not matched, and does not
+    // stop the scan from reaching the real _flags at [3] (proven above).  A lookup
+    // whose field matches ONLY the partial entry's (absent) field finds nothing.
+    check("mfw_deep2_scan_skips_partial_entry_no_false_match",
+          scan_owned_table(table.data(), "Method", "_nonexistent_field") == nullptr);
+
+    // Right type + wrong field, and wrong type + right field, both miss (BOTH must
+    // strcmp-match) -- the two-key bound the scan enforces.
+    check("mfw_deep2_scan_right_type_wrong_field_misses",
+          scan_owned_table(table.data(), "Method", "_constants") == nullptr);
+    check("mfw_deep2_scan_wrong_type_right_field_misses",
+          scan_owned_table(table.data(), "Klass", "_flags") == nullptr);
+
+    // Null-arg guard mirrors the real function.
+    check("mfw_deep2_scan_null_args_return_null",
+          scan_owned_table(table.data(), nullptr, "_flags") == nullptr
+          && scan_owned_table(table.data(), "Method", nullptr) == nullptr);
+
+    // The zero terminator STOPS the scan: a type that appears NOWHERE returns
+    // nullptr (the loop exits on e->type_name == nullptr, not by overrun).
+    check("mfw_deep2_scan_terminator_stops_unknown_type",
+          scan_owned_table(table.data(), "NoSuchType", "_x") == nullptr);
+}
+
+// -- E8. is_valid_pointer boundary thresholds the slot/cp guards depend on. ---
+//  resolve_method_flags_slot AND resolve_constant_pool_symbol both gate on
+//  is_valid_pointer.  Pin the exact just-in / just-out edges at BOTH the floor
+//  (0xFFFF) and ceiling (0x00007FFFFFFFFFFF), purely on integer value.
+static auto test_mfw_deep2_is_valid_pointer_thresholds() -> void
+{
+    using vmhook::hotspot::is_valid_pointer;
+    auto p = [](std::uintptr_t v) -> const void* { return reinterpret_cast<const void*>(v); };
+
+    // Floor: addr <= 0xFFFF rejected; the first EVEN addr strictly above accepted.
+    check("mfw_deep2_ivp_at_floor_rejected",       !is_valid_pointer(p(0xFFFFull)));
+    check("mfw_deep2_ivp_floor_plus_1_odd_rejected", !is_valid_pointer(p(0x10000ull + 1ull)));
+    check("mfw_deep2_ivp_floor_plus_1_even_accepted", is_valid_pointer(p(0x10000ull)));
+
+    // Ceiling: addr >= ceiling rejected; the largest EVEN addr below it accepted.
+    check("mfw_deep2_ivp_at_ceiling_rejected",  !is_valid_pointer(p(0x00007FFFFFFFFFFFull)));
+    check("mfw_deep2_ivp_ceiling_plus_rejected", !is_valid_pointer(p(0x0000800000000000ull)));
+    check("mfw_deep2_ivp_ceiling_minus_1_even_accepted",
+          is_valid_pointer(p(0x00007FFFFFFFFFFEull)));
+
+    // The accepted band's parity rule: same in-range magnitude, odd rejected /
+    // even accepted -- the single low-bit discriminator the scan-base check uses.
+    check("mfw_deep2_ivp_in_range_parity_rule",
+          is_valid_pointer(p(0x40000000ull)) && !is_valid_pointer(p(0x40000001ull)));
+}
+
 int main()
 {
     test_set_dont_inline_null();
@@ -2236,6 +2634,16 @@ int main()
     test_mfw_deep_confident_layout_slot_wellformed();
     test_mfw_deep_set_dont_inline_no_write_window();
     test_mfw_deep_precedence_truth_table();
+
+    // Deepening wave 2 (mfw_deep2) additive section.
+    test_mfw_deep2_iterate_struct_null_and_no_jvm();
+    test_mfw_deep2_iterate_type_null_and_no_jvm();
+    test_mfw_deep2_resolve_slot_no_jvm();
+    test_mfw_deep2_cp_symbol_early_rejects();
+    test_mfw_deep2_cp_bound_threshold_logic();
+    test_mfw_deep2_vmstruct_abi_layout();
+    test_mfw_deep2_owned_table_scan_model();
+    test_mfw_deep2_is_valid_pointer_thresholds();
 
     std::printf("\n%s: %d failure(s)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;

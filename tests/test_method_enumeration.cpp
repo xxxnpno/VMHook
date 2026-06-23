@@ -1331,5 +1331,385 @@ int main()
         check("W11_long_name_size_4095", n4095.size() == 4095);
     }
 
+    // =====================================================================
+    // PART X (instanceklass_methods_walk DEEPENING — additive bounds/structure).
+    //
+    // ADDITIVE namespaced section.  Pins the BOUNDS / STRUCTURE-LOGIC the walk's
+    // offset-resolution substrate stands on that PART W did not reach: the
+    // VMStruct entry-record ABI (struct layout / standard-layout / offsetof),
+    // the null-when-no-JVM offset-resolution contract of BOTH the struct and
+    // type iterators (gHotSpotVMStructs / gHotSpotVMTypes are null in-process),
+    // the find_struct / find_type null-name reject path, the
+    // resolve_constant_pool_symbol bound-and-reject thresholds (index==0 / base
+    // rejected / index>=cp_length), is_readable_pointer's STRICTER 8-byte
+    // alignment gate (distinct from is_valid_pointer's 2-byte odd-rule),
+    // untag_pointer's mask, and the get_flags() u2 width-extraction decision.
+    //
+    // Every expected value derived from vmhook.hpp source (line refs inline).
+    // POSIX-SAFETY: no fabricated high pointer is ever read.  All accessors are
+    // called ONLY on (a) null, (b) is_valid_pointer / is_readable_pointer-
+    // REJECTED low/odd/unaligned constants (which bail BEFORE any region query
+    // or deref), or (c) over OWNED std::array storage for pure offsetof/sizeof
+    // arithmetic.  Layout/clamp SEMANTICS needing a live klass are pinned via
+    // captureless arithmetic mirrors of the exact source expressions.
+    // =====================================================================
+
+    using vmhook::hotspot::is_readable_pointer;
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+    using vmhook::hotspot::untag_pointer;
+
+    // ---------------------------------------------------------------------
+    // X1 -- vm_struct_entry_t / vm_type_entry_t ABI: the field-record types the
+    // offset resolver returns and every accessor reads `entry->offset` /
+    // `entry->type_string` from.  Pin their member ORDER and OFFSETS (offsetof,
+    // standard-layout) so a struct-shape drift trips here, not as a silent
+    // mis-read of `_methods`'s offset at runtime.  Source:
+    //   vm_type_entry_t   vmhook.hpp:1880-1888
+    //     { const char* type_name; const char* superclass_name;
+    //       int32 is_oop_type_type; int32 is_integer_type; int32 is_unsigned;
+    //       uint64 size; }
+    //   vm_struct_entry_t vmhook.hpp:1891-1899
+    //     { const char* type_name; const char* field_name; const char* type_string;
+    //       int32 is_static; uint64 offset; void* address; }
+    // ---------------------------------------------------------------------
+    {
+        using vmhook::hotspot::vm_struct_entry_t;
+        using vmhook::hotspot::vm_type_entry_t;
+
+        // Both records must be standard-layout for offsetof to be well-defined
+        // and for the C-ABI overlay onto the JVM-exported array to be valid.
+        check("X1_struct_entry_standard_layout",
+              std::is_standard_layout<vm_struct_entry_t>::value);
+        check("X1_type_entry_standard_layout",
+              std::is_standard_layout<vm_type_entry_t>::value);
+
+        // vm_struct_entry_t member order/offsets (the resolver reads ->offset
+        // @ the 5th member, ->type_string @ the 3rd, ->field_name @ the 2nd).
+        check("X1_struct_type_name_at_0",
+              offsetof(vm_struct_entry_t, type_name) == 0);
+        check("X1_struct_field_name_after_type_name",
+              offsetof(vm_struct_entry_t, field_name) == sizeof(const char*));
+        check("X1_struct_type_string_third",
+              offsetof(vm_struct_entry_t, type_string) == 2 * sizeof(const char*));
+        // is_static is int32 right after the three pointers.
+        check("X1_struct_is_static_after_three_ptrs",
+              offsetof(vm_struct_entry_t, is_static) == 3 * sizeof(const char*));
+        // offset (uint64) follows is_static (int32) -- the field every accessor
+        // adds to `this`.  It must be 8-byte aligned (uint64) and strictly after
+        // is_static.
+        check("X1_struct_offset_after_is_static",
+              offsetof(vm_struct_entry_t, offset) > offsetof(vm_struct_entry_t, is_static));
+        check("X1_struct_offset_field_8_aligned",
+              (offsetof(vm_struct_entry_t, offset) % alignof(std::uint64_t)) == 0);
+        // address (void*) is the final member, after offset.
+        check("X1_struct_address_after_offset",
+              offsetof(vm_struct_entry_t, address) > offsetof(vm_struct_entry_t, offset));
+        // The ->offset member is exactly a uint64 (the width the accessor uses
+        // in `this + entry->offset`).
+        check("X1_struct_offset_member_is_uint64",
+              sizeof(vm_struct_entry_t{}.offset) == 8);
+
+        // vm_type_entry_t member order/offsets: type_name @0, superclass_name
+        // next, then three int32 flags, then a uint64 size.
+        check("X1_type_type_name_at_0",
+              offsetof(vm_type_entry_t, type_name) == 0);
+        check("X1_type_superclass_second",
+              offsetof(vm_type_entry_t, superclass_name) == sizeof(const char*));
+        check("X1_type_size_member_is_uint64",
+              sizeof(vm_type_entry_t{}.size) == 8);
+        // The three int32 discriminator flags are contiguous after the two
+        // pointers (no padding between them: int32 alignment == 4).
+        check("X1_type_is_oop_after_two_ptrs",
+              offsetof(vm_type_entry_t, is_oop_type_type) == 2 * sizeof(const char*));
+        check("X1_type_is_integer_after_is_oop",
+              offsetof(vm_type_entry_t, is_integer_type)
+                  == offsetof(vm_type_entry_t, is_oop_type_type) + sizeof(std::int32_t));
+        check("X1_type_is_unsigned_after_is_integer",
+              offsetof(vm_type_entry_t, is_unsigned)
+                  == offsetof(vm_type_entry_t, is_integer_type) + sizeof(std::int32_t));
+    }
+
+    // ---------------------------------------------------------------------
+    // X2 -- offset-resolution null-when-no-JVM contract for BOTH iterators.
+    // gHotSpotVMStructs / gHotSpotVMTypes resolve to null in-process (no JVM),
+    // so get_vm_structs()/get_vm_types() are null (vmhook.hpp:1952/1929) and
+    // the walk loop body `entry && entry->type_name` never enters -> null.
+    // This is the EXACT path that makes get_methods_count()/get_methods_ptr()
+    // bail at their `!entry` guard (vmhook.hpp:3509/3548).  Pure pointer-table
+    // walk: no dereference of any JVM address (the table base IS null).
+    // ---------------------------------------------------------------------
+    {
+        // The _methods entry the raw accessors resolve: null with no JVM.
+        check("X2_instanceklass_methods_entry_null_no_jvm",
+              iterate_struct_entries("InstanceKlass", "_methods") == nullptr);
+        // Every other field the walk's decode path resolves is likewise null,
+        // proving the whole substrate degrades uniformly (not just _methods).
+        check("X2_constmethod_name_index_entry_null",
+              iterate_struct_entries("ConstMethod", "_name_index") == nullptr);
+        check("X2_constmethod_signature_index_entry_null",
+              iterate_struct_entries("ConstMethod", "_signature_index") == nullptr);
+        check("X2_symbol_length_entry_null",
+              iterate_struct_entries("Symbol", "_length") == nullptr);
+        check("X2_symbol_body_entry_null",
+              iterate_struct_entries("Symbol", "_body") == nullptr);
+        check("X2_method_flags_entry_null",
+              iterate_struct_entries("Method", "_flags") == nullptr);
+        check("X2_method_access_flags_entry_null",
+              iterate_struct_entries("Method", "_access_flags") == nullptr);
+        // The TYPE iterator (gHotSpotVMTypes) is null-table too.
+        check("X2_constantpool_type_entry_null",
+              iterate_type_entries("ConstantPool") == nullptr);
+        check("X2_instanceklass_type_entry_null",
+              iterate_type_entries("InstanceKlass") == nullptr);
+        // A non-existent type/field is null on either iterator (the loop falls
+        // through to its terminal `return nullptr`).
+        check("X2_unknown_struct_field_null",
+              iterate_struct_entries("NoSuchType", "noSuchField") == nullptr);
+        check("X2_unknown_type_null",
+              iterate_type_entries("NoSuchTypeZZZ") == nullptr);
+    }
+
+    // ---------------------------------------------------------------------
+    // X3 -- find_struct / find_type null-NAME reject path (vmhook.hpp:1993 /
+    // 1967): a null type_name (or, for the struct iterator, a null field_name)
+    // is rejected UP FRONT with no table walk and no strcmp(nullptr,...) UB.
+    // This guard is what keeps the walk safe when a partial/custom VMStruct
+    // record carries a null name.  No memory read for any of these inputs.
+    // ---------------------------------------------------------------------
+    {
+        check("X3_struct_null_type_name_null",
+              iterate_struct_entries(nullptr, "_methods") == nullptr);
+        check("X3_struct_null_field_name_null",
+              iterate_struct_entries("InstanceKlass", nullptr) == nullptr);
+        check("X3_struct_both_null_null",
+              iterate_struct_entries(nullptr, nullptr) == nullptr);
+        check("X3_type_null_name_null",
+              iterate_type_entries(nullptr) == nullptr);
+        // Empty (non-null) names are a clean MISS, not a crash (strcmp over the
+        // null table never runs because the table base is null with no JVM).
+        check("X3_struct_empty_names_null",
+              iterate_struct_entries("", "") == nullptr);
+        check("X3_type_empty_name_null",
+              iterate_type_entries("") == nullptr);
+    }
+
+    // ---------------------------------------------------------------------
+    // X4 -- is_readable_pointer's STRICTER alignment/range gate (vmhook.hpp:
+    // 2023-2025): rejects addr<=floor, addr>=ceiling, OR (addr & 0x7)!=0 BEFORE
+    // any region query.  This is the 8-byte-aligned gate distinct from
+    // is_valid_pointer's 2-byte odd-rule (vmhook.hpp:2059).  The per-slot CP
+    // read path (resolve_constant_pool_symbol @3909) uses is_readable_pointer,
+    // so its 8-aligned requirement is load-bearing.  We call it ONLY on
+    // REJECTED constants (which bail before the query) so no wild read occurs.
+    // ---------------------------------------------------------------------
+    {
+        constexpr std::uintptr_t floor{ vmhook::os::user_address_floor };     // 0xFFFF
+        constexpr std::uintptr_t ceiling{ vmhook::os::user_address_ceiling }; // 0x7FFF_FFFF_FFFF
+
+        // Low / null / odd constants: rejected by the range+alignment fast path.
+        check("X4_readable_null_rejected", !is_readable_pointer(nullptr));
+        check("X4_readable_floor_rejected",
+              !is_readable_pointer(reinterpret_cast<const void*>(floor)));
+        check("X4_readable_ceiling_rejected",
+              !is_readable_pointer(reinterpret_cast<const void*>(ceiling)));
+        check("X4_readable_low_0x1000_rejected",
+              !is_readable_pointer(reinterpret_cast<const void*>(0x1000ull)));
+
+        // 8-byte alignment is the DISTINGUISHING rule: an in-range address that
+        // is is_valid_pointer-ACCEPTED (2-byte rule) but NOT 8-aligned is
+        // is_readable_pointer-REJECTED.  Pick an in-range even base and offset
+        // it by +2/+4/+6 (all even -> is_valid_pointer accepts; none 8-aligned
+        // -> is_readable_pointer's `(addr & 0x7)!=0` rejects BEFORE any query).
+        constexpr std::uintptr_t aligned_base{ 0x00000A0000000000ull };       // 8-aligned, in-range
+        check("X4_base_is_8_aligned", (aligned_base & 0x7ull) == 0);
+        // +2: even (valid_pointer ok), not 8-aligned (readable_pointer rejects
+        // at the gate, no region query).
+        const std::uintptr_t plus2{ aligned_base + 2 };
+        check("X4_plus2_valid_pointer_accepts",
+              is_valid_pointer(reinterpret_cast<const void*>(plus2)));
+        check("X4_plus2_readable_pointer_rejects_unaligned",
+              !is_readable_pointer(reinterpret_cast<const void*>(plus2)));
+        const std::uintptr_t plus4{ aligned_base + 4 };
+        check("X4_plus4_valid_pointer_accepts",
+              is_valid_pointer(reinterpret_cast<const void*>(plus4)));
+        check("X4_plus4_readable_pointer_rejects_unaligned",
+              !is_readable_pointer(reinterpret_cast<const void*>(plus4)));
+        const std::uintptr_t plus6{ aligned_base + 6 };
+        check("X4_plus6_readable_pointer_rejects_unaligned",
+              !is_readable_pointer(reinterpret_cast<const void*>(plus6)));
+        // Pure mirror of the two distinct alignment masks so the contrast is
+        // greppable: valid_pointer rejects bit0, readable_pointer rejects bits0-2.
+        auto valid_align_reject = [](std::uintptr_t a) -> bool { return (a & 0x1u) != 0u; };
+        auto readable_align_reject = [](std::uintptr_t a) -> bool { return (a & 0x7u) != 0u; };
+        check("X4_mirror_valid_rejects_only_odd",
+              valid_align_reject(aligned_base + 2) == false
+              && valid_align_reject(aligned_base + 1) == true);
+        check("X4_mirror_readable_rejects_low3_bits",
+              readable_align_reject(aligned_base + 2) == true
+              && readable_align_reject(aligned_base + 4) == true
+              && readable_align_reject(aligned_base) == false);
+    }
+
+    // ---------------------------------------------------------------------
+    // X5 -- resolve_constant_pool_symbol BOUND-AND-REJECT logic (vmhook.hpp:
+    // 3898-3919): the per-Method* decode reaches each NAME/SIG Symbol through
+    // this guard.  Reject order: index==0 (slot 0 reserved) OR base rejected
+    // -> null; then cp_length>=0 && index>=cp_length -> null (the bound).  We
+    // call it ONLY with an is_valid_pointer-REJECTED base (0x1000) so it bails
+    // at the `!is_valid_pointer(constant_pool_base)` guard (3901) WITHOUT any
+    // read, then pin the bound DECISION as a pure mirror of line 3905.
+    // ---------------------------------------------------------------------
+    {
+        // Rejected base (0x1000 < floor): null for any index/length, no read.
+        void** const rejected_base{ reinterpret_cast<void**>(0x1000ull) };
+        check("X5_rejected_base_index1_null",
+              klass::resolve_constant_pool_symbol(rejected_base, 1u, 16) == nullptr);
+        check("X5_rejected_base_large_index_null",
+              klass::resolve_constant_pool_symbol(rejected_base, 100u, 16) == nullptr);
+        // index==0 is rejected up front (the `!index` guard) regardless of base.
+        check("X5_index_zero_null",
+              klass::resolve_constant_pool_symbol(rejected_base, 0u, 16) == nullptr);
+        // null base -> null.
+        check("X5_null_base_null",
+              klass::resolve_constant_pool_symbol(nullptr, 1u, 16) == nullptr);
+        // cp_length<0 ("unknown") means the bound is SKIPPED -- but a rejected
+        // base still bails before any read.
+        check("X5_rejected_base_unknown_length_null",
+              klass::resolve_constant_pool_symbol(rejected_base, 1u, -1) == nullptr);
+
+        // Pure mirror of the bound decision at vmhook.hpp:3905:
+        //   reject_for_bound = (cp_length >= 0 && index >= (uint32)cp_length)
+        auto bound_rejects = [](std::uint32_t index, std::int32_t cp_length) -> bool {
+            return cp_length >= 0 && index >= static_cast<std::uint32_t>(cp_length);
+        };
+        // index just-in (cp_length-1) is NOT rejected; just-out (cp_length) IS.
+        check("X5_bound_just_in_accepted", bound_rejects(15u, 16) == false);
+        check("X5_bound_at_length_rejected", bound_rejects(16u, 16) == true);
+        check("X5_bound_just_over_rejected", bound_rejects(17u, 16) == true);
+        check("X5_bound_index1_in_small_pool_accepted", bound_rejects(1u, 2) == false);
+        // cp_length == 0: every index>=0 is rejected (empty pool).
+        check("X5_bound_zero_length_rejects_index1", bound_rejects(1u, 0) == true);
+        // cp_length < 0 (unknown): bound is NOT applied for ANY index.
+        check("X5_bound_unknown_length_never_rejects",
+              bound_rejects(1u, -1) == false
+              && bound_rejects(0xFFFFFFFFu, -1) == false);
+        // The `!index` reserved-slot-0 guard mirrored: index 0 always rejected.
+        auto index_zero_rejected = [](std::uint32_t index) -> bool { return index == 0u; };
+        check("X5_index_zero_guard", index_zero_rejected(0u) == true
+              && index_zero_rejected(1u) == false);
+    }
+
+    // ---------------------------------------------------------------------
+    // X6 -- get_methods_count() / get_methods_ptr() FULL no-JVM bail on null
+    // and rejected `this`, AND the sanity-clamp at the just-in/just-out
+    // boundaries reproduced as a pure mirror (vmhook.hpp:3528 clamp,
+    // 3509/3548 entry-guard).  Extends PART W2/W3 with the EXACT 65535
+    // u2-ceiling neighbours the count clamp pivots on, plus the
+    // count==0 -> get_methods_ptr-still-bails linkage on a rejected klass.
+    // ---------------------------------------------------------------------
+    {
+        // Rejected `this` (0xFFFF == floor, also odd) -> both accessors bail.
+        klass* const at_floor{ reinterpret_cast<klass*>(0xFFFFull) };
+        check("X6_at_floor_count_zero", at_floor->get_methods_count() == 0);
+        check("X6_at_floor_ptr_null", at_floor->get_methods_ptr() == nullptr);
+        // A non-null but is_valid_pointer-rejected even low constant.
+        klass* const low_even{ reinterpret_cast<klass*>(0x100ull) };  // <= floor -> rejected
+        check("X6_low_even_count_zero", low_even->get_methods_count() == 0);
+        check("X6_low_even_ptr_null", low_even->get_methods_ptr() == nullptr);
+
+        // Pure mirror of the count clamp `if (count<0||count>65535) return 0;`
+        // at the EXACT u2 ceiling neighbours (just-in 65535, just-out 65536),
+        // and the negative just-out (-1).  This is the flaw-#2 hardening the
+        // walk's reserve()/loop relies on to never over-allocate on a torn read.
+        auto clamped = [](std::int32_t count) -> std::int32_t {
+            if (count < 0 || count > 65535) { return 0; }
+            return count;
+        };
+        check("X6_clamp_just_in_65535", clamped(65535) == 65535);
+        check("X6_clamp_just_out_65536_zero", clamped(65536) == 0);
+        check("X6_clamp_just_out_negative_one_zero", clamped(-1) == 0);
+        check("X6_clamp_zero_is_zero", clamped(0) == 0);
+        // The HotSpot per-class method_count is a u2; pin the ceiling equals the
+        // u2 max so a future widening of the clamp is caught against source.
+        check("X6_clamp_ceiling_equals_u2_max",
+              65535 == static_cast<std::int32_t>(std::numeric_limits<std::uint16_t>::max()));
+    }
+
+    // ---------------------------------------------------------------------
+    // X7 -- get_flags() u2 WIDTH-EXTRACTION decision (vmhook.hpp:2944-2972).
+    // The accessor returns a std::uint16_t* ONLY when the exported Method::_flags
+    // type_string is absent/empty (legacy "trust the offset") OR exactly "u2";
+    // a POSITIVELY non-u2 type_string forces nullptr (would-be u1/u4 clobber
+    // refused).  With no JVM the entry is null so the LIVE call is nullptr
+    // regardless; we additionally pin the width-mismatch DECISION as a pure
+    // mirror of the source predicate, plus the return-type width.
+    // ---------------------------------------------------------------------
+    {
+        // Return type is a 16-bit pointer target (the u2 view).
+        using flags_ptr_t = decltype(std::declval<vmhook::hotspot::method>().get_flags());
+        check("X7_get_flags_returns_u16_ptr",
+              std::is_same<flags_ptr_t, std::uint16_t*>::value);
+        check("X7_u2_view_width_is_2", sizeof(std::uint16_t) == 2);
+
+        // Pure mirror of the width_mismatch predicate (vmhook.hpp:2962-2965):
+        //   mismatch = type_string && type_string[0] != '\0'
+        //              && strcmp(type_string,"u2") != 0
+        auto width_mismatch = [](const char* type_string) -> bool {
+            return type_string != nullptr
+                   && type_string[0] != '\0'
+                   && std::string_view{ type_string } != std::string_view{ "u2" };
+        };
+        // Absent (null) or empty -> NOT a mismatch (legacy trust-the-offset path
+        // keeps real JDK 11-20 byte-for-byte unchanged).
+        check("X7_null_type_string_not_mismatch", width_mismatch(nullptr) == false);
+        check("X7_empty_type_string_not_mismatch", width_mismatch("") == false);
+        // Exactly "u2" -> NOT a mismatch (the live band where the pointer is
+        // returned).
+        check("X7_u2_type_string_not_mismatch", width_mismatch("u2") == false);
+        // A positively-different width -> mismatch -> the accessor returns null.
+        check("X7_u1_type_string_is_mismatch", width_mismatch("u1") == true);
+        check("X7_u4_type_string_is_mismatch", width_mismatch("u4") == true);
+        check("X7_other_type_string_is_mismatch", width_mismatch("jushort") == true);
+
+        // Live no-JVM call on an is_valid_pointer-REJECTED `this`: nullptr with
+        // no read (bails at the `!entry || !is_valid_pointer(this)` guard 2954).
+        vmhook::hotspot::method* const rejected_method{
+            reinterpret_cast<vmhook::hotspot::method*>(0x1000ull) };
+        check("X7_get_flags_rejected_this_null", rejected_method->get_flags() == nullptr);
+    }
+
+    // ---------------------------------------------------------------------
+    // X8 -- untag_pointer mask (vmhook.hpp:2092-2097): strips high GC tag bits
+    // by AND-ing with user_address_ceiling (0x7FFF_FFFF_FFFF).  A canonical
+    // in-range address is unchanged; a high-tagged address is masked back into
+    // range.  Pure arithmetic over CONSTANTS (no memory touched).  Relevant to
+    // the walk because every decoded Symbol*/Method* slot may carry tag bits
+    // the is_valid_pointer ceiling check then rejects unless untagged.
+    // ---------------------------------------------------------------------
+    {
+        constexpr std::uintptr_t ceiling{ vmhook::os::user_address_ceiling }; // 0x7FFF_FFFF_FFFF
+        check("X8_ceiling_mask_value", ceiling == 0x00007FFFFFFFFFFFull);
+
+        // A clean in-range address is its own untagged value (idempotent).
+        constexpr std::uintptr_t clean_addr{ 0x00000A0000000010ull };
+        check("X8_clean_addr_in_range", clean_addr < ceiling && clean_addr > 0xFFFFull);
+        check("X8_untag_clean_is_identity",
+              untag_pointer(reinterpret_cast<const void*>(clean_addr))
+                  == reinterpret_cast<const void*>(clean_addr));
+
+        // A high-tagged address (top bits set above the ceiling) is masked back
+        // to its low canonical form: tagged & ceiling == clean_addr.
+        constexpr std::uintptr_t tagged_addr{ 0xFFFF0A0000000010ull };
+        check("X8_untag_strips_high_bits",
+              untag_pointer(reinterpret_cast<const void*>(tagged_addr))
+                  == reinterpret_cast<const void*>(tagged_addr & ceiling));
+        check("X8_untagged_tagged_equals_clean_low",
+              (tagged_addr & ceiling) == clean_addr);
+        // Mirror the exact mask expression so a ceiling change is caught here.
+        check("X8_mask_mirror_matches_ceiling",
+              (tagged_addr & ceiling) == (tagged_addr & 0x00007FFFFFFFFFFFull));
+    }
+
     return failures == 0 ? 0 : 1;
 }
