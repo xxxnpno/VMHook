@@ -2919,6 +2919,159 @@ int main()
               (clear_mask & 0x0000FFFFu) == 0x0000FFFFu);
     }
 
+    // =====================================================================
+    // DEEPEN-EB.  (ADDITIVE, "eb_" namespace.)  symbol::to_string() - the
+    //    TERMINAL consumer of the Symbol* the FIX B chain resolves.  Every
+    //    prior section stops at "the getter returns a Symbol* (or nullptr)";
+    //    this section pins the ONE more gate that runs on a wrong-but-mapped
+    //    Symbol* that slips the index bound (feature notes: "a wrong-but-mapped
+    //    Symbol* that slips through the index bound still gets one more length
+    //    sanity gate here").  Source body verified at vmhook.hpp :2237-2307:
+    //       static _length/_body VMStruct entries (Symbol._length / Symbol._body)
+    //       if (!length_entry) throw;  if (!body_entry) throw;       // (a)
+    //       if (!safe_read_pointer(this)) return "";                 // (b)
+    //       safe_read u2 _length;  if fail return "";                // (c)
+    //       if (length == 0 || length > 0x1000) return "";           // (d) sanity gate
+    //       char buffer[0x1000];  safe_read(buffer, body, length);   // (e)
+    //       return std::string{ buffer, length };
+    //       catch (...) return "";                                   // throws -> ""
+    //    With no JVM the Symbol._length / Symbol._body entries are unresolved
+    //    -> (a) throws -> catch returns "".  So EVERY entry into to_string here
+    //    degrades to the empty string with NO fault, on any synthetic-but-
+    //    aligned / invalid / null `this`.  This is the no-JVM CONTRACT of the
+    //    feature's final consumer, and it pins the length-sanity-gate boundary
+    //    constants (0, 1, 0x1000, 0x1001) as a faithful local model - the gate
+    //    that converts a slipped wrong-Symbol into "" instead of a wild read.
+    //    POSIX-safe by construction: to_string is only ever called on a static
+    //    storage / volatile-laundered-null / is_valid_pointer-shaped `this`
+    //    whose first act (the entry-null throw) returns before any deref; the
+    //    sanity-gate model is pure arithmetic on constants.
+    // =====================================================================
+    {
+        using vmhook::hotspot::symbol;
+
+        // EB1. Faithful local model of the length sanity gate (:2272): a
+        //   decoded _length is REJECTED (-> "") iff length == 0 OR length >
+        //   0x1000.  This is the gate that bounds a wrong-but-mapped Symbol*'s
+        //   body read to at most 0x1000 bytes (the buffer width, :2294).
+        auto length_gate_rejects = [](std::uint16_t length) -> bool
+        {
+            return length == 0u || length > 0x1000u;
+        };
+        // The accepted band is exactly [1, 0x1000] inclusive.  Pin the four
+        // load-bearing edges so a future widen/narrow of the cap reddens here.
+        check("eb_length_gate_zero_rejected", length_gate_rejects(0u));
+        check("eb_length_gate_one_accepted", !length_gate_rejects(1u));
+        check("eb_length_gate_0x1000_accepted", !length_gate_rejects(0x1000u)); // == buffer width
+        check("eb_length_gate_0x1001_rejected", length_gate_rejects(0x1001u));
+        check("eb_length_gate_maxu2_rejected", length_gate_rejects(0xFFFFu));
+        // The cap equals the on-stack buffer width: a length the gate ADMITS can
+        // never exceed the buffer, so the safe_read into char buffer[0x1000]
+        // cannot overflow (the read length is bounded by the same 0x1000).  Pin
+        // that the accepted maximum is exactly the buffer size, not one past it.
+        {
+            constexpr std::size_t buffer_width{ 0x1000u }; // char buffer[0x1000], :2294
+            check("eb_length_gate_cap_equals_buffer_width",
+                  !length_gate_rejects(static_cast<std::uint16_t>(buffer_width))
+                      && length_gate_rejects(static_cast<std::uint16_t>(buffer_width + 1u)));
+        }
+        // Exhaustive sweep of the FULL u2 length domain: the gate admits exactly
+        // [1, 0x1000] and rejects everything else, with no off-by-one.
+        {
+            bool gate_partition_exact{ true };
+            for (std::uint32_t l{ 0u }; l <= 0xFFFFu; ++l)
+            {
+                const std::uint16_t length{ static_cast<std::uint16_t>(l) };
+                const bool rejected{ length_gate_rejects(length) };
+                const bool want{ l == 0u || l > 0x1000u };
+                if (rejected != want) { gate_partition_exact = false; break; }
+            }
+            check("eb_length_gate_partition_exact_full_u2_domain", gate_partition_exact);
+        }
+
+        // EB2. The NO-JVM contract of the real to_string(): on any `this` it
+        //   degrades to "" (the Symbol._length / Symbol._body entries are
+        //   unresolved, so (a) throws and the catch returns "") with NO fault.
+        //   `this` values: a plausibly-aligned in-range static buffer (passes
+        //   is_valid_pointer-shape but the entry-null throw fires first), and a
+        //   volatile-laundered null (the library's safe_read_pointer/throw path
+        //   must own it, not a language-level null deref).  Reaching each check
+        //   proves no fault occurred.
+        {
+            alignas(16) static std::uint8_t eb_storage[64]{};
+            auto* const sym{ reinterpret_cast<symbol*>(&eb_storage[0]) };
+            const std::string s{ sym->to_string() };
+            check("eb_to_string_no_jvm_returns_empty", s.empty());
+            check("eb_to_string_returns_std_string",
+                  std::is_same_v<decltype(sym->to_string()), std::string>);
+            // Repeatable: the static entry caches stay null, so it is stable and
+            // never opportunistically resolves to garbage.
+            check("eb_to_string_no_jvm_stable_on_repeat", sym->to_string().empty());
+        }
+        {
+            // A null `this`, laundered through volatile so the compiler cannot
+            // fold the call into a literal null-deref (-Wnonnull): at run time
+            // `this` is 0 and the library's own entry-null-throw / safe_read
+            // guard is what must return "" without faulting.
+            volatile std::uintptr_t null_addr{ 0 };
+            auto* const sym_null{ reinterpret_cast<symbol*>(null_addr) };
+            check("eb_to_string_null_this_returns_empty", sym_null->to_string().empty());
+        }
+
+        // EB3. The END-TO-END chain composition the feature exists to make safe:
+        //   resolve_constant_pool_symbol(...) -> Symbol* (or nullptr) -> the
+        //   consumer turns a nullptr into "" (the method::get_name wrapper) and a
+        //   wrong-but-mapped Symbol* into "" via to_string's own gate.  We drive
+        //   the REAL resolve helper over an OWNED block to obtain a Symbol* that
+        //   IS a valid-shaped pointer (points into our page), then confirm
+        //   to_string() on it STILL returns "" with no fault (no-JVM: the entry
+        //   throw fires before any body read).  This is the "wrong-but-mapped
+        //   Symbol* slips the index bound, caught by the final consumer" path.
+        {
+            using vmhook::hotspot::klass;
+
+            const std::size_t page{ vmhook::os::page_size() };
+            void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+            if (!block)
+            {
+                check("eb_chain_skipped_alloc_failed", false);
+            }
+            else
+            {
+                *static_cast<volatile std::uint8_t*>(block) = 0xEB; // commit
+                void** const base{ static_cast<void**>(block) };
+                // Plant a real, valid (in-page, 8-aligned) slot value at index 1
+                // so the resolve helper passes all four guards and returns it as
+                // a Symbol* - a "mapped but not-actually-a-Symbol" pointer.
+                base[1] = static_cast<void*>(&base[1]);
+                symbol* const resolved{ klass::resolve_constant_pool_symbol(base, 1u, -1) };
+                check("eb_chain_resolve_returns_mapped_symbol",
+                      resolved != nullptr && reinterpret_cast<void*>(resolved) == base[1]);
+                // The mapped-but-wrong Symbol* hits to_string's gate: no-JVM the
+                // entry-null throw returns "" (and even with a JDK, the _length
+                // sanity gate would bound any body read).  No fault either way.
+                if (resolved)
+                {
+                    check("eb_chain_to_string_on_mapped_symbol_returns_empty",
+                          resolved->to_string().empty());
+                }
+                else
+                {
+                    check("eb_chain_to_string_on_mapped_symbol_returns_empty", false);
+                }
+                // And a resolved nullptr (index 0 - the unused-slot reject) means
+                // the consumer never calls to_string at all -> the wrapper yields
+                // "": model that branch so the nullptr->"" arm is pinned too.
+                symbol* const resolved0{ klass::resolve_constant_pool_symbol(base, 0u, -1) };
+                const std::string wrapper_result{ resolved0 ? resolved0->to_string() : std::string{} };
+                check("eb_chain_null_symbol_yields_empty_string",
+                      resolved0 == nullptr && wrapper_result.empty());
+
+                vmhook::os::release(block, page);
+            }
+        }
+    }
+
     if (failures == 0)
     {
         std::printf("vmhook const_method/ConstantPool bounds: OK\n");

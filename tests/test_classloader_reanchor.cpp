@@ -50,6 +50,7 @@
 // as it found it and cannot corrupt any later assertion within this binary.
 #include <vmhook/vmhook.hpp>
 
+#include <atomic>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -168,6 +169,49 @@ namespace
     auto evict_never_throws(std::string_view name) -> bool
     {
         try { vmhook::evict_class_lookup(name); return true; }
+        catch (...) { return false; }
+    }
+
+    // ---- ADDITIVE deepening (section 13) no-throw probes ---------------------
+    // The remaining no-JVM-observable entry points of the classloader_reanchor
+    // feature beyond the four already covered above: the public JNI context-
+    // loader resolver (vmhook::jni::find_class_with_context_loader), the
+    // HotSpot-internal find_class consumer that override/evict actually steer
+    // (vmhook::find_class), and the detail:: host-classloader-inheritance
+    // machinery (klass_to_class_loader_oop / capture_host_classloader_klass /
+    // inherit_host_context_classloader_for_current_thread).  Each must honour the
+    // no-JVM contract (null / no-op, never throw, never fault on a NON-deref'd
+    // null / is_valid_pointer-rejected argument).  None of these fabricates a
+    // live oop/klass and reads through it: with no JVM, ensure_current_java_thread
+    // is false and get_vm_structs() is null, so every dereference is gated off
+    // before the pointer is touched.
+    auto ctx_loader_never_throws(std::string_view name) -> bool
+    {
+        try { (void)vmhook::jni::find_class_with_context_loader(name); return true; }
+        catch (...) { return false; }
+    }
+    auto find_class_never_throws(std::string_view name) -> bool
+    {
+        try { (void)vmhook::find_class(name); return true; }
+        catch (...) { return false; }
+    }
+    // klass_to_class_loader_oop only dereferences its argument AFTER an
+    // is_valid_pointer gate AND only once iterate_struct_entries("Klass", ...)
+    // returns non-null — which it cannot with no JVM (gHotSpotVMStructs unexported),
+    // so a null / low-constant klass* is never read.  We pass nullptr only.
+    auto klass_to_loader_never_throws(vmhook::hotspot::klass* k) -> bool
+    {
+        try { (void)vmhook::detail::klass_to_class_loader_oop(k); return true; }
+        catch (...) { return false; }
+    }
+    auto capture_host_never_throws(vmhook::hotspot::klass* k) -> bool
+    {
+        try { vmhook::detail::capture_host_classloader_klass(k); return true; }
+        catch (...) { return false; }
+    }
+    auto inherit_host_never_throws() -> bool
+    {
+        try { vmhook::detail::inherit_host_context_classloader_for_current_thread(); return true; }
         catch (...) { return false; }
     }
 
@@ -911,6 +955,246 @@ int main()
         check("reanchor_empty_deterministic_repeat", reanchor_empty_stable);
         check("reanchor_nonempty_deterministic_repeat", reanchor_nonempty_stable);
         check("reanchor_null_deterministic_repeat", reanchor_null_stable);
+    }
+
+    // =====================================================================
+    // 13. ADDITIVE deepening pass — the rest of the classloader_reanchor
+    //     feature's no-JVM-observable surface beyond the four entry points
+    //     exercised above.  Three further entry points are part of this
+    //     feature per the header (vmhook.hpp):
+    //
+    //       * vmhook::jni::find_class_with_context_loader(name)  (~13620)
+    //           -> detail::jni_find_class_with_context_loader (~12173), which
+    //           short-circuits to nullptr on !ensure_current_java_thread()
+    //           (~12176).  Public, noexcept, klass*.
+    //       * vmhook::find_class(name)  (~8146) — the HotSpot-internal consumer
+    //           that override_class_lookup / reanchor actually steer.  Its
+    //           empty-name fast-reject (~8161) and array-name '[' branch (~8175,
+    //           via jni_find_class which also gates on ensure_current_java_thread
+    //           ~11872) make it a clean nullptr with no JVM for EVERY shape.
+    //       * detail host-classloader inheritance: klass_to_class_loader_oop
+    //           (~12463), capture_host_classloader_klass (~12492),
+    //           inherit_host_context_classloader_for_current_thread (~12534),
+    //           and the host_classloader_klass latch (~12451).  With no JVM,
+    //           iterate_struct_entries("Klass", ...) is null (gHotSpotVMStructs
+    //           unexported) so klass_to_class_loader_oop returns nullptr WITHOUT
+    //           dereferencing its argument; capture is therefore a no-op and the
+    //           latch stays null.
+    //
+    //     Every assertion below is the null/empty/no-op/no-throw no-JVM
+    //     contract.  No fabricated live oop/klass is ever dereferenced (only
+    //     nullptr is passed where the arg would be read), and the section leaves
+    //     klass_lookup_cache and host_classloader_klass exactly as it found them,
+    //     so the section-12 cleanliness check below still observes an empty cache.
+    // =====================================================================
+
+    // ---- 13a. Compile-time signature / return-type / noexcept contracts -----
+    static_assert(std::is_same_v<
+                      decltype(vmhook::jni::find_class_with_context_loader(std::string_view{})),
+                      vmhook::hotspot::klass*>,
+                  "find_class_with_context_loader must return vmhook::hotspot::klass*");
+    static_assert(noexcept(vmhook::jni::find_class_with_context_loader(std::string_view{})),
+                  "find_class_with_context_loader must be noexcept");
+    static_assert(std::is_same_v<
+                      decltype(vmhook::find_class(std::string_view{})),
+                      vmhook::hotspot::klass*>,
+                  "find_class must return vmhook::hotspot::klass*");
+    static_assert(std::is_same_v<
+                      decltype(vmhook::detail::klass_to_class_loader_oop(nullptr)),
+                      void*>,
+                  "klass_to_class_loader_oop must return void*");
+    static_assert(noexcept(vmhook::detail::klass_to_class_loader_oop(nullptr)),
+                  "klass_to_class_loader_oop must be noexcept");
+    static_assert(std::is_same_v<
+                      decltype(vmhook::detail::capture_host_classloader_klass(nullptr)),
+                      void>,
+                  "capture_host_classloader_klass must return void");
+    static_assert(noexcept(vmhook::detail::capture_host_classloader_klass(nullptr)),
+                  "capture_host_classloader_klass must be noexcept");
+    static_assert(std::is_same_v<
+                      decltype(vmhook::detail::inherit_host_context_classloader_for_current_thread()),
+                      void>,
+                  "inherit_host_context_classloader_for_current_thread must return void");
+    static_assert(noexcept(vmhook::detail::inherit_host_context_classloader_for_current_thread()),
+                  "inherit_host_context_classloader_for_current_thread must be noexcept");
+    // The host-klass latch is a std::atomic<klass*>.
+    static_assert(std::is_same_v<decltype(vmhook::detail::host_classloader_klass),
+                      std::atomic<vmhook::hotspot::klass*>>,
+                  "host_classloader_klass must be std::atomic<klass*>");
+    check("section13_compile_time_contracts_compiled", true);
+
+    // ---- 13b. find_class_with_context_loader: null for EVERY name shape -----
+    //      The ensure_current_java_thread() gate (~12176) fails with no JVM, so
+    //      every name resolves to nullptr without any JNI / loadClass work, and
+    //      it never throws nor mutates the cache.
+    {
+        const std::size_t before{ cache_size() };
+        const auto names{ build_name_matrix() };
+        bool all_null{ true };
+        bool none_threw{ true };
+        for (const auto& n : names)
+        {
+            const std::string_view sv{ n.data(), n.size() };
+            if (vmhook::jni::find_class_with_context_loader(sv) != nullptr) { all_null = false; }
+            if (!ctx_loader_never_throws(sv))                              { none_threw = false; }
+        }
+        check("ctx_loader_all_names_null_no_jvm", all_null);
+        check("ctx_loader_no_throw_all_shapes", none_threw);
+        check("ctx_loader_empty_name_null",
+              vmhook::jni::find_class_with_context_loader("") == nullptr);
+        check("ctx_loader_default_string_view_null",
+              vmhook::jni::find_class_with_context_loader(std::string_view{}) == nullptr);
+        check("ctx_loader_does_not_grow_cache", cache_size() == before);
+    }
+
+    // ---- 13c. find_class: the HotSpot-internal consumer override/evict steer -
+    //      No JVM -> nullptr for every shape: empty (fast-reject ~8161), array
+    //      descriptors (the '[' branch via jni_find_class, gated ~11872), dotted,
+    //      separator pathologies (find_class does NOT reject mixed separators —
+    //      it just fails to resolve with no JVM), unicode, NUL-bearing, long.
+    //      Crucially: a miss must NOT leave an insertion behind (insert only
+    //      happens after a SUCCESSFUL resolution ~8252), so the cache size is
+    //      unchanged and no probed name appears.
+    {
+        const std::size_t before{ cache_size() };
+        const auto names{ build_name_matrix() };
+        bool all_null{ true };
+        bool none_threw{ true };
+        bool none_inserted{ true };
+        for (const auto& n : names)
+        {
+            const std::string_view sv{ n.data(), n.size() };
+            if (vmhook::find_class(sv) != nullptr) { all_null = false; }
+            if (!find_class_never_throws(sv))      { none_threw = false; }
+            if (cache_contains(n))                 { none_inserted = false; }
+        }
+        check("find_class_all_names_null_no_jvm", all_null);
+        check("find_class_no_throw_all_shapes", none_threw);
+        check("find_class_miss_inserts_nothing_no_jvm", none_inserted);
+        check("find_class_does_not_grow_cache_no_jvm", cache_size() == before);
+        // Explicit array-descriptor spot checks (the '[' branch).
+        check("find_class_array_int_null", vmhook::find_class("[I") == nullptr);
+        check("find_class_array_obj_null",
+              vmhook::find_class("[Ljava/lang/Object;") == nullptr);
+        check("find_class_array_2d_null",
+              vmhook::find_class("[[Ljava/lang/String;") == nullptr);
+        // Explicit empty + default-view fast-reject.
+        check("find_class_empty_null", vmhook::find_class("") == nullptr);
+        check("find_class_default_string_view_null",
+              vmhook::find_class(std::string_view{}) == nullptr);
+        // Mixed-separator inputs resolve to null (no JVM) but must not throw —
+        // find_class normalises rather than rejecting them.
+        check("find_class_dotted_name_null", vmhook::find_class("java.lang.Object") == nullptr);
+        check("find_class_mixed_sep_no_throw",
+              find_class_never_throws("java.lang/Object"));
+    }
+
+    // ---- 13d. override_class_lookup -> find_class observation, no JVM --------
+    //      With a JVM, override seeds a klass that find_class would return on its
+    //      cache-hit path.  With NO JVM the cache-hit guard
+    //      `cached_klass && is_valid_pointer(cached_klass)` (~8212) REJECTS our
+    //      fabricated low-constant sentinel, find_class erases it and re-walks
+    //      (-> null), so the name is GONE from the cache afterwards.  Pin this
+    //      heal precisely (it is the same mechanism flaw-1 documents for the null
+    //      override) — we assert the post-find_class state, restoring via guard.
+    {
+        const std::string name{ "section13/OverrideThenFindClass" };
+        scoped_cache_guard guard{ name };
+        vmhook::evict_class_lookup(name);
+
+        auto* const sentinel{ reinterpret_cast<vmhook::hotspot::klass*>(
+            static_cast<std::uintptr_t>(0x7A7A00)) };
+        vmhook::override_class_lookup(name, sentinel);
+        check("section13_override_present_before_find_class", cache_contains(name));
+
+        const auto fc{ vmhook::find_class(std::string_view{ name.data(), name.size() }) };
+        check("section13_override_find_class_null_no_jvm", fc == nullptr);
+        // is_valid_pointer rejects the low-constant sentinel -> evicted by the
+        // stale-cache check; the name no longer maps to anything.
+        info("section13_invalid_sentinel_survives_find_class", cache_contains(name));
+        check("section13_invalid_sentinel_healed_by_find_class", !cache_contains(name));
+    }
+
+    // ---- 13e. host-classloader inheritance: null / no-op contract, no JVM ----
+    //      klass_to_class_loader_oop returns nullptr for null AND for any klass
+    //      with no JVM (iterate_struct_entries null), capture is a no-op so the
+    //      latch stays null, and inherit_* is a no-op.  None throws.  We pass
+    //      only nullptr where the argument would be dereferenced (no fabricated
+    //      live klass read).  The latch must be null on entry and exit.
+    {
+        check("host_latch_null_at_section_entry",
+              vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) == nullptr);
+
+        check("klass_to_loader_null_arg_null",
+              vmhook::detail::klass_to_class_loader_oop(nullptr) == nullptr);
+        check("klass_to_loader_null_arg_no_throw", klass_to_loader_never_throws(nullptr));
+
+        // A non-null but is_valid_pointer-REJECTED low constant: klass_to_oop
+        // still returns null (no JVM -> iterate_struct_entries null gates first;
+        // and even past that, is_valid_pointer rejects it before any deref).
+        auto* const low_klass{ reinterpret_cast<vmhook::hotspot::klass*>(
+            static_cast<std::uintptr_t>(0x4)) };
+        check("klass_to_loader_low_const_null",
+              vmhook::detail::klass_to_class_loader_oop(low_klass) == nullptr);
+        check("klass_to_loader_low_const_no_throw", klass_to_loader_never_throws(low_klass));
+
+        // capture_host_classloader_klass: null candidate -> no-op; low-const
+        // candidate -> klass_to_class_loader_oop(candidate) is null so it bails
+        // before the CAS.  Either way the latch is never published with no JVM.
+        check("capture_null_candidate_no_throw", capture_host_never_throws(nullptr));
+        check("capture_low_const_candidate_no_throw", capture_host_never_throws(low_klass));
+        check("host_latch_still_null_after_capture",
+              vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) == nullptr);
+
+        // inherit_*: latch is null -> immediate no-op, never throws.
+        check("inherit_host_no_throw", inherit_host_never_throws());
+        check("host_latch_null_at_section_exit",
+              vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) == nullptr);
+    }
+
+    // ---- 13f. Concurrent no-JVM smoke for the added resolution entry points --
+    //      find_class_with_context_loader, find_class, klass_to_class_loader_oop
+    //      (null), capture (null) and inherit hammered from many threads must all
+    //      hold the no-JVM contract and never crash.  We count any non-null /
+    //      any latch publication; both must remain zero / null.
+    {
+        constexpr int thread_count{ 8 };
+        constexpr int iterations{ 200 };
+        std::vector<std::thread> workers{};
+        std::vector<int> resolved(static_cast<std::size_t>(thread_count), 0);
+        workers.reserve(static_cast<std::size_t>(thread_count));
+        for (int t{ 0 }; t < thread_count; ++t)
+        {
+            workers.emplace_back([t, &resolved]() noexcept
+            {
+                for (int i{ 0 }; i < iterations; ++i)
+                {
+                    if (vmhook::jni::find_class_with_context_loader("java/lang/Object") != nullptr)
+                    {
+                        ++resolved[static_cast<std::size_t>(t)];
+                    }
+                    if (vmhook::find_class("java/lang/String") != nullptr)
+                    {
+                        ++resolved[static_cast<std::size_t>(t)];
+                    }
+                    if (vmhook::detail::klass_to_class_loader_oop(nullptr) != nullptr)
+                    {
+                        ++resolved[static_cast<std::size_t>(t)];
+                    }
+                    vmhook::detail::capture_host_classloader_klass(nullptr);
+                    vmhook::detail::inherit_host_context_classloader_for_current_thread();
+                }
+            });
+        }
+        for (auto& w : workers) { w.join(); }
+        bool none_resolved{ true };
+        for (int t{ 0 }; t < thread_count; ++t)
+        {
+            if (resolved[static_cast<std::size_t>(t)] != 0) { none_resolved = false; }
+        }
+        check("section13_concurrent_never_resolves_no_jvm", none_resolved);
+        check("section13_concurrent_latch_still_null",
+              vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) == nullptr);
     }
 
     // ---------------------------------------------------------------------

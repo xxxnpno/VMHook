@@ -28,9 +28,11 @@
 // pinned functions (they live in unevaluated decltype / is_invocable contexts),
 // so the no-JVM precondition is never violated by the surface lockdown.
 #include <vmhook/vmhook.hpp>
+#include <array>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1795,6 +1797,336 @@ int main()
     }
 
     // =====================================================================
+    // ADDITIVE DEEPENING PASS (wave-14) — exhaustive degenerate-input no-JVM
+    // contract.  Every assertion below derives its expected value directly
+    // from the vmhook.hpp source (line refs in comments).  No fabricated live
+    // oop/Method/klass/handle is ever dereferenced: every pointer fed in is
+    // either null, an is_valid_pointer-REJECTED constant (floor/ceiling/odd/
+    // poison-sentinel — rejected BEFORE any read, vmhook.hpp:2047-2084), or a
+    // REAL heap buffer this test owns (std::vector / std::array data()).
+    // =====================================================================
+    {
+        // --- find_class degenerate names: all null without a JVM, no throw ---
+        // find_class (vmhook.hpp:8146) short-circuits "" -> null (8161); a '['
+        // descriptor goes through jni_find_class (8175) which is null+cleared
+        // with no JVM; every other name falls through the ClassLoaderDataGraph
+        // walk + jni context-loader fallback, both null with no JVM, all under
+        // try/catch (8234-8265).  Mixed '.'/'/' separators do NOT short-circuit
+        // -- they are resolved like any other name and simply miss -> null.
+        bool threw{ false };
+        bool all_null{ false };
+        try
+        {
+            const vmhook::hotspot::klass* const a{ vmhook::find_class("[I") };
+            const vmhook::hotspot::klass* const b{ vmhook::find_class("[[J") };
+            const vmhook::hotspot::klass* const c{ vmhook::find_class("[Ljava/lang/String;") };
+            const vmhook::hotspot::klass* const d{ vmhook::find_class("java.lang.Object") };
+            const vmhook::hotspot::klass* const e{ vmhook::find_class("java/lang/Object") };
+            const vmhook::hotspot::klass* const f{ vmhook::find_class("net/minecraft/client/Minecraft") };
+            all_null = a == nullptr && b == nullptr && c == nullptr
+                    && d == nullptr && e == nullptr && f == nullptr;
+        }
+        catch (...) { threw = true; }
+        check("find_class_array_and_mixed_separator_names_null", all_null);
+        check("find_class_degenerate_names_do_not_throw", !threw);
+    }
+    {
+        // A pathologically long name (100 KB of '/'-separated segments) must
+        // still resolve to null without throwing and without overrunning any
+        // internal buffer (find_class works on a string_view; no fixed buffer).
+        std::string long_name;
+        long_name.reserve(100u * 1024u);
+        for (int i{ 0 }; i < 6800; ++i) { long_name += "pkg/"; }
+        long_name += "Class";
+        bool threw{ false };
+        const vmhook::hotspot::klass* k{ reinterpret_cast<vmhook::hotspot::klass*>(0x2) };
+        try { k = vmhook::find_class(long_name); }
+        catch (...) { threw = true; }
+        check("find_class_very_long_name_null", k == nullptr);
+        check("find_class_very_long_name_does_not_throw", !threw);
+    }
+    {
+        // A name with an embedded NUL byte (string_view length carries past it)
+        // is treated as an ordinary miss -> null, never throws, never reads OOB.
+        const char raw[]{ 'a', '/', 'B', '\x00', 'c', '/', 'D' };
+        const std::string_view embedded_nul{ raw, sizeof(raw) };
+        bool threw{ false };
+        const vmhook::hotspot::klass* k{ reinterpret_cast<vmhook::hotspot::klass*>(0x2) };
+        try { k = vmhook::find_class(embedded_nul); }
+        catch (...) { threw = true; }
+        check("find_class_embedded_nul_name_null", k == nullptr);
+        check("find_class_embedded_nul_name_does_not_throw", !threw);
+    }
+
+    // --- read_java_string: is_valid_pointer-REJECTED pointers -> empty -------
+    // read_java_string (vmhook.hpp:20471) bails at 20474 when the pointer fails
+    // is_valid_pointer (2047-2084) BEFORE any dereference.  Every pointer here
+    // is rejected by a DIFFERENT arm of that filter, proving each reject leg
+    // yields "" and never throws.  None is ever read through.
+    {
+        // user_address_floor is 0xFFFF (vmhook.hpp:520); addr <= floor rejects.
+        void* const at_floor{ reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(0xFFFFu)) };
+        // user_address_ceiling is 0x00007FFFFFFFFFFF (vmhook.hpp:515); addr >=
+        // ceiling rejects.  Use the ceiling exactly (>= is inclusive).
+        void* const at_ceiling{ reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(0x00007FFFFFFFFFFFull)) };
+        // Odd (low bit set) in-range pointer: alignment arm (2059) rejects.
+        void* const odd_inrange{ reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(0x100003ull)) };
+        // Debug-poison: low32 == 0xCCCCCCCC (MSVC uninitialised stack, 2072).
+        // It is even and in range, so the alignment arm passes it through to
+        // the poison switch, which rejects it.  (0xDEADBEEF / 0xCDCDCDCD are
+        // ODD, so they would be caught by the alignment arm first -- to prove
+        // the POISON arm specifically the low32 sentinel must be even.)
+        void* const poison_cccc{ reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(0xCCCCCCCCull)) };
+        // Debug-poison: low32 == 0xFEEEFEEE (Windows HeapFree, 2075), even.
+        void* const poison_feee{ reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(0xFEEEFEEEull)) };
+        bool threw{ false };
+        bool all_empty{ false };
+        try
+        {
+            all_empty = vmhook::read_java_string(at_floor).empty()
+                     && vmhook::read_java_string(at_ceiling).empty()
+                     && vmhook::read_java_string(odd_inrange).empty()
+                     && vmhook::read_java_string(poison_cccc).empty()
+                     && vmhook::read_java_string(poison_feee).empty();
+        }
+        catch (...) { threw = true; }
+        check("read_java_string_rejected_pointers_all_empty", all_empty);
+        check("read_java_string_rejected_pointers_do_not_throw", !threw);
+    }
+
+    // --- decode_array_oop: NON-zero compressed -> null without VMStructs -----
+    // decode_array_oop (vmhook.hpp:20984) forwards a non-zero compressed value
+    // to decode_oop_pointer (5504), which resolves the narrow-oop base/shift
+    // VMStruct entries (5527-5530); with no JVM both are null so it returns
+    // null at 5532, and decode_array_oop's is_valid_pointer gate (20992) keeps
+    // it null.  The existing file only covered the compressed==0 fast path.
+    {
+        bool threw{ false };
+        bool all_null{ false };
+        try
+        {
+            all_null = vmhook::decode_array_oop(1u) == nullptr
+                    && vmhook::decode_array_oop(0x7FFFFFFFu) == nullptr
+                    && vmhook::decode_array_oop(0xFFFFFFFFu) == nullptr;
+        }
+        catch (...) { threw = true; }
+        check("decode_array_oop_nonzero_null_without_jvm", all_null);
+        check("decode_array_oop_nonzero_does_not_throw", !threw);
+    }
+
+    // --- get/set_array_element element-type breadth on REAL owned buffers ----
+    // The existing file round-trips only int32.  Element data starts at +16
+    // with stride sizeof(element_type); _length is the int32 at +12
+    // (vmhook.hpp:14796-14797 / 14845 / 14875).  Each buffer below is a real
+    // heap allocation (std::array on the stack is also a canonical mapped
+    // address) sized header(16) + count*stride, with _length seeded at +12.
+    // We prove the public template entry points round-trip every width the
+    // primitive-array helpers support and that the no-JVM safe defaults hold.
+    {
+        // Element count for buffer SIZING is size_t (no signed/unsigned mixing
+        // in the std::array bound); the int32 length SEEDED at +12 is separate.
+        constexpr std::size_t elem_count{ 3u };
+        const std::int32_t length{ 3 };
+        // int8_t
+        {
+            std::array<std::uint8_t, 16u + elem_count * sizeof(std::int8_t)> buf{};
+            std::memcpy(buf.data() + 12, &length, sizeof(length));
+            void* const oop{ buf.data() };
+            vmhook::set_array_element<std::int8_t>(oop, 0, std::int8_t{ 0x7F });
+            vmhook::set_array_element<std::int8_t>(oop, 2, std::int8_t{ -128 });
+            check("array_element_int8_roundtrip0",
+                  vmhook::get_array_element<std::int8_t>(oop, 0) == std::int8_t{ 0x7F });
+            check("array_element_int8_roundtrip2",
+                  vmhook::get_array_element<std::int8_t>(oop, 2) == std::int8_t{ -128 });
+            check("array_element_int8_length", vmhook::array_length(oop) == length);
+        }
+        // int16_t
+        {
+            std::array<std::uint8_t, 16u + elem_count * sizeof(std::int16_t)> buf{};
+            std::memcpy(buf.data() + 12, &length, sizeof(length));
+            void* const oop{ buf.data() };
+            vmhook::set_array_element<std::int16_t>(oop, 1, std::int16_t{ -12345 });
+            check("array_element_int16_roundtrip1",
+                  vmhook::get_array_element<std::int16_t>(oop, 1) == std::int16_t{ -12345 });
+        }
+        // int64_t
+        {
+            std::array<std::uint8_t, 16u + elem_count * sizeof(std::int64_t)> buf{};
+            std::memcpy(buf.data() + 12, &length, sizeof(length));
+            void* const oop{ buf.data() };
+            const std::int64_t v{ static_cast<std::int64_t>(0x0123456789ABCDEFll) };
+            vmhook::set_array_element<std::int64_t>(oop, 2, v);
+            check("array_element_int64_roundtrip2",
+                  vmhook::get_array_element<std::int64_t>(oop, 2) == v);
+        }
+        // float
+        {
+            std::array<std::uint8_t, 16u + elem_count * sizeof(float)> buf{};
+            std::memcpy(buf.data() + 12, &length, sizeof(length));
+            void* const oop{ buf.data() };
+            vmhook::set_array_element<float>(oop, 0, 3.5f);
+            check("array_element_float_roundtrip0",
+                  vmhook::get_array_element<float>(oop, 0) == 3.5f);
+        }
+        // double
+        {
+            std::array<std::uint8_t, 16u + elem_count * sizeof(double)> buf{};
+            std::memcpy(buf.data() + 12, &length, sizeof(length));
+            void* const oop{ buf.data() };
+            vmhook::set_array_element<double>(oop, 1, 2.25);
+            check("array_element_double_roundtrip1",
+                  vmhook::get_array_element<double>(oop, 1) == 2.25);
+        }
+        // bool (single byte width)
+        {
+            std::array<std::uint8_t, 16u + elem_count * sizeof(bool)> buf{};
+            std::memcpy(buf.data() + 12, &length, sizeof(length));
+            void* const oop{ buf.data() };
+            vmhook::set_array_element<bool>(oop, 0, true);
+            vmhook::set_array_element<bool>(oop, 1, false);
+            check("array_element_bool_roundtrip0",
+                  vmhook::get_array_element<bool>(oop, 0) == true);
+            check("array_element_bool_roundtrip1",
+                  vmhook::get_array_element<bool>(oop, 1) == false);
+        }
+    }
+    {
+        // array_length on the same rejected pointers used elsewhere is 0 with
+        // no deref: null, sub-floor, and odd (vmhook.hpp:14781).
+        check("array_length_null_zero", vmhook::array_length(nullptr) == 0);
+        check("array_length_subfloor_zero",
+              vmhook::array_length(reinterpret_cast<void*>(
+                  static_cast<std::uintptr_t>(0x100u))) == 0);
+        check("array_length_odd_zero",
+              vmhook::array_length(reinterpret_cast<void*>(
+                  static_cast<std::uintptr_t>(0x100001ull))) == 0);
+    }
+
+    // --- make_java_array degenerate args: null without a JVM, no throw -------
+    // make_java_array (vmhook.hpp:14403): negative length rejects at 14406;
+    // otherwise find_class is null and the '[' JNI fallback (14419) is null
+    // with no JVM, so it returns null at 14439.  noexcept, so it cannot throw.
+    {
+        bool all_null{ false };
+        all_null = vmhook::make_java_array("[I", 0, sizeof(std::int32_t)) == nullptr
+                && vmhook::make_java_array("[Ljava/lang/Object;", 3, sizeof(void*)) == nullptr
+                && vmhook::make_java_array("", 2, 1u) == nullptr
+                && vmhook::make_java_array("java/lang/Object", -7, sizeof(void*)) == nullptr
+                && vmhook::make_java_array("byte[]", 4, 1u) == nullptr;
+        check("make_java_array_degenerate_args_all_null", all_null);
+    }
+
+    // --- object<T> field/method resolution with no JVM -> std::nullopt -------
+    // get_field/get_method/static_field/static_method all call resolve_klass
+    // first (vmhook.hpp:18138/18260/18325/18540).  dummy_wrapper was never
+    // registered (register_class returned false above), so resolve_klass
+    // returns null (18544-18548) -> std::nullopt.  Building the wrapper around
+    // a NULL oop never dereferences it (object_base just stores the pointer).
+    {
+        const dummy_wrapper obj{ nullptr };
+        bool threw{ false };
+        bool all_nullopt{ false };
+        try
+        {
+            const auto f{ obj.get_field("counter") };
+            const auto m1{ obj.get_method("doStuff") };
+            const auto m2{ obj.get_method("doStuff", "()V") };
+            const auto sf{ vmhook::object<dummy_wrapper>::static_field("COUNT") };
+            const auto sm1{ vmhook::object<dummy_wrapper>::static_method("create") };
+            const auto sm2{ vmhook::object<dummy_wrapper>::static_method("create", "()V") };
+            all_nullopt = !f.has_value() && !m1.has_value() && !m2.has_value()
+                       && !sf.has_value() && !sm1.has_value() && !sm2.has_value();
+        }
+        catch (...) { threw = true; }
+        check("object_field_method_resolution_all_nullopt", all_nullopt);
+        check("object_field_method_resolution_does_not_throw", !threw);
+        // get_instance() echoes back the (null) oop the wrapper was built with.
+        check("object_null_wrapper_get_instance_null", obj.get_instance() == nullptr);
+    }
+
+    // --- jni::global_ref inert-state accessors: no JVM, never deref ----------
+    // A default-constructed / null-pinned global_ref keeps handle_ == nullptr
+    // (vmhook.hpp:21731 default; 21735 the null-oop early return), so
+    // operator bool() is false (21811), oop() returns null without the
+    // tagged-handle deref (21776), handle() is null (21806), and reset() is an
+    // idempotent no-op (21797).  No fabricated non-null oop is pinned, so the
+    // jni_oop_handle / jni_new_global_ref deref path is never entered.
+    {
+        bool threw{ false };
+        bool default_inert{ false };
+        bool null_pin_inert{ false };
+        try
+        {
+            vmhook::jni::global_ref g_default{};
+            default_inert = !static_cast<bool>(g_default)
+                         && g_default.oop() == nullptr
+                         && g_default.handle() == nullptr;
+
+            vmhook::jni::global_ref g_null{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
+            null_pin_inert = !static_cast<bool>(g_null)
+                          && g_null.oop() == nullptr
+                          && g_null.handle() == nullptr;
+
+            // reset() on an inert handle is a safe idempotent no-op.
+            g_null.reset();
+            g_null.reset();
+            null_pin_inert = null_pin_inert
+                          && g_null.oop() == nullptr
+                          && g_null.handle() == nullptr;
+        }
+        catch (...) { threw = true; }
+        check("global_ref_default_inert_accessors", default_inert);
+        check("global_ref_null_pin_inert_accessors", null_pin_inert);
+        check("global_ref_inert_accessors_do_not_throw", !threw);
+    }
+
+    // --- NEVER-THROW BLANKET over the remaining no-JVM surface ---------------
+    // One try/catch around a batch of entry points not individually wrapped
+    // above, asserting the whole degenerate-input surface is exception-safe
+    // with no JVM.  Every value fed in is null / empty / an is_valid_pointer-
+    // rejected constant; no result is inspected here (the value contracts are
+    // pinned above) -- this isolates the "never throws" half of the contract.
+    {
+        bool threw{ false };
+        try
+        {
+            (void)vmhook::find_class("a/b/c");
+            (void)vmhook::find_class_via_oop(nullptr, "a/b/c");
+            (void)vmhook::klass_from_oop(nullptr);
+            vmhook::override_class_lookup("blanket/Probe", nullptr);
+            vmhook::evict_class_lookup("blanket/Probe");
+            (void)vmhook::reanchor_classes_via_oop(nullptr, { "a/b/c" });
+            (void)vmhook::get_class_methods("a/b/c");
+            (void)vmhook::get_class_methods<dummy_wrapper>();
+            (void)vmhook::find_methods_by_signature<dummy_wrapper>("()V");
+            vmhook::log_class_methods<dummy_wrapper>();
+            (void)vmhook::register_class<base_wrapper>("a/b/c");
+            (void)vmhook::make_unique<dummy_wrapper>();
+            (void)vmhook::make_unique<dummy_wrapper>(1, 2.0, true);
+            (void)vmhook::make_java_string("blanket");
+            (void)vmhook::make_java_string("");
+            (void)vmhook::make_java_array("[I", 1, sizeof(std::int32_t));
+            (void)vmhook::read_java_string(nullptr);
+            (void)vmhook::decode_array_oop(0u);
+            (void)vmhook::decode_array_oop(42u);
+            (void)vmhook::verify_hooks();
+            vmhook::shutdown_hooks();
+            (void)vmhook::deoptimize_all_jit_compiled_methods();
+            (void)vmhook::get_array_element<std::int32_t>(nullptr, 0);
+            vmhook::set_array_element<std::int32_t>(nullptr, 0, 0);
+            (void)vmhook::array_length(nullptr);
+            (void)vmhook::auto_repair_enabled();
+        }
+        catch (...) { threw = true; }
+        check("never_throw_blanket_no_jvm_surface", !threw);
+    }
+
+    // =====================================================================
     // COMPILE-TIME SURFACE-LOCKDOWN ACKNOWLEDGEMENTS
     // =====================================================================
     // The hundreds of static_asserts in namespace surface_lock above are the
@@ -1813,6 +2145,7 @@ int main()
     check("surface_lock_groupH_global_ref_pin_pinned", true);
     check("surface_lock_groupI_jni_forwarders_pinned", true);
     check("surface_lock_groupJ_public_type_traits_pinned", true);
+    check("wave14_additive_degenerate_input_deepening_present", true);
 
     return failures == 0 ? 0 : 1;
 }

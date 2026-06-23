@@ -1688,6 +1688,396 @@ int main()
         check("find_class_large_power_of_two_lengths_ok", big_ok);
     }
 
+    // =====================================================================
+    // 30. ADDITIVE DEEPENING PASS (wave). Every assertion below is derived
+    //     directly from the current vmhook.hpp source and pins NO-JVM
+    //     contracts not covered by sections 0-29 above. Pure null/empty/false
+    //     /size comparisons and is_valid_pointer-rejected integer constants —
+    //     no fabricated handle is ever dereferenced, no real allocation, no
+    //     platform-variant comparison. Self-contained; touches no prior
+    //     assertion. Any shared-cache key it seeds is saved and restored so
+    //     the postcondition section below is unaffected.
+    // =====================================================================
+
+    // ---- Shared snapshot/restore for the klass_lookup_cache (same technique
+    //      section 26 uses; klass_lookup_cache + its mutex are process memory,
+    //      readable with no JVM). Lets the array-bypass probe seed a key and
+    //      restore the exact prior state afterwards. -----------------------
+    auto deepen_cache_snapshot = [](const std::string& key)
+        -> std::pair<bool, vmhook::hotspot::klass*>
+    {
+        std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+        const auto it{ vmhook::klass_lookup_cache.find(key) };
+        if (it == vmhook::klass_lookup_cache.end()) { return { false, nullptr }; }
+        return { true, it->second };
+    };
+    auto deepen_cache_restore = [](const std::string& key,
+                                   const std::pair<bool, vmhook::hotspot::klass*>& prior)
+        -> void
+    {
+        std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+        if (prior.first) { vmhook::klass_lookup_cache[key] = prior.second; }
+        else             { vmhook::klass_lookup_cache.erase(key); }
+    };
+    auto deepen_cache_has = [](const std::string& key) -> bool
+    {
+        std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+        return vmhook::klass_lookup_cache.find(key) != vmhook::klass_lookup_cache.end();
+    };
+
+    // ---------------------------------------------------------------------
+    // 30a. ARRAY-NAME branch BYPASSES the cache entirely (vmhook.hpp ~8175).
+    //      find_class checks class_name.front()=='[' BEFORE consulting
+    //      klass_lookup_cache: it routes straight to jni_find_class (null with
+    //      no JVM, via the ensure_current_java_thread gate ~11872) and returns
+    //      WITHOUT ever reading OR erasing the cache. Therefore:
+    //        * an override_class_lookup() seeded under an array name is IGNORED
+    //          by find_class on that name (returns null, not the seeded ptr),
+    //        * and the seeded entry SURVIVES the find_class call (the array
+    //          branch never erases) — unlike the non-array stale path
+    //          (section 6c / 26) which consults+evicts.
+    //      We seed with an is_valid_pointer-REJECTED low constant (0x2: below
+    //      user_address_floor 0xFFFF) so the fake klass is NEVER dereferenced
+    //      on any path. Prior cache state for the key is saved and restored.
+    // ---------------------------------------------------------------------
+    {
+        // 0x2 is even but <= floor (0xFFFF) -> is_valid_pointer rejects it
+        // purely by arithmetic; it is never read. Confirm that first.
+        auto* const rejected_fake{ reinterpret_cast<vmhook::hotspot::klass*>(
+            static_cast<std::uintptr_t>(0x2ull)) };
+        check("section30a_fake_klass_rejected_by_is_valid_pointer",
+              vmhook::hotspot::is_valid_pointer(rejected_fake) == false);
+
+        const char* const array_names[]{
+            "[I", "[J", "[Z", "[B", "[C", "[S", "[F", "[D",
+            "[Ljava/lang/Object;", "[[I", "[[Ljava/lang/String;",
+        };
+        bool seeded_ignored_all_null{ true };
+        bool seeded_entry_survives{ true };
+        bool none_threw{ true };
+        for (const char* n : array_names)
+        {
+            const std::string key{ n };
+            const auto prior{ deepen_cache_snapshot(key) };
+
+            vmhook::override_class_lookup(n, rejected_fake);
+            // find_class takes the '[' branch BEFORE the cache, so it returns
+            // null (no JVM) and never reads the seeded fake pointer.
+            bool threw{ false };
+            vmhook::hotspot::klass* result{ rejected_fake };
+            try { result = vmhook::find_class(n); }
+            catch (...) { threw = true; }
+            if (threw)              { none_threw = false; }
+            if (result != nullptr)  { seeded_ignored_all_null = false; }
+            // The array branch never erased the cache, so the seeded entry is
+            // still present (proving find_class never touched the cache here).
+            if (!deepen_cache_has(key)) { seeded_entry_survives = false; }
+
+            deepen_cache_restore(key, prior);
+        }
+        check("find_class_array_name_ignores_seeded_cache_entry", seeded_ignored_all_null);
+        check("find_class_array_name_leaves_cache_entry_intact", seeded_entry_survives);
+        check("find_class_array_name_seeded_no_throw", none_threw);
+    }
+
+    // ---------------------------------------------------------------------
+    // 30b. find_class_via_oop SECOND-clause guard: a NON-null anchor that is
+    //      an is_valid_pointer-rejected low constant passes the `!anchor_oop`
+    //      test (it is non-null) and so reaches the `!ensure_current_java_thread()`
+    //      clause of the `||` guard (vmhook.hpp ~13777), which is true with no
+    //      JVM -> returns null BEFORE jni_oop_handle ever dereferences the
+    //      anchor. Sections 7/27 only ever pass nullptr (first clause); this
+    //      pins the second clause. The anchor is NEVER dereferenced: the guard
+    //      short-circuits first, and the constants are is_valid_pointer-rejected
+    //      regardless. (anchor is void*, so we cast through uintptr_t.)
+    // ---------------------------------------------------------------------
+    {
+        const std::uintptr_t rejected_anchors[]{
+            0x0000000000000002ull,   // even, below floor
+            0x0000000000000004ull,   // even, below floor
+            0x0000000000000FFEull,   // even, below floor
+        };
+        const char* const names[]{
+            "", "java/lang/Object", "definitely/Not/A/Class",
+            "[Ljava/lang/String;", "weird$Inner",
+        };
+        bool all_null{ true };
+        bool none_threw{ true };
+        for (const std::uintptr_t a : rejected_anchors)
+        {
+            void* const anchor{ reinterpret_cast<void*>(a) };
+            for (const char* n : names)
+            {
+                bool threw{ false };
+                vmhook::hotspot::klass* result{ nullptr };
+                try { result = vmhook::find_class_via_oop(anchor, n); }
+                catch (...) { threw = true; }
+                if (threw)             { none_threw = false; }
+                if (result != nullptr) { all_null = false; }
+            }
+        }
+        check("find_class_via_oop_nonnull_rejected_anchor_all_null", all_null);
+        check("find_class_via_oop_nonnull_rejected_anchor_no_throw", none_threw);
+    }
+
+    // ---------------------------------------------------------------------
+    // 30c. reanchor_classes_via_oop with a NON-null (rejected) anchor enters
+    //      the per-name loop (the `!anchor_oop` early-false guard at ~13923 is
+    //      NOT taken), calls find_class_via_oop per name (null with no JVM,
+    //      gated by ensure_current_java_thread), so NO name resolves, nothing
+    //      is overridden, and all_resolved stays false. Section 27 only covers
+    //      the null-anchor EARLY return; this covers the loop's all-miss path.
+    //      A non-empty list MUST be false (no name resolved). The EMPTY list
+    //      with a non-null anchor is vacuously TRUE (the loop body never runs,
+    //      all_resolved stays its initial true) — the documented "true only if
+    //      EVERY name resolved" rule, vacuously satisfied. Anchor never deref'd
+    //      (find_class_via_oop's gate fails first; constant is rejected anyway).
+    // ---------------------------------------------------------------------
+    {
+        void* const rejected_anchor{ reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(0x2ull)) };
+
+        // Non-empty lists: nothing resolves with no JVM -> false.
+        check("reanchor_nonnull_anchor_single_false",
+              vmhook::reanchor_classes_via_oop(rejected_anchor, { "a/B" }) == false);
+        check("reanchor_nonnull_anchor_multi_false",
+              vmhook::reanchor_classes_via_oop(
+                  rejected_anchor, { "a/B", "c/D", "java/lang/Object" }) == false);
+        check("reanchor_nonnull_anchor_arrays_false",
+              vmhook::reanchor_classes_via_oop(
+                  rejected_anchor, { "[I", "[Ljava/lang/String;" }) == false);
+
+        // Empty list + non-null anchor: loop body never runs -> vacuously true.
+        check("reanchor_nonnull_anchor_empty_list_vacuously_true",
+              vmhook::reanchor_classes_via_oop(rejected_anchor, {}) == true);
+
+        // Never throws across a batch of mixed name shapes (rejected anchor).
+        bool none_threw{ true };
+        try
+        {
+            (void)vmhook::reanchor_classes_via_oop(
+                rejected_anchor,
+                { "", "java/lang/Object", "[I", "Ljava/lang/String;",
+                  "()V", "weird$Inner", "java.dotted.Form" });
+        }
+        catch (...) { none_threw = false; }
+        check("reanchor_nonnull_anchor_varied_shapes_no_throw", none_threw);
+
+        // The all-miss loop left NOTHING overridden in the cache (no name
+        // resolved, so override_class_lookup was never called for any of them).
+        bool nothing_overridden{ true };
+        for (const char* n : { "a/B", "c/D" })
+        {
+            if (deepen_cache_has(std::string{ n })) { nothing_overridden = false; }
+        }
+        check("reanchor_nonnull_anchor_overrides_nothing_no_jvm", nothing_overridden);
+    }
+
+    // ---------------------------------------------------------------------
+    // 30d. reanchor_classes_via_oop return-type AND null-anchor independence
+    //      from list contents. The return type is exactly bool (documents the
+    //      poll-until-true channel). With a null anchor the result is false for
+    //      EVERY list shape — including the empty list — because the
+    //      `!anchor_oop` guard returns false BEFORE the loop (so, unlike 30c's
+    //      non-null empty-list vacuous-true, the null empty-list is FALSE). The
+    //      two empty-list outcomes (null->false at ~13923 vs non-null->true via
+    //      the untouched all_resolved) are the boundary this pins from both
+    //      sides.
+    // ---------------------------------------------------------------------
+    {
+        using reanchor_ret_t = decltype(vmhook::reanchor_classes_via_oop(nullptr, {}));
+        static_assert(std::is_same_v<reanchor_ret_t, bool>,
+                      "reanchor_classes_via_oop must return bool");
+        check("reanchor_return_type_is_bool", true);
+
+        // Null anchor: false regardless of list contents (early guard).
+        check("reanchor_null_anchor_empty_false_vs_nonnull_true_boundary",
+              vmhook::reanchor_classes_via_oop(nullptr, {}) == false);
+    }
+
+    // ---------------------------------------------------------------------
+    // 30e. override_class_lookup / evict_class_lookup degenerate-name
+    //      contract. Both take the name by value into std::string{class_name}
+    //      under the lock (vmhook.hpp ~13882 / ~13900) and are noexcept (their
+    //      bodies are wrapped in try/catch). They accept ANY name shape —
+    //      including the empty name, embedded NULs, and a default-constructed
+    //      view — without throwing. After a null-override + evict of an
+    //      ordinary (non-array) name, find_class re-walks to null. We exercise
+    //      a spread of degenerate keys and confirm: no throw, and a final
+    //      find_class on each is null, and the key is gone after eviction.
+    //      Every key we use is a fresh probe name; we evict each at the end so
+    //      no entry is left armed.
+    // ---------------------------------------------------------------------
+    {
+        // Length-bearing degenerate keys (string_view carries the size, so the
+        // interior/leading NUL keys are non-empty and travel the full path).
+        const std::string nul_key{ std::string{ "deepen/Nul" } + '\0' + "Key" };
+        const std::string lead_nul_key{ std::string{ '\0' } + "deepen/LeadNul" };
+        const std::string_view keys[]{
+            std::string_view{},                         // default-constructed (empty)
+            std::string_view{ "" },                     // valid ptr, 0 size
+            std::string_view{ "deepen/Plain/Probe" },
+            std::string_view{ "deepen/Sep//Probe" },
+            std::string_view{ nul_key.data(), nul_key.size() },
+            std::string_view{ lead_nul_key.data(), lead_nul_key.size() },
+        };
+        bool override_no_throw{ true };
+        bool evict_no_throw{ true };
+        bool find_null_after{ true };
+        bool gone_after_evict{ true };
+        for (const std::string_view k : keys)
+        {
+            try { vmhook::override_class_lookup(k, nullptr); }
+            catch (...) { override_no_throw = false; }
+            // A null override does not seed a durable negative; find_class
+            // re-walks (-> null with no JVM). Non-array keys only (no '[').
+            if (vmhook::find_class(k) != nullptr) { find_null_after = false; }
+            try { vmhook::evict_class_lookup(k); }
+            catch (...) { evict_no_throw = false; }
+            if (deepen_cache_has(std::string{ k })) { gone_after_evict = false; }
+        }
+        check("override_class_lookup_degenerate_keys_no_throw", override_no_throw);
+        check("evict_class_lookup_degenerate_keys_no_throw", evict_no_throw);
+        check("find_class_after_null_override_degenerate_null", find_null_after);
+        check("evict_class_lookup_degenerate_keys_gone", gone_after_evict);
+
+        // Double-evict of the same key is a safe no-op the second time.
+        bool double_evict_no_throw{ true };
+        try
+        {
+            vmhook::override_class_lookup("deepen/Double/Evict", nullptr);
+            vmhook::evict_class_lookup("deepen/Double/Evict");
+            vmhook::evict_class_lookup("deepen/Double/Evict");   // already gone
+        }
+        catch (...) { double_evict_no_throw = false; }
+        check("evict_class_lookup_double_evict_no_throw", double_evict_no_throw);
+        check("evict_class_lookup_double_evict_key_gone",
+              deepen_cache_has(std::string{ "deepen/Double/Evict" }) == false);
+    }
+
+    // ---------------------------------------------------------------------
+    // 30f. jni::find_class returns a JNI HANDLE channel (void*), distinct from
+    //      the HotSpot-internal klass* channel, and jni::find_class_with_context_loader
+    //      returns a klass*. Both null with no JVM (sections 8/9). Here we add
+    //      the EXACT-byte determinism of the JNI handle channel across the full
+    //      0x01..0xFF single-byte name space (size 1, never the empty guard):
+    //      every single-byte name yields a null handle, twice in a row, never
+    //      throwing — the JNI-side mirror of section 14(a)/24. void* compares
+    //      are platform-invariant (only against nullptr / itself).
+    // ---------------------------------------------------------------------
+    {
+        bool jni_single_byte_null{ true };
+        bool jni_single_byte_stable{ true };
+        bool jni_single_byte_no_throw{ true };
+        bool ctx_single_byte_null{ true };
+        for (int b{ 1 }; b <= 0xFF; ++b)
+        {
+            const char c{ static_cast<char>(b) };
+            const std::string_view sv{ &c, 1 };
+            try
+            {
+                void* const h1{ vmhook::jni::find_class(sv) };
+                void* const h2{ vmhook::jni::find_class(sv) };
+                if (h1 != nullptr) { jni_single_byte_null = false; }
+                if (h1 != h2)      { jni_single_byte_stable = false; }   // both null
+                if (vmhook::jni::find_class_with_context_loader(sv) != nullptr)
+                {
+                    ctx_single_byte_null = false;
+                }
+            }
+            catch (...) { jni_single_byte_no_throw = false; }
+        }
+        check("jni_find_class_every_single_byte_null", jni_single_byte_null);
+        check("jni_find_class_every_single_byte_stable", jni_single_byte_stable);
+        check("jni_find_class_every_single_byte_no_throw", jni_single_byte_no_throw);
+        check("jni_find_class_ctx_every_single_byte_null", ctx_single_byte_null);
+
+        // The HotSpot-internal find_class (klass*) and the JNI find_class
+        // (void*) are SEPARATE channels but agree on not-found with no JVM for
+        // a batch of array / descriptor / dotted shapes (array names take the
+        // '[' branch in the internal form, the FindClass slot in the JNI form;
+        // both null). This ties the two channels together where they diverge
+        // most (the array path).
+        const char* const array_descs[]{
+            "[I", "[J", "[Ljava/lang/Object;", "[[I",
+            "Ljava/lang/String;", "()V", "java.dotted.Name",
+        };
+        bool channels_agree{ true };
+        for (const char* n : array_descs)
+        {
+            const bool internal_null{ vmhook::find_class(n) == nullptr };
+            const bool jni_null{ vmhook::jni::find_class(n) == nullptr };
+            const bool ctx_null{ vmhook::jni::find_class_with_context_loader(n) == nullptr };
+            if (!(internal_null && jni_null && ctx_null)) { channels_agree = false; }
+        }
+        check("find_class_internal_and_jni_channels_agree_arrays_null", channels_agree);
+    }
+
+    // ---------------------------------------------------------------------
+    // 30g. register_class<T>(name) return-value contract with no JVM, over a
+    //      spread of degenerate names. Source (vmhook.hpp ~8926): the function
+    //      FIRST verifies the class via vmhook::find_class(class_name) (~8929)
+    //      and returns false BEFORE the type_to_class_map write (~8948) when
+    //      that is null — which it ALWAYS is with no JVM, for EVERY name shape
+    //      (empty, garbage, dotted, array, separator-laden). It is noexcept.
+    //      So register_class<T>() returns false for every name here and never
+    //      throws. Return type is exactly bool. We reuse the three throwaway
+    //      wrappers; each is harmless to (attempt to) register repeatedly.
+    //      This pins the verify-gate-false branch, which the two valid-name
+    //      calls in sections 11/11b touch only incidentally.
+    // ---------------------------------------------------------------------
+    {
+        using reg_ret_t = decltype(vmhook::register_class<unreg_w>(std::string_view{}));
+        static_assert(std::is_same_v<reg_ret_t, bool>,
+                      "register_class<T>() must return bool");
+        check("register_class_T_return_type_is_bool", true);
+
+        const char* const reg_names[]{
+            "",                              // empty -> find_class empty-guard null
+            "test/find_class/Deepen",        // ordinary
+            "java/lang/Object",              // real-but-no-JVM
+            "[I",                            // array name (find_class '[' branch null)
+            "Ljava/lang/String;",            // field descriptor
+            "()V",                           // method descriptor
+            "java.dotted.Form",              // dotted
+            "double//slash",                 // separator pathology
+            "weird$Inner",                   // nested
+        };
+        bool all_false{ true };
+        bool none_threw{ true };
+        for (const char* n : reg_names)
+        {
+            try
+            {
+                // unreg_w stays a wrapper we never durably register (each call
+                // returns false before the map write with no JVM).
+                if (vmhook::register_class<unreg_w>(n) != false) { all_false = false; }
+            }
+            catch (...) { none_threw = false; }
+        }
+        check("register_class_T_all_names_false_no_jvm", all_false);
+        check("register_class_T_no_throw", none_threw);
+
+        // Repeated registration of the SAME wrapper+name is stable (false every
+        // time with no JVM) and never throws — the verify gate is re-evaluated
+        // each call and stays false.
+        bool repeat_false{ true };
+        bool repeat_no_throw{ true };
+        for (int i{ 0 }; i < 32; ++i)
+        {
+            try
+            {
+                if (vmhook::register_class<reg_w>("test/find_class/Reg") != false)
+                {
+                    repeat_false = false;
+                }
+            }
+            catch (...) { repeat_no_throw = false; }
+        }
+        check("register_class_T_repeat_same_false", repeat_false);
+        check("register_class_T_repeat_same_no_throw", repeat_no_throw);
+    }
+
     // ---------------------------------------------------------------------
     // 15. Final invariant: after ALL the cache seeding / eviction churn above,
     //     a brand-new never-touched name still resolves to null and the JVM-

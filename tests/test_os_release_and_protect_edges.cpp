@@ -2440,6 +2440,331 @@ namespace expansion4_os_layer_surface
     }
 } // namespace expansion4_os_layer_surface
 
+// ===========================================================================
+// EXPANSION 5 (additive, namespaced) -- the os_allocate_release ROUND-TRIP
+// corners that none of the prior sections in THIS file reach: the
+// released-block -> query_region transition (a freed reservation is reported
+// NON-committed / free), the zero-size-release guard exercised on a MULTI-PAGE
+// block with full-span re-verification (wave-5 only used a single-page block),
+// the partial-release tail CHARACTERIZED via query_region (wave-5 used only the
+// fault-safe byte probe), and the sub-page-request WHOLE-page usability contract
+// (a ps-1 request yields a full ps-byte usable page because both VirtualAlloc
+// and mmap commit whole pages -- wave-5 touched only the requested ps-1 bytes).
+//
+// CHARTER (no duplication):
+//   * wave5_alloc_release owns sizing-bit / alignment / leak-loop / negative-
+//     release no-crash / hint / execute-bit, and queries only a LIVE block plus
+//     nullptr.  This block owns the AFTER-release query transition, which wave-5
+//     never touches, plus the zero-size guard on a MULTI-PAGE block and the
+//     sub-page WHOLE-page span.
+//   * expansion-3 owns query_region STRUCTURAL invariants of a live block; this
+//     block owns the freed-region report (different State / perms semantics).
+//   * The early-return guard (vmhook.hpp:776 `!address || size == 0`) is pinned
+//     here on a multi-page allocation -- distinct from the single-page / null /
+//     bogus combinations already covered at the top of the file.
+//
+// Every value DERIVED FROM SOURCE (vmhook.hpp:703-786, 793-897).  Every pointer
+// handed to a reader or to query_region is a real allocate_rwx block we own (or
+// its freed base, which query_region accepts -- it never dereferences the page,
+// only asks the kernel/maps about the address); no fabricated unmapped address
+// is read as data.  Platform-variable outcomes -> info(), never hard-asserted.
+// ===========================================================================
+namespace expansion5_release_query_roundtrip
+{
+    // -----------------------------------------------------------------------
+    // The zero-size-release guard on a MULTI-PAGE block.  vmhook.hpp:776 returns
+    // BEFORE any kernel call when size == 0, so a whole multi-page reservation
+    // must survive a run of release(block, 0) intact -- every page still
+    // writable.  Then a single real release(block, ps*pages) frees it cleanly.
+    // (The existing single-page idempotent test only stamps one byte of one
+    // page; here the full multi-page span is re-verified after each no-op.)
+    // -----------------------------------------------------------------------
+    static auto test_zero_size_release_multipage_keeps_full_span() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        constexpr std::size_t pages{ 5 };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps * pages) };
+        if (!block)
+        {
+            check("exp5_zero_release_multipage_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+
+        bool survived{ true };
+        for (int i{ 0 }; i < 6; ++i)
+        {
+            vmhook::os::release(block, 0); // guarded no-op (size == 0)
+            for (std::size_t p{ 0 }; p < pages; ++p)
+            {
+                const auto marker{
+                    static_cast<std::uint8_t>((0x30 + i + static_cast<int>(p)) & 0xFF) };
+                bytes[p * ps] = marker;
+                if (bytes[p * ps] != marker)
+                {
+                    survived = false;
+                }
+            }
+            // The far edge of the last page must survive too.
+            bytes[ps * pages - 1] = static_cast<std::uint8_t>((0xE0 + i) & 0xFF);
+            if (bytes[ps * pages - 1] != static_cast<std::uint8_t>((0xE0 + i) & 0xFF))
+            {
+                survived = false;
+            }
+        }
+        check("exp5_zero_size_release_multipage_keeps_every_page_live", survived);
+
+        vmhook::os::release(block, ps * pages); // real release
+        check("exp5_zero_size_release_multipage_then_real_no_crash", true);
+    }
+
+    // -----------------------------------------------------------------------
+    // RELEASED-block -> query_region transition.  A freshly allocated block is
+    // committed (asserted in wave-5); after a real release the SAME base must no
+    // longer be reported as a live committed mapping on the introspective
+    // backends.  query_region accepts a freed address -- it asks the kernel
+    // (VirtualQuery) or walks /proc/self/maps about the address, never reads the
+    // page -- so this is fault-safe and uses no fabricated pointer.
+    //
+    //   * Windows (VirtualQuery): the freed reservation reports MEM_FREE ->
+    //     committed == false AND free == true.  HARD on Windows.
+    //   * Linux/Android (/proc maps): the unmapped address falls into a gap ->
+    //     committed == false (the walker sets free == true for a gap, but a
+    //     neighbouring mapping could in principle re-cover the exact address, so
+    //     we HARD-assert only the !committed half and characterize free).
+    //   * macOS (mach_vm_region): returns the NEXT region at/above the address,
+    //     which is a DIFFERENT live mapping -- committed may be true for that
+    //     other region.  iOS stub always reports committed.  Both are
+    //     characterized via info(), never asserted.
+    // We capture committed BEFORE and AFTER on the same base to show the
+    // transition direction where the backend supports it.
+    // -----------------------------------------------------------------------
+    static auto test_released_block_query_region_transition() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps) };
+        if (!block)
+        {
+            check("exp5_released_query_skipped_alloc_failed", false);
+            return;
+        }
+
+        *static_cast<volatile std::uint8_t*>(block) = 0x5A;
+
+        const vmhook::os::region_info before{ vmhook::os::query_region(block) };
+        // A live allocate_rwx block is committed on the introspective backends;
+        // characterize so the AFTER comparison is meaningful even where it isn't.
+        info("exp5_live_block_committed_before_release", before.committed);
+
+        vmhook::os::release(block, ps);
+
+        const vmhook::os::region_info after{ vmhook::os::query_region(block) };
+
+#if VMHOOK_OS_WINDOWS
+        // VirtualQuery on a fully released reservation reports MEM_FREE.
+        check("exp5_windows_released_block_not_committed", !after.committed);
+        check("exp5_windows_released_block_free", after.free);
+#elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
+        // The /proc walker reports the unmapped address as a gap (free) -> not
+        // committed.  HARD on the !committed half; free characterized (a later
+        // mapping could re-cover the exact base between unmap and query).
+        check("exp5_linux_released_block_not_committed", !after.committed);
+        info("exp5_linux_released_block_free", after.free);
+#else
+        // macOS mach_vm_region returns the next live region; iOS stub always
+        // reports committed.  Both legitimately committed -> characterize only.
+        info("exp5_apple_released_block_committed", after.committed);
+#endif
+        // committed and free are never simultaneously true on ANY backend, even
+        // after release.
+        check("exp5_released_block_committed_xor_free",
+              !(after.committed && after.free));
+    }
+
+    // -----------------------------------------------------------------------
+    // PARTIAL release tail CHARACTERIZED via query_region (distinct from wave-5,
+    // which only used the fault-safe byte probe on the last page).  We allocate a
+    // generous multi-page block, release ONLY the first page, then query the LAST
+    // page's base.  The outcome is LEGITIMATELY platform-variable:
+    //   * POSIX munmap(base, ps) unmaps page 0 only -> the last page is very
+    //     likely still committed.
+    //   * Windows VirtualFree(base, 0, MEM_RELEASE) ignores the size and frees
+    //     the WHOLE reservation -> the last page is very likely free.
+    // So we hard-assert ONLY no-crash + the committed/free mutual exclusion, and
+    // report committed/free of the tail via info().  SAFETY: every address named
+    // is inside our own original allocation; we reclaim the full span afterwards.
+    // -----------------------------------------------------------------------
+    static auto test_partial_release_tail_query_is_characterized() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        constexpr std::size_t pages{ 4 };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps * pages) };
+        if (!block)
+        {
+            check("exp5_partial_tail_query_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0] = 0x01;
+        bytes[ps * (pages - 1)] = 0x02; // marker in the LAST page
+
+        void* const last_page{ static_cast<void*>(bytes + ps * (pages - 1)) };
+
+        // Release ONLY the first page.
+        vmhook::os::release(block, ps);
+        check("exp5_partial_release_first_page_no_crash", true);
+
+        // query_region of the LAST page base: fault-safe (never dereferences),
+        // accepts any address.  Characterize the committed/free of the tail.
+        const vmhook::os::region_info tail{ vmhook::os::query_region(last_page) };
+        check("exp5_partial_tail_committed_xor_free",
+              !(tail.committed && tail.free));
+        info("exp5_partial_tail_committed", tail.committed);
+        info("exp5_partial_tail_free", tail.free);
+
+        // Reclaim the full original span (POSIX unmaps the still-mapped tail;
+        // Windows re-frees an already-freed base harmlessly).  No crash == pass.
+        vmhook::os::release(block, ps * pages);
+        check("exp5_partial_release_then_full_no_crash", true);
+    }
+
+    // -----------------------------------------------------------------------
+    // SUB-PAGE request -> WHOLE usable page.  A request of ps-1 bytes (and of 1
+    // byte) is rounded UP by the kernel to a full page (VirtualAlloc commits in
+    // page units; mmap maps whole pages).  Wave-5 touches only the requested
+    // ps-1 / 1 bytes; here we prove the ENTIRE ps-byte page is usable -- write a
+    // pattern across all ps bytes (one past the request) and read it back -- so
+    // the "rounded up, fully committed" contract is pinned, not just the
+    // requested prefix.  Release uses the same sub-page size the caller asked
+    // for (POSIX munmap rounds the length up; Windows ignores it).
+    // -----------------------------------------------------------------------
+    static auto test_subpage_request_yields_whole_usable_page() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+
+        // Request ps-1; the whole ps-byte page must be writable end-to-end.
+        {
+            void* const block{ vmhook::os::allocate_rwx(nullptr, ps - 1u) };
+            if (!block)
+            {
+                check("exp5_subpage_ps_minus_1_skipped_alloc_failed", false);
+            }
+            else
+            {
+                auto* const bytes{ static_cast<std::uint8_t*>(block) };
+                bool full_page_ok{ true };
+                for (std::size_t i{ 0 }; i < ps; ++i) // up to ps, one PAST the request
+                {
+                    bytes[i] = static_cast<std::uint8_t>((i * 13u + 5u) & 0xFFu);
+                }
+                for (std::size_t i{ 0 }; i < ps; ++i)
+                {
+                    if (bytes[i] != static_cast<std::uint8_t>((i * 13u + 5u) & 0xFFu))
+                    {
+                        full_page_ok = false;
+                    }
+                }
+                check("exp5_subpage_ps_minus_1_whole_page_writable", full_page_ok);
+                vmhook::os::release(block, ps - 1u);
+            }
+        }
+
+        // Request 1 byte; same whole-page contract.
+        {
+            void* const block{ vmhook::os::allocate_rwx(nullptr, 1u) };
+            if (!block)
+            {
+                check("exp5_subpage_one_skipped_alloc_failed", false);
+            }
+            else
+            {
+                auto* const bytes{ static_cast<std::uint8_t*>(block) };
+                bool full_page_ok{ true };
+                for (std::size_t i{ 0 }; i < ps; ++i)
+                {
+                    bytes[i] = static_cast<std::uint8_t>((i * 7u + 1u) & 0xFFu);
+                }
+                for (std::size_t i{ 0 }; i < ps; ++i)
+                {
+                    if (bytes[i] != static_cast<std::uint8_t>((i * 7u + 1u) & 0xFFu))
+                    {
+                        full_page_ok = false;
+                    }
+                }
+                check("exp5_subpage_one_byte_whole_page_writable", full_page_ok);
+                vmhook::os::release(block, 1u);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // GRANULARITY-sized allocate/release round-trip with a query_region size
+    // check.  allocation_granularity() is the unit VirtualAlloc reserves in
+    // (>= page); allocating exactly that many bytes must hand back a fully
+    // committed, page-aligned, end-to-end-writable block whose reported region
+    // size covers the request, and release of the same size must be clean.  This
+    // ties the two sizing primitives together through a real round-trip the
+    // trampoline allocator depends on (it aligns candidates to granularity).
+    // -----------------------------------------------------------------------
+    static auto test_granularity_sized_round_trip() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        const std::size_t gr{ vmhook::os::allocation_granularity() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, gr) };
+        if (!block)
+        {
+            check("exp5_granularity_round_trip_skipped_alloc_failed", false);
+            return;
+        }
+
+        // Page-aligned base (every backend; mask is exact since ps is 2^k).
+        check("exp5_granularity_block_page_aligned",
+              (reinterpret_cast<std::uintptr_t>(block)
+               & (static_cast<std::uintptr_t>(ps) - 1u)) == 0u);
+
+        // Whole granularity span writable end-to-end.
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bool span_ok{ true };
+        for (std::size_t i{ 0 }; i < gr; ++i)
+        {
+            bytes[i] = static_cast<std::uint8_t>((i * 19u + 11u) & 0xFFu);
+        }
+        for (std::size_t i{ 0 }; i < gr; ++i)
+        {
+            if (bytes[i] != static_cast<std::uint8_t>((i * 19u + 11u) & 0xFFu))
+            {
+                span_ok = false;
+            }
+        }
+        check("exp5_granularity_full_span_writable", span_ok);
+
+        // Reported region size covers the request where the backend introspects.
+        const vmhook::os::region_info ri{ vmhook::os::query_region(block) };
+        if (ri.committed)
+        {
+            check("exp5_granularity_query_size_covers_request", ri.size >= gr);
+        }
+        else
+        {
+            info("exp5_granularity_query_committed", ri.committed);
+        }
+
+        vmhook::os::release(block, gr);
+        check("exp5_granularity_round_trip_release_no_crash", true);
+    }
+
+    static auto run() -> void
+    {
+        test_zero_size_release_multipage_keeps_full_span();
+        test_released_block_query_region_transition();
+        test_partial_release_tail_query_is_characterized();
+        test_subpage_request_yields_whole_usable_page();
+        test_granularity_sized_round_trip();
+    }
+} // namespace expansion5_release_query_roundtrip
+
 int main()
 {
     test_release_zero_size_is_idempotent_noop();
@@ -2481,6 +2806,11 @@ int main()
     //     safe_write round-trip read-back, flush_instruction_cache, ceiling
     //     bit-identity ---
     expansion4_os_layer_surface::run();
+
+    // --- expansion 5: released-block query transition, zero-size-release on a
+    //     multi-page block, partial-release tail query characterization, sub-page
+    //     whole-page usability, granularity-sized round-trip ---
+    expansion5_release_query_roundtrip::run();
 
     if (failures == 0)
     {
