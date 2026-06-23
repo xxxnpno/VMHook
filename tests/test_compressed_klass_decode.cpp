@@ -62,6 +62,7 @@
 #include <cstdint>
 #include <cstring>    // std::strcmp (klass candidate (type, field) name pins)
 #include <iterator>   // std::size (candidate-array counts for resolve_struct_entry)
+#include <type_traits> // std::is_standard_layout_v / is_same_v (struct-layout pins)
 #include <vector>
 
 static int failures{ 0 };
@@ -1029,6 +1030,308 @@ int main()
         }
         check("klass_lossless_channel_all_shifts_0_to_31", channel_ok);
         check("klass_lossless_channel_is_dense", channel_cases >= 400);
+    }
+
+    // =====================================================================
+    // T. EXPORTED STRUCT LAYOUT — the records the klass codec reads THROUGH.
+    //    decode_klass_pointer / encode_klass_pointer resolve a
+    //    vm_struct_entry_t* and then dereference entry->address; the resolver
+    //    they feed walks an array of struct_entry_candidate_t.  Both are plain
+    //    aggregates whose binary layout MUST stay standard-layout (the codec
+    //    treats them as C PODs that mirror HotSpot's gHotSpotVMStructs ABI and
+    //    constexpr candidate arrays).  These are 100% no-JVM-determinable: pure
+    //    type traits + offsetof, no memory touched.  Member layout/types are
+    //    pinned from the source declarations:
+    //      vm_struct_entry_t { const char* type_name; const char* field_name;
+    //                          const char* type_string; std::int32_t is_static;
+    //                          std::uint64_t offset; void* address; }
+    //      struct_entry_candidate_t { const char* type_name;
+    //                                 const char* field_name; }
+    // =====================================================================
+    {
+        using vmhook::hotspot::vm_struct_entry_t;
+        using vmhook::hotspot::struct_entry_candidate_t;
+
+        // --- standard-layout (required for offsetof to be well-defined and for
+        //     the records to alias the JVM's C ABI / live in constexpr arrays).
+        static_assert(std::is_standard_layout_v<vm_struct_entry_t>,
+                      "vm_struct_entry_t must be standard-layout");
+        static_assert(std::is_standard_layout_v<struct_entry_candidate_t>,
+                      "struct_entry_candidate_t must be standard-layout");
+        check("vm_struct_entry_is_standard_layout",
+              std::is_standard_layout_v<vm_struct_entry_t>);
+        check("struct_entry_candidate_is_standard_layout",
+              std::is_standard_layout_v<struct_entry_candidate_t>);
+
+        // --- vm_struct_entry_t member TYPES (exact, from the declaration).
+        static_assert(std::is_same_v<decltype(vm_struct_entry_t::type_name), const char*>,
+                      "vm_struct_entry_t::type_name must be const char*");
+        static_assert(std::is_same_v<decltype(vm_struct_entry_t::field_name), const char*>,
+                      "vm_struct_entry_t::field_name must be const char*");
+        static_assert(std::is_same_v<decltype(vm_struct_entry_t::type_string), const char*>,
+                      "vm_struct_entry_t::type_string must be const char*");
+        static_assert(std::is_same_v<decltype(vm_struct_entry_t::is_static), std::int32_t>,
+                      "vm_struct_entry_t::is_static must be std::int32_t");
+        static_assert(std::is_same_v<decltype(vm_struct_entry_t::offset), std::uint64_t>,
+                      "vm_struct_entry_t::offset must be std::uint64_t");
+        static_assert(std::is_same_v<decltype(vm_struct_entry_t::address), void*>,
+                      "vm_struct_entry_t::address must be void* (codec reads *address)");
+        check("vm_struct_entry_member_types_exact", true);
+
+        // --- struct_entry_candidate_t member TYPES (the (type, field) pair the
+        //     resolver compares with strcmp).
+        static_assert(std::is_same_v<decltype(struct_entry_candidate_t::type_name), const char*>,
+                      "struct_entry_candidate_t::type_name must be const char*");
+        static_assert(std::is_same_v<decltype(struct_entry_candidate_t::field_name), const char*>,
+                      "struct_entry_candidate_t::field_name must be const char*");
+        check("struct_entry_candidate_member_types_exact", true);
+
+        // --- offsetof MONOTONICITY (declaration order is preserved; the codec
+        //     and the JVM ABI both depend on type_name being first and address
+        //     last).  Exact byte offsets are ABI/padding-dependent and NOT
+        //     hard-coded; only the strict ordering + distinctness is pinned.
+        check("vm_struct_entry_offsets_strictly_increasing",
+              offsetof(vm_struct_entry_t, type_name) < offsetof(vm_struct_entry_t, field_name)
+                  && offsetof(vm_struct_entry_t, field_name) < offsetof(vm_struct_entry_t, type_string)
+                  && offsetof(vm_struct_entry_t, type_string) < offsetof(vm_struct_entry_t, is_static)
+                  && offsetof(vm_struct_entry_t, is_static) < offsetof(vm_struct_entry_t, offset)
+                  && offsetof(vm_struct_entry_t, offset) < offsetof(vm_struct_entry_t, address));
+        check("vm_struct_entry_type_name_is_first",
+              offsetof(vm_struct_entry_t, type_name) == 0u);
+        check("struct_entry_candidate_offsets_ordered",
+              offsetof(struct_entry_candidate_t, type_name) == 0u
+                  && offsetof(struct_entry_candidate_t, type_name)
+                         < offsetof(struct_entry_candidate_t, field_name));
+
+        // --- sizeof SANITY: each record is at least the sum of its members'
+        //     minimum sizes (no member elided), and a candidate is exactly two
+        //     pointers wide (so constexpr candidate arrays pack tightly).
+        check("vm_struct_entry_size_covers_all_members",
+              sizeof(vm_struct_entry_t)
+                  >= 3u * sizeof(const char*) + sizeof(std::int32_t)
+                         + sizeof(std::uint64_t) + sizeof(void*));
+        check("struct_entry_candidate_is_two_pointers",
+              sizeof(struct_entry_candidate_t) == 2u * sizeof(const char*));
+        check("vm_struct_entry_larger_than_candidate",
+              sizeof(vm_struct_entry_t) > sizeof(struct_entry_candidate_t));
+    }
+
+    // =====================================================================
+    // U. iterate_struct_entries NULL-ARGUMENT contract — the leaf lookup the
+    //    klass codec's resolver calls per candidate.  The documented guard
+    //    (`if (!type_name || !field_name) return nullptr;`) exists to avoid
+    //    strcmp(nullptr, x) UB; it fires BEFORE any gHotSpotVMStructs walk, so
+    //    it is fully no-JVM-determinable.  Off-JVM the symbol is also absent, so
+    //    even WELL-FORMED names return nullptr — pinning the degrade path the
+    //    klass codec's "missing entry -> nullptr/0" promise rests on.
+    // =====================================================================
+    {
+        using vmhook::hotspot::iterate_struct_entries;
+
+        static_assert(
+            std::is_same_v<decltype(iterate_struct_entries(nullptr, nullptr)),
+                           vmhook::hotspot::vm_struct_entry_t*>,
+            "iterate_struct_entries must return vm_struct_entry_t*");
+        static_assert(noexcept(iterate_struct_entries(nullptr, nullptr)),
+                      "iterate_struct_entries must be noexcept");
+
+        // Null on EITHER argument -> nullptr, never a strcmp on null.
+        check("iterate_struct_entries_both_null_is_null",
+              iterate_struct_entries(nullptr, nullptr) == nullptr);
+        check("iterate_struct_entries_null_type_is_null",
+              iterate_struct_entries(nullptr, "_narrow_klass._base") == nullptr);
+        check("iterate_struct_entries_null_field_is_null",
+              iterate_struct_entries("CompressedKlassPointers", nullptr) == nullptr);
+        // The EXACT klass (type, field) pairs the codec embeds, well-formed,
+        // still resolve to nullptr off-JVM (symbol absent).  This is the precise
+        // reason decode_klass_pointer/encode_klass_pointer bail to nullptr/0.
+        const char* const klass_pairs[][2]{
+            { "CompressedKlassPointers", "_narrow_klass._base" },
+            { "CompressedKlassPointers", "_base" },
+            { "Universe", "_narrow_klass._base" },
+            { "CompressedKlassPointers", "_narrow_klass._shift" },
+            { "CompressedKlassPointers", "_shift" },
+            { "Universe", "_narrow_klass._shift" },
+        };
+        bool all_klass_pairs_null{ true };
+        for (const auto& pair : klass_pairs)
+        {
+            if (iterate_struct_entries(pair[0], pair[1]) != nullptr)
+            {
+                all_klass_pairs_null = false;
+            }
+        }
+        check("iterate_struct_entries_klass_pairs_no_jvm_all_null", all_klass_pairs_null);
+        // An empty-string (non-null) name is well-defined and simply misses.
+        check("iterate_struct_entries_empty_strings_is_null",
+              iterate_struct_entries("", "") == nullptr);
+    }
+
+    // =====================================================================
+    // V. is_valid_pointer POISON-SENTINEL gate on DECODED klass results — the
+    //    consumer-side safety net (decode_klass_pointer itself is unguarded;
+    //    klass_from_oop / for_each_instance gate the DECODE RESULT with
+    //    is_valid_pointer).  These nine low-32 debug-fill patterns are rejected
+    //    even when the address is otherwise in range / even-aligned, which is
+    //    what stops a torn narrow-klass word from yielding a "plausible" klass.
+    //    Pure logic: is_valid_pointer is a constexpr-shaped range/align/switch,
+    //    no memory read.  Patterns taken verbatim from the switch in source.
+    // =====================================================================
+    {
+        // All nine sentinels, placed at their EXACT low32 in a canonical,
+        // in-range high half (0x0000'1234'0000'0000).  Each MUST be rejected:
+        // the even ones (0xCCCCCCCC / 0xFEEEFEEE / 0xCAFEBABE) by the poison
+        // switch, the odd ones by the alignment rule that precedes it — either
+        // way the gate refuses them, which is the safety property flaw #1 leans
+        // on.  We do NOT mask bit 0 (that would change the low32 and miss the
+        // sentinel); we assert rejection at the verbatim pattern.
+        const std::uint32_t poison_low32[]{
+            0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+            0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu,
+        };
+        bool all_poison_rejected{ true };
+        bool all_poison_in_range{ true };
+        for (const std::uint32_t low : poison_low32)
+        {
+            const std::uintptr_t addr{
+                std::uintptr_t{ 0x0000'1234'0000'0000ull } | low };
+            if (addr <= std::uintptr_t{ 0xFFFFu }
+                || addr >= std::uintptr_t{ 0x0000'7FFF'FFFF'FFFFull })
+            {
+                all_poison_in_range = false;
+            }
+            if (is_valid_pointer(reinterpret_cast<void*>(addr))) { all_poison_rejected = false; }
+        }
+        check("is_valid_pointer_poison_low32_sanity_in_range", all_poison_in_range);
+        check("is_valid_pointer_rejects_all_nine_poison_low32", all_poison_rejected);
+
+        // The three EVEN sentinels reach and trip the poison SWITCH specifically
+        // (alignment passes, range passes, only the switch can reject) — pinning
+        // that the switch, not the align rule, is what catches these.
+        const std::uint32_t even_poison[]{ 0xCAFEBABEu, 0xCCCCCCCCu, 0xFEEEFEEEu };
+        bool even_poison_rejected_by_switch{ true };
+        for (const std::uint32_t low : even_poison)
+        {
+            const std::uintptr_t addr{
+                std::uintptr_t{ 0x0000'1234'0000'0000ull } | low };
+            // sanity: even + in range (so only the switch can reject it).
+            if ((addr & 0x1u) != 0u) { even_poison_rejected_by_switch = false; }
+            if (is_valid_pointer(reinterpret_cast<void*>(addr)))
+            {
+                even_poison_rejected_by_switch = false;
+            }
+        }
+        check("is_valid_pointer_even_poison_rejected_by_switch",
+              even_poison_rejected_by_switch);
+
+        // Contrast: the SAME high half with a NON-poison, EVEN low32 is a
+        // valid-shaped pointer — proves the rejection above is the content
+        // (poison/odd), not the range gate.  0x...'0000'1000 is in range, even,
+        // non-sentinel.
+        check("is_valid_pointer_accepts_nonpoison_inrange_even",
+              is_valid_pointer(reinterpret_cast<void*>(
+                  std::uintptr_t{ 0x0000'1234'0000'1000ull })));
+    }
+
+    // =====================================================================
+    // W. NARROW-DECODE result feeding the consumer gate — the END-TO-END
+    //    no-JVM-determinable composition behind flaw #1.  decode_klass_pointer
+    //    (with live base/shift) is `narrow_decode(base, shift, c)`; the consumer
+    //    then runs is_valid_pointer on it.  We drive narrow_decode with EXPLICIT
+    //    (base, shift) so a narrow value that lands on a poison-low32 address is
+    //    rejected, and one that lands on a clean in-range address is accepted —
+    //    proving the consumer gate is what classifies a decoded klass, with no
+    //    fabricated-address READ (we only inspect the pointer VALUE).
+    // =====================================================================
+    {
+        // Choose base/shift so the decoded VALUE has a poison low32.  shift 0,
+        // base = high-half, narrow = 0xDEADBEEF -> addr low32 == 0xDEADBEEF.
+        // (bit0 of 0xDEADBEEF is 1 -> is_valid_pointer rejects on alignment too;
+        // that is fine — the point is the gate rejects it, by EITHER rule.)
+        void* const decoded_poison{
+            narrow_decode(std::uint64_t{ 0x0000'1234'0000'0000ull }, 0u, 0xDEAD'BEEFu) };
+        check("narrow_decode_to_poison_value_is_rejected_by_gate",
+              !is_valid_pointer(decoded_poison));
+        // A clean narrow -> clean, even, in-range address -> gate accepts.
+        void* const decoded_clean{
+            narrow_decode(std::uint64_t{ 0x0000'1234'0000'0000ull }, 3u, 0x2000u) };
+        check("narrow_decode_to_clean_value_is_accepted_by_gate",
+              is_valid_pointer(decoded_clean));
+        // decode of 0 via the WRAPPER is nullptr and the gate rejects it
+        // (already in M; re-pinned here as the start of the decode->gate chain).
+        check("wrapper_decode_zero_then_gate_rejects",
+              !is_valid_pointer(decode_klass_pointer(0u)));
+    }
+
+    // =====================================================================
+    // X. untag_pointer over DECODED-klass addresses — the GC-tag stripper some
+    //    consumers chain after the codec.  Pure bit-mask (& user_address_ceiling
+    //    == & 0x0000'7FFF'FFFF'FFFF), no memory touched.  Pins: high tag bits
+    //    are cleared, an already-canonical address is unchanged (idempotent),
+    //    and a decoded-then-tagged klass recovers its canonical address.
+    // =====================================================================
+    {
+        // High tag bits (above bit 46) are masked off.
+        check("untag_clears_high_tag_bits",
+              untag_pointer(reinterpret_cast<void*>(
+                  std::uintptr_t{ 0xFFFF'8000'1234'5678ull }))
+                  == reinterpret_cast<void*>(std::uintptr_t{ 0x0000'0000'1234'5678ull }));
+        // An already-canonical (<= ceiling) decoded address is unchanged.
+        void* const canonical{
+            narrow_decode(std::uint64_t{ 0x0000'0008'0000'0000ull }, 3u, 0x1000u) };
+        check("untag_canonical_decoded_klass_is_identity",
+              untag_pointer(canonical) == canonical);
+        // Idempotency: untag(untag(x)) == untag(x) for an arbitrary tagged value.
+        void* const tagged{ reinterpret_cast<void*>(std::uintptr_t{ 0x8003'1234'0000'0008ull }) };
+        check("untag_is_idempotent",
+              untag_pointer(untag_pointer(tagged)) == untag_pointer(tagged));
+        // Tag a canonical decoded klass in the high bits, then untag recovers it.
+        const std::uintptr_t canon_addr{ as_uptr(canonical) };
+        void* const re_tagged{ reinterpret_cast<void*>(
+            canon_addr | std::uintptr_t{ 0xFFFF'8000'0000'0000ull }) };
+        check("untag_recovers_decoded_klass_after_high_tag",
+              untag_pointer(re_tagged)
+                  == reinterpret_cast<const void*>(canon_addr));
+    }
+
+    // =====================================================================
+    // Y. CROSS-PRIMITIVE INVARIANT — narrow_decode and narrow_encode are exact
+    //    inverses on the AT-BASE and FIRST-SLOT grid points for every klass mode
+    //    AND every shift 0..8, with the result classified by is_valid_pointer
+    //    only on its VALUE (no read).  Ties the codec arithmetic (C..S) to the
+    //    consumer gate (V) in one closed statement: encode(decode(c)) == c, and
+    //    the decoded first-slot of a real, even, in-range base is gate-valid.
+    // =====================================================================
+    {
+        bool inverse_holds{ true };
+        std::size_t y_cases{ 0 };
+        const std::uint64_t real_bases[]{
+            std::uint64_t{ 0x0000'0008'0000'0000ull },   // 32 GB, 8-aligned
+            std::uint64_t{ 0x0000'7F00'0000'0000ull },   // high CDS-ish, 8-aligned
+        };
+        for (const std::uint64_t base : real_bases)
+        {
+            for (std::uint32_t sh{ 0u }; sh <= 8u; ++sh)
+            {
+                for (std::uint32_t c{ 1u }; c <= 32u; ++c)
+                {
+                    void* const d{ narrow_decode(base, sh, c) };
+                    if (narrow_encode(base, sh, static_cast<std::uint64_t>(as_uptr(d))) != c)
+                    {
+                        inverse_holds = false;
+                    }
+                    ++y_cases;
+                }
+            }
+        }
+        check("narrow_codec_inverse_real_bases_shifts_0_to_8", inverse_holds);
+        check("narrow_codec_inverse_matrix_is_dense", y_cases >= 500);
+        // The first decoded slot above an even, in-range, 8-aligned base passes
+        // the consumer gate (value-only classification, no dereference).
+        void* const first_slot{
+            narrow_decode(std::uint64_t{ 0x0000'0008'0000'0000ull }, 3u, 1u) };
+        check("first_klass_slot_above_real_base_is_gate_valid",
+              is_valid_pointer(first_slot));
     }
 
     return failures == 0 ? 0 : 1;

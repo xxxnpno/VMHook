@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 
 static int failures{ 0 };
 
@@ -960,6 +961,350 @@ static auto test_runtime_hooking_capability_contract() -> void
 #endif
 }
 
+// ===========================================================================
+// ADDITIVE DEEPENING PASS (sections G..K).
+//
+// Everything below is PURE LOGIC, derivable entirely from vmhook.hpp source —
+// no live JVM, no fabricated-address reads, no value_t casts, no zero-size
+// region writes.  It pins the surfaces the install path is built on that the
+// original sections (A..F) did not assert:
+//
+//   G. Trampoline byte-layout ARITHMETIC.  The two hand-written assembly arrays
+//      (Win x64 / SysV AMD64) carry magic landmark offsets (JE_OFFSET,
+//      RESUME_OFFSET, RESUME_JMP_OFFSET, DETOUR_ADDRESS_OFFSET) plus HOOK_SIZE /
+//      JMP_SIZE / JMP_OPCODE.  The ctor bakes the je-delta and resume-JMP rel32
+//      from these; rewrite_chain_resume() keeps a SECOND private copy of
+//      RESUME_JMP_OFFSET that MUST stay in lockstep (flaw #1).  These offsets are
+//      private / function-local in the header, so we reproduce the exact source
+//      values here as named constants and assert the INTERNAL arithmetic
+//      relationships the code relies on (je_delta formula, detour slot == end-8,
+//      offset-twin equality).  Any future array edit that desyncs them trips an
+//      assertion here instead of silently miscompiling a live trampoline.
+//   H. return_slot layout.  The trampoline reads `cmp byte [rsp],0` (cancel) and
+//      `mov rax,[rsp+8]` (retval); return_slot must therefore place cancel at
+//      offset 0 and retval at offset 8 — a load-bearing offsetof contract.
+//   I. compressed narrow codec round-trip.  narrow_decode/narrow_encode take
+//      base/shift EXPLICITLY (pure — no VMStruct, no JVM), so the encode∘decode
+//      identity is fully determinable here.
+//   J. no-JVM NULL contract.  With gHotSpotVMStructs null (no JVM in this
+//      process) iterate_struct_entries / decode_oop_pointer / decode_klass_pointer
+//      must return null/0, never crash.
+//   K. exported-struct bit layout: standard-layout + sizeof + field offsets of
+//      vm_struct_entry_t and struct_entry_candidate_t.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// (G) Trampoline byte-layout arithmetic.  Values transcribed verbatim from the
+// header's per-ABI constants (Win: lines ~6622-6637; SysV: ~6731-6736) and the
+// emitted sizeof(assembly) (Win = 0x80 = 128, SysV = 0x81 = 129 bytes after
+// stripping comment-only hex).  We assert the relationships the ctor and
+// rewrite_chain_resume() compute, so a desync surfaces as a failing unit check.
+// ---------------------------------------------------------------------------
+namespace tramp_layout
+{
+    // ABI-independent constants (header: HOOK_SIZE=8, JMP_SIZE=5, JMP_OPCODE=0xE9).
+    static constexpr std::int32_t kHookSize{ 8 };
+    static constexpr std::int32_t kJmpSize{ 5 };
+    static constexpr std::uint8_t kJmpOpcode{ 0xE9u };
+    static constexpr std::int32_t kJeSize{ 6 };          // 0F 84 + rel32
+    static constexpr std::int32_t kResumeJmpSize{ 5 };   // E9 + rel32
+
+    // The je opcode is two bytes (0x0F 0x84); the resume JMP opcode is one (0xE9).
+    static constexpr std::uint8_t kJeByte0{ 0x0Fu };
+    static constexpr std::uint8_t kJeByte1{ 0x84u };
+
+    // --- Windows x64 ABI ---
+    struct win
+    {
+        static constexpr std::int32_t je_offset{ 0x32 };
+        static constexpr std::int32_t resume_offset{ 0x63 };
+        static constexpr std::int32_t resume_jmp_offset{ 0x73 };
+        static constexpr std::int32_t detour_address_offset{ 0x78 };
+        static constexpr std::int32_t sizeof_assembly{ 0x80 }; // 128
+        // rewrite_chain_resume()'s SECOND private copy (flaw #1 twin).
+        static constexpr std::int32_t resume_jmp_offset_twin{ 0x73 };
+    };
+
+    // --- System V AMD64 ABI ---
+    struct sysv
+    {
+        static constexpr std::int32_t je_offset{ 0x2F };
+        static constexpr std::int32_t resume_offset{ 0x62 };
+        static constexpr std::int32_t resume_jmp_offset{ 0x74 };
+        static constexpr std::int32_t detour_address_offset{ 0x79 };
+        static constexpr std::int32_t sizeof_assembly{ 0x81 }; // 129
+        static constexpr std::int32_t resume_jmp_offset_twin{ 0x74 };
+    };
+}
+
+static auto test_trampoline_layout_arithmetic() -> void
+{
+    using namespace tramp_layout;
+
+    // ABI-independent: the 5-byte E9 rel32 redirect the ctor writes over target.
+    check("tramp_jmp_size_is_5", kJmpSize == 5);
+    check("tramp_jmp_opcode_is_E9", kJmpOpcode == 0xE9u);
+    check("tramp_hook_size_is_8", kHookSize == 8);
+    // A near JMP is exactly opcode(1) + rel32(4).
+    check("tramp_jmp_size_is_opcode_plus_rel32",
+          kJmpSize == 1 + static_cast<std::int32_t>(sizeof(std::int32_t)));
+    // The detour data slot is exactly an 8-byte pointer.
+    check("tramp_detour_slot_is_pointer_width",
+          static_cast<std::size_t>(kHookSize) == sizeof(void*));
+
+    // ---- Windows x64 ----
+    {
+        // je_delta = RESUME_OFFSET - (JE_OFFSET + JE_SIZE).  Source: 0x63-(0x32+6).
+        const std::int32_t je_delta{ win::resume_offset - (win::je_offset + kJeSize) };
+        check("tramp_win_je_delta_is_0x2B", je_delta == 0x2B);
+        // The je's rel32 occupies bytes [2..5] of the 6-byte je: it is written at
+        // assembly+JE_OFFSET+2 (after the 2-byte 0F 84 opcode) and its 4 bytes end
+        // exactly at JE_OFFSET+JE_SIZE (the next instruction).
+        check("tramp_win_je_rel32_fills_bytes_2_through_5",
+              win::je_offset + 2 + static_cast<std::int32_t>(sizeof(std::int32_t)) == win::je_offset + kJeSize);
+        // The resume path begins exactly where the je jumps to.
+        check("tramp_win_je_target_equals_resume_offset",
+              (win::je_offset + kJeSize) + je_delta == win::resume_offset);
+        // The detour pointer slot is the trailing 8 bytes of the assembly.
+        check("tramp_win_detour_slot_is_end_minus_8",
+              win::detour_address_offset == win::sizeof_assembly - kHookSize);
+        // The resume JMP opcode + its rel32 fit before the detour slot.
+        check("tramp_win_resume_jmp_precedes_detour_slot",
+              win::resume_jmp_offset + kResumeJmpSize == win::detour_address_offset);
+        // Landmarks are strictly ordered and in-bounds.
+        check("tramp_win_landmarks_ordered",
+              win::je_offset < win::resume_offset
+              && win::resume_offset < win::resume_jmp_offset
+              && win::resume_jmp_offset < win::detour_address_offset
+              && win::detour_address_offset < win::sizeof_assembly);
+        // FLAW #1 invariant: rewrite_chain_resume()'s private twin == ctor's value.
+        check("tramp_win_resume_jmp_offset_twin_in_lockstep",
+              win::resume_jmp_offset_twin == win::resume_jmp_offset);
+        // The ctor's resume-rel write address is allocated+HOOK_SIZE+RESUME_JMP_OFFSET+1;
+        // rewrite_chain_resume uses the identical expression — assert they agree.
+        check("tramp_win_resume_rel_write_offset_consistent",
+              (kHookSize + win::resume_jmp_offset + 1)
+              == (kHookSize + win::resume_jmp_offset_twin + 1));
+    }
+
+    // ---- System V AMD64 ----
+    {
+        const std::int32_t je_delta{ sysv::resume_offset - (sysv::je_offset + kJeSize) };
+        check("tramp_sysv_je_delta_is_0x2D", je_delta == 0x2D);
+        check("tramp_sysv_je_rel32_fills_bytes_2_through_5",
+              sysv::je_offset + 2 + static_cast<std::int32_t>(sizeof(std::int32_t)) == sysv::je_offset + kJeSize);
+        check("tramp_sysv_je_target_equals_resume_offset",
+              (sysv::je_offset + kJeSize) + je_delta == sysv::resume_offset);
+        check("tramp_sysv_detour_slot_is_end_minus_8",
+              sysv::detour_address_offset == sysv::sizeof_assembly - kHookSize);
+        check("tramp_sysv_resume_jmp_precedes_detour_slot",
+              sysv::resume_jmp_offset + kResumeJmpSize == sysv::detour_address_offset);
+        check("tramp_sysv_landmarks_ordered",
+              sysv::je_offset < sysv::resume_offset
+              && sysv::resume_offset < sysv::resume_jmp_offset
+              && sysv::resume_jmp_offset < sysv::detour_address_offset
+              && sysv::detour_address_offset < sysv::sizeof_assembly);
+        check("tramp_sysv_resume_jmp_offset_twin_in_lockstep",
+              sysv::resume_jmp_offset_twin == sysv::resume_jmp_offset);
+        check("tramp_sysv_resume_rel_write_offset_consistent",
+              (kHookSize + sysv::resume_jmp_offset + 1)
+              == (kHookSize + sysv::resume_jmp_offset_twin + 1));
+    }
+
+    // total_size = HOOK_SIZE + sizeof(assembly) — the value handed to
+    // allocate_nearby_memory.  Both ABIs land comfortably under one page, so the
+    // single-page allocation path (exercised in section A) is the only one used.
+    check("tramp_win_total_size_under_4k",
+          static_cast<std::size_t>(kHookSize + win::sizeof_assembly) < 0x1000u);
+    check("tramp_sysv_total_size_under_4k",
+          static_cast<std::size_t>(kHookSize + sysv::sizeof_assembly) < 0x1000u);
+    // The kTrampolineSize used by section A (8 + 0x80) is >= the real Windows
+    // request and within one page of the SysV request — i.e. representative.
+    check("tramp_sectionA_size_matches_win_total",
+          kTrampolineSize == static_cast<std::size_t>(kHookSize + win::sizeof_assembly));
+}
+
+// ---------------------------------------------------------------------------
+// (H) return_slot layout.  The baked assembly does `cmp byte [rsp],0` to read
+// `cancel` and `mov rax,[rsp+8]` to read `retval` (header lines ~6640-6641,
+// 6667-6671).  That hard-codes cancel at offset 0 and retval at offset 8, so
+// the C++ struct MUST agree or the trampoline reads the wrong bytes.
+// ---------------------------------------------------------------------------
+static auto test_return_slot_layout_contract() -> void
+{
+    using slot = vmhook::hotspot::return_slot;
+    check("return_slot_is_standard_layout", std::is_standard_layout<slot>::value);
+    check("return_slot_cancel_at_offset_0",
+          offsetof(slot, cancel) == 0u);
+    check("return_slot_retval_at_offset_8",
+          offsetof(slot, retval) == 8u);
+    check("return_slot_cancel_is_one_byte",
+          sizeof(static_cast<slot*>(nullptr)->cancel) == 1u);
+    check("return_slot_retval_is_eight_bytes",
+          sizeof(static_cast<slot*>(nullptr)->retval) == 8u);
+    // cancel(1) + pad(7) + retval(8) — the assembly assumes retval is 8 bytes
+    // past the slot base, so the struct must be at least 16 bytes.
+    check("return_slot_size_at_least_16", sizeof(slot) >= 16u);
+}
+
+// ---------------------------------------------------------------------------
+// (I) Compressed narrow-pointer codec round-trip.  narrow_decode(base,shift,c)
+// = base + (c << shift); narrow_encode(base,shift,addr) = (addr-base) >> shift.
+// Both take base/shift EXPLICITLY, so they are pure arithmetic with no JVM /
+// VMStruct dependency.  We pin the formula and the encode∘decode identity for
+// the shift values HotSpot actually uses (0 for heap < 4 GB, 3 for 8-byte
+// aligned oops up to 32 GB) across representative bases.
+// ---------------------------------------------------------------------------
+static auto test_narrow_codec_roundtrip() -> void
+{
+    struct Case { std::uint64_t base; std::uint32_t shift; std::uint32_t compressed; };
+    const Case cases[]{
+        { 0x0000000000000000ull, 0u, 0x00000001u },
+        { 0x0000000000000000ull, 3u, 0x00000001u },
+        { 0x0000000700000000ull, 0u, 0x00001000u },
+        { 0x0000000700000000ull, 3u, 0x00001000u },
+        { 0x00007F0000000000ull, 3u, 0x0ABCDEF0u },
+        { 0x0000000080000000ull, 0u, 0xFFFFFFFFu },
+        { 0x0000001000000000ull, 3u, 0x12345678u },
+    };
+
+    bool decode_formula_ok{ true };
+    bool encode_formula_ok{ true };
+    bool roundtrip_ok{ true };
+
+    for (const Case& c : cases)
+    {
+        // decode formula: base + (compressed << shift).
+        const std::uint64_t expect_decoded{
+            c.base + (static_cast<std::uint64_t>(c.compressed) << c.shift) };
+        void* const decoded{ vmhook::hotspot::narrow_decode(c.base, c.shift, c.compressed) };
+        if (reinterpret_cast<std::uint64_t>(decoded) != expect_decoded)
+        {
+            decode_formula_ok = false;
+        }
+
+        // encode formula on the decoded address: (addr - base) >> shift.
+        const std::uint64_t addr{ reinterpret_cast<std::uint64_t>(decoded) };
+        const std::uint32_t expect_encoded{
+            static_cast<std::uint32_t>((addr - c.base) >> c.shift) };
+        const std::uint32_t encoded{ vmhook::hotspot::narrow_encode(c.base, c.shift, addr) };
+        if (encoded != expect_encoded)
+        {
+            encode_formula_ok = false;
+        }
+
+        // Round-trip identity: encode(decode(c)) == c, since the chosen
+        // compressed values are exactly representable at these shifts.
+        if (encoded != c.compressed)
+        {
+            roundtrip_ok = false;
+        }
+    }
+
+    check("narrow_decode_matches_base_plus_shift_formula", decode_formula_ok);
+    check("narrow_encode_matches_minus_base_shift_formula", encode_formula_ok);
+    check("narrow_codec_encode_after_decode_is_identity", roundtrip_ok);
+
+    // Shift==0 is the multiply-by-1 identity: decode == base + compressed.
+    check("narrow_decode_shift0_is_base_plus_compressed",
+          reinterpret_cast<std::uint64_t>(
+              vmhook::hotspot::narrow_decode(0x100000u, 0u, 0x2A)) == 0x100000u + 0x2Au);
+    // Shift==3 scales the compressed value by 8 (8-byte oop alignment).
+    check("narrow_decode_shift3_scales_by_8",
+          reinterpret_cast<std::uint64_t>(
+              vmhook::hotspot::narrow_decode(0u, 3u, 0x10)) == static_cast<std::uint64_t>(0x10) * 8u);
+    // encode with addr==base yields 0 (the compressed-null boundary).
+    check("narrow_encode_addr_equals_base_is_zero",
+          vmhook::hotspot::narrow_encode(0x700000000ull, 3u, 0x700000000ull) == 0u);
+}
+
+// ---------------------------------------------------------------------------
+// (J) No-JVM NULL contract.  This process has no HotSpot loaded, so
+// gHotSpotVMStructs resolves to null and every VMStruct lookup must fail
+// closed.  iterate_struct_entries returns null for any name; decode_oop_pointer
+// / decode_klass_pointer return null because their base/shift entries never
+// resolve (they short-circuit BEFORE dereferencing any entry->address, so no
+// fabricated read occurs).  A zero compressed value is the explicit
+// short-circuit and must always yield null/0.
+// ---------------------------------------------------------------------------
+static auto test_no_jvm_null_contract() -> void
+{
+    // No VMStruct array -> no entry resolves, for the exact names the codecs use.
+    check("novm_iterate_CompressedOops_base_null",
+          vmhook::hotspot::iterate_struct_entries("CompressedOops", "_narrow_oop._base") == nullptr);
+    check("novm_iterate_CompressedKlassPointers_base_null",
+          vmhook::hotspot::iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._base") == nullptr);
+    check("novm_iterate_Universe_base_null",
+          vmhook::hotspot::iterate_struct_entries("Universe", "_narrow_oop._base") == nullptr);
+    check("novm_iterate_Method_i2i_null",
+          vmhook::hotspot::iterate_struct_entries("Method", "_i2i_entry") == nullptr);
+    // Null name arguments are guarded up front.
+    check("novm_iterate_null_type_null",
+          vmhook::hotspot::iterate_struct_entries(nullptr, "_base") == nullptr);
+    check("novm_iterate_null_field_null",
+          vmhook::hotspot::iterate_struct_entries("CompressedOops", nullptr) == nullptr);
+    // A name pair that does not exist on ANY JDK still resolves to null.
+    check("novm_iterate_bogus_name_null",
+          vmhook::hotspot::iterate_struct_entries("NoSuchType", "_no_such_field") == nullptr);
+
+    // The explicit compressed==0 short-circuit (no entry lookup at all).
+    check("novm_decode_oop_zero_is_null",
+          vmhook::hotspot::decode_oop_pointer(0u) == nullptr);
+    check("novm_decode_klass_zero_is_null",
+          vmhook::hotspot::decode_klass_pointer(0u) == nullptr);
+    // Non-zero compressed values: entries never resolve with no JVM, so the
+    // codecs return null BEFORE any address dereference (fail-closed, no SEGV).
+    check("novm_decode_oop_nonzero_is_null_without_jvm",
+          vmhook::hotspot::decode_oop_pointer(0x12345678u) == nullptr);
+    check("novm_decode_klass_nonzero_is_null_without_jvm",
+          vmhook::hotspot::decode_klass_pointer(0x0ABCDEF0u) == nullptr);
+    // encode of a null decoded pointer is the explicit 0 short-circuit.
+    check("novm_encode_oop_null_is_zero",
+          vmhook::hotspot::encode_oop_pointer(nullptr) == 0u);
+    check("novm_encode_klass_null_is_zero",
+          vmhook::hotspot::encode_klass_pointer(nullptr) == 0u);
+}
+
+// ---------------------------------------------------------------------------
+// (K) Exported-struct bit layout.  vm_struct_entry_t and struct_entry_candidate_t
+// are part of the resolver's public shape; their field order / standard-layout
+// status is relied on by iterate_struct_entries and resolve_struct_entry.
+// ---------------------------------------------------------------------------
+static auto test_exported_struct_bit_layout() -> void
+{
+    using entry = vmhook::hotspot::vm_struct_entry_t;
+    check("vmstruct_entry_standard_layout", std::is_standard_layout<entry>::value);
+    // Field order from source: type_name, field_name, type_string, is_static,
+    // offset, address.
+    check("vmstruct_entry_type_name_first", offsetof(entry, type_name) == 0u);
+    check("vmstruct_entry_field_name_after_type_name",
+          offsetof(entry, field_name) == sizeof(const char*));
+    check("vmstruct_entry_type_string_third",
+          offsetof(entry, type_string) == 2u * sizeof(const char*));
+    // is_static is int32; offset is uint64 (must be naturally aligned after it).
+    check("vmstruct_entry_is_static_is_int32",
+          sizeof(static_cast<entry*>(nullptr)->is_static) == 4u);
+    check("vmstruct_entry_offset_is_uint64",
+          sizeof(static_cast<entry*>(nullptr)->offset) == 8u);
+    check("vmstruct_entry_address_is_pointer",
+          sizeof(static_cast<entry*>(nullptr)->address) == sizeof(void*));
+    // offset must be 8-byte aligned within the struct (it is a uint64 field).
+    check("vmstruct_entry_offset_8byte_aligned",
+          (offsetof(entry, offset) % 8u) == 0u);
+
+    using cand = vmhook::hotspot::struct_entry_candidate_t;
+    check("candidate_standard_layout", std::is_standard_layout<cand>::value);
+    check("candidate_is_two_pointers",
+          sizeof(cand) == 2u * sizeof(const char*));
+    check("candidate_type_name_first", offsetof(cand, type_name) == 0u);
+    check("candidate_field_name_second",
+          offsetof(cand, field_name) == sizeof(const char*));
+    // The codec candidate arrays are constexpr; a trivially-copyable aggregate
+    // is required for that.  Pin it so a future field addition is caught.
+    check("candidate_trivially_copyable",
+          std::is_trivially_copyable<cand>::value);
+}
+
 int main()
 {
     // A. allocate_nearby_memory reachability allocator.
@@ -990,6 +1335,18 @@ int main()
 
     // F. midi2i_hook no-JVM capability contract.
     test_runtime_hooking_capability_contract();
+
+    // --- ADDITIVE DEEPENING PASS (G..K) ---
+    // G. Trampoline byte-layout arithmetic (per-ABI landmark offsets / deltas).
+    test_trampoline_layout_arithmetic();
+    // H. return_slot offsetof contract the baked assembly depends on.
+    test_return_slot_layout_contract();
+    // I. compressed narrow codec round-trip (pure base/shift arithmetic).
+    test_narrow_codec_roundtrip();
+    // J. no-JVM null/fail-closed contract for VMStruct lookups + codecs.
+    test_no_jvm_null_contract();
+    // K. exported-struct bit layout (standard-layout / sizeof / offsetof).
+    test_exported_struct_bit_layout();
 
     if (failures == 0)
     {

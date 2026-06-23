@@ -2264,5 +2264,182 @@ int main()
               imp_s == static_cast<std::string>(vr) && imp_s.empty());
     }
 
+    // ---------------------------------------------------------------------
+    // 53. COMPILE-TIME variant structural contract.  The runtime index
+    //     checks (sections 1/45) pin which ORDINAL each get() arm lands on,
+    //     but never the TYPE identity of each ordinal nor the alternative
+    //     COUNT.  std::variant_alternative_t<N, ...> and std::variant_size_v
+    //     are pure compile-time queries over field_proxy::value_t::data's
+    //     declared variant (vmhook.hpp ~14931-14941); a reordering or an
+    //     added/removed alternative (FLAW #4 latent hazard) would break BOTH
+    //     these static_asserts AND the positional value_t{ alt, sig } call
+    //     sites at once.  Nothing here touches memory.
+    // ---------------------------------------------------------------------
+    {
+        using data_t = decltype(std::declval<value_t>().data);
+        static_assert(std::variant_size_v<data_t> == 9,
+                      "value_t variant must hold exactly 9 alternatives "
+                      "(bool,i8,i16,i32,i64,float,double,u16,u32)");
+        static_assert(std::is_same_v<std::variant_alternative_t<idx::k_bool, data_t>, bool>,
+                      "alternative 0 must be bool");
+        static_assert(std::is_same_v<std::variant_alternative_t<idx::k_i8, data_t>, std::int8_t>,
+                      "alternative 1 must be int8_t");
+        static_assert(std::is_same_v<std::variant_alternative_t<idx::k_i16, data_t>, std::int16_t>,
+                      "alternative 2 must be int16_t");
+        static_assert(std::is_same_v<std::variant_alternative_t<idx::k_i32, data_t>, std::int32_t>,
+                      "alternative 3 must be int32_t");
+        static_assert(std::is_same_v<std::variant_alternative_t<idx::k_i64, data_t>, std::int64_t>,
+                      "alternative 4 must be int64_t");
+        static_assert(std::is_same_v<std::variant_alternative_t<idx::k_float, data_t>, float>,
+                      "alternative 5 must be float");
+        static_assert(std::is_same_v<std::variant_alternative_t<idx::k_double, data_t>, double>,
+                      "alternative 6 must be double");
+        static_assert(std::is_same_v<std::variant_alternative_t<idx::k_u16, data_t>, std::uint16_t>,
+                      "alternative 7 must be uint16_t");
+        static_assert(std::is_same_v<std::variant_alternative_t<idx::k_u32, data_t>, std::uint32_t>,
+                      "alternative 8 must be uint32_t (compressed OOP)");
+        // signature member is std::string and the default-constructed value_t
+        // leaves it empty (consumed by get()'s value_t{ value, sig } builds).
+        static_assert(std::is_same_v<decltype(value_t{}.signature), std::string>,
+                      "value_t::signature must be std::string");
+        check("default_value_t_signature_empty", value_t{}.signature.empty());
+        // A default-constructed variant value-initialises its FIRST alternative
+        // (bool) per [variant.ctor]; pins that the leading alternative is the
+        // monostate-free bool, not a reference alt.
+        check("default_value_t_alt_is_bool", value_t{}.data.index() == idx::k_bool);
+        check("default_value_t_not_reference", value_t{}.is_reference() == false);
+    }
+
+    // ---------------------------------------------------------------------
+    // 54. noexcept contract of the whole conversion surface.  get(),
+    //     get_compressed_oop(), as_string(), value_t::is_reference(), and the
+    //     templated operator target_type() are all declared noexcept
+    //     (vmhook.hpp get() ~15577, get_compressed_oop ~15953, as_string
+    //     ~15476, is_reference ~15497, operator ~15451).  Pure type-trait
+    //     queries — no buffer, no read.  A regression that drops noexcept (and
+    //     so could throw out of a hot read path) trips these at compile time.
+    // ---------------------------------------------------------------------
+    {
+        const value_t cv{ std::int32_t{ 0 } };
+        static_assert(noexcept(cv.as_string()), "as_string() must be noexcept");
+        static_assert(noexcept(cv.is_reference()), "value_t::is_reference() must be noexcept");
+        static_assert(noexcept(static_cast<int>(cv)),
+                      "operator target_type() (numeric) must be noexcept");
+        static_assert(noexcept(static_cast<void*>(cv)),
+                      "operator target_type() (void*) must be noexcept");
+        vmhook::field_proxy probe{ nullptr, "I", false };
+        static_assert(noexcept(probe.get()), "field_proxy::get() must be noexcept");
+        static_assert(noexcept(probe.get_compressed_oop()),
+                      "field_proxy::get_compressed_oop() must be noexcept");
+        static_assert(noexcept(probe.is_reference()),
+                      "field_proxy::is_reference() must be noexcept");
+        static_assert(noexcept(probe.signature()), "field_proxy::signature() must be noexcept");
+        static_assert(noexcept(probe.raw_address()), "field_proxy::raw_address() must be noexcept");
+        static_assert(noexcept(probe.is_static()), "field_proxy::is_static() must be noexcept");
+        check("noexcept_section_reached", true);
+    }
+
+    // ---------------------------------------------------------------------
+    // 55. get() is a PURE read: calling it twice on the same proxy yields
+    //     value_t copies that are byte-identical in alternative index, carried
+    //     signature, and decoded value.  get() reads the SAME bytes each call
+    //     (no caching, no mutation of field_pointer); section 34+ exercise the
+    //     safe-read path but never the call-to-call stability.  Stack buffer
+    //     (valid address), pure logic.
+    // ---------------------------------------------------------------------
+    {
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0xAB });
+        const std::int32_t planted{ 0x12345678 };
+        std::memcpy(storage.data(), &planted, sizeof(planted));
+        vmhook::field_proxy proxy{ storage.data(), "I", false };
+        const value_t a = proxy.get();
+        const value_t b = proxy.get();
+        check("get_idempotent_same_index", a.data.index() == b.data.index());
+        check("get_idempotent_same_signature", a.signature == b.signature);
+        check("get_idempotent_same_value",
+              std::get<std::int32_t>(a.data) == std::get<std::int32_t>(b.data));
+        check("get_idempotent_value_correct",
+              std::get<std::int32_t>(a.data) == planted);
+
+        // Null proxy: get() twice both land on the int32 zero contract with the
+        // signature preserved, identically.
+        vmhook::field_proxy null_proxy{ nullptr, "Ljava/lang/String;", false };
+        const value_t na = null_proxy.get();
+        const value_t nb = null_proxy.get();
+        check("null_get_idempotent_index",
+              na.data.index() == idx::k_i32 && nb.data.index() == idx::k_i32);
+        check("null_get_idempotent_signature",
+              na.signature == "Ljava/lang/String;" && nb.signature == na.signature);
+    }
+
+    // ---------------------------------------------------------------------
+    // 56. value_t COPY and MOVE preserve the alternative, signature, and the
+    //     decoded value, and conversions on the copy match the original.  The
+    //     struct is a plain {variant, std::string} aggregate, so this pins that
+    //     no slicing / alternative-collapse occurs across a copy/move and that
+    //     a copied value_t is independently convertible.  Direct construction,
+    //     pure logic.
+    // ---------------------------------------------------------------------
+    {
+        const value_t original{ std::int64_t{ -9223372036854775807LL - 1 },
+                                std::string{ "J" } };
+        const value_t copy{ original };           // copy ctor
+        check("value_t_copy_preserves_index", copy.data.index() == original.data.index());
+        check("value_t_copy_preserves_signature", copy.signature == original.signature);
+        check("value_t_copy_preserves_value",
+              std::get<std::int64_t>(copy.data) == std::get<std::int64_t>(original.data));
+        check("value_t_copy_convertible_matches",
+              static_cast<std::int64_t>(copy) == static_cast<std::int64_t>(original));
+
+        value_t source{ std::uint32_t{ 0u }, std::string{ "Ljava/lang/String;" } };
+        const std::size_t src_index{ source.data.index() };
+        const value_t moved{ std::move(source) }; // move ctor
+        check("value_t_move_preserves_index", moved.data.index() == src_index);
+        check("value_t_move_preserves_signature", moved.signature == "Ljava/lang/String;");
+        check("value_t_move_is_reference_true", moved.is_reference() == true);
+        // Moved-from uint32 zero OOP still decodes to "" / nullptr safely.
+        check("value_t_move_as_string_empty", moved.as_string().empty());
+        check("value_t_move_void_ptr_null", static_cast<void*>(moved) == nullptr);
+
+        // Copy-assignment likewise re-points the alternative + signature.
+        value_t assign_target{ double{ 3.5 }, std::string{ "D" } };
+        assign_target = original;
+        check("value_t_copy_assign_index", assign_target.data.index() == idx::k_i64);
+        check("value_t_copy_assign_signature", assign_target.signature == "J");
+    }
+
+    // ---------------------------------------------------------------------
+    // 57. char ("C", uint16 alternative) NEVER sign-extends into the widest
+    //     SIGNED targets.  Section 31 pins operator int at full BMP range;
+    //     this extends the no-sign-extension guarantee to int64_t / long long
+    //     / unsigned long long at U+FFFF (0xFFFF), the value most likely to
+    //     surface a stray sign-extend.  The source is an unsigned 16-bit
+    //     alternative, so every widening must zero-extend to exactly 65535.
+    //     Pure two's-complement arithmetic, direct construction.
+    // ---------------------------------------------------------------------
+    {
+        const value_t max_unit{ std::uint16_t{ 0xFFFF } };
+        check("C_FFFF_to_int64_zero_extends",
+              static_cast<std::int64_t>(max_unit) == std::int64_t{ 65535 });
+        check("C_FFFF_to_long_long_zero_extends",
+              static_cast<long long>(max_unit) == 65535LL);
+        check("C_FFFF_to_unsigned_long_long_zero_extends",
+              static_cast<unsigned long long>(max_unit) == 65535ULL);
+        check("C_FFFF_to_uint32_zero_extends",
+              static_cast<std::uint32_t>(max_unit) == 0xFFFFu);
+        check("C_FFFF_to_int32_zero_extends",
+              static_cast<std::int32_t>(max_unit) == std::int32_t{ 65535 });
+        // Round-trip identity on the uint16 target itself.
+        check("C_FFFF_to_uint16_identity",
+              static_cast<std::uint16_t>(max_unit) == std::uint16_t{ 0xFFFF });
+        // Lowest BMP unit (U+0000) widens to exactly 0 on every target.
+        const value_t zero_unit{ std::uint16_t{ 0x0000 } };
+        check("C_0000_to_int64_zero",
+              static_cast<std::int64_t>(zero_unit) == std::int64_t{ 0 });
+        check("C_0000_to_unsigned_long_long_zero",
+              static_cast<unsigned long long>(zero_unit) == 0ULL);
+    }
+
     return failures == 0 ? 0 : 1;
 }

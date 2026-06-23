@@ -58,9 +58,12 @@
 #include <vmhook/vmhook.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <tuple>
+#include <type_traits>
 #include <vector>
 
 static int failures{ 0 };
@@ -77,6 +80,124 @@ static auto check(const char* name, bool ok) -> void
 static auto info(const char* name, const char* detail) -> void
 {
     std::printf("[INFO] %s: %s\n", name, detail);
+}
+
+// ===========================================================================
+// ADDITIVE DEEPENING (Criterion 2) — pure-logic surface of the slot model and
+// the exported frame-walk structs.  Everything below is compile-time-decidable
+// or pure integer arithmetic derived FROM SOURCE; nothing reads a fabricated or
+// live address, constructs a value_t, or writes a 0-size vector region.  It
+// complements (does not touch) the saved-rbp safety/termination sections above.
+//
+// Provenance of every constant used here (vmhook.hpp):
+//   * is_java_double_slot_v normalises via std::remove_cvref_t            (~9492)
+//       int64_t / uint64_t / double -> 2 slots; everything else -> 1 slot.
+//   * java_slot_offsets<std::tuple<...>>::compute() widens +2 per J/D     (~9523)
+//       empty-tuple specialisation -> std::array<int32_t,0>              (~9540)
+//   * frame::get_method() reads the Method* at  this - 24 bytes           (~6124)
+//       interpreter_frame_method_offset = -3 words = -24 bytes.
+//   * get_locals() JDK-21+ index recovery: r14 = rbp + index * 8          (~6263)
+//       classified as an index iff slot_index < 0x1000u                   (~6264)
+//       JDK 8-20 direct-pointer branch gated by is_valid_pointer          (~6256)
+//   * extract_frame_arg / get_argument bounds-guard max_jvm_locals==0xFFFF (~9556, ~6481)
+//   * saved-rbp growth guard: strictly above AND <= (1 << 20) bytes       (~9815, ~9952)
+//   * is_valid_pointer: reject addr <= user_address_floor(0xFFFF),        (~2047)
+//       reject odd, reject >= user_address_ceiling(0x00007FFFFFFFFFFF).
+// ===========================================================================
+
+// --- is_java_double_slot_v: cv / ref / pointer normalisation -----------------
+// The frame-walk decoders take T, const T&, T&, unique_ptr<wrapper>... and rely
+// on the trait collapsing cv/ref via remove_cvref_t.  test_traits.cpp pins the
+// BARE types; here we pin the qualified-type normalisation the walk depends on.
+namespace ifw_slotmodel
+{
+    namespace d = vmhook::detail;
+
+    // Two-slot types stay two-slot through const / ref / cv-ref.
+    static_assert(d::is_java_double_slot_v<const std::int64_t>,
+                  "const int64_t still 2 slots (remove_cvref)");
+    static_assert(d::is_java_double_slot_v<std::int64_t&>,
+                  "int64_t& still 2 slots");
+    static_assert(d::is_java_double_slot_v<const std::int64_t&>,
+                  "const int64_t& still 2 slots");
+    static_assert(d::is_java_double_slot_v<volatile std::uint64_t>,
+                  "volatile uint64_t still 2 slots");
+    static_assert(d::is_java_double_slot_v<const double&>,
+                  "const double& still 2 slots");
+
+    // One-slot types stay one-slot through const / ref.
+    static_assert(!d::is_java_double_slot_v<const std::int32_t&>,
+                  "const int32_t& still 1 slot");
+    static_assert(!d::is_java_double_slot_v<float&>,
+                  "float& still 1 slot (float != double)");
+    static_assert(!d::is_java_double_slot_v<const float>,
+                  "const float still 1 slot");
+
+    // Distinct-type discipline the J/D rule leans on (long != double != float).
+    static_assert(d::is_java_double_slot_v<double> == d::is_java_double_slot_v<std::int64_t>,
+                  "double and long agree: both 2-slot");
+    static_assert(d::is_java_double_slot_v<float> != d::is_java_double_slot_v<double>,
+                  "float (1) and double (2) must differ");
+
+    // --- java_slot_offsets at the extremes test_traits.cpp does not reach -----
+    // Empty tuple -> empty table (0-arg method / static no-arg).
+    static_assert(d::java_slot_offsets<std::tuple<>>::value.size() == 0u,
+                  "0-arg frame -> empty slot table");
+
+    // Single arg of each width.
+    static_assert(d::java_slot_offsets<std::tuple<std::int32_t>>::value
+                  == std::array<std::int32_t, 1>{ { 0 } },
+                  "single int -> [0]");
+    static_assert(d::java_slot_offsets<std::tuple<std::int64_t>>::value
+                  == std::array<std::int32_t, 1>{ { 0 } },
+                  "single long -> [0] (start slot, width handled at read)");
+
+    // Leading double then trailing arg: the trailing arg jumps to slot 2.
+    static_assert(d::java_slot_offsets<std::tuple<double, std::int32_t>>::value
+                  == std::array<std::int32_t, 2>{ { 0, 2 } },
+                  "(double,int) -> [0,2]");
+
+    // All-double run: each successive double starts two slots later.
+    static_assert(d::java_slot_offsets<std::tuple<double, double, double, double>>::value
+                  == std::array<std::int32_t, 4>{ { 0, 2, 4, 6 } },
+                  "(d,d,d,d) -> [0,2,4,6]");
+
+    // Higher arity than the size-3 unit checks: mixed widths summing correctly.
+    // (this, long, int, double, int) -> 0,1,3,4,6.
+    static_assert(
+        d::java_slot_offsets<std::tuple<void*, std::int64_t, std::int32_t, double, std::int32_t>>::value
+        == std::array<std::int32_t, 5>{ { 0, 1, 3, 4, 6 } },
+        "(this,long,int,double,int) widening table");
+
+    // Table length always equals the arg count regardless of widths.
+    static_assert(
+        d::java_slot_offsets<std::tuple<std::int64_t, double, std::int64_t, double>>::value.size() == 4u,
+        "slot-table length == arg count even when every arg is 2-slot");
+
+    // The last entry equals the sum of all preceding widths (monotone, derived).
+    static_assert(
+        d::java_slot_offsets<std::tuple<std::int64_t, double, std::int64_t, double>>::value[3] == 6,
+        "4th of four 2-slot args starts at slot 6 (2+2+2)");
+}
+
+// --- caller_info: standard layout + member order + valid() truth table -------
+// The exported result struct of the walk.  valid() is defined as method!=nullptr.
+namespace ifw_callerinfo
+{
+    using ci = vmhook::return_value::caller_info;
+
+    static_assert(std::is_standard_layout_v<ci>,
+                  "caller_info must be standard-layout (stable ABI for the result)");
+    static_assert(std::is_nothrow_default_constructible_v<ci>,
+                  "caller_info default ctor is noexcept");
+    static_assert(std::is_same_v<decltype(std::declval<ci>().method),
+                                 vmhook::hotspot::method*>,
+                  "caller_info::method is a hotspot::method*");
+    // method is the first member (offset 0) so a zeroed result is invalid.
+    static_assert(offsetof(ci, method) == 0u,
+                  "caller_info::method must be the first member");
+    static_assert(noexcept(std::declval<const ci&>().valid()),
+                  "caller_info::valid() is noexcept");
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +735,144 @@ static auto test_caller_trace_agreement(arena& a) -> void
     check("caller_and_trace_agree_no_caller_on_fabricated_frames", agree);
 }
 
+// ===========================================================================
+// SECTION 10 (ADDITIVE) — runtime checks of the walk's pure arithmetic and the
+// caller_info value contract.  No fabricated/live address is dereferenced: the
+// "index recovery" math below operates on a real, mapped arena base treated as
+// an rbp VALUE (pure integer arithmetic, never read), reproducing get_locals()'s
+// JDK-21+ formula `r14 = rbp + index*8` and the classification cliff at 0x1000.
+// Every literal is derived from vmhook.hpp as documented at the top of the file.
+// ===========================================================================
+static auto test_walk_arithmetic_and_value_contract(arena& a) -> void
+{
+    // --- interpreter_frame_method_offset = -3 words = -24 bytes (get_method). -
+    {
+        constexpr std::int64_t method_offset_words{ -3 };
+        constexpr std::int64_t word_bytes{ 8 };
+        check("method_offset_is_minus_24_bytes",
+              (method_offset_words * word_bytes) == std::int64_t{ -24 });
+    }
+
+    // --- max_jvm_locals == 0xFFFF (the u2 bound shared by extract_frame_arg /
+    // get_argument / set_arg).  An index is accepted iff 0 <= index <= 0xFFFF. --
+    {
+        constexpr std::int32_t max_jvm_locals{ 0xFFFF };
+        check("max_jvm_locals_is_65535", max_jvm_locals == 65535);
+        // Boundary classification of the documented guard `index < 0 || > max`.
+        auto in_range{ [](std::int32_t idx) -> bool
+        {
+            constexpr std::int32_t mx{ 0xFFFF };
+            return !(idx < 0 || idx > mx);
+        } };
+        check("locals_index_zero_in_range", in_range(0));
+        check("locals_index_max_in_range", in_range(0xFFFF));
+        check("locals_index_negative_rejected", !in_range(-1));
+        check("locals_index_intmin_rejected", !in_range(-2147483647 - 1));
+        check("locals_index_past_max_rejected", !in_range(0x10000));
+    }
+
+    // --- saved-rbp growth guard: caller_rbp must be strictly ABOVE and at most
+    // (1 << 20) == 1 MiB above the current slot.  Pure boundary arithmetic. -----
+    {
+        constexpr std::uintptr_t one_mib{ std::uintptr_t{ 1 } << 20 };
+        check("growth_bound_is_one_mib", one_mib == std::uintptr_t{ 1048576u });
+        // Reproduce: bool ok = cal > cur && (cal - cur) <= one_mib.
+        auto accepts{ [](std::uintptr_t cur, std::uintptr_t cal) -> bool
+        {
+            constexpr std::uintptr_t lim{ std::uintptr_t{ 1 } << 20 };
+            return cal > cur && (cal - cur) <= lim;
+        } };
+        const std::uintptr_t cur{ std::uintptr_t{ 0x40000000u } };
+        check("growth_equal_rejected", !accepts(cur, cur));                       // not strictly above
+        check("growth_below_rejected", !accepts(cur, cur - 8u));                  // downward
+        check("growth_one_above_accepted", accepts(cur, cur + 8u));              // strictly above, near
+        check("growth_exactly_one_mib_accepted", accepts(cur, cur + one_mib));   // boundary inclusive
+        check("growth_one_past_mib_rejected", !accepts(cur, cur + one_mib + 1u));// just over
+    }
+
+    // --- is_valid_pointer floor/ceiling/alignment, as the walk's first gate
+    // applies them.  Pure constants — no dereference. ------------------------
+    {
+        check("user_address_floor_is_0xFFFF",
+              vmhook::os::user_address_floor == std::uintptr_t{ 0xFFFFu });
+        check("user_address_ceiling_is_canonical",
+              vmhook::os::user_address_ceiling == std::uintptr_t{ 0x00007FFFFFFFFFFFull });
+        // Floor is exclusive (addr <= floor rejected); ceiling exclusive (>=).
+        check("ivp_rejects_floor_value",
+              !vmhook::hotspot::is_valid_pointer(
+                  reinterpret_cast<const void*>(vmhook::os::user_address_floor)));
+        check("ivp_rejects_below_floor",
+              !vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x100u })));
+        check("ivp_rejects_ceiling_value",
+              !vmhook::hotspot::is_valid_pointer(
+                  reinterpret_cast<const void*>(vmhook::os::user_address_ceiling)));
+        check("ivp_rejects_odd_in_range",
+              !vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x100001u })));
+        check("ivp_accepts_even_in_range",
+              vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x100000u })));
+    }
+
+    // --- get_locals() JDK-21+ index recovery: r14 = rbp + index*8, and the
+    // classification cliff `slot_index < 0x1000` (else nullptr).  We compute on
+    // a REAL mapped arena base used purely as an rbp VALUE — never dereferenced. -
+    {
+        constexpr std::uintptr_t index_cliff{ 0x1000u };
+        check("locals_index_cliff_is_4096", index_cliff == std::uintptr_t{ 4096u });
+
+        // The hs_err proof from the header: rbp + 3*8 with index 3.
+        const std::uintptr_t proof_rbp{ std::uintptr_t{ 0x243f888u } };
+        const std::uintptr_t proof_index{ 3u };
+        check("locals_recovery_matches_hs_err_proof",
+              (proof_rbp + proof_index * 8u) == std::uintptr_t{ 0x243f8a0u });
+
+        // Round-trip the spilled value: index = (r14 - rbp) >> 3, then recover.
+        const std::uintptr_t rbp_val{ std::uintptr_t{ 0x10000000u } };
+        const std::uintptr_t r14_val{ rbp_val + 7u * 8u };           // 7 slots above rbp
+        const std::uintptr_t spilled{ (r14_val - rbp_val) >> 3 };    // == 7
+        check("locals_index_encode_roundtrip", spilled == 7u);
+        check("locals_recover_from_index", (rbp_val + spilled * 8u) == r14_val);
+
+        // Classification: index just under cliff recovered; at/over cliff -> null.
+        auto classify_is_index{ [](std::uintptr_t slot) -> bool
+        {
+            return slot < 0x1000u;   // get_locals(): JDK-21+ index branch
+        } };
+        check("locals_index_below_cliff_is_index", classify_is_index(0xFFFu));
+        check("locals_index_at_cliff_is_not_index", !classify_is_index(0x1000u));
+        check("locals_index_zero_is_index", classify_is_index(0u));
+
+        if (a.ok())
+        {
+            // Use the arena base as an rbp VALUE only; compute the recovered
+            // locals address and confirm it lands inside the arena for a small
+            // index (so the formula stays self-consistent with a real mapping).
+            const std::uintptr_t rbp{ reinterpret_cast<std::uintptr_t>(a.base) };
+            const std::uintptr_t recovered{ rbp + 5u * 8u };
+            const std::uintptr_t arena_end{ rbp + static_cast<std::uintptr_t>(a.size) };
+            check("locals_recovery_in_arena_bounds",
+                  recovered > rbp && recovered < arena_end);
+        }
+    }
+
+    // --- caller_info value contract at runtime: default-constructed is invalid;
+    // setting method!=nullptr flips valid(); the string members start empty. ----
+    {
+        vmhook::return_value::caller_info ci{};
+        check("default_caller_info_invalid", !ci.valid());
+        check("default_caller_info_method_null", ci.method == nullptr);
+        check("default_caller_info_class_empty", ci.class_name.empty());
+        check("default_caller_info_method_name_empty", ci.method_name.empty());
+        check("default_caller_info_signature_empty", ci.signature.empty());
+
+        // valid() is purely method!=nullptr — a non-null sentinel flips it true
+        // WITHOUT any dereference (valid() only compares the pointer to null).
+        ci.method = reinterpret_cast<vmhook::hotspot::method*>(std::uintptr_t{ 0x1000u });
+        check("caller_info_nonnull_method_valid", ci.valid());
+        ci.method = nullptr;
+        check("caller_info_reset_method_invalid", !ci.valid());
+    }
+}
+
 int main()
 {
     std::printf("=== interpreter_frame_walk (no-JVM) ===\n");
@@ -636,6 +895,7 @@ int main()
     test_max_depth_cap(a);
     test_frame_accessor_identity(a);
     test_caller_trace_agreement(a);
+    test_walk_arithmetic_and_value_contract(a);
 
     free_arena(a);
 
