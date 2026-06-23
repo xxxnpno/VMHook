@@ -235,7 +235,7 @@ function Run-Cell([string] $c, [string] $major, [hashtable] $build) {
     Push-Location $work
     try {
         $jproc = Start-Process -FilePath $javaExe `
-            -ArgumentList '-Xmx6g', '-Xmn4g', '-cp', 'out', 'vmhook.Main' `
+            -ArgumentList '-Xmx4g', '-Xmn3g', '-cp', 'out', 'vmhook.Main' `
             -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput 'java_stdout.txt' -RedirectStandardError 'java_stderr.txt'
         Start-Sleep -Seconds 5
