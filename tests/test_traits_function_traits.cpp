@@ -34,6 +34,8 @@
 // regression also surfaces as a visible [FAIL] line at runtime.
 #include <vmhook/vmhook.hpp>
 
+#include <array>
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <functional>
@@ -282,6 +284,75 @@ namespace
     };
     void detour_other(vmhook::return_value&, std::unique_ptr<other_wrapper>,
                       std::int64_t, std::int32_t) {}
+
+    // ── SECOND PASS scaffolding: ONE fixed wide detour signature, expressed in
+    //    every accepted callable SHAPE.  The first pass owns the callable-shape
+    //    axis (which shapes are accepted, what args_tuple_t each yields) and
+    //    test_traits_extra.cpp owns hand-built java_slot_offsets tuples; NEITHER
+    //    drives the SAME signature through every shape all the way to the slot
+    //    table the consumer instantiates (java_slot_offsets<method_arg_tuple_t>).
+    //    This scaffolding lets the new section pin that the end-to-end chain —
+    //    function_traits -> tuple_tail -> java_slot_offsets — converges to one
+    //    identical offset array regardless of which callable shape carried it.
+    //
+    //    The fixed shared signature (after the leading return_value& is stripped):
+    //        (unique_ptr<self>, long, int, double, int, long, int)
+    //    method tuple = (unique_ptr<sample_wrapper>, int64, int32, double,
+    //                    int32, int64, int32).  Slot widening, computed by hand
+    //    from is_java_double_slot_v (long/double -> 2 slots, else 1):
+    //        self  @0 (+1) -> 0
+    //        long  @1 (+2) -> 1
+    //        int   @3 (+1) -> 3
+    //        double@4 (+2) -> 4
+    //        int   @6 (+1) -> 6
+    //        long  @7 (+2) -> 7
+    //        int   @9 (+1) -> 9
+    //    -> std::array<int32_t,7>{ 0, 1, 3, 4, 6, 7, 9 }.
+    using wide_method_tuple = std::tuple<std::unique_ptr<sample_wrapper>,
+                                         std::int64_t, std::int32_t, double,
+                                         std::int32_t, std::int64_t, std::int32_t>;
+
+    // Free-function POINTER carrier (spec #1).
+    void wide_detour_free(vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                          std::int64_t, std::int32_t, double,
+                          std::int32_t, std::int64_t, std::int32_t) {}
+    // STATIC member carrier (also spec #1 — ordinary function pointer).
+    struct wide_static_host
+    {
+        static void s_wide(vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                           std::int64_t, std::int32_t, double,
+                           std::int32_t, std::int64_t, std::int32_t) {}
+    };
+    // const MEMBER carrier (spec #4).
+    struct wide_member_host
+    {
+        void m_wide(vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                    std::int64_t, std::int32_t, double,
+                    std::int32_t, std::int64_t, std::int32_t) const {}
+    };
+
+    // ── cv/ref param-spelling INVARIANCE of the slot table (flaw #2 contract) ──
+    // function_traits preserves a parameter's cv/ref VERBATIM in the tuple, but
+    // java_slot_offsets calls is_java_double_slot_v which strips cv/ref before
+    // deciding 1-vs-2 slots.  So a detour spelled with const-ref long/double must
+    // produce the SAME offset table as the by-value spelling, even though the two
+    // method tuples are DISTINCT types.  These two carriers differ ONLY by the
+    // cv/ref on the widening (long/double) params.
+    void wide_detour_byval(vmhook::return_value&, std::int64_t, std::int32_t,
+                           double, std::int32_t) {}
+    void wide_detour_cref(vmhook::return_value&, const std::int64_t&, std::int32_t,
+                          const double&, std::int32_t) {}
+
+    // A single-slot-only interleave of eight DISTINCT primitive spellings — none
+    // is a J/D type, so the offset table must be the strict identity 0..7.  This
+    // exercises the java_slot_offsets fold past the small cases the suite pins.
+    void wide_detour_singles(vmhook::return_value&, bool, char16_t, std::int8_t,
+                             float, void*, std::uint32_t, std::int16_t, char32_t) {}
+
+    // A small enum and a pointer-to-double, to extend the is_java_double_slot_v
+    // spelling matrix: an enum is single-slot; double* is a pointer (single-slot)
+    // even though it points at a double.
+    enum class small_enum : std::int32_t { a, b };
 }
 
 int main()
@@ -898,6 +969,219 @@ int main()
     check("noexcept_fnptr_args_match_throwing_twin",
           std::is_same_v<args_of<void(*)(vmhook::return_value&, int, double) noexcept>,
                          args_of<void(*)(vmhook::return_value&, int, double)>>);
+
+    // ========================================================================
+    // SECOND ADDITIVE PASS — the END-TO-END chain hook<T>() actually runs:
+    //   function_traits<F>::args_tuple_t -> tuple_tail -> method_arg_tuple_t
+    //   -> java_slot_offsets<method_arg_tuple_t>::value
+    //   -> extract_frame_arg<std::tuple_element_t<k, method_arg_tuple_t>>.
+    // The first pass stops at the method tuple (callable-shape axis) and
+    // test_traits_extra.cpp drives only HAND-BUILT tuples into java_slot_offsets.
+    // NEITHER drives ONE fixed signature through EVERY accepted callable shape all
+    // the way to the slot table, nor pins the per-element tuple_element_t the
+    // consumer instantiates, nor the cv/ref-invariance of the slot table.  All of
+    // that is new ground.  Every expected value is computed from source: the slot
+    // rule is is_java_double_slot_v (long/double/uint64 -> +2, else +1); the slot
+    // table for the shared signature is { 0, 1, 3, 4, 6, 7, 9 } (derived above).
+    // ========================================================================
+
+    // 22.  SHAPE-CONVERGENCE of the method tuple.  The shared wide signature,
+    //      carried by a free-fn pointer, a static member (also a fn pointer), a
+    //      const member pointer, a lambda, and a std::function, must all strip the
+    //      leading return_value& to the SAME method tuple type.
+    {
+        auto wide_lambda = [](vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                              std::int64_t, std::int32_t, double,
+                              std::int32_t, std::int64_t, std::int32_t) {};
+        using fn_t = std::function<void(vmhook::return_value&,
+                                        std::unique_ptr<sample_wrapper>,
+                                        std::int64_t, std::int32_t, double,
+                                        std::int32_t, std::int64_t, std::int32_t)>;
+        check("wide_free_pointer_method_tuple_is_canonical",
+              std::is_same_v<method_args_of<decltype(&wide_detour_free)>, wide_method_tuple>);
+        check("wide_static_member_method_tuple_is_canonical",
+              std::is_same_v<method_args_of<decltype(&wide_static_host::s_wide)>, wide_method_tuple>);
+        check("wide_const_member_method_tuple_is_canonical",
+              std::is_same_v<method_args_of<decltype(&wide_member_host::m_wide)>, wide_method_tuple>);
+        check("wide_lambda_method_tuple_is_canonical",
+              std::is_same_v<method_args_of<decltype(wide_lambda)>, wide_method_tuple>);
+        check("wide_std_function_method_tuple_is_canonical",
+              std::is_same_v<method_args_of<fn_t>, wide_method_tuple>);
+        // All five shapes agree pairwise — the decomposition is shape-agnostic.
+        check("all_wide_shapes_share_one_method_tuple",
+              std::is_same_v<method_args_of<decltype(&wide_detour_free)>,
+                             method_args_of<decltype(&wide_static_host::s_wide)>>
+              && std::is_same_v<method_args_of<decltype(&wide_static_host::s_wide)>,
+                                method_args_of<decltype(&wide_member_host::m_wide)>>
+              && std::is_same_v<method_args_of<decltype(&wide_member_host::m_wide)>,
+                                method_args_of<decltype(wide_lambda)>>
+              && std::is_same_v<method_args_of<decltype(wide_lambda)>,
+                                method_args_of<fn_t>>);
+
+        // 23.  END-TO-END slot table from EACH shape.  java_slot_offsets over the
+        //      method tuple derived from each callable shape must equal the hand-
+        //      computed { 0, 1, 3, 4, 6, 7, 9 }.  This is the exact expression
+        //      hook<T>()'s wrapper_detour evaluates (java_slot_offsets<
+        //      method_arg_tuple_t>::value), driven from a real callable, not a
+        //      hand-built tuple.
+        constexpr std::array<std::int32_t, 7> expect_wide{ 0, 1, 3, 4, 6, 7, 9 };
+        check("wide_free_pointer_slot_table",
+              (vmhook::detail::java_slot_offsets<
+                   method_args_of<decltype(&wide_detour_free)>>::value == expect_wide));
+        check("wide_static_member_slot_table",
+              (vmhook::detail::java_slot_offsets<
+                   method_args_of<decltype(&wide_static_host::s_wide)>>::value == expect_wide));
+        check("wide_const_member_slot_table",
+              (vmhook::detail::java_slot_offsets<
+                   method_args_of<decltype(&wide_member_host::m_wide)>>::value == expect_wide));
+        check("wide_lambda_slot_table",
+              (vmhook::detail::java_slot_offsets<
+                   method_args_of<decltype(wide_lambda)>>::value == expect_wide));
+        check("wide_std_function_slot_table",
+              (vmhook::detail::java_slot_offsets<method_args_of<fn_t>>::value == expect_wide));
+        // The slot table has exactly one entry per method arg (arity 7).
+        check("wide_slot_table_size_equals_arity",
+              vmhook::detail::java_slot_offsets<wide_method_tuple>::value.size() == 7);
+
+        // 24.  PER-ELEMENT tuple_element_t round-trip — the precise type each
+        //      extract_frame_arg<std::tuple_element_t<k, method_arg_tuple_t>> is
+        //      instantiated with, for the lambda shape, k = 0..6.
+        check("wide_lambda_element_0_is_unique_ptr_self",
+              std::is_same_v<std::tuple_element_t<0, method_args_of<decltype(wide_lambda)>>,
+                             std::unique_ptr<sample_wrapper>>);
+        check("wide_lambda_element_1_is_long",
+              std::is_same_v<std::tuple_element_t<1, method_args_of<decltype(wide_lambda)>>,
+                             std::int64_t>);
+        check("wide_lambda_element_2_is_int",
+              std::is_same_v<std::tuple_element_t<2, method_args_of<decltype(wide_lambda)>>,
+                             std::int32_t>);
+        check("wide_lambda_element_3_is_double",
+              std::is_same_v<std::tuple_element_t<3, method_args_of<decltype(wide_lambda)>>,
+                             double>);
+        check("wide_lambda_element_4_is_int",
+              std::is_same_v<std::tuple_element_t<4, method_args_of<decltype(wide_lambda)>>,
+                             std::int32_t>);
+        check("wide_lambda_element_5_is_long",
+              std::is_same_v<std::tuple_element_t<5, method_args_of<decltype(wide_lambda)>>,
+                             std::int64_t>);
+        check("wide_lambda_element_6_is_int",
+              std::is_same_v<std::tuple_element_t<6, method_args_of<decltype(wide_lambda)>>,
+                             std::int32_t>);
+    }
+
+    // 25.  cv/ref PARAM SPELLING INVARIANCE of the slot table (flaw #2 contract).
+    //      The by-value and const-ref carriers differ ONLY by cv/ref on the
+    //      widening params, so their method TUPLES are distinct types — but
+    //      java_slot_offsets routes each element through is_java_double_slot_v,
+    //      which strips cv/ref, so the offset tables must be IDENTICAL.
+    //      Signature (after strip): (long, int, double, int) ->
+    //        long@0(+2)->0, int@2(+1)->2, double@3(+2)->3, int@5(+1)->5 = {0,2,3,5}.
+    {
+        using byval_tuple = method_args_of<decltype(&wide_detour_byval)>;
+        using cref_tuple  = method_args_of<decltype(&wide_detour_cref)>;
+        // The two method tuples are NOT the same type (cv/ref preserved verbatim).
+        check("byval_and_cref_method_tuples_are_distinct_types",
+              !std::is_same_v<byval_tuple, cref_tuple>);
+        // The by-value tuple is exactly the unqualified spelling.
+        check("byval_method_tuple_exact",
+              std::is_same_v<byval_tuple,
+                             std::tuple<std::int64_t, std::int32_t, double, std::int32_t>>);
+        // The const-ref tuple preserves the const-ref on the widening params.
+        check("cref_method_tuple_preserves_const_ref",
+              std::is_same_v<cref_tuple,
+                             std::tuple<const std::int64_t&, std::int32_t,
+                                        const double&, std::int32_t>>);
+        constexpr std::array<std::int32_t, 4> expect_cref{ 0, 2, 3, 5 };
+        check("byval_slot_table_is_0_2_3_5",
+              (vmhook::detail::java_slot_offsets<byval_tuple>::value == expect_cref));
+        check("cref_slot_table_is_0_2_3_5",
+              (vmhook::detail::java_slot_offsets<cref_tuple>::value == expect_cref));
+        // The load-bearing fact: DESPITE distinct tuple types, the slot tables
+        // are bit-for-bit identical — cv/ref on a param cannot shift any slot.
+        check("byval_and_cref_slot_tables_identical",
+              (vmhook::detail::java_slot_offsets<byval_tuple>::value
+               == vmhook::detail::java_slot_offsets<cref_tuple>::value));
+    }
+
+    // 26.  ALL-SINGLE-SLOT INTERLEAVE — eight distinct non-J/D primitive spellings
+    //      must produce the strict identity table 0..7 (no widening anywhere).
+    {
+        using singles_tuple = method_args_of<decltype(&wide_detour_singles)>;
+        check("singles_method_tuple_exact",
+              std::is_same_v<singles_tuple,
+                             std::tuple<bool, char16_t, std::int8_t, float, void*,
+                                        std::uint32_t, std::int16_t, char32_t>>);
+        constexpr std::array<std::int32_t, 8> expect_singles{ 0, 1, 2, 3, 4, 5, 6, 7 };
+        check("singles_slot_table_is_identity_0_to_7",
+              (vmhook::detail::java_slot_offsets<singles_tuple>::value == expect_singles));
+    }
+
+    // 27.  J/D-FIRST and J/D-LAST boundary tables, derived from real callables,
+    //      pinning the fold at both ends of the parameter pack.
+    {
+        // (long, int): long@0(+2)->0, int@2 -> {0,2}.
+        check("jd_first_long_int_slot_table",
+              (vmhook::detail::java_slot_offsets<
+                   std::tuple<std::int64_t, std::int32_t>>::value
+               == std::array<std::int32_t, 2>{ 0, 2 }));
+        // (int, long): int@0(+1)->0, long@1 -> {0,1}.  The trailing long consumes
+        // its own two slots but nothing follows, so it never shifts another entry.
+        check("jd_last_int_long_slot_table",
+              (vmhook::detail::java_slot_offsets<
+                   std::tuple<std::int32_t, std::int64_t>>::value
+               == std::array<std::int32_t, 2>{ 0, 1 }));
+        // Three consecutive widening types (long, double, uint64) -> {0,2,4}.
+        check("three_consecutive_widening_slot_table",
+              (vmhook::detail::java_slot_offsets<
+                   std::tuple<std::int64_t, double, std::uint64_t>>::value
+               == std::array<std::int32_t, 3>{ 0, 2, 4 }));
+    }
+
+    // 28.  is_java_double_slot_v — additional spellings not pinned elsewhere.
+    //      An enum is single-slot; a pointer-to-double is a pointer (single-slot)
+    //      even though it points at a double; long double is NOT std::int64_t /
+    //      uint64_t / double, so it is single-slot by this trait's definition;
+    //      a uint64_t lvalue/rvalue-ref still widens (cv/ref stripped first).
+    check("is_java_double_slot_v_enum_is_one",
+          !vmhook::detail::is_java_double_slot_v<small_enum>);
+    check("is_java_double_slot_v_double_pointer_is_one",
+          !vmhook::detail::is_java_double_slot_v<double*>);
+    check("is_java_double_slot_v_long_double_is_one",
+          !vmhook::detail::is_java_double_slot_v<long double>);
+    check("is_java_double_slot_v_float_is_one_again",
+          !vmhook::detail::is_java_double_slot_v<float>);
+    check("is_java_double_slot_v_uint64_rvalue_ref_is_two",
+          vmhook::detail::is_java_double_slot_v<std::uint64_t&&>);
+    check("is_java_double_slot_v_double_const_volatile_is_two",
+          vmhook::detail::is_java_double_slot_v<const volatile double>);
+
+    // 29.  COMPILE-TIME ENFORCEMENT for the second pass (build breaks on regress).
+    static_assert(std::is_same_v<method_args_of<decltype(&wide_detour_free)>,
+                                 wide_method_tuple>,
+                  "the shared wide signature must strip return_value& to the canonical "
+                  "method tuple on the free-fn pointer spec");
+    static_assert(std::is_same_v<method_args_of<decltype(&wide_static_host::s_wide)>,
+                                 method_args_of<decltype(&wide_member_host::m_wide)>>,
+                  "static-member and const-member carriers of the same signature must "
+                  "decompose to the same method tuple");
+    static_assert(vmhook::detail::java_slot_offsets<wide_method_tuple>::value
+                      == std::array<std::int32_t, 7>{ 0, 1, 3, 4, 6, 7, 9 },
+                  "the canonical wide method tuple must widen to slot table "
+                  "{0,1,3,4,6,7,9} (long/double advance the cursor by 2)");
+    static_assert(vmhook::detail::java_slot_offsets<
+                          method_args_of<decltype(&wide_detour_byval)>>::value
+                      == vmhook::detail::java_slot_offsets<
+                          method_args_of<decltype(&wide_detour_cref)>>::value,
+                  "cv/ref on a parameter must NOT shift any slot: is_java_double_slot_v "
+                  "strips cv/ref, so by-value and const-ref signatures share one table");
+    static_assert(vmhook::detail::java_slot_offsets<
+                          method_args_of<decltype(&wide_detour_singles)>>::value
+                      == std::array<std::int32_t, 8>{ 0, 1, 2, 3, 4, 5, 6, 7 },
+                  "eight single-slot primitives must produce the strict identity table");
+    static_assert(!vmhook::detail::is_java_double_slot_v<small_enum>,
+                  "an enum is a single-slot Java argument");
+    static_assert(!vmhook::detail::is_java_double_slot_v<double*>,
+                  "a pointer-to-double is a single-slot pointer, not a double");
 
     std::printf("vmhook traits-function_traits: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

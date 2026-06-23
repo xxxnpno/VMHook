@@ -2524,5 +2524,327 @@ int main()
           vmhook::detail::jvm_primitive_byte_width(
               vmhook::jni::signature_for_arg<std::uint16_t>()) == 2);
 
+    // =====================================================================
+    // EXHAUSTIVE PASS 10 -- additive coverage of inputs/relations NOT reached
+    // by passes 1-9.  Every expected value is derived ONLY from the three
+    // confirmed tables + the two consumer code paths in vmhook.hpp:
+    //   sig_char_to_basic_type   (vmhook.hpp:16174 -- Z4 C5 F6 D7 B8 S9 I10 J11
+    //                             L12 [13 V14, default 12)
+    //   jvm_primitive_byte_width (vmhook.hpp:16209 -- size!=1 ->0; Z/B1 S/C2 I/F4
+    //                             J/D8, default 0)
+    //   jni_signature_for_arg    (vmhook.hpp:12953 -- decay; String; bool->Z;
+    //                             char16_t|uint16_t->C; generic is_integral &&
+    //                             sizeof N=1->B 2->S 4->I 8->J; float->F double->D;
+    //                             unique_ptr<wrapper>/object_base -> class map
+    //                             "L"+name+";" with Object fallback; else assert)
+    //   array-element-width consumer (vmhook.hpp:15025-15026 / 20855 --
+    //                             jvm_primitive_byte_width(signature.substr(1)) to
+    //                             extract a "[X" array's ELEMENT width)
+    //   is_unique_ptr_v          (vmhook.hpp:1813 -- remove_cvref_t then match)
+    // The NEW surfaces here: the generic-ladder sizeof==2 NON-char branch
+    // (wchar_t where it is 2 bytes -> "S", which the corrected ladder ADMITS and
+    // does NOT static_assert), the substr(1) array-element-width extraction the
+    // field reader actually performs, the is_unique_ptr_v cv/ref-stripping trait
+    // that feeds the wrapper branch, plus descriptor shapes/relations passes 1-9
+    // did not jointly pin.
+    // =====================================================================
+
+    // ---- jni_signature_for_arg: the generic sizeof==2 NON-char branch ---------
+    // int16_t -> "S" pins the sizeof==2 fall-through for a SIGNED 2-byte alias
+    // (already covered), but the branch also admits ANY other 2-byte integral that
+    // is NOT bool/char16_t/uint16_t.  `wchar_t` is exactly such a type WHERE it is
+    // 2 bytes (Windows): it is integral, sizeof==2, and a DISTINCT type from
+    // char16_t/uint16_t, so the corrected ladder routes it to the sizeof==2 branch
+    // -> "S" (it does NOT hit the static_assert, contrary to the older pass-8
+    // comment, and it does NOT become "C").  Gate on the 2-byte case so this is
+    // only instantiated where wchar_t is 2 bytes; the 4-byte case is pinned in
+    // pass 8 (-> "I").  The property the routing keys on is asserted regardless.
+    static_assert(!std::is_same_v<std::decay_t<wchar_t>, char16_t>,
+                  "wchar_t must be a distinct type from char16_t");
+    static_assert(!std::is_same_v<std::decay_t<wchar_t>, std::uint16_t>,
+                  "wchar_t must be a distinct type from uint16_t");
+    if constexpr (std::is_integral_v<wchar_t> && sizeof(wchar_t) == 2)
+    {
+        check("jni_sig_wchar_t_2byte_is_S_generic_sizeof2_branch",
+              vmhook::detail::jni_signature_for_arg<wchar_t>() == "S");
+        // cv/ref qualified 2-byte wchar_t still decays through to "S".
+        check("jni_sig_const_ref_wchar_t_2byte_is_S",
+              vmhook::detail::jni_signature_for_arg<const wchar_t&>() == "S");
+    }
+    // A wchar_t that is 2 bytes must NOT collide with the char16_t/uint16_t "C"
+    // branch even though it is the SAME width as a Java char -- the branch is
+    // keyed on the exact type, not the width.  Pin that discriminating property in
+    // a form valid on every platform (true vacuously where wchar_t is 4 bytes).
+    check("jni_sig_wchar_t_is_not_uint16_or_char16_type_property",
+          (!std::is_same_v<std::decay_t<wchar_t>, std::uint16_t>)
+          && (!std::is_same_v<std::decay_t<wchar_t>, char16_t>));
+
+    // ---- the generic sizeof ladder is keyed by WIDTH, not signedness ----------
+    // For each width bucket the signed and unsigned fixed-width aliases collapse
+    // to the SAME tag EXCEPT at width 2, where uint16_t is special-cased to "C"
+    // (Java char) ahead of the generic sizeof==2 branch.  Pin the full
+    // signed==unsigned partition: width 1 both "B", width 4 both "I", width 8 both
+    // "J"; width 2 is the deliberate asymmetry (S vs C).
+    check("jni_sig_signed_unsigned_agree_width1_B",
+             vmhook::detail::jni_signature_for_arg<std::int8_t>()
+                 == vmhook::detail::jni_signature_for_arg<std::uint8_t>()
+          && vmhook::detail::jni_signature_for_arg<std::int8_t>() == "B");
+    check("jni_sig_signed_unsigned_agree_width4_I",
+             vmhook::detail::jni_signature_for_arg<std::int32_t>()
+                 == vmhook::detail::jni_signature_for_arg<std::uint32_t>()
+          && vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I");
+    check("jni_sig_signed_unsigned_agree_width8_J",
+             vmhook::detail::jni_signature_for_arg<std::int64_t>()
+                 == vmhook::detail::jni_signature_for_arg<std::uint64_t>()
+          && vmhook::detail::jni_signature_for_arg<std::int64_t>() == "J");
+    check("jni_sig_width2_is_the_only_signed_unsigned_disagreement",
+          vmhook::detail::jni_signature_for_arg<std::int16_t>()
+              != vmhook::detail::jni_signature_for_arg<std::uint16_t>());
+
+    // ---- ARRAY-ELEMENT width extraction: the substr(1) consumer relation ------
+    // field_proxy's array reader (vmhook.hpp:15025) extracts a "[X" array's
+    // ELEMENT width as jvm_primitive_byte_width(signature.substr(1)).  For a 1-D
+    // primitive array the substring is the single element letter -> its width; for
+    // a MULTI-dimensional array "[[X" the substring is "[X" (length 2) -> 0 (the
+    // size!=1 gate), which is exactly how the reader skips the width guard on
+    // arrays-of-arrays.  Pin both the 1-D widths and the multi-D zero.
+    {
+        struct arr_elt { std::string_view sig; std::size_t elt_width; };
+        const arr_elt rows[]{
+            { "[Z", 1 }, { "[B", 1 }, { "[S", 2 }, { "[C", 2 },
+            { "[I", 4 }, { "[F", 4 }, { "[J", 8 }, { "[D", 8 },
+        };
+        bool all_ok{ true };
+        for (const arr_elt& a : rows)
+        {
+            if (vmhook::detail::jvm_primitive_byte_width(a.sig.substr(1)) != a.elt_width)
+            {
+                all_ok = false;
+            }
+        }
+        check("array_element_width_substr1_every_primitive", all_ok);
+    }
+    // Multi-dimensional: substr(1) of "[[I" is "[I" (size 2) -> 0; of "[[[I" is
+    // "[[I" (size 3) -> 0.  This is the reader's "skip width guard on nested
+    // arrays" behaviour, derived purely from the size!=1 gate.
+    check("array_element_width_substr1_2d_is_0",
+          vmhook::detail::jvm_primitive_byte_width(std::string_view{ "[[I" }.substr(1)) == 0);
+    check("array_element_width_substr1_3d_is_0",
+          vmhook::detail::jvm_primitive_byte_width(std::string_view{ "[[[I" }.substr(1)) == 0);
+    // An OBJECT array "[Ljava/lang/String;": substr(1) is the multi-char object
+    // descriptor (size>1) -> 0, so the reader treats it as non-primitive (OOP
+    // path), never width-guarding a reference element.
+    check("array_element_width_substr1_object_array_is_0",
+          vmhook::detail::jvm_primitive_byte_width(
+              std::string_view{ "[Ljava/lang/String;" }.substr(1)) == 0);
+    // The extracted element width equals the standalone element's width: the
+    // substr(1) of "[X" classifies identically to "X" for every primitive.  Pin
+    // the equivalence so the consumer relation is provably the same table.
+    {
+        const char prims[]{ 'Z', 'B', 'S', 'C', 'I', 'F', 'J', 'D' };
+        bool all_eq{ true };
+        for (const char c : prims)
+        {
+            const char arr[2]{ '[', c };
+            const char one[1]{ c };
+            const std::size_t via_array{
+                vmhook::detail::jvm_primitive_byte_width(std::string_view{ arr, 2 }.substr(1)) };
+            const std::size_t via_scalar{
+                vmhook::detail::jvm_primitive_byte_width(std::string_view{ one, 1 }) };
+            if (via_array != via_scalar) { all_eq = false; }
+        }
+        check("array_element_width_substr1_equals_scalar_width", all_eq);
+    }
+
+    // ---- is_unique_ptr_v: the cv/ref-stripping trait that gates the wrapper -----
+    // jni_signature_for_arg's unique_ptr branch is reached via
+    // is_unique_ptr_v<clean_t>; the trait remove_cvref_t-strips first, so a bare,
+    // const, ref, const-ref, volatile, and rvalue-ref unique_ptr all test TRUE,
+    // while non-unique_ptr types (primitives, string, raw pointer, wrapper value)
+    // test FALSE.  Pin the full truth table -- this is the predicate that decides
+    // whether the L...; class-map branch runs at all.
+    check("is_unique_ptr_v_bare_true",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<sig_wrapper>>);
+    check("is_unique_ptr_v_const_true",
+          vmhook::detail::is_unique_ptr_v<const std::unique_ptr<sig_wrapper>>);
+    check("is_unique_ptr_v_lref_true",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<sig_wrapper>&>);
+    check("is_unique_ptr_v_const_lref_true",
+          vmhook::detail::is_unique_ptr_v<const std::unique_ptr<sig_wrapper>&>);
+    check("is_unique_ptr_v_rref_true",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<sig_wrapper>&&>);
+    check("is_unique_ptr_v_volatile_true",
+          vmhook::detail::is_unique_ptr_v<volatile std::unique_ptr<sig_wrapper>>);
+    check("is_unique_ptr_v_primitive_false",
+          !vmhook::detail::is_unique_ptr_v<int>);
+    check("is_unique_ptr_v_string_false",
+          !vmhook::detail::is_unique_ptr_v<std::string>);
+    check("is_unique_ptr_v_raw_pointer_false",
+          !vmhook::detail::is_unique_ptr_v<sig_wrapper*>);
+    check("is_unique_ptr_v_wrapper_value_false",
+          !vmhook::detail::is_unique_ptr_v<sig_wrapper>);
+
+    // ---- registered-wrapper descriptor build: the "L"+name+";" assembly --------
+    // The unique_ptr and object_base branches both build the descriptor as
+    // "L" + class_name + ";" (vmhook.hpp:13030-13033 / 13046-13049).  Pin that
+    // assembly explicitly for several name shapes, asserting the EXACT three-part
+    // structure (leading 'L', the verbatim name, trailing ';') and that the two
+    // branches (unique_ptr vs by-value) produce a byte-identical descriptor for
+    // the same registered type.
+    {
+        struct name_case { const char* name; const char* expected; };
+        const name_case cases[]{
+            { "X",                    "LX;" },
+            { "java/lang/Object",     "Ljava/lang/Object;" },
+            { "com/example/Foo",      "Lcom/example/Foo;" },
+            { "a/b/c/Outer$Inner",    "La/b/c/Outer$Inner;" },
+        };
+        bool all_ok{ true };
+        for (const name_case& c : cases)
+        {
+            vmhook::type_to_class_map.insert_or_assign(
+                std::type_index{ typeid(sig_wrapper) }, std::string{ c.name });
+            const std::string via_uptr{
+                vmhook::detail::jni_signature_for_arg<std::unique_ptr<sig_wrapper>>() };
+            const std::string via_value{
+                vmhook::detail::jni_signature_for_arg<sig_wrapper>() };
+            const std::string want{ c.expected };
+            if (via_uptr != want || via_value != want || via_uptr != via_value)
+            {
+                all_ok = false;
+            }
+            // Structural decomposition: starts with 'L', ends with ';', and the
+            // middle is exactly the registered name.
+            if (via_value.size() < 2 || via_value.front() != 'L'
+                || via_value.back() != ';'
+                || via_value.substr(1, via_value.size() - 2) != c.name)
+            {
+                all_ok = false;
+            }
+        }
+        check("registered_wrapper_descriptor_is_L_name_semicolon_both_branches", all_ok);
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(sig_wrapper) });
+    }
+    // The leading 'L' of a registered-wrapper descriptor round-trips through
+    // sig_char_to_basic_type to T_OBJECT(12), and the whole descriptor's width is
+    // 0 (size>1) -- i.e. a wrapper arg is classified/sized exactly like any object
+    // reference, coupling the class-map branch to the other two helpers.
+    {
+        vmhook::type_to_class_map.insert_or_assign(
+            std::type_index{ typeid(sig_wrapper) }, std::string{ "com/example/Foo" });
+        const std::string sig{ vmhook::detail::jni_signature_for_arg<sig_wrapper>() };
+        check("registered_wrapper_descriptor_lead_is_object_12_and_width_0",
+              !sig.empty()
+              && vmhook::detail::sig_char_to_basic_type(sig[0]) == 12
+              && vmhook::detail::jvm_primitive_byte_width(sig) == 0);
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(sig_wrapper) });
+    }
+
+    // ---- ctor signature: wrapper-only and all-reference packs -----------------
+    // A pack of ONLY reference/object tokens (String + registered wrapper +
+    // String) assembles back-to-back L...; tokens with no separators and a ")V"
+    // tail -- the exact GetMethodID('<init>') string for an all-object ctor.
+    {
+        vmhook::type_to_class_map.insert_or_assign(
+            std::type_index{ typeid(sig_wrapper) }, std::string{ "com/example/Foo" });
+        check("ctor_sig_string_wrapper_string_all_objects",
+              ctor_signature_of<std::string, std::unique_ptr<sig_wrapper>, const char*>()
+                  == "(Ljava/lang/String;Lcom/example/Foo;Ljava/lang/String;)V");
+        // Two registered wrappers adjacent -> two L...; tokens, no separator.
+        check("ctor_sig_two_wrappers_adjacent",
+              ctor_signature_of<std::unique_ptr<sig_wrapper>, sig_wrapper>()
+                  == "(Lcom/example/Foo;Lcom/example/Foo;)V");
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(sig_wrapper) });
+    }
+    // An UNregistered wrapper in a ctor pack contributes the Object fallback token
+    // inline (flaw #5 visible end-to-end in a whole <init> descriptor).
+    check("ctor_sig_unregistered_wrapper_uses_object_fallback_token",
+          ctor_signature_of<int, std::unique_ptr<sig_wrapper_unregistered>>()
+              == "(ILjava/lang/Object;)V");
+
+    // ---- ctor signature: the wchar_t row (gated) composes end-to-end ----------
+    // Where wchar_t is 2 bytes (-> "S") it must compose into a whole ctor
+    // descriptor like any other primitive token; where it is 4 bytes (-> "I")
+    // likewise.  Gate each instantiation on the platform width so the expected
+    // token is always the one the ladder dictates here.
+    if constexpr (std::is_integral_v<wchar_t> && sizeof(wchar_t) == 2)
+    {
+        check("ctor_sig_wchar_t_2byte_token_is_S",
+              ctor_signature_of<int, wchar_t, double>() == "(ISD)V");
+    }
+    else if constexpr (std::is_integral_v<wchar_t> && sizeof(wchar_t) == 4)
+    {
+        check("ctor_sig_wchar_t_4byte_token_is_I",
+              ctor_signature_of<int, wchar_t, double>() == "(IID)V");
+    }
+
+    // ---- whole reference walk: the COMPONENT of a deep mixed array ------------
+    // parse_one_field_descriptor reports component_basic for an array regardless of
+    // depth: "[[[Ljava/lang/Object;" is T_ARRAY(13), dims 3, component T_OBJECT(12),
+    // consuming the whole descriptor (3 brackets + the L...; element).  Pins the
+    // object-component path at depth (earlier object-array cases were dims<=2).
+    {
+        const std::string_view sig{ "[[[Ljava/lang/Object;" };
+        const field_descriptor_parse f{ parse_one_field_descriptor(sig, 0) };
+        check("fielddesc_3d_object_array_component_object_dims_3",
+              f.ok && f.basic_type == 13 && f.array_dims == 3
+              && f.component_basic == 12 && f.consumed == sig.size());
+    }
+    // A method whose single return is a 3-D object array: T_ARRAY(13), dims 3.
+    {
+        const method_descriptor_parse m{
+            parse_method_descriptor("()[[[Ljava/lang/Object;") };
+        check("methoddesc_3d_object_array_return_is_array_dim3",
+              m.ok && m.arg_count == 0 && m.return_basic == 13 && m.return_dims == 3);
+    }
+
+    // ---- whole reference walk: maximal single-method realistic descriptor -----
+    // A descriptor mixing every category as parameters -- primitive, wide, object,
+    // primitive array, object array, multi-dim array -- followed by an object
+    // return.  Count, slots, and the object return are all derived from the rules:
+    // I(1) J(2) Ljava/lang/String;(1) [I(1) [Ljava/lang/Object;(1) D(2) =
+    // 6 args, 8 slots, object return.
+    {
+        const method_descriptor_parse m{ parse_method_descriptor(
+            "(IJLjava/lang/String;[I[Ljava/lang/Object;D)Ljava/lang/String;") };
+        check("methoddesc_kitchen_sink_6args_8slots_object_return",
+              m.ok && m.arg_count == 6 && m.arg_slots == 8
+              && m.return_basic == 12 && m.return_dims == 0);
+    }
+
+    // ---- helper cross-table: every primitive letter is classified AND sized,
+    //      every NON-primitive recognised letter is classified but NOT sized -----
+    // One consolidated partition over all 11 recognised descriptor letters: the 8
+    // primitives are basic-type [4..11] with width!=0; the 3 non-primitives (L,[,V)
+    // are recognised basic types (12,13,14) with width==0.  Couples the two
+    // single-char helpers across the COMPLETE recognised alphabet in one assertion.
+    {
+        struct letter { char c; int basic; std::size_t width; bool primitive; };
+        const letter letters[]{
+            { 'Z', 4,  1, true  }, { 'C', 5,  2, true  }, { 'F', 6,  4, true  },
+            { 'D', 7,  8, true  }, { 'B', 8,  1, true  }, { 'S', 9,  2, true  },
+            { 'I', 10, 4, true  }, { 'J', 11, 8, true  },
+            { 'L', 12, 0, false }, { '[', 13, 0, false }, { 'V', 14, 0, false },
+        };
+        bool all_ok{ true };
+        for (const letter& l : letters)
+        {
+            const char one[1]{ l.c };
+            const int basic{ vmhook::detail::sig_char_to_basic_type(l.c) };
+            const std::size_t width{
+                vmhook::detail::jvm_primitive_byte_width(std::string_view{ one, 1 }) };
+            if (basic != l.basic || width != l.width) { all_ok = false; }
+            if (l.primitive)
+            {
+                if (!(basic >= 4 && basic <= 11) || width == 0) { all_ok = false; }
+            }
+            else
+            {
+                if (!(basic >= 12 && basic <= 14) || width != 0) { all_ok = false; }
+            }
+        }
+        check("recognised_alphabet_primitive_partition_classify_and_size", all_ok);
+    }
+
     return failures == 0 ? 0 : 1;
 }

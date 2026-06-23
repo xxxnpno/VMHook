@@ -1648,6 +1648,295 @@ int main()
 #endif
     }
 
+    // =====================================================================
+    // DEEPENING WAVE 2 (additive) — a SECOND namespaced section ("dw2_")
+    // covering format_log / emit_log_line inputs the first wave ("dw_") did
+    // NOT touch: the 64-bit signed base boundaries, bool under base specs,
+    // the '-' sign flag, dynamic alignment/width/precision drawn together,
+    // '{:g}' trailing-zero trimming, deeper string-precision/width
+    // interactions, additional {:c} glyph boundaries, multi-tag composition,
+    // and further sink-byte invariants.  PURE LOGIC ONLY — no memory reads,
+    // no pointer fabrication, no value_t casts.  Every expected value is
+    // derived directly from the source contract:
+    //   * VMHOOK_HAS_STD_FORMAT==1  -> format_log == std::vformat(fmt, args);
+    //     every spelling chosen here is STANDARD-PINNED (no shortest-round-
+    //     trip, no locale, no impl-defined NaN/hexfloat token), hence
+    //     byte-identical on libstdc++ AND the MSVC STL.
+    //   * VMHOOK_HAS_STD_FORMAT==0  -> format_log == std::string{ fmt }, the
+    //     verbatim fallback, asserted byte-for-byte for the same inputs.
+    // =====================================================================
+#if VMHOOK_HAS_STD_FORMAT
+    // --- 64-bit signed base boundaries (signed magnitude, not two's-comp). -
+    // LLONG_MIN magnitude is 0x8000000000000000; std::format prints '-' + the
+    // base-N magnitude.
+    check("dw2_llong_min_hex_signed",
+        vmhook::detail::format_log("{:x}", LLONG_MIN) == "-8000000000000000");
+    check("dw2_llong_max_hex",
+        vmhook::detail::format_log("{:x}", LLONG_MAX) == "7fffffffffffffff");
+    check("dw2_llong_min_octal_signed",
+        vmhook::detail::format_log("{:o}", LLONG_MIN) == "-1000000000000000000000");
+    check("dw2_llong_max_octal",
+        vmhook::detail::format_log("{:o}", LLONG_MAX) == "777777777777777777777");
+    check("dw2_ullong_max_hex",
+        vmhook::detail::format_log("{:x}", ULLONG_MAX) == "ffffffffffffffff");
+    check("dw2_ullong_max_octal",
+        vmhook::detail::format_log("{:o}", ULLONG_MAX) == "1777777777777777777777");
+    // 64-bit binary of LLONG_MAX is 63 set bits; alt-form upper-hex of ULLONG.
+    check("dw2_llong_max_binary",
+        vmhook::detail::format_log("{:b}", LLONG_MAX)
+            == "111111111111111111111111111111111111111111111111111111111111111");
+    check("dw2_ullong_max_hex_alt_upper",
+        vmhook::detail::format_log("{:#X}", ULLONG_MAX) == "0XFFFFFFFFFFFFFFFF");
+
+    // --- The '-' sign flag (only negatives get a sign; default behaviour). -
+    // '{:-}' is the explicit spelling of the default: no '+' on non-negatives.
+    check("dw2_minus_flag_positive_no_sign",
+        vmhook::detail::format_log("{:-}", 5) == "5");
+    check("dw2_minus_flag_negative_has_sign",
+        vmhook::detail::format_log("{:-}", -5) == "-5");
+    check("dw2_minus_flag_zero_no_sign",
+        vmhook::detail::format_log("{:-}", 0) == "0");
+
+    // --- bool under integer base / sign presentation types. ---------------
+    // bool accepts integer presentation: true==1, false==0 across bases.
+    check("dw2_bool_true_hex",
+        vmhook::detail::format_log("{:x}", true) == "1");
+    check("dw2_bool_false_hex",
+        vmhook::detail::format_log("{:x}", false) == "0");
+    check("dw2_bool_true_binary",
+        vmhook::detail::format_log("{:b}", true) == "1");
+    check("dw2_bool_true_octal",
+        vmhook::detail::format_log("{:o}", true) == "1");
+    check("dw2_bool_true_alt_hex",
+        vmhook::detail::format_log("{:#x}", true) == "0x1");
+    check("dw2_bool_true_plus_dec",
+        vmhook::detail::format_log("{:+d}", true) == "+1");
+
+    // --- Dynamic alignment + width + precision combinations. --------------
+    // Right-align (default for non-strings) into a dynamic width.
+    check("dw2_dynamic_width_right_default",
+        vmhook::detail::format_log("{:{}}", 7, 5) == "    7");
+    // Explicit right-align glyph with a dynamic width and custom fill.
+    check("dw2_dynamic_fill_right_width",
+        vmhook::detail::format_log("{:0>{}}", 7, 5) == "00007");
+    // Left-align glyph with a dynamic width on a string.
+    check("dw2_dynamic_left_width_string",
+        vmhook::detail::format_log("{:<{}}", std::string{ "ab" }, 5) == "ab   ");
+    // Dynamic width on a STRING with a dynamic precision (truncate then pad):
+    // precision 3 truncates "hello" -> "hel", width 6 pads right -> "hel   ".
+    check("dw2_dynamic_string_width_and_precision",
+        vmhook::detail::format_log("{:{}.{}}", std::string{ "hello" }, 6, 3)
+            == "hel   ");
+    // Dynamic precision alone on a fixed float (auto-indexed).
+    check("dw2_dynamic_fixed_precision_only",
+        vmhook::detail::format_log("{:.{}f}", 2.0, 4) == "2.0000");
+
+    // --- {:g} trailing-zero trimming (general format removes them). -------
+    // 'g' strips trailing zeros, so 1.0 -> "1", 2.50 -> "2.5".
+    check("dw2_general_trims_integer",
+        vmhook::detail::format_log("{:g}", 1.0) == "1");
+    check("dw2_general_trims_trailing_zero",
+        vmhook::detail::format_log("{:g}", 2.5) == "2.5");
+    // Fixed format KEEPS trailing zeros at the requested precision.
+    check("dw2_fixed_keeps_trailing_zeros",
+        vmhook::detail::format_log("{:.4f}", 2.5) == "2.5000");
+    // High fixed precision on an exactly representable value is byte-pinned.
+    check("dw2_fixed_precision_10_exact",
+        vmhook::detail::format_log("{:.10f}", 0.5) == "0.5000000000");
+    // Fixed precision on a negative exact value.
+    check("dw2_fixed_precision_negative_exact",
+        vmhook::detail::format_log("{:.3f}", -0.25) == "-0.250");
+
+    // --- More {:c} glyph boundaries (int code -> single character). -------
+    check("dw2_int_as_char_A",
+        vmhook::detail::format_log("{:c}", 65) == "A");
+    check("dw2_int_as_char_zero_digit",
+        vmhook::detail::format_log("{:c}", 48) == "0");
+    check("dw2_int_as_char_backtick",
+        vmhook::detail::format_log("{:c}", 96) == "`");
+    // {:c} honours width + fill on the produced glyph.
+    check("dw2_int_as_char_width_fill",
+        vmhook::detail::format_log("{:*>4c}", 65) == "***A");
+
+    // --- Multi-tag composition in one message (e.g. tag + nested context). -
+    // Two distinct tags substituted into one format string keep their bytes.
+    check("dw2_two_tags_in_one_message",
+        vmhook::detail::format_log("{} then {}", vmhook::error_tag, vmhook::info_tag)
+            == "[VMHook ERROR] then [VMHook INFO]");
+    // A tag re-used via a positional index appears twice.
+    check("dw2_repeated_tag_positional",
+        vmhook::detail::format_log("{0} / {0}", vmhook::warning_tag)
+            == "[VMHook WARNING] / [VMHook WARNING]");
+    // Tag right-aligned into a width wider than itself: the bracketed token is
+    // padded on the left (error_tag is 14 chars, width 16 -> 2 leading spaces).
+    check("dw2_tag_right_aligned_width",
+        vmhook::detail::format_log("{:>16}", vmhook::error_tag)
+            == "  [VMHook ERROR]");
+
+    // --- ASCII string precision interacting with width (byte-pinned). ------
+    // For pure-ASCII payloads the code-unit count equals the display width on
+    // every STL, so precision/width spellings are byte-identical (the UTF-8
+    // width-estimation divergence between libstdc++ and the MSVC STL is avoided
+    // by staying ASCII).  Precision 4 truncates "abcdef" -> "abcd", then width
+    // 7 right-aligns it with 3 leading spaces.
+    check("dw2_ascii_precision_then_width_right",
+        vmhook::detail::format_log("{:>7.4}", std::string{ "abcdef" })
+            == "   abcd");
+    // Precision 4 truncates, width 7 LEFT-aligns with a custom fill.
+    check("dw2_ascii_precision_then_width_left_fill",
+        vmhook::detail::format_log("{:-<7.4}", std::string{ "abcdef" })
+            == "abcd---");
+    // Precision equal to the length is a no-op; width still pads.
+    check("dw2_ascii_precision_eq_len_width_pads",
+        vmhook::detail::format_log("{:>5.3}", std::string{ "abc" })
+            == "  abc");
+
+    // --- Empty format string with a TAG argument still drops it (no field). -
+    check("dw2_empty_fmt_with_tag_empty",
+        vmhook::detail::format_log("", vmhook::error_tag).empty());
+
+    // --- Fixed-width hex on each pointer-sized boundary value (as integer). -
+    // These are the compressed-OOP / address idioms ({:016x}) on the 64-bit
+    // word boundaries; integer inputs only, no real address is dereferenced.
+    check("dw2_hex16_zero",
+        vmhook::detail::format_log("{:016x}", static_cast<std::uint64_t>(0))
+            == "0000000000000000");
+    check("dw2_hex16_one",
+        vmhook::detail::format_log("{:016x}", static_cast<std::uint64_t>(1))
+            == "0000000000000001");
+    check("dw2_hex16_high_nibble",
+        vmhook::detail::format_log("{:016x}",
+            static_cast<std::uint64_t>(0xF000000000000000ull))
+            == "f000000000000000");
+
+    // --- Sign flag interaction with alt-form and base on a tiny value. ----
+    // {:+#x} on 1 -> '+' then "0x" then "1".
+    check("dw2_plus_altform_hex_one",
+        vmhook::detail::format_log("{:+#x}", 1) == "+0x1");
+    // {: #o} on 8 -> space sign then alt-octal "010".
+    check("dw2_space_altform_octal_eight",
+        vmhook::detail::format_log("{: #o}", 8) == " 010");
+#else
+    // Fallback leg: every dw2_ input above returns the format string verbatim,
+    // ignoring all arguments and specifiers.  Mirror the spec-bearing strings
+    // so the pre-std::format MinGW/Clang CI legs exercise the same surface.
+    check("dw2_fb_llong_min_hex_verbatim",
+        vmhook::detail::format_log("{:x}", LLONG_MIN) == "{:x}");
+    check("dw2_fb_ullong_max_octal_verbatim",
+        vmhook::detail::format_log("{:o}", ULLONG_MAX) == "{:o}");
+    check("dw2_fb_minus_flag_verbatim",
+        vmhook::detail::format_log("{:-}", -5) == "{:-}");
+    check("dw2_fb_bool_hex_verbatim",
+        vmhook::detail::format_log("{:x}", true) == "{:x}");
+    check("dw2_fb_dynamic_width_right_verbatim",
+        vmhook::detail::format_log("{:{}}", 7, 5) == "{:{}}");
+    check("dw2_fb_dynamic_string_wp_verbatim",
+        vmhook::detail::format_log("{:{}.{}}", std::string{ "hello" }, 6, 3)
+            == "{:{}.{}}");
+    check("dw2_fb_general_trims_verbatim",
+        vmhook::detail::format_log("{:g}", 1.0) == "{:g}");
+    check("dw2_fb_fixed_prec10_verbatim",
+        vmhook::detail::format_log("{:.10f}", 0.5) == "{:.10f}");
+    check("dw2_fb_int_as_char_verbatim",
+        vmhook::detail::format_log("{:c}", 65) == "{:c}");
+    check("dw2_fb_int_as_char_width_verbatim",
+        vmhook::detail::format_log("{:*>4c}", 65) == "{:*>4c}");
+    check("dw2_fb_two_tags_verbatim",
+        vmhook::detail::format_log("{} then {}", vmhook::error_tag, vmhook::info_tag)
+            == "{} then {}");
+    check("dw2_fb_tag_width_verbatim",
+        vmhook::detail::format_log("{:>16}", vmhook::error_tag) == "{:>16}");
+    check("dw2_fb_ascii_precision_width_verbatim",
+        vmhook::detail::format_log("{:>7.4}", std::string{ "abcdef" }) == "{:>7.4}");
+    check("dw2_fb_empty_fmt_with_tag_empty",
+        vmhook::detail::format_log("", vmhook::error_tag).empty());
+    check("dw2_fb_hex16_verbatim",
+        vmhook::detail::format_log("{:016x}", static_cast<std::uint64_t>(1))
+            == "{:016x}");
+    check("dw2_fb_plus_altform_hex_verbatim",
+        vmhook::detail::format_log("{:+#x}", 1) == "{:+#x}");
+    check("dw2_fb_space_altform_octal_verbatim",
+        vmhook::detail::format_log("{: #o}", 8) == "{: #o}");
+#endif
+
+    // --- Cross-branch sink-byte invariants not covered above (dw2_). -------
+    // A payload of multiple interior newlines: emit appends exactly one '\n',
+    // so "a\nb\nc" -> "a\nb\nc\n" (4 LF-delimited segments, last is empty-term).
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(std::string{ "a\nb\nc" });
+            captured = cap.str();
+        }
+        check("dw2_emit_multi_interior_newlines", captured == "a\nb\nc\n");
+    }
+    // A payload that is exactly a single newline -> emit yields two newlines.
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(std::string{ "\n" });
+            captured = cap.str();
+        }
+        check("dw2_emit_lone_newline_doubles", captured == "\n\n");
+    }
+    // A tab-only payload passes through verbatim plus the appended newline.
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(std::string{ "\t" });
+            captured = cap.str();
+        }
+        check("dw2_emit_tab_verbatim", captured == "\t\n");
+    }
+    // Three sequential emissions concatenate in strict order, each terminated.
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(std::string{ "one" });
+            vmhook::detail::emit_log_line(std::string{ "two" });
+            vmhook::detail::emit_log_line(std::string{ "three" });
+            captured = cap.str();
+        }
+        check("dw2_emit_three_lines_in_order",
+            captured == "one\ntwo\nthree\n");
+    }
+    // A payload that is itself a full bracketed tag with a trailing field,
+    // pre-formatted by hand, is emitted verbatim + newline (the exact shape of
+    // a real VMHOOK_LOG("{} ...", tag) emission, asserted through the sink).
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(std::string{ "[VMHook INFO] ok" });
+            captured = cap.str();
+        }
+        check("dw2_emit_preformatted_tag_line",
+            captured == "[VMHook INFO] ok\n");
+    }
+    // emit_log_line on the result of a TAG-only format_log call: cross-branch,
+    // the tag substitutes (std::format leg) or is dropped (fallback leg).  Both
+    // legs append exactly one '\n'; assert the leg-specific exact bytes.
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(
+                vmhook::detail::format_log("{}", vmhook::error_tag));
+            captured = cap.str();
+        }
+#if VMHOOK_HAS_STD_FORMAT
+        check("dw2_emit_tag_format_then_emit",
+            captured == "[VMHook ERROR]\n");
+#else
+        check("dw2_emit_tag_format_then_emit",
+            captured == "{}\n");
+#endif
+    }
+
     std::printf("\n%d checks failed\n", failures);
     return failures == 0 ? 0 : 1;
 }

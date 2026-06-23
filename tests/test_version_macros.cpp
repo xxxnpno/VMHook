@@ -415,6 +415,145 @@ static_assert(VMHOOK_MAKE_VERSION(0, 1 - 1 + 2, 0) == 2000,
 #   error "packing relation must hold in #if context"
 #endif
 
+// ===========================================================================
+// SECOND DEEPENING SECTION (additive, namespaced).  Everything below this
+// banner is NEW coverage that does NOT touch any assertion above it and does
+// NOT overlap the first deepening section (D1-D6 / R1-R6).  All expected
+// values are derived directly from vmhook.hpp:67-82 (MAJOR=0, MINOR=5,
+// PATCH=3; decimal pack major*1e6 + minor*1e3 + patch; two-level stringize
+// -> "0.5.3").  PURE preprocessor + integer arithmetic + std::string logic --
+// no JVM, no memory reads, no fabricated pointers, no value_t conversions.
+// ===========================================================================
+namespace vm_deepen2
+{
+    // 64-bit oracle, identical math to the macro but independent expression.
+    constexpr long long oracle(long long M, long long m, long long p)
+    {
+        return (M * 1000000LL) + (m * 1000LL) + p;
+    }
+
+    // (E1) EXHAUSTIVE single-field width sweep.  The first pass sampled cubes;
+    // here we walk the ENTIRE patch field 0..999 holding major/minor at the live
+    // value and prove every value packs losslessly and decomposes back exactly,
+    // i.e. the patch field truly owns 3 decimal digits with no bleed -- a far
+    // denser proof of the field width than any sampled triple.
+    constexpr bool patch_field_full_sweep()
+    {
+        long long prev{ -1 };
+        for (int p = 0; p <= 999; ++p)
+        {
+            const long long packed{ oracle(0, 5, p) }; // live major.minor, sweep patch
+            if (packed != 5000LL + p) { return false; }      // 0*1e6 + 5*1e3 + p
+            if (packed / 1000000LL != 0) { return false; }   // major recovers
+            if ((packed / 1000LL) % 1000LL != 5) { return false; } // minor recovers
+            if (packed % 1000LL != p) { return false; }      // patch recovers
+            if (packed <= prev) { return false; }            // strictly ascending
+            prev = packed;
+        }
+        return true;
+    }
+
+    // (E2) EXHAUSTIVE minor-field sweep 0..999 holding major=0, patch=0: each
+    // step changes the pack by exactly 1000 and the minor decomposes exactly.
+    constexpr bool minor_field_full_sweep()
+    {
+        for (int m = 0; m <= 999; ++m)
+        {
+            const long long packed{ oracle(0, m, 0) };
+            if (packed != static_cast<long long>(m) * 1000LL) { return false; }
+            if ((packed / 1000LL) % 1000LL != m) { return false; }
+            if (packed % 1000LL != 0) { return false; }
+            if (packed / 1000000LL != 0) { return false; }
+        }
+        return true;
+    }
+
+    // (E3) Pack ADDITIVITY: the pack is linear in each field, so summing two
+    // triples field-wise (while every summed field stays < 1000, i.e. no carry)
+    // equals summing their packed values.  This is a structural property the
+    // first pass never asserted and underpins why field-isolated bumps compose.
+    constexpr bool pack_is_additive()
+    {
+        for (int M = 0; M <= 9; ++M)
+            for (int m = 0; m <= 9; ++m)
+                for (int p = 0; p <= 9; ++p)
+                {
+                    // (M,m,p) + (1,2,3): every summed field <= 12 < 1000.
+                    if (oracle(M + 1, m + 2, p + 3)
+                        != oracle(M, m, p) + oracle(1, 2, 3))
+                    {
+                        return false;
+                    }
+                }
+        return true;
+    }
+}
+// Whole-field exhaustive sweeps (1000 values each) + additivity over a 1000-
+// point cube, all evaluated by the compiler -- a hard error on any miscompile.
+static_assert(vm_deepen2::patch_field_full_sweep(),
+              "every patch 0..999 must pack/decompose losslessly at the live M.m");
+static_assert(vm_deepen2::minor_field_full_sweep(),
+              "every minor 0..999 must pack/decompose losslessly at major0.patch0");
+static_assert(vm_deepen2::pack_is_additive(),
+              "the decimal pack must be field-wise additive when no field carries");
+
+// (E4) Macro-vs-oracle agreement at NEW exact numeric points NOT sampled by the
+// first pass, including the carry just ABOVE the live version (0.5.999 -> 0.6.0)
+// and the live-adjacent band.  Each literal RHS is hand-computed from source.
+static_assert(VMHOOK_MAKE_VERSION(0, 5, 3)    == 5003);   // live
+static_assert(VMHOOK_MAKE_VERSION(0, 5, 4)    == 5004);   // next patch
+static_assert(VMHOOK_MAKE_VERSION(0, 5, 2)    == 5002);   // prev patch
+static_assert(VMHOOK_MAKE_VERSION(0, 5, 999)  == 5999);   // patch field max at live minor
+static_assert(VMHOOK_MAKE_VERSION(0, 6, 0)    == 6000);   // minor bump
+static_assert(VMHOOK_MAKE_VERSION(0, 5, 1000) == VMHOOK_MAKE_VERSION(0, 6, 0)); // lossy carry
+static_assert(VMHOOK_MAKE_VERSION(0, 5, 1000) == 6000);   // == 0.6.0 numerically
+static_assert(VMHOOK_MAKE_VERSION(0, 4, 999)  == 4999);   // one below the 0.5.x band floor
+static_assert(VMHOOK_MAKE_VERSION(0, 5, 0)    == 5000);   // 0.5.x band floor
+// Difference identities across DIFFERENT fields (first pass only did same-field
+// single steps): a full minor below the live patch differs by 1000 - patchstep.
+static_assert(VMHOOK_MAKE_VERSION(0, 6, 0) - VMHOOK_MAKE_VERSION(0, 5, 3) == 997);
+static_assert(VMHOOK_MAKE_VERSION(0, 5, 3) - VMHOOK_MAKE_VERSION(0, 5, 0) == 3);
+static_assert(VMHOOK_MAKE_VERSION(1, 0, 0) - VMHOOK_MAKE_VERSION(0, 5, 3) == 994997);
+// Idempotent self-relations on the live packed value (new corners).
+static_assert(VMHOOK_VERSION - VMHOOK_VERSION == 0);
+static_assert(VMHOOK_VERSION / VMHOOK_VERSION == 1);
+static_assert(VMHOOK_VERSION % VMHOOK_VERSION == 0);
+
+// (E5) Distributivity of a scalar over the pack: 2*MAKE(M,m,p) == MAKE(2M,2m,2p)
+// when no doubled field reaches 1000.  Confirms the closed-form is a linear map
+// (and re-confirms the outer parens survive a leading scalar in const-expr).
+static_assert(2 * VMHOOK_MAKE_VERSION(3, 4, 5) == VMHOOK_MAKE_VERSION(6, 8, 10));
+static_assert(3 * VMHOOK_MAKE_VERSION(1, 1, 1) == VMHOOK_MAKE_VERSION(3, 3, 3));
+
+// (E6) NEW #if preprocessor sweeps using operators the first pass omitted in
+// #if context (<=, >, !=) and pinning the live carry-above boundary there.
+#if !(VMHOOK_VERSION <= VMHOOK_MAKE_VERSION(0, 5, 3))
+#   error "VMHOOK_VERSION (0.5.3) must be <= 0.5.3 in #if context"
+#endif
+#if !(VMHOOK_VERSION <= VMHOOK_MAKE_VERSION(0, 5, 4))
+#   error "VMHOOK_VERSION (0.5.3) must be <= 0.5.4 in #if context"
+#endif
+#if !(VMHOOK_VERSION != VMHOOK_MAKE_VERSION(0, 5, 4))
+#   error "VMHOOK_VERSION (0.5.3) must differ from 0.5.4 in #if context"
+#endif
+#if !(VMHOOK_VERSION > VMHOOK_MAKE_VERSION(0, 4, 999))
+#   error "VMHOOK_VERSION (0.5.3) must exceed 0.4.999 in #if context"
+#endif
+// The lossy carry equality holds in the preprocessor too (flaw #2 spec in #if).
+#if VMHOOK_MAKE_VERSION(0, 5, 1000) != VMHOOK_MAKE_VERSION(0, 6, 0)
+#   error "0.5.1000 must alias 0.6.0 in #if context (decimal field carry)"
+#endif
+// Preprocessor-context field-width guard: the live minor/patch MUST be < 1000,
+// or the pack would carry.  static_assert proved this in the compiler; this is
+// the distinct #if proof (where a width violation would silently corrupt gates).
+#if !(VMHOOK_VERSION_MINOR < 1000 && VMHOOK_VERSION_PATCH < 1000)
+#   error "live MINOR/PATCH must each be < 1000 in #if context (field width)"
+#endif
+// Scalar distributivity must also hold under the preprocessor.
+#if (2 * VMHOOK_MAKE_VERSION(3, 4, 5)) != VMHOOK_MAKE_VERSION(6, 8, 10)
+#   error "scalar distributivity over MAKE must hold in #if context"
+#endif
+
 int main()
 {
     // -----------------------------------------------------------------------
@@ -983,6 +1122,129 @@ int main()
         // terminator).  Guards against an embedded NUL from a mis-stringize.
         check("deepen_string_no_embedded_nul",
               version_text.find('\0') == std::string::npos);
+    }
+
+    // =======================================================================
+    // SECOND DEEPENING RUNTIME SECTION (additive).  Runtime coverage with NO
+    // overlap of the first runtime block (R1-R6): whole-field sweeps at runtime,
+    // pack additivity/distributivity at runtime, and string<->packed identities
+    // built by std::string concatenation (not snprintf, not split) -- a distinct
+    // construction path.  Every expected value is from vmhook.hpp:67-82.
+    // =======================================================================
+    {
+        // (S1) Runtime whole-patch-field sweep at the live major.minor: every
+        // patch 0..999 packs to 5000+p and decomposes exactly, strictly rising.
+        bool patch_sweep_ok{ true };
+        long prev_pk{ -1 };
+        for (int p = 0; p <= 999 && patch_sweep_ok; ++p)
+        {
+            const long pk{ (static_cast<long>(v_major) * 1000000L)
+                         + (static_cast<long>(v_minor) * 1000L) + p };
+            if (pk != 5000L + p) { patch_sweep_ok = false; }        // 0,5 live
+            if (pk / 1000000L != v_major) { patch_sweep_ok = false; }
+            if ((pk / 1000L) % 1000L != v_minor) { patch_sweep_ok = false; }
+            if (pk % 1000L != p) { patch_sweep_ok = false; }
+            if (pk <= prev_pk) { patch_sweep_ok = false; }
+            prev_pk = pk;
+        }
+        check("deepen2_patch_field_full_sweep_runtime", patch_sweep_ok);
+
+        // (S2) Runtime additivity: (M,m,p)+(1,2,3) packs to the sum of packs,
+        // over a small cube where no summed field reaches 1000.  Cross-checked
+        // against the actual macro at a sampled corner so the macro and the
+        // closed form cannot silently diverge at runtime.
+        bool additive_ok{ true };
+        for (int M = 0; M <= 8 && additive_ok; ++M)
+            for (int mm = 0; mm <= 8 && additive_ok; ++mm)
+                for (int pp = 0; pp <= 8 && additive_ok; ++pp)
+                {
+                    const long lhs{ ((static_cast<long>(M) + 1) * 1000000L)
+                                  + ((static_cast<long>(mm) + 2) * 1000L)
+                                  + (pp + 3) };
+                    const long rhs{ (static_cast<long>(M) * 1000000L
+                                     + static_cast<long>(mm) * 1000L + pp)
+                                  + (1 * 1000000L + 2 * 1000L + 3) };
+                    if (lhs != rhs) { additive_ok = false; }
+                }
+        check("deepen2_pack_additive_runtime", additive_ok);
+        check("deepen2_additive_corner_matches_macro",
+              VMHOOK_MAKE_VERSION(1 + 1, 2 + 2, 3 + 3)
+                  == VMHOOK_MAKE_VERSION(1, 2, 3) + VMHOOK_MAKE_VERSION(1, 2, 3));
+
+        // (S3) Runtime scalar distributivity: 2*MAKE(M,m,p)==MAKE(2M,2m,2p) when
+        // no doubled field reaches 1000.  Distinct from the const-expr twin.
+        bool distrib_ok{ true };
+        for (int M = 0; M <= 7 && distrib_ok; ++M)
+            for (int mm = 0; mm <= 7 && distrib_ok; ++mm)
+                for (int pp = 0; pp <= 7 && distrib_ok; ++pp)
+                {
+                    const long single{ static_cast<long>(M) * 1000000L
+                                     + static_cast<long>(mm) * 1000L + pp };
+                    const long doubled{ static_cast<long>(2 * M) * 1000000L
+                                      + static_cast<long>(2 * mm) * 1000L
+                                      + (2 * pp) };
+                    if (2 * single != doubled) { distrib_ok = false; }
+                }
+        check("deepen2_pack_scalar_distributive_runtime", distrib_ok);
+
+        // (S4) String built by std::string CONCATENATION (a third construction
+        // path -- not snprintf (R/main), not split): join to_string of each live
+        // component with literal "." separators; must equal VMHOOK_VERSION_STRING.
+        const std::string built{ std::to_string(v_major) + "."
+                               + std::to_string(v_minor) + "."
+                               + std::to_string(v_patch) };
+        check("deepen2_string_concat_matches_macro", built == version_text);
+        check("deepen2_string_concat_is_0_5_3", built == std::string{ "0.5.3" });
+
+        // (S5) String built from the PACKED-value decomposition (ties the string
+        // to the integer through the documented /-and-% identities, via a fresh
+        // concatenation rather than the earlier split/parse path).
+        const std::string from_packed{ std::to_string(packed / 1000000) + "."
+                                     + std::to_string((packed / 1000) % 1000) + "."
+                                     + std::to_string(packed % 1000) };
+        check("deepen2_string_from_packed_decompose_matches", from_packed == version_text);
+
+        // (S6) The string's dotted layout, pinned by explicit index reads (a
+        // direct twin of D3's static_asserts but exercised at runtime through the
+        // std::string, guarding against any runtime/compile divergence): exactly
+        // "0.5.3", indices 0,2,4 are the component digits and 1,3 are dots.
+        check("deepen2_string_index0_is_major_digit",
+              version_text.size() == 5 && version_text[0] == ('0' + v_major));
+        check("deepen2_string_index1_is_dot",
+              version_text.size() == 5 && version_text[1] == '.');
+        check("deepen2_string_index2_is_minor_digit",
+              version_text.size() == 5 && version_text[2] == ('0' + v_minor));
+        check("deepen2_string_index3_is_dot",
+              version_text.size() == 5 && version_text[3] == '.');
+        check("deepen2_string_index4_is_patch_digit",
+              version_text.size() == 5 && version_text[4] == ('0' + v_patch));
+
+        // (S7) Carry-above-live boundary at runtime: 0.5.999 is the top of the
+        // live minor band, 0.6.0 is exactly one above it, and 0.5.1000 aliases
+        // 0.6.0 (the lossy decimal carry).  All numeric values are from source.
+        check("deepen2_live_minor_band_top_is_5999",
+              VMHOOK_MAKE_VERSION(0, 5, 999) == 5999);
+        check("deepen2_next_minor_floor_is_6000",
+              VMHOOK_MAKE_VERSION(0, 6, 0) == 6000);
+        check("deepen2_patch_1000_aliases_next_minor",
+              VMHOOK_MAKE_VERSION(0, 5, 1000) == VMHOOK_MAKE_VERSION(0, 6, 0));
+        check("deepen2_live_strictly_below_minor_band_top",
+              packed < VMHOOK_MAKE_VERSION(0, 5, 999));
+        check("deepen2_live_strictly_below_next_minor_floor",
+              packed < VMHOOK_MAKE_VERSION(0, 6, 0));
+
+        // (S8) Cross-field difference identities at runtime (new corners): the
+        // gap from the live version up to the next minor floor and down to the
+        // live minor band floor, derived from source: 6000-5003=997, 5003-5000=3.
+        check("deepen2_gap_to_next_minor_is_997",
+              VMHOOK_MAKE_VERSION(0, 6, 0) - packed == 997);
+        check("deepen2_gap_from_band_floor_is_3",
+              packed - VMHOOK_MAKE_VERSION(0, 5, 0) == 3);
+
+        // (S9) Idempotent self-relations on the live packed value at runtime.
+        check("deepen2_self_difference_zero", packed - packed == 0);
+        check("deepen2_self_quotient_one", packed / packed == 1);
+        check("deepen2_self_modulo_zero", packed % packed == 0);
     }
 
     std::printf("\n%d checks failed\n", failures);

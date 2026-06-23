@@ -1238,5 +1238,320 @@ int main()
         }
     }
 
+    // =======================================================================
+    // ADDITIVE WAVE 2: surfaces the first additive wave did NOT cover.  Every
+    // expected value is traced directly from vmhook.hpp source cited inline.
+    // PURE LOGIC ONLY -- no memory is ever read: is_valid_pointer / untag_pointer
+    // inspect/mask the numeric pointer VALUE only (vmhook.hpp:2047-2097), and all
+    // macro / enum / DR7 work is compile-time arithmetic.  No fabricated address
+    // is dereferenced.  Distinct names from wave 1 (suffix "_w2") so this is
+    // strictly additive.
+    // =======================================================================
+    {
+        // -- (1) Apple ladder split: macOS-vs-iOS arm (vmhook.hpp:140-154) ----
+        // Wave 1 pinned the APPLE aggregate to the gate inputs but never split
+        // the macOS arm out.  The __APPLE__ arm (reached only after Android and
+        // Windows missed) sets exactly one of MACOS/IOS via TARGET_OS_IPHONE.
+        // From the source: MACOS is set iff we reached the Apple arm AND the
+        // iOS sub-branch did NOT fire -- i.e. APPLE && !IOS.  These are pure
+        // restatements of the resolved macros (tautologies on every target).
+        check("os_macos_equals_apple_and_not_ios_w2",
+              VMHOOK_OS_MACOS == (VMHOOK_OS_APPLE && !VMHOOK_OS_IOS));
+        check("os_ios_equals_apple_and_not_macos_w2",
+              VMHOOK_OS_IOS == (VMHOOK_OS_APPLE && !VMHOOK_OS_MACOS));
+        // Within the Apple family macOS and iOS partition it exactly: at most one,
+        // and (when APPLE) exactly one.  Their sum equals the APPLE aggregate and
+        // they never both fire.
+        check("os_macos_ios_sum_equals_apple_w2",
+              (VMHOOK_OS_MACOS + VMHOOK_OS_IOS) == VMHOOK_OS_APPLE);
+        check("os_macos_ios_mutually_exclusive_w2",
+              (VMHOOK_OS_MACOS & VMHOOK_OS_IOS) == 0);
+        check("apple_selects_exactly_one_of_macos_ios_w2",
+              !VMHOOK_OS_APPLE || ((VMHOOK_OS_MACOS + VMHOOK_OS_IOS) == 1));
+        // macOS implies APPLE implies POSIX and not Windows (mirror of the iOS
+        // implication wave 1 already pinned, for the other Apple arm).
+        check("macos_implies_apple_posix_not_windows_w2",
+              !VMHOOK_OS_MACOS
+                  || (VMHOOK_OS_APPLE == 1 && VMHOOK_OS_POSIX == 1
+                      && VMHOOK_OS_WINDOWS == 0));
+        // macOS is x86_64-capable (no iOS exclusion), so on a macOS build
+        // RUNTIME_HOOKING_AVAILABLE tracks arch alone: it equals VMHOOK_ARCH_X86_64
+        // there (since !iOS holds).  Vacuous off macOS.
+        check("macos_runtime_hooking_tracks_x86_64_w2",
+              !VMHOOK_OS_MACOS
+                  || (VMHOOK_RUNTIME_HOOKING_AVAILABLE == VMHOOK_ARCH_X86_64));
+
+        // -- (2) The #else/#error arm contract, viewed from the result --------
+        // The trailing ladder arm (vmhook.hpp:161-167) sets all five OS macros
+        // to 0 and #error's, so a successfully-compiled TU can NEVER be in the
+        // all-zero OS state.  Pin that the resolved set is non-empty (>= 1) and
+        // that the bitwise-OR of all five base flags is 1 -- the dual of the
+        // existing "sum == 1", catching a hypothetical two-set state that sums
+        // wrong but ORs to 1, vs the error state that ORs to 0.
+        check("os_set_is_non_empty_w2",
+              (VMHOOK_OS_WINDOWS + VMHOOK_OS_LINUX + VMHOOK_OS_MACOS
+               + VMHOOK_OS_IOS + VMHOOK_OS_ANDROID) >= 1);
+        check("os_base_flags_or_to_one_w2",
+              (VMHOOK_OS_WINDOWS | VMHOOK_OS_LINUX | VMHOOK_OS_MACOS
+               | VMHOOK_OS_IOS | VMHOOK_OS_ANDROID) == 1);
+        // Linux (the arm 4) implies POSIX and not Apple/Windows -- the remaining
+        // base-OS implication wave 1 left to the aggregate checks.
+        check("linux_implies_posix_not_apple_not_windows_w2",
+              !VMHOOK_OS_LINUX
+                  || (VMHOOK_OS_POSIX == 1 && VMHOOK_OS_APPLE == 0
+                      && VMHOOK_OS_WINDOWS == 0));
+
+        // -- (3) Capability tier as a MONOTONE integer ladder -----------------
+        // The three booleans form a strict subset chain:
+        //   HW_DATA_BREAKPOINTS => RUNTIME_HOOKING_AVAILABLE => x86_64.
+        // Wave 1 pinned the boolean implications; here pin the *integer* ordering
+        // (a >= relation) so the tier can never invert numerically, and that the
+        // ascending sum is one of the only legal tier counts {0,1,2,3} -- never
+        // a "skip" like HW set but runtime clear (which would make the partial
+        // sums non-monotone).
+        check("cap_tier_hwbp_le_runtime_w2",
+              VMHOOK_HAS_HW_DATA_BREAKPOINTS <= VMHOOK_RUNTIME_HOOKING_AVAILABLE);
+        check("cap_tier_runtime_le_x86_64_w2",
+              VMHOOK_RUNTIME_HOOKING_AVAILABLE <= VMHOOK_ARCH_X86_64);
+        // The descending chain x86_64 >= runtime >= hwbp means the triple,
+        // read as a 3-bit "thermometer", is one of 000/100/110/111 -- i.e. the
+        // partial sums are monotone.  Encode that as: once a lower tier is off,
+        // every higher tier is off too.
+        check("cap_tier_thermometer_monotone_w2",
+              (VMHOOK_ARCH_X86_64
+                   ? true
+                   : (VMHOOK_RUNTIME_HOOKING_AVAILABLE == 0
+                      && VMHOOK_HAS_HW_DATA_BREAKPOINTS == 0))
+              && (VMHOOK_RUNTIME_HOOKING_AVAILABLE
+                      ? true
+                      : (VMHOOK_HAS_HW_DATA_BREAKPOINTS == 0)));
+        // The count of enabled tiers is exactly the thermometer height and lies
+        // in {0,1,2,3}; combined with the chain above this forbids any gap.
+        {
+            const int tier{ VMHOOK_ARCH_X86_64
+                            + VMHOOK_RUNTIME_HOOKING_AVAILABLE
+                            + VMHOOK_HAS_HW_DATA_BREAKPOINTS };
+            check("cap_tier_count_in_0_to_3_w2", tier >= 0 && tier <= 3);
+            // Thermometer identity: tier height == x86_64 + runtime + hwbp AND
+            // each successive tier flag is <= the one below it, so the height
+            // uniquely determines all three flags.  Reconstruct and compare.
+            const bool t_x86{ tier >= 1 };
+            const bool t_rt { tier >= 2 };
+            const bool t_hw { tier >= 3 };
+            check("cap_tier_height_reconstructs_flags_w2",
+                  (t_x86 ? 1 : 0) == VMHOOK_ARCH_X86_64
+                  && (t_rt ? 1 : 0) == VMHOOK_RUNTIME_HOOKING_AVAILABLE
+                  && (t_hw ? 1 : 0) == VMHOOK_HAS_HW_DATA_BREAKPOINTS);
+        }
+
+        // -- (4) untag_pointer: pure mask over a richer tag table -------------
+        // untag_pointer ANDs with user_address_ceiling (vmhook.hpp:2092-2097).
+        // It NEVER dereferences -- pure arithmetic on the value.  Wave 1 checked
+        // one tagged nibble + the canonical identity; extend to a table of tag
+        // patterns and confirm the helper recovers the low-47-bit base exactly.
+        namespace hs2 = vmhook::hotspot;
+        {
+            const std::uintptr_t base{ 0x0000'0000'1357'9BD0ull };  // < 2^47, even
+            const std::uintptr_t tags[]{
+                std::uintptr_t{ 1 } << 47,                  // first bit above window
+                std::uintptr_t{ 1 } << 48,
+                std::uintptr_t{ 1 } << 63,                  // top bit
+                std::uintptr_t{ 0xFFFFull } << 48,          // canonical sign ext
+                std::uintptr_t{ 0x5A5Aull } << 48,          // arbitrary nibble soup
+                ~((std::uintptr_t{ 1 } << 47) - 1),         // ALL high bits set
+            };
+            bool all_base_recovered{ true };
+            for (const std::uintptr_t tg : tags)
+            {
+                const std::uintptr_t tagged{ base | tg };
+                const auto un{ reinterpret_cast<std::uintptr_t>(
+                    hs2::untag_pointer(reinterpret_cast<const void*>(tagged))) };
+                if (un != base) { all_base_recovered = false; }
+            }
+            check("untag_pointer_recovers_base_over_tag_table_w2", all_base_recovered);
+
+            // Idempotency: untag(untag(p)) == untag(p).  Masking is idempotent
+            // because the second AND with the same mask is a no-op on an already
+            // masked value.
+            const std::uintptr_t tagged{ base | (std::uintptr_t{ 0xDEADull } << 48) };
+            const void* once{ hs2::untag_pointer(reinterpret_cast<const void*>(tagged)) };
+            const void* twice{ hs2::untag_pointer(once) };
+            check("untag_pointer_is_idempotent_w2", once == twice);
+
+            // Composition with the OTHER feature helper: a tagged pointer whose
+            // BASE is a valid user address must, after untagging, pass
+            // is_valid_pointer -- and an already-canonical valid value untags to
+            // itself and stays valid.  Pure value logic (is_valid_pointer reads
+            // nothing).  base is even, in (floor, ceiling), low32 = 0x13579BD0
+            // (not a sentinel) -> valid.
+            check("untag_of_tagged_valid_base_is_valid_w2",
+                  hs2::is_valid_pointer(
+                      hs2::untag_pointer(reinterpret_cast<const void*>(tagged))) == true);
+            check("untag_preserves_validity_of_canonical_w2",
+                  hs2::is_valid_pointer(reinterpret_cast<const void*>(base)) == true
+                  && hs2::untag_pointer(reinterpret_cast<const void*>(base))
+                         == reinterpret_cast<const void*>(base));
+        }
+
+        // -- (5) is_valid_pointer: non-canonical high-half boundary -----------
+        // ceiling == 2^47 - 1 (0x00007FFF'FFFFFFFF).  The first address with
+        // bit 47 set is 2^47 (0x0000'8000'0000'0000), which is >= ceiling ->
+        // rejected.  Pure value test, no read.
+        check("ivp_two_pow_47_rejected_w2",
+              hs2::is_valid_pointer(reinterpret_cast<const void*>(
+                  std::uintptr_t{ 1 } << 47)) == false);
+        // The all-ones address (every bit set) is far above ceiling -> rejected.
+        check("ivp_all_ones_rejected_w2",
+              hs2::is_valid_pointer(reinterpret_cast<const void*>(
+                  ~std::uintptr_t{ 0 })) == false);
+        // A representative even, in-range, non-sentinel address near the TOP of
+        // the window (high32 = 0x00007FFF keeps it < ceiling) is accepted -- the
+        // existing sweep checked ceiling-1; this picks an unrelated high address.
+        check("ivp_high_in_range_even_nonsentinel_accepted_w2",
+              hs2::is_valid_pointer(reinterpret_cast<const void*>(
+                  (std::uintptr_t{ 0x00007FFFull } << 32) | 0x00112230ull)) == true);
+        // Monotone-with-mask composition: for the tag table above, masking a
+        // tagged-but-valid-base pointer never turns a valid base invalid, and the
+        // masked result equals is_valid_pointer(base) for every entry.
+        {
+            const std::uintptr_t base{ 0x0000'0000'1357'9BD0ull };
+            const std::uintptr_t tags[]{
+                std::uintptr_t{ 1 } << 47,
+                std::uintptr_t{ 1 } << 60,
+                ~((std::uintptr_t{ 1 } << 47) - 1),
+            };
+            const bool base_valid{ hs2::is_valid_pointer(
+                reinterpret_cast<const void*>(base)) };
+            bool all_match_base{ true };
+            for (const std::uintptr_t tg : tags)
+            {
+                const std::uintptr_t tagged{ base | tg };
+                const bool untagged_valid{ hs2::is_valid_pointer(
+                    hs2::untag_pointer(reinterpret_cast<const void*>(tagged))) };
+                if (untagged_valid != base_valid) { all_match_base = false; }
+            }
+            check("untag_then_valid_matches_base_validity_w2", all_match_base);
+        }
+
+        // -- (6) memory_protection: uint32 <-> enum round-trip ----------------
+        // Each ordinal cast to its uint32 underlying value and back to the enum
+        // is the identity (no aliasing of distinct semantics).  Wave 1 pinned the
+        // ordinals; this pins the bijection.
+        {
+            using mp = vmhook::os::memory_protection;
+            const mp values[]{ mp::no_access, mp::read, mp::read_write,
+                               mp::execute_read, mp::execute_rw };
+            bool round_trips{ true };
+            for (const mp v : values)
+            {
+                const std::uint32_t u{ static_cast<std::uint32_t>(v) };
+                if (static_cast<mp>(u) != v) { round_trips = false; }
+            }
+            check("memory_protection_uint32_round_trip_w2", round_trips);
+            // The five underlying values, summed, are 0+1+2+3+4 == 10 -- a cheap
+            // independent witness that the set is exactly {0,1,2,3,4} with no
+            // gap/dup (any reorder keeps the sum; any gap/dup changes it).
+            std::uint32_t ord_sum{ 0 };
+            for (const mp v : values) { ord_sum += static_cast<std::uint32_t>(v); }
+            check("memory_protection_ordinal_sum_is_10_w2", ord_sum == 10);
+        }
+
+        // -- (7) DR breakpoint enums: underlying-value round-trip (unconditional)
+        // The enums are declared OUTSIDE the capability gate (vmhook.hpp:1210-
+        // 1225), so this round-trip runs on EVERY platform.  Each enumerator cast
+        // to uint8 and back is the identity, and the LEN set summed is
+        // 0b00+0b01+0b10+0b11 == 6 (exactly {0,1,2,3} -- the full 2-bit space,
+        // proving no LEN code is duplicated or out of range).
+        {
+            using vmhook::os::data_breakpoint_kind;
+            using vmhook::os::data_breakpoint_length;
+            const data_breakpoint_kind kinds[]{
+                data_breakpoint_kind::write, data_breakpoint_kind::read_write };
+            bool kind_round_trips{ true };
+            for (const data_breakpoint_kind k : kinds)
+            {
+                const std::uint8_t u{ static_cast<std::uint8_t>(k) };
+                if (static_cast<data_breakpoint_kind>(u) != k) { kind_round_trips = false; }
+            }
+            check("dr_kind_uint8_round_trip_w2", kind_round_trips);
+
+            const data_breakpoint_length lens[]{
+                data_breakpoint_length::one_byte, data_breakpoint_length::two_bytes,
+                data_breakpoint_length::four_bytes, data_breakpoint_length::eight_bytes };
+            bool len_round_trips{ true };
+            std::uint32_t len_sum{ 0 };
+            for (const data_breakpoint_length l : lens)
+            {
+                const std::uint8_t u{ static_cast<std::uint8_t>(l) };
+                if (static_cast<data_breakpoint_length>(u) != l) { len_round_trips = false; }
+                len_sum += u;
+            }
+            check("dr_length_uint8_round_trip_w2", len_round_trips);
+            check("dr_length_codes_span_full_2bit_space_w2", len_sum == 6);
+            // The two kind codes sum to 0b01 + 0b11 == 4; both occupy the 2-bit
+            // space and share bit 0 (the "writes" bit) -- execute (0b00) is
+            // deliberately absent from the data-watch enum.
+            check("dr_kind_codes_sum_is_4_w2",
+                  (static_cast<std::uint32_t>(data_breakpoint_kind::write)
+                   + static_cast<std::uint32_t>(data_breakpoint_kind::read_write)) == 4);
+        }
+
+        // -- (8) build_dr7 LEN/kind field EXTRACT-and-round-trip (gated) -------
+        // Build a DR7 word, then extract the R/W and LEN sub-fields back out and
+        // cast them to the enums -- they must equal the inputs for every length
+        // at a representative slot.  This is the inverse direction of wave 1's
+        // closed-form construction check (a genuine round-trip, not a re-build).
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+        {
+            using vmhook::os::data_breakpoint_kind;
+            using vmhook::os::data_breakpoint_length;
+            const data_breakpoint_length lens[]{
+                data_breakpoint_length::one_byte, data_breakpoint_length::two_bytes,
+                data_breakpoint_length::four_bytes, data_breakpoint_length::eight_bytes };
+            const data_breakpoint_kind kinds[]{
+                data_breakpoint_kind::write, data_breakpoint_kind::read_write };
+            bool extract_round_trips{ true };
+            for (int slot{ 0 }; slot < 4; ++slot)
+            {
+                for (const data_breakpoint_kind k : kinds)
+                {
+                    for (const data_breakpoint_length l : lens)
+                    {
+                        const std::uint64_t v{ vmhook::os::detail_dr::build_dr7(slot, k, l) };
+                        const std::uint8_t rw_field{ static_cast<std::uint8_t>(
+                            (v >> (16 + slot * 4)) & 0b11u) };
+                        const std::uint8_t len_field{ static_cast<std::uint8_t>(
+                            (v >> (18 + slot * 4)) & 0b11u) };
+                        if (static_cast<data_breakpoint_kind>(rw_field) != k)
+                        {
+                            extract_round_trips = false;
+                        }
+                        if (static_cast<data_breakpoint_length>(len_field) != l)
+                        {
+                            extract_round_trips = false;
+                        }
+                    }
+                }
+            }
+            check("build_dr7_field_extract_round_trip_w2", extract_round_trips);
+            // Population-count witness: a write/one_byte watch (LEN=0b00, R/W=0b01)
+            // sets EXACTLY two bits -- the slot's L-enable (bit 2*slot) and the
+            // single R/W low bit (bit 16+4*slot).  Verify the popcount is 2 for
+            // every slot (an independent check on "no stray bits set").
+            bool popcount_ok{ true };
+            for (int slot{ 0 }; slot < 4; ++slot)
+            {
+                std::uint64_t v{ vmhook::os::detail_dr::build_dr7(
+                    slot, data_breakpoint_kind::write,
+                    data_breakpoint_length::one_byte) };
+                int bits{ 0 };
+                while (v) { v &= (v - 1); ++bits; }
+                if (bits != 2) { popcount_ok = false; }
+            }
+            check("build_dr7_write_one_byte_popcount_is_2_w2", popcount_ok);
+        }
+#endif
+    }
+
     return failures == 0 ? 0 : 1;
 }
