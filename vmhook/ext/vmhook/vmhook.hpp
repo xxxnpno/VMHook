@@ -9362,8 +9362,7 @@ namespace vmhook
         // so without these a `noexcept` detour decomposes to the undefined primary
         // template ("no member named args_tuple_t") and hook<T>(...) fails to
         // compile even though the same lambda without `noexcept` works.  Plain and
-        // const noexcept are covered here; ref-qualified (& / &&), volatile, and
-        // C-variadic member forms remain intentional gaps.
+        // const noexcept are covered here.
         template<typename class_type, typename return_type, typename... argument_types>
         struct function_traits<return_type(class_type::*)(argument_types...) const noexcept>
         {
@@ -9375,6 +9374,48 @@ namespace vmhook
         {
             using args_tuple_t = std::tuple<argument_types...>;
         };
+
+        // Ref-qualified (& / &&) and volatile-qualified member-function forms.
+        // Like cv and noexcept, a ref-qualifier (`operator() &`, `operator() &&`)
+        // and a `volatile` qualifier are part of the member function TYPE, so a
+        // hand-written functor whose operator() carries one of these would have
+        // decomposed to the undefined primary ("no member args_tuple_t") and made
+        // hook<T>(...) fail to compile.  The full cv (none/const/volatile/const
+        // volatile) x ref (& / &&) x noexcept (none/noexcept) matrix is enumerated
+        // below so every well-formed callable shape is accepted; args_tuple_t is
+        // the same std::tuple<argument_types...> in every case (the qualifier is
+        // irrelevant to the Java parameter list).  C-style variadic member forms
+        // (R(C::*)(Args..., ...)) remain an intentional gap — the trailing
+        // ellipsis is part of the type and matches no specialisation.
+#define VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(QUALIFIERS)                          \
+        template<typename class_type, typename return_type,                    \
+                 typename... argument_types>                                   \
+        struct function_traits<                                                \
+            return_type(class_type::*)(argument_types...) QUALIFIERS>          \
+        {                                                                      \
+            using args_tuple_t = std::tuple<argument_types...>;                \
+        }
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(volatile);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const volatile);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(&);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const&);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(volatile&);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const volatile&);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(&&);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const&&);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(volatile&&);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const volatile&&);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(volatile noexcept);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const volatile noexcept);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(& noexcept);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const& noexcept);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(volatile& noexcept);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const volatile& noexcept);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(&& noexcept);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const&& noexcept);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(volatile&& noexcept);
+        VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const volatile&& noexcept);
+#undef VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC
 
         /*
             @brief Removes the first element from a std::tuple type.

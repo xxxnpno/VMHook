@@ -94,14 +94,14 @@ namespace
     // (b) has NO single addressable `operator()` (generic / overloaded /
     // templated call operator), in which case the 7498 spec's void_t
     // substitution fails and F cleanly falls through to the undefined primary
-    // -> args_tuple_t absent -> detector reports false.  A functor whose
-    // operator() is present-and-addressable but carries a qualifier the
-    // member-pointer specs do NOT cover (noexcept / & / && / volatile / C
-    // varargs) is a HARD COMPILE ERROR, NOT a detectable absence: 7498 IS
-    // selected, its base function_traits<member-ptr> is the undefined primary,
-    // and reading args_tuple_t off it is a non-SFINAE error.  Such shapes are
-    // therefore documented below as build-breaking and are deliberately NOT
-    // fed to this detector (doing so would fail to compile the whole TU).
+    // -> args_tuple_t absent -> detector reports false.  Every cv- / ref- /
+    // noexcept-qualified member operator() now has a matching specialisation, so
+    // a functor carrying any of those qualifiers resolves to a clean POSITIVE
+    // here.  The ONLY remaining build-breaker member shape is the C-variadic
+    // operator() (R(C::*)(args..., ...)): 7498 IS selected, its base is the
+    // undefined primary, and reading args_tuple_t off it is a non-SFINAE error,
+    // so a C-variadic functor is still deliberately NOT fed to this detector
+    // (doing so would fail to compile the whole TU).
     template<typename F, typename = void>
     struct has_args_tuple : std::false_type {};
     template<typename F>
@@ -704,7 +704,8 @@ int main()
     // has a dedicated R(*)(args...) noexcept specialisation (noexcept is part of
     // the function type since C++17), so its args_tuple_t is present and matches
     // the throwing twin.  (Previously the detectable face of the noexcept gap;
-    // now closed for plain/const noexcept — ref-qualified/volatile remain gaps.)
+    // noexcept, ref-qualified, and volatile member forms are now all accepted —
+    // only the C-variadic member form remains a documented gap.)
     check("has_args_tuple_present_for_noexcept_free_function_pointer",
           has_args_tuple<void(*)(vmhook::return_value&, std::int32_t) noexcept>::value);
     // Overloaded / templated / generic operator() leave &F::operator()
@@ -1676,9 +1677,11 @@ int main()
     //   operator()                  -> 9354 (existing checks)
     //   operator() const noexcept   -> 9368 (noexcept lambda / const noexcept functor)
     //   operator() noexcept         -> 9374 (mutable noexcept lambda / noexcept functor)
-    // The ref-qualified (& / &&) and volatile member forms remain documented
-    // GAPS (intentionally NOT fed to the detector — they would hard-error, per
-    // the detectability-boundary note near has_args_tuple above).
+    // The ref-qualified (& / &&) and volatile member forms are now ALSO accepted
+    // (the full cv x ref x noexcept matrix); they are exercised positively in the
+    // ref/volatile-qualifier wave just below.  Only the C-variadic member form
+    // remains a documented gap (never fed to the detector — it would hard-error,
+    // per the detectability-boundary note near has_args_tuple above).
     // =========================================================================
     {
         // A noexcept-qualified plain lambda: operator() const noexcept (spec 9368).
@@ -1743,6 +1746,117 @@ int main()
         check("const_noexcept_functor_matches_plain_const_functor",
               std::is_same_v<method_args_of<const_noexcept_functor>,
                              method_args_of<const_call_functor>>);
+    }
+    // =========================================================================
+    // WAVE: ref-qualified (& / &&) and volatile member operator() shapes — the
+    // full cv (none/const/volatile/const volatile) x ref (& / &&) x noexcept
+    // member-function-pointer matrix.  Like noexcept, a ref-qualifier and a
+    // `volatile` qualifier are part of the member-function TYPE, so a functor
+    // whose operator() carries one would previously have fallen through to the
+    // undefined primary ("no member args_tuple_t").  Each representative shape
+    // below is now (a) accepted by the detector and (b) decomposes to the
+    // IDENTICAL method tuple as the plain const functor — the qualifier is
+    // irrelevant to the Java parameter list.  Pure type algebra; no JVM.
+    // =========================================================================
+    {
+        struct lref_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) & {}
+        };
+        struct const_lref_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) const& {}
+        };
+        struct rref_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) && {}
+        };
+        struct volatile_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) volatile {}
+        };
+        struct const_volatile_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) const volatile {}
+        };
+        struct lref_noexcept_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) & noexcept {}
+        };
+        struct rref_noexcept_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) && noexcept {}
+        };
+        check("lref_functor_has_args_tuple", has_args_tuple<lref_functor>::value);
+        check("const_lref_functor_has_args_tuple", has_args_tuple<const_lref_functor>::value);
+        check("rref_functor_has_args_tuple", has_args_tuple<rref_functor>::value);
+        check("volatile_functor_has_args_tuple", has_args_tuple<volatile_functor>::value);
+        check("const_volatile_functor_has_args_tuple",
+              has_args_tuple<const_volatile_functor>::value);
+        check("lref_noexcept_functor_has_args_tuple",
+              has_args_tuple<lref_noexcept_functor>::value);
+        check("rref_noexcept_functor_has_args_tuple",
+              has_args_tuple<rref_noexcept_functor>::value);
+        // Every ref-/volatile-qualified shape decomposes to the SAME method tuple
+        // (int, long) as the plain const functor — the qualifier never leaks.
+        using expected = std::tuple<std::int32_t, std::int64_t>;
+        check("lref_functor_method_tuple_int_long",
+              std::is_same_v<method_args_of<lref_functor>, expected>);
+        check("rref_functor_method_tuple_int_long",
+              std::is_same_v<method_args_of<rref_functor>, expected>);
+        check("volatile_functor_method_tuple_int_long",
+              std::is_same_v<method_args_of<volatile_functor>, expected>);
+        check("const_volatile_functor_method_tuple_int_long",
+              std::is_same_v<method_args_of<const_volatile_functor>, expected>);
+        check("rref_noexcept_functor_method_tuple_int_long",
+              std::is_same_v<method_args_of<rref_noexcept_functor>, expected>);
+        check("all_ref_volatile_functors_match_plain_const_functor",
+              std::is_same_v<method_args_of<lref_functor>, method_args_of<const_call_functor>>
+              && std::is_same_v<method_args_of<const_lref_functor>, method_args_of<const_call_functor>>
+              && std::is_same_v<method_args_of<rref_functor>, method_args_of<const_call_functor>>
+              && std::is_same_v<method_args_of<volatile_functor>, method_args_of<const_call_functor>>
+              && std::is_same_v<method_args_of<const_volatile_functor>, method_args_of<const_call_functor>>
+              && std::is_same_v<method_args_of<lref_noexcept_functor>, method_args_of<const_call_functor>>
+              && std::is_same_v<method_args_of<rref_noexcept_functor>, method_args_of<const_call_functor>>);
+        // End-to-end slot table: (int, long) -> int@0(+1), long@1(+2) = {0,1}.
+        check("ref_volatile_functor_slot_offsets",
+              (vmhook::detail::java_slot_offsets<method_args_of<volatile_functor>>::value
+               == std::array<std::int32_t, 2>{ 0, 1 }));
+    }
+    // Member-function-POINTER forms taken directly (not via a functor), pinning
+    // the cv/ref matrix specialisations in isolation.
+    {
+        struct host
+        {
+            void m_lref(std::int32_t, std::int64_t) & {}
+            void m_rref(std::int32_t, std::int64_t) && {}
+            void m_volatile(std::int32_t, std::int64_t) volatile {}
+            void m_const_volatile(std::int32_t, std::int64_t) const volatile {}
+            void m_const_lref_ne(std::int32_t, std::int64_t) const& noexcept {}
+        };
+        using expected = std::tuple<std::int32_t, std::int64_t>;
+        check("member_ptr_lref_args_verbatim",
+              std::is_same_v<all_args_of<decltype(&host::m_lref)>, expected>);
+        check("member_ptr_rref_args_verbatim",
+              std::is_same_v<all_args_of<decltype(&host::m_rref)>, expected>);
+        check("member_ptr_volatile_args_verbatim",
+              std::is_same_v<all_args_of<decltype(&host::m_volatile)>, expected>);
+        check("member_ptr_const_volatile_args_verbatim",
+              std::is_same_v<all_args_of<decltype(&host::m_const_volatile)>, expected>);
+        check("member_ptr_const_lref_noexcept_args_verbatim",
+              std::is_same_v<all_args_of<decltype(&host::m_const_lref_ne)>, expected>);
+    }
+    // The C-variadic MEMBER form remains the sole intentional gap: its trailing
+    // ellipsis is part of the type and matches no specialisation.  Asserted by
+    // SHAPE (taking it as a functor operator() would hard-error, so never probed).
+    {
+        struct cvariadic_host
+        {
+            void m_cvariadic(std::int32_t, ...) const {}
+        };
+        check("member_ptr_c_variadic_is_unsupported_shape",
+              std::is_same_v<decltype(&cvariadic_host::m_cvariadic),
+                             void (cvariadic_host::*)(std::int32_t, ...) const>);
     }
     // The noexcept FREE-FUNCTION-POINTER spec (9330): a noexcept fn-ptr type must
     // decompose to the same method tuple as the throwing fn-ptr.  (The detector

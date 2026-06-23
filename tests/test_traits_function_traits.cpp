@@ -12,16 +12,21 @@
 //     specialisations below therefore has no args_tuple_t (a detectable absence
 //     via SFINAE, or — for a present-but-unsupported-qualifier operator() — a
 //     hard error; see the detectability note on has_args_tuple).
-//   * Eight specialisations populate `using args_tuple_t = std::tuple<args...>`:
+//   * The specialisations populate `using args_tuple_t = std::tuple<args...>`:
 //       1. free-function POINTER       R(*)(args...)
 //       2. std::function               std::function<R(args...)>
-//       3. generic functor (void_t probe on &F::operator(), forwards to 4-8)
+//       3. generic functor (void_t probe on &F::operator(), forwards to 4-N)
 //       4. const member function ptr   R(C::*)(args...) const   (the lambda case)
 //       5. non-const member fn ptr     R(C::*)(args...)         (mutable lambda)
 //       6. noexcept free-fn POINTER    R(*)(args...) noexcept
 //       7. const noexcept member ptr   R(C::*)(args...) const noexcept (noexcept lambda)
 //       8. noexcept member ptr         R(C::*)(args...) noexcept       (mutable noexcept lambda)
-//     Ref-qualified (& / &&), volatile, and C-variadic member forms remain gaps.
+//       9. the full cv (none/const/volatile/const volatile) x ref (& / &&) x
+//          noexcept member-pointer matrix — every ref- and volatile-qualified
+//          member operator() form is now accepted, so a hand-written functor
+//          whose operator() carries any of those qualifiers decomposes cleanly.
+//     C-style variadic member forms (R(C::*)(args..., ...)) remain an intentional
+//     gap (the trailing ellipsis is part of the type and matches no spec).
 //   * The trait exposes ONLY args_tuple_t.  There is deliberately NO return_type
 //     / result_type / arity member (the detour's return value is delivered out
 //     of band via vmhook::return_value, never read from the callable's type).
@@ -81,12 +86,13 @@ namespace
     // non-overloaded, non-template member-pointer the void_t spec forwards to,
     // OR (b) has NO single addressable operator() (overloaded / templated /
     // generic), in which case the void_t spec drops and F falls to the undefined
-    // primary -> false.  A functor whose operator() IS addressable but carries a
-    // qualifier the member-pointer specs do not cover (noexcept / & / && /
-    // volatile) is a HARD COMPILE ERROR, not a detectable false — the void_t
-    // spec IS selected, its base is the undefined primary, and reading
-    // args_tuple_t off it is a non-SFINAE error.  Such shapes are documented
-    // below as build-breaking and are deliberately never fed to this detector.
+    // primary -> false.  Every cv- / ref- / noexcept-qualified member operator()
+    // now has a matching specialisation, so a functor whose operator() carries
+    // any of those qualifiers resolves to a clean POSITIVE (true) here.  The only
+    // remaining build-breaker member shape is the C-variadic operator()
+    // (R(C::*)(args..., ...)): the void_t spec IS selected, its base is the
+    // undefined primary, and reading args_tuple_t off it is a non-SFINAE error,
+    // so a C-variadic functor is still never fed to this detector.
     template<typename F, typename = void>
     struct has_args_tuple : std::false_type {};
     template<typename F>
@@ -157,7 +163,7 @@ namespace
         std::string   m_const_ret(char) const { return {}; }
         std::int64_t  m_nonconst_ret(void*) { return 0; }   // two-slot return
         void          m_const_noexcept(int) const noexcept {}   // NOW supported (spec 7)
-        void          m_lref_qualified(int) & {}                // gap: & ref-qualifier
+        void          m_lref_qualified(int) & {}                // NOW supported (& ref-qualifier)
     };
 
     // ── Functors with a single concrete operator() (accepted shapes) ─────────
@@ -207,24 +213,24 @@ namespace
 
     // ── MEMBER-function pointers: the full qualifier matrix ──────────────────
     // member_host (above) covers const / non-const / const-noexcept / lvalue-&.
-    // These add the REMAINING C++ member-function qualifier spellings so the gap
-    // boundary is pinned for ALL of them, not just two.  The const and non-const
-    // specs (#4/#5) match ONLY the bare `const` and bare unqualified forms; every
-    // qualifier below (volatile, const volatile, &&, const &, ref/noexcept combos)
-    // matches NEITHER spec, so taken as a functor's operator() it would be a hard
-    // error — here we hold the member-POINTER type directly and assert its exact
-    // unsupported spelling (the detector-safe, build-stable way to document them).
+    // These add the REMAINING C++ member-function qualifier spellings.  The full
+    // cv (none/const/volatile/const volatile) x ref (& / &&) x noexcept matrix is
+    // now enumerated as specialisations, so each of the qualifier spellings below
+    // (volatile, const volatile, &&, const &, && noexcept) is ACCEPTED — its
+    // args_tuple_t is present and equals the unqualified form's.  The ONLY member
+    // shape that still matches no specialisation is the C-style variadic form
+    // (m_cvariadic), which remains a documented gap and is asserted by SHAPE.
     struct member_quals
     {
-        void m_volatile(int, double) volatile {}                       // never matched
-        void m_const_volatile(int, double) const volatile {}          // never matched
-        void m_rref(int, double) && {}                                 // never matched
-        void m_const_lref(int, double) const& {}                       // never matched
+        void m_volatile(int, double) volatile {}                       // NOW supported (volatile)
+        void m_const_volatile(int, double) const volatile {}           // NOW supported (const volatile)
+        void m_rref(int, double) && {}                                 // NOW supported (&&)
+        void m_const_lref(int, double) const& {}                       // NOW supported (const&)
         void m_nonconst_noexcept(long) noexcept {}                     // NOW supported (spec 8)
-        void m_rref_noexcept(int) && noexcept {}                       // gap: && ref-qualifier
+        void m_rref_noexcept(int) && noexcept {}                       // NOW supported (&& noexcept)
         // A C-style variadic MEMBER function pointer — the member analogue of the
         // free-fn C-variadic gap.  R(C::*)(args..., ...) const matches no spec.
-        void m_cvariadic(int, ...) const {}                            // never matched
+        void m_cvariadic(int, ...) const {}                            // never matched (intentional gap)
         // Wide member pointers feeding the member-pointer arity ladder below.
         void m_const_wide(int, int, int, int, int, int) const {}
         int  m_nonconst_wide(int, int, int, int, int) { return 0; }
@@ -239,13 +245,14 @@ namespace
         void m_const_val(const int, const double) const {}            // top-level const dropped
     };
 
-    // ── Functors whose operator() carries an UNSUPPORTED qualifier ───────────
-    // These are the FUNCTOR (closure-like) face of the member-qualifier gap.
-    // Their operator() IS addressable (so the void_t functor spec #3 selects),
-    // but it forwards to a member pointer the const/non-const specs do NOT match,
-    // so reading args_tuple_t off them is a HARD ERROR — they must never be fed
-    // to has_args_tuple<>.  We assert the SHAPE of &F::operator() by construction
-    // instead, documenting exactly why function_traits cannot introspect them.
+    // ── Functors whose operator() carries a (now-SUPPORTED) qualifier ────────
+    // These are the FUNCTOR (closure-like) face of the volatile / && qualifier
+    // forms.  Their operator() IS addressable (so the void_t functor spec #3
+    // selects) and now forwards to a member-pointer specialisation that exists,
+    // so reading args_tuple_t off them is well-formed and detectable — they CAN
+    // be fed to has_args_tuple<> and report true.  (Before the cv/ref matrix was
+    // enumerated this was a hard error; the C-variadic functor is now the sole
+    // member shape that still cannot be introspected.)
     struct volatile_call_functor
     {
         void operator()(vmhook::return_value&, int) volatile {}
@@ -595,16 +602,21 @@ int main()
     // 8.  noexcept member functions are now SUPPORTED (dedicated const-noexcept
     //     and noexcept member specialisations, 7/8).  A const-noexcept member
     //     pointer decomposes to its args verbatim, exactly like its throwing twin
-    //     — the member face of the now-closed noexcept gap.  The REMAINING
-    //     build-breaker shape is the lvalue-ref-qualified member: its `&`
-    //     qualifier matches no specialisation, so reading args_tuple_t off it is
-    //     a hard error and it is asserted BY SHAPE (type identity), never probed.
+    //     — the member face of the now-closed noexcept gap.  The lvalue-ref-
+    //     qualified member is ALSO supported now (the cv/ref matrix), so its `&`
+    //     form decomposes to its args verbatim; we both probe it positively and
+    //     pin its exact member-pointer SHAPE so a regression is caught either way.
     check("member_pointer_const_noexcept_now_has_args_tuple",
           has_args_tuple<decltype(&member_host::m_const_noexcept)>::value);
     check("member_pointer_const_noexcept_args_verbatim",
           std::is_same_v<args_of<decltype(&member_host::m_const_noexcept)>,
                          std::tuple<int>>);
-    check("member_pointer_lvalue_ref_qualified_shape_is_unsupported_qualifier",
+    check("member_pointer_lvalue_ref_qualified_now_has_args_tuple",
+          has_args_tuple<decltype(&member_host::m_lref_qualified)>::value);
+    check("member_pointer_lvalue_ref_qualified_args_verbatim",
+          std::is_same_v<args_of<decltype(&member_host::m_lref_qualified)>,
+                         std::tuple<int>>);
+    check("member_pointer_lvalue_ref_qualified_shape_is_lvalue_ref",
           std::is_same_v<decltype(&member_host::m_lref_qualified),
                          void (member_host::*)(int) &>);
 
@@ -752,24 +764,45 @@ int main()
                          std::tuple<int, double>>);
 
     // ========================================================================
-    // 14.  THE REMAINING MEMBER-QUALIFIER GAPS, asserted BY CONSTRUCTION.
-    //      noexcept members are now SUPPORTED (specs 7/8) — non-const noexcept is
-    //      checked positively just below.  These pin the qualifier spellings that
-    //      STILL match no specialisation — volatile, const volatile, &&, const&,
-    //      and && noexcept (the ref-qualifier, NOT the noexcept, excludes it) — as
-    //      the exact member-pointer types.  Taken as a functor operator() each is a
-    //      hard error, so they are documented by SHAPE (never via has_args_tuple).
+    // 14.  THE FULL MEMBER-QUALIFIER MATRIX, now ACCEPTED.  noexcept members are
+    //      supported (specs 7/8) and so are every cv- / ref-qualified member form
+    //      (the cv x ref x noexcept matrix): volatile, const volatile, &&, const&,
+    //      and && noexcept all decompose to their args VERBATIM, with the qualifier
+    //      irrelevant to args_tuple_t.  Each is probed positively via has_args_tuple
+    //      AND pinned by exact member-pointer SHAPE so a regression in either the
+    //      acceptance or the precise type is caught.  (The C-variadic member form
+    //      is the sole remaining gap — asserted by shape in §15.)
     // ========================================================================
-    check("member_pointer_volatile_is_unsupported_qualifier",
+    check("member_pointer_volatile_now_has_args_tuple",
+          has_args_tuple<decltype(&member_quals::m_volatile)>::value);
+    check("member_pointer_volatile_args_verbatim",
+          std::is_same_v<args_of<decltype(&member_quals::m_volatile)>,
+                         std::tuple<int, double>>);
+    check("member_pointer_volatile_shape_is_volatile",
           std::is_same_v<decltype(&member_quals::m_volatile),
                          void (member_quals::*)(int, double) volatile>);
-    check("member_pointer_const_volatile_is_unsupported_qualifier",
+    check("member_pointer_const_volatile_now_has_args_tuple",
+          has_args_tuple<decltype(&member_quals::m_const_volatile)>::value);
+    check("member_pointer_const_volatile_args_verbatim",
+          std::is_same_v<args_of<decltype(&member_quals::m_const_volatile)>,
+                         std::tuple<int, double>>);
+    check("member_pointer_const_volatile_shape_is_const_volatile",
           std::is_same_v<decltype(&member_quals::m_const_volatile),
                          void (member_quals::*)(int, double) const volatile>);
-    check("member_pointer_rvalue_ref_is_unsupported_qualifier",
+    check("member_pointer_rvalue_ref_now_has_args_tuple",
+          has_args_tuple<decltype(&member_quals::m_rref)>::value);
+    check("member_pointer_rvalue_ref_args_verbatim",
+          std::is_same_v<args_of<decltype(&member_quals::m_rref)>,
+                         std::tuple<int, double>>);
+    check("member_pointer_rvalue_ref_shape_is_rvalue_ref",
           std::is_same_v<decltype(&member_quals::m_rref),
                          void (member_quals::*)(int, double) &&>);
-    check("member_pointer_const_lvalue_ref_is_unsupported_qualifier",
+    check("member_pointer_const_lvalue_ref_now_has_args_tuple",
+          has_args_tuple<decltype(&member_quals::m_const_lref)>::value);
+    check("member_pointer_const_lvalue_ref_args_verbatim",
+          std::is_same_v<args_of<decltype(&member_quals::m_const_lref)>,
+                         std::tuple<int, double>>);
+    check("member_pointer_const_lvalue_ref_shape_is_const_lref",
           std::is_same_v<decltype(&member_quals::m_const_lref),
                          void (member_quals::*)(int, double) const&>);
     check("member_pointer_nonconst_noexcept_now_has_args_tuple",
@@ -777,7 +810,12 @@ int main()
     check("member_pointer_nonconst_noexcept_args_verbatim",
           std::is_same_v<args_of<decltype(&member_quals::m_nonconst_noexcept)>,
                          std::tuple<long>>);
-    check("member_pointer_rvalue_ref_noexcept_is_unsupported_qualifier",
+    check("member_pointer_rvalue_ref_noexcept_now_has_args_tuple",
+          has_args_tuple<decltype(&member_quals::m_rref_noexcept)>::value);
+    check("member_pointer_rvalue_ref_noexcept_args_verbatim",
+          std::is_same_v<args_of<decltype(&member_quals::m_rref_noexcept)>,
+                         std::tuple<int>>);
+    check("member_pointer_rvalue_ref_noexcept_shape_is_rref_noexcept",
           std::is_same_v<decltype(&member_quals::m_rref_noexcept),
                          void (member_quals::*)(int) && noexcept>);
 
@@ -798,17 +836,25 @@ int main()
           !has_args_tuple<void(*)(int, double, ...)>::value);
 
     // ========================================================================
-    // 16.  FUNCTOR operator() carrying an UNSUPPORTED qualifier (build-breaker
-    //      face).  The functor void_t spec (#3) IS selected for these (their
-    //      operator() is addressable), but it forwards to a member pointer the
-    //      const/non-const specs do not match -> reading args_tuple_t is a hard
-    //      error.  They must NEVER be fed to has_args_tuple; assert the shape of
-    //      &F::operator() by construction instead (the closure-like analogue of
-    //      member_host's noexcept/lref by-construction pins).
+    // 16.  FUNCTOR operator() carrying a volatile / && qualifier — now ACCEPTED.
+    //      The functor void_t spec (#3) is selected for these (their operator()
+    //      is addressable) and now forwards to a member-pointer specialisation
+    //      that exists, so reading args_tuple_t is well-formed: they CAN be fed
+    //      to has_args_tuple and report true, decomposing past the leading
+    //      return_value& to the method tuple.  The exact &F::operator() shape is
+    //      still pinned so a regression in the qualifier handling is caught.
     // ========================================================================
+    check("volatile_call_functor_now_has_args_tuple",
+          has_args_tuple<volatile_call_functor>::value);
+    check("volatile_call_functor_method_args_drop_return_value",
+          std::is_same_v<method_args_of<volatile_call_functor>, std::tuple<int>>);
     check("volatile_call_functor_operator_is_volatile_qualified",
           std::is_same_v<decltype(&volatile_call_functor::operator()),
                          void (volatile_call_functor::*)(vmhook::return_value&, int) volatile>);
+    check("rref_call_functor_now_has_args_tuple",
+          has_args_tuple<rref_call_functor>::value);
+    check("rref_call_functor_method_args_drop_return_value",
+          std::is_same_v<method_args_of<rref_call_functor>, std::tuple<int>>);
     check("rref_call_functor_operator_is_rvalue_ref_qualified",
           std::is_same_v<decltype(&rref_call_functor::operator()),
                          void (rref_call_functor::*)(vmhook::return_value&, int) &&>);
@@ -904,14 +950,25 @@ int main()
                                  std::tuple<int&, const double&, void*>>,
                   "const member-pointer spec must preserve ref/const-ref/pointer "
                   "parameter spellings verbatim");
-    // The full member-qualifier gap, by construction.
-    static_assert(std::is_same_v<decltype(&member_quals::m_volatile),
-                                 void (member_quals::*)(int, double) volatile>,
-                  "a volatile-qualified member function matches no function_traits "
-                  "specialisation (documented gap)");
-    static_assert(std::is_same_v<decltype(&member_quals::m_rref),
-                                 void (member_quals::*)(int, double) &&>,
-                  "an rvalue-ref-qualified member function matches no specialisation");
+    // The full member-qualifier matrix is now accepted: a volatile- and an
+    // rvalue-ref-qualified member function each expose args_tuple_t verbatim.
+    static_assert(std::is_same_v<args_of<decltype(&member_quals::m_volatile)>,
+                                 std::tuple<int, double>>,
+                  "a volatile-qualified member function is now accepted and exposes "
+                  "its args verbatim (cv/ref/noexcept matrix)");
+    static_assert(std::is_same_v<args_of<decltype(&member_quals::m_rref)>,
+                                 std::tuple<int, double>>,
+                  "an rvalue-ref-qualified member function is now accepted and "
+                  "exposes its args verbatim (cv/ref/noexcept matrix)");
+    static_assert(std::is_same_v<args_of<decltype(&member_quals::m_const_lref)>,
+                                 std::tuple<int, double>>,
+                  "a const-lvalue-ref-qualified member function is now accepted");
+    static_assert(std::is_same_v<args_of<decltype(&member_quals::m_const_volatile)>,
+                                 std::tuple<int, double>>,
+                  "a const-volatile-qualified member function is now accepted");
+    static_assert(std::is_same_v<args_of<decltype(&member_quals::m_rref_noexcept)>,
+                                 std::tuple<int>>,
+                  "an rvalue-ref + noexcept qualified member function is now accepted");
     // C-variadic member pointer shape + multi-fixed free variadic rejection.
     static_assert(std::is_same_v<decltype(&member_quals::m_cvariadic),
                                  void (member_quals::*)(int, ...) const>,
