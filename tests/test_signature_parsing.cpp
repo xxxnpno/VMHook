@@ -309,6 +309,384 @@ public:
     }
 };
 
+// =====================================================================
+// WAVE-21 ADDITIVE DEEPENING (no-JVM, -Werror on gcc/clang/msvc).
+//
+// A SELF-CONTAINED namespaced section closing the EXACT open gaps from
+// audit/COVERAGE_LEDGER.md that the passes above (1-12) touched only
+// partially or not jointly:
+//   * the `signature[rparen+1]` ends-in-')' boundary, driven through the
+//     library's OWN raw + guarded ladders rebuilt here (rparen+1==size);
+//   * a `sig_char_to_basic_type` total 0..255 sweep that ALSO walks the
+//     signed-char negative-int domain explicitly (high bytes -> default);
+//   * `jvm_primitive_byte_width` adversarial inputs (" I"/"I "/embedded-NUL
+//     view/0xFF) re-pinned as a single greppable table;
+//   * the `jni_signature_for_arg` integral-width matrix for long / long long
+//     / size_t / ptrdiff_t / wchar_t / char16_t / char32_t, each gated on the
+//     platform property the routing keys on so it compiles on LP64+LLP64;
+//   * `enum class` does NOT satisfy is_integral_v (so it hits the assert);
+//   * full ctor-signature build "(IDLjava/lang/String;)V" + "()V" + uint16->
+//     "(C)V"; and signature_for_arg == jni_signature_for_arg parity.
+//
+// Every helper is a fresh, independently-named reconstruction of the library
+// ladders (NOT a call into the file's existing return_basic_type_of /
+// call_site_result_type), so this section adds NEW coverage and touches no
+// existing assertion.  Every expected value is derived from the vmhook.hpp
+// source confirmed in this review:
+//   sig_char_to_basic_type   (vmhook.hpp:16215-16232 — Z4 C5 F6 D7 B8 S9 I10
+//                             J11 L12 [13 V14, default 12)
+//   jvm_primitive_byte_width (vmhook.hpp:16250-16265 — size!=1 ->0; Z/B1 S/C2
+//                             I/F4 J/D8, default 0)
+//   jni_signature_for_arg    (vmhook.hpp:12994-13051 — decay; String; bool->Z;
+//                             char16_t|uint16_t->C; generic is_integral &&
+//                             sizeof N=1->B 2->S 4->I 8->J; float->F double->D)
+//   guarded return decode    (vmhook.hpp:17216-17230 — allow-list + bounds;
+//                             unknown / ends-in-')' -> T_VOID(14))
+// All buffers passed to multi-byte consumers are sized to the consumer's MAX
+// read width; no NUL/non-ASCII literals appear in source (runtime '\0' /
+// \xNN escapes only); no value_t->vector cast; no signed/unsigned narrowing.
+// =====================================================================
+namespace wave21
+{
+    // FRESH reconstruction of the HISTORICAL unguarded return extraction
+    // (rfind(')') then sig[rparen+1] with a 'V' fallback only when there is no
+    // ')').  Distinct name from the file's return_basic_type_of so this is
+    // additive.  Unguarded by design — callers MUST NOT pass an ends-in-')'
+    // signature (UB on string_view operator[](size())); the guarded mirror
+    // below is the one driven over that boundary.
+    inline auto raw_return_basic(std::string_view sig) -> int
+    {
+        const std::size_t rparen{ sig.rfind(')') };
+        const char ret{ rparen != std::string_view::npos ? sig[rparen + 1] : 'V' };
+        return vmhook::detail::sig_char_to_basic_type(ret);
+    }
+
+    // FRESH reconstruction of the CURRENT guarded call-site decode
+    // (vmhook.hpp:17216-17230): a `rparen + 1 < size()` bounds check feeds 'V'
+    // for an ends-in-')' signature, and an allow-list degrades any UNKNOWN
+    // return descriptor to T_VOID(14) instead of sig_char_to_basic_type's
+    // T_OBJECT(12) default.  Independently named from call_site_result_type.
+    inline auto guarded_return_basic(std::string_view sig) -> int
+    {
+        const std::size_t rparen{ sig.rfind(')') };
+        const char ret{
+            (rparen != std::string_view::npos && rparen + 1 < sig.size())
+                ? sig[rparen + 1]
+                : 'V' };
+        switch (ret)
+        {
+        case 'Z': case 'C': case 'F': case 'D': case 'B': case 'S':
+        case 'I': case 'J': case 'L': case '[': case 'V':
+            return vmhook::detail::sig_char_to_basic_type(ret);
+        default:
+            return 14; // T_VOID — unknown return degrades safely
+        }
+    }
+
+    // Width helper over a single byte, via a length-1 view of a real one-byte
+    // buffer.  Keeps the size==1 invariant the helper requires.
+    inline auto width_of_byte(int byte_value) -> std::size_t
+    {
+        const char one[1]{ static_cast<char>(byte_value) };
+        return vmhook::detail::jvm_primitive_byte_width(std::string_view{ one, 1 });
+    }
+
+    // FRESH ctor-fold reconstruction (distinct name from ctor_signature_of):
+    // "(" + concat(jni_signature_for_arg<decay<args>>()...) + ")V".
+    template<typename... args_t>
+    inline auto build_ctor_sig() -> std::string
+    {
+        std::string out{ "(" };
+        ((out += vmhook::detail::jni_signature_for_arg<std::remove_cvref_t<args_t>>()), ...);
+        out += ")V";
+        return out;
+    }
+
+    inline auto run() -> void
+    {
+        // ---- ends-in-')' BOUNDARY (rparen+1 == size) ------------------------
+        // The historical raw read would index sig[size()] (UB on string_view);
+        // the guarded read takes the 'V' branch -> T_VOID(14) with NO
+        // out-of-bounds access.  Drive the guarded mirror over a spread of
+        // "chopped return" signatures and pin the safe void result.  Every
+        // expected value is 14 by the bounds branch of vmhook.hpp:17216-17230.
+        {
+            const char* chopped[]{
+                "()", "(I)", "(IJ)", "(JD)", "(Z)", "([I)", "([[I)",
+                "(Ljava/lang/String;)", "([Ljava/lang/Object;)", "(()())", ")",
+            };
+            bool every_chopped_void{ true };
+            for (const char* s : chopped)
+            {
+                if (guarded_return_basic(s) != 14) { every_chopped_void = false; }
+            }
+            check("wave21_ends_in_rparen_boundary_all_void_14", every_chopped_void);
+        }
+        // The single-char ")" signature: rparen==0, size()==1, 0+1==1 is NOT
+        // < 1, so the guard takes 'V' -> 14 and never reads index 1.
+        check("wave21_lone_rparen_is_void_14_no_read",
+              guarded_return_basic(")") == 14);
+        // A well-formed signature whose ')' is NOT final is unaffected by the
+        // bounds guard: the raw and guarded ladders agree on the real return.
+        check("wave21_nonfinal_rparen_raw_and_guarded_agree_int",
+              raw_return_basic("(I)I") == 10 && guarded_return_basic("(I)I") == 10);
+
+        // ---- UNKNOWN return policy: raw T_OBJECT(12) vs guarded T_VOID(14) --
+        // Pin BOTH ladders on the SAME unknown inputs so the divergence (raw
+        // classifier default 12 vs guarded allow-list 14) is explicit; any
+        // change to either policy fails loudly.  raw values from the default
+        // arm at vmhook.hpp:16230; guarded values from the allow-list default.
+        check("wave21_unknown_Q_raw_12_guarded_14",
+              raw_return_basic("(I)Q") == 12 && guarded_return_basic("(I)Q") == 14);
+        check("wave21_unknown_lower_i_raw_12_guarded_14",
+              raw_return_basic("(I)i") == 12 && guarded_return_basic("(I)i") == 14);
+        check("wave21_unknown_digit_raw_12_guarded_14",
+              raw_return_basic("()9") == 12 && guarded_return_basic("()9") == 14);
+        // A genuine object return 'L' is allow-listed, so BOTH ladders give 12
+        // for it — only UNKNOWN letters diverge.  Pin that valid object returns
+        // are not collateral damage of the unknown->void policy.
+        check("wave21_valid_object_L_both_ladders_12",
+              raw_return_basic("(I)Ljava/lang/String;") == 12
+              && guarded_return_basic("(I)Ljava/lang/String;") == 12);
+
+        // ---- sig_char_to_basic_type: total 0..255 sweep + signed-char domain
+        // Re-walk the whole byte range against a fresh oracle, AND additionally
+        // walk the SIGNED interpretation -128..127 (the values a signed `char`
+        // actually presents on MSVC/MinGW) to prove the switch routes negative
+        // ints to `default` -> 12 with no signed-char surprise.  Oracle derived
+        // from vmhook.hpp:16219-16230.
+        {
+            auto oracle = [](int b) -> int
+            {
+                switch (b)
+                {
+                case 'Z': return 4;  case 'C': return 5;  case 'F': return 6;
+                case 'D': return 7;  case 'B': return 8;  case 'S': return 9;
+                case 'I': return 10; case 'J': return 11; case 'L': return 12;
+                case '[': return 13; case 'V': return 14; default: return 12;
+                }
+            };
+            bool unsigned_domain_ok{ true };
+            for (int b{ 0 }; b <= 0xFF; ++b)
+            {
+                if (vmhook::detail::sig_char_to_basic_type(static_cast<char>(b)) != oracle(b))
+                {
+                    unsigned_domain_ok = false;
+                }
+            }
+            check("wave21_sig_char_full_0_255_sweep_matches_oracle", unsigned_domain_ok);
+            // Signed-char domain: iterate the signed range and reconstruct the
+            // byte each value denotes (negative -> +256) for the oracle.  The
+            // helper takes a plain `char`, so this exercises exactly the bit
+            // pattern a signed char carries for high bytes.
+            bool signed_domain_ok{ true };
+            for (int sv{ -128 }; sv <= 127; ++sv)
+            {
+                const char c{ static_cast<char>(sv) };
+                const int as_byte{ sv < 0 ? sv + 256 : sv };
+                if (vmhook::detail::sig_char_to_basic_type(c) != oracle(as_byte))
+                {
+                    signed_domain_ok = false;
+                }
+            }
+            check("wave21_sig_char_signed_domain_neg128_to_127_no_surprise", signed_domain_ok);
+            // Every byte with the high bit set (0x80..0xFF) — the ones that
+            // arrive negative under a signed `char` — must be the T_OBJECT
+            // default; none of the 11 recognised letters is a high byte.
+            bool all_high_default{ true };
+            for (int b{ 0x80 }; b <= 0xFF; ++b)
+            {
+                if (vmhook::detail::sig_char_to_basic_type(static_cast<char>(b)) != 12)
+                {
+                    all_high_default = false;
+                }
+            }
+            check("wave21_sig_char_every_high_byte_is_object_12", all_high_default);
+        }
+
+        // ---- jvm_primitive_byte_width: adversarial inputs, one table --------
+        // Whitespace-padded letters (size 2 -> 0), an embedded-NUL view (the
+        // NUL does not shorten string_view; size 2 -> 0), a single high byte
+        // (size 1 but not a primitive letter -> 0), and the empty/default
+        // views.  All values 0 by the size!=1 gate or the default arm of
+        // vmhook.hpp:16253-16263.  The 0xFF byte is built into a real buffer.
+        {
+            const char hi[1]{ static_cast<char>(0xFF) };
+            const char i_nul[2]{ 'I', '\0' };
+            const char nul_i[2]{ '\0', 'I' };
+            struct zero_case { std::string_view sig; const char* name; };
+            const zero_case zeros[]{
+                { std::string_view{ " I" },          "wave21_width_space_then_I_is_0" },
+                { std::string_view{ "I " },          "wave21_width_I_then_space_is_0" },
+                { std::string_view{ "\tI" },         "wave21_width_tab_then_I_is_0" },
+                { std::string_view{ i_nul, 2 },      "wave21_width_I_then_nul_size2_is_0" },
+                { std::string_view{ nul_i, 2 },      "wave21_width_nul_then_I_size2_is_0" },
+                { std::string_view{ hi, 1 },         "wave21_width_single_high_byte_0xFF_is_0" },
+                { std::string_view{},                "wave21_width_default_view_is_0" },
+                { std::string_view{ "II" },          "wave21_width_double_I_is_0" },
+            };
+            for (const zero_case& z : zeros)
+            {
+                check(z.name, vmhook::detail::jvm_primitive_byte_width(z.sig) == 0);
+            }
+            // And the positive control: a bare valid letter still measures its
+            // width, so the table above is rejecting on LENGTH/content, not
+            // because the helper is broken.
+            check("wave21_width_bare_I_is_4_positive_control", width_of_byte('I') == 4);
+        }
+
+        // ---- jni_signature_for_arg: integral-width matrix, platform-gated ---
+        // long / long long / size_t / ptrdiff_t each route by their concrete
+        // typedef identity / sizeof; instantiate ONLY on the compilable arm so
+        // this is green on LP64 (long==int64_t->"J") and LLP64 (long==4->"I").
+        if constexpr (std::is_same_v<long, std::int64_t>)
+        {
+            check("wave21_long_is_J_LP64",
+                  vmhook::detail::jni_signature_for_arg<long>() == "J");
+        }
+        else if constexpr (std::is_integral_v<long> && sizeof(long) == 4)
+        {
+            check("wave21_long_is_I_LLP64",
+                  vmhook::detail::jni_signature_for_arg<long>() == "I");
+        }
+        if constexpr (std::is_same_v<unsigned long, std::uint64_t>)
+        {
+            check("wave21_ulong_is_J_LP64",
+                  vmhook::detail::jni_signature_for_arg<unsigned long>() == "J");
+        }
+        else if constexpr (std::is_integral_v<unsigned long> && sizeof(unsigned long) == 4)
+        {
+            check("wave21_ulong_is_I_LLP64",
+                  vmhook::detail::jni_signature_for_arg<unsigned long>() == "I");
+        }
+        if constexpr (std::is_same_v<long long, std::int64_t>)
+        {
+            check("wave21_long_long_is_J",
+                  vmhook::detail::jni_signature_for_arg<long long>() == "J");
+        }
+        if constexpr (std::is_same_v<unsigned long long, std::uint64_t>)
+        {
+            check("wave21_ulong_long_is_J",
+                  vmhook::detail::jni_signature_for_arg<unsigned long long>() == "J");
+        }
+        if constexpr (std::is_same_v<std::size_t, std::uint64_t>)
+        {
+            check("wave21_size_t_is_J_64bit",
+                  vmhook::detail::jni_signature_for_arg<std::size_t>() == "J");
+        }
+        else if constexpr (std::is_integral_v<std::size_t> && sizeof(std::size_t) == 4)
+        {
+            check("wave21_size_t_is_I_32bit",
+                  vmhook::detail::jni_signature_for_arg<std::size_t>() == "I");
+        }
+        if constexpr (std::is_same_v<std::ptrdiff_t, std::int64_t>)
+        {
+            check("wave21_ptrdiff_t_is_J_64bit",
+                  vmhook::detail::jni_signature_for_arg<std::ptrdiff_t>() == "J");
+        }
+        else if constexpr (std::is_integral_v<std::ptrdiff_t> && sizeof(std::ptrdiff_t) == 4)
+        {
+            check("wave21_ptrdiff_t_is_I_32bit",
+                  vmhook::detail::jni_signature_for_arg<std::ptrdiff_t>() == "I");
+        }
+
+        // char16_t and char32_t: char16_t hits the char-branch -> "C"; char32_t
+        // is a 4-byte integral that is NOT uint16_t/char16_t -> generic "I".
+        // Both compile on every target (no static_assert arm).  Values from
+        // vmhook.hpp:13014 (C) and :13036 (I).
+        check("wave21_char16_t_is_C",
+              vmhook::detail::jni_signature_for_arg<char16_t>() == "C");
+        check("wave21_char32_t_is_I",
+              vmhook::detail::jni_signature_for_arg<char32_t>() == "I");
+        static_assert(!std::is_same_v<std::decay_t<char32_t>, std::uint16_t>,
+                      "char32_t must not alias uint16_t");
+        // wchar_t: 4-byte (Linux/macOS) -> "I"; 2-byte (Windows) -> the generic
+        // sizeof==2 branch -> "S".  Both arms compile; gate on the width so the
+        // expected token is the one the ladder dictates here.
+        if constexpr (std::is_integral_v<wchar_t> && sizeof(wchar_t) == 4)
+        {
+            check("wave21_wchar_t_4byte_is_I",
+                  vmhook::detail::jni_signature_for_arg<wchar_t>() == "I");
+        }
+        else if constexpr (std::is_integral_v<wchar_t> && sizeof(wchar_t) == 2)
+        {
+            check("wave21_wchar_t_2byte_is_S",
+                  vmhook::detail::jni_signature_for_arg<wchar_t>() == "S");
+        }
+
+        // ---- enum class does NOT satisfy is_integral_v -> static_assert arm --
+        // A scoped `enum class : int` and an unscoped `enum : long` are NOT
+        // integral, NOT object_base-derived, and NOT unique_ptr — so the ONLY
+        // jni_signature_for_arg branch left for them is the hard static_assert
+        // (a compile error), which is exactly why instantiating the helper on
+        // them is forbidden.  Pin the routing properties (cannot probe a
+        // static_assert at runtime).
+        {
+            enum class scoped_e : int { lo, hi };
+            enum unscoped_e : long { a, b };
+            check("wave21_enum_class_not_integral", !std::is_integral_v<scoped_e>);
+            check("wave21_enum_unscoped_not_integral", !std::is_integral_v<unscoped_e>);
+            check("wave21_enum_class_not_object_base",
+                  !std::is_base_of_v<vmhook::object_base, scoped_e>);
+            check("wave21_enum_class_not_unique_ptr",
+                  !vmhook::detail::is_unique_ptr_v<scoped_e>);
+            // The discriminating contrast: an actual integral (int) DOES satisfy
+            // the trait that the enum fails, so it is the enum-ness, not some
+            // unrelated reason, that routes the enum to the assert.
+            check("wave21_int_is_integral_but_enum_is_not",
+                  std::is_integral_v<int> && !std::is_integral_v<scoped_e>);
+        }
+
+        // ---- full ctor-signature build: the named briefing shapes -----------
+        // "(IDLjava/lang/String;)V", the empty pack "()V", and the uint16->"C"
+        // single-arg "(C)V".  Built through the FRESH fold; expected values are
+        // the concatenation of the per-arg descriptors confirmed in source.
+        check("wave21_ctor_int_double_string_is_IDLString_V",
+              build_ctor_sig<int, double, std::string>() == "(IDLjava/lang/String;)V");
+        check("wave21_ctor_empty_pack_is_void",
+              build_ctor_sig<>() == "()V");
+        check("wave21_ctor_single_uint16_is_CV",
+              build_ctor_sig<std::uint16_t>() == "(C)V");
+        // cv/ref-qualified args decay to the same tokens (remove_cvref_t in the
+        // fold), so the const-ref pack matches the bare pack byte-for-byte.
+        check("wave21_ctor_cvref_pack_decays_like_bare",
+              build_ctor_sig<const int&, double&&, const std::string&>()
+                  == "(IDLjava/lang/String;)V");
+        // An all-eight-primitive pack in BasicType order Z B C S I J F D, so the
+        // uint16->C split is visible mid-stream end-to-end.
+        check("wave21_ctor_all_eight_primitives_ZBCSIJFD",
+              build_ctor_sig<bool, std::int8_t, std::uint16_t, std::int16_t,
+                             std::int32_t, std::int64_t, float, double>()
+                  == "(ZBCSIJFD)V");
+
+        // ---- signature_for_arg == jni_signature_for_arg parity --------------
+        // The public re-export forwards verbatim; pin byte-identical output over
+        // a spread spanning every branch family (String / Z / C-split / I / J /
+        // F / D) plus the char-type generic-ladder rows, so the two entry points
+        // cannot diverge on any branch.
+        {
+            const bool parity{
+                   vmhook::jni::signature_for_arg<std::string>()    == vmhook::detail::jni_signature_for_arg<std::string>()
+                && vmhook::jni::signature_for_arg<bool>()           == vmhook::detail::jni_signature_for_arg<bool>()
+                && vmhook::jni::signature_for_arg<std::uint16_t>()  == vmhook::detail::jni_signature_for_arg<std::uint16_t>()
+                && vmhook::jni::signature_for_arg<char16_t>()       == vmhook::detail::jni_signature_for_arg<char16_t>()
+                && vmhook::jni::signature_for_arg<char>()           == vmhook::detail::jni_signature_for_arg<char>()
+                && vmhook::jni::signature_for_arg<std::int32_t>()   == vmhook::detail::jni_signature_for_arg<std::int32_t>()
+                && vmhook::jni::signature_for_arg<std::int64_t>()   == vmhook::detail::jni_signature_for_arg<std::int64_t>()
+                && vmhook::jni::signature_for_arg<float>()          == vmhook::detail::jni_signature_for_arg<float>()
+                && vmhook::jni::signature_for_arg<double>()         == vmhook::detail::jni_signature_for_arg<double>() };
+            check("wave21_signature_for_arg_parity_across_all_branch_families", parity);
+        }
+        // And pin the concrete value through the PUBLIC entry on the two most
+        // surprising rows so a re-export drift is caught by value, not just by
+        // self-comparison: uint16->"C", char->"B".
+        check("wave21_public_export_uint16_value_is_C",
+              vmhook::jni::signature_for_arg<std::uint16_t>() == "C");
+        check("wave21_public_export_char_value_is_B",
+              vmhook::jni::signature_for_arg<char>() == "B");
+    }
+} // namespace wave21
+
 int main()
 {
     // ---- detail::sig_char_to_basic_type: HotSpot BasicType ints --------------
@@ -3298,6 +3676,11 @@ int main()
         check("decode_u5_byte_1_is_value_0_consume_1", r1.value == 0u && r1.consumed == 1);
         check("decode_u5_byte_64_is_value_63_consume_1", r64.value == 63u && r64.consumed == 1);
     }
+
+    // WAVE-21 additive section (boundary / signed-char sweep / adversarial
+    // widths / integral matrix / enum-not-integral / ctor build / re-export
+    // parity) — runs after all existing passes, touches no assertion above.
+    wave21::run();
 
     return failures == 0 ? 0 : 1;
 }

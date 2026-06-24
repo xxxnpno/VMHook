@@ -51,7 +51,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
-
+#include <type_traits>
 static int failures{ 0 };
 
 static auto check(const char* name, bool ok) -> void
@@ -2397,6 +2397,211 @@ static auto test_safe_read_wrapping_size_rejected() -> void
 
 } // namespace deepen_safe_read
 
+// ===========================================================================
+// ADDITIVE DEEPENING SECTION 3 (old_prot ROUND-TRIP-RESTORE caller pattern,
+// namespaced).  The body's old_prot tests pin the platform-asymmetric VALUE of
+// the out-param (Windows: genuine PAGE_* bitmask; POSIX: exactly 0) and the
+// null-old_prot success path, but they deliberately NEVER exercise the natural
+// caller pattern that consumes that value: "save old, do work, restore old".
+// This section encodes that pattern as a behavioural witness on REAL owned
+// allocate_rwx pages, proving:
+//   * WINDOWS — the saved old_prot is a faithful, reusable native PAGE_*: a
+//     trampoline-style caller can flip a page RW, write, then hand the SAVED
+//     value straight back to ::VirtualProtect and the page returns to its prior
+//     readable/protected state.  We feed the saved value back through the SAME
+//     kernel call protect() uses (VirtualProtect), confirming the round trip is
+//     genuinely usable, and verify readability via the fault-safe path.
+//   * POSIX — the saved old_prot is ALWAYS 0, which equals
+//     memory_protection::no_access if naively round-tripped through the enum.
+//     We pin that value AND demonstrate why the pattern is unsafe here: a caller
+//     that fed the saved 0 back as a memory_protection would request no_access
+//     and brick the page.  We NEVER actually do that to a live page; instead we
+//     assert static_cast<memory_protection>(saved) == no_access (pure value
+//     check, no kernel call) so the trap is encoded, and restore the page the
+//     ONLY portable-safe way (an explicit enum), proving the documented
+//     contract: "old_prot is meaningful for restore on Windows ONLY".
+// Everything operates on memory THIS section allocated; no fabricated address is
+// ever read, the Windows VirtualProtect feedback uses the page's own saved
+// flags, and every page is left writable before release.  No value_t-cast / no
+// vector-stringop / no narrowing / no raw NUL.  remove_cvref_t is used for the
+// element-type assertion over the saved-protection array.  Every const declared
+// here is referenced.
+// ===========================================================================
+namespace deepen_old_prot_roundtrip
+{
+
+// ---------------------------------------------------------------------------
+// The save -> work -> restore caller pattern, platform-correct.  On Windows the
+// saved old_prot is fed back to the kernel to restore; on POSIX it is asserted
+// to be 0 (== no_access) and the page is restored via the portable enum, which
+// is the only safe spelling.  This pins gap #2 from the coverage ledger: the
+// returned old_prot's USABILITY for restore, not merely its value.
+// ---------------------------------------------------------------------------
+static auto test_old_prot_save_work_restore_pattern() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deepen_oldprot_rt_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x3C;
+
+    // Establish a known prior protection (read-only) so "the previous flags" is
+    // a single, well-defined state before the caller flips the page writable.
+    const bool to_read{ vmhook::os::protect(block, page,
+                                            vmhook::os::memory_protection::read, nullptr) };
+    check("deepen_oldprot_rt_prior_state_established", to_read);
+
+    // The caller pattern: flip RW, capturing the prior protection into `saved`.
+    std::uint32_t saved{ 0u };
+    const bool to_rw{ vmhook::os::protect(block, page,
+                                          vmhook::os::memory_protection::read_write, &saved) };
+    check("deepen_oldprot_rt_flip_rw_succeeds", to_rw);
+
+    if (to_rw)
+    {
+        // Do "work" while writable: a store must stick.
+        bytes[0] = 0x4D;
+        check("deepen_oldprot_rt_work_store_sticks", bytes[0] == 0x4D);
+
+#if VMHOOK_OS_WINDOWS
+        // Windows: `saved` is the genuine prior native protection (PAGE_READONLY
+        // for the read state we set above).  It is non-zero and DIRECTLY
+        // reusable: feed it straight back to ::VirtualProtect — exactly the
+        // round-trip restore a trampoline installer performs — and the page
+        // returns to its prior protected state.
+        check("deepen_oldprot_rt_windows_saved_nonzero", saved != 0u);
+        DWORD prev_again{ 0 };
+        const BOOL restored{ ::VirtualProtect(block, page,
+                                              static_cast<DWORD>(saved), &prev_again) };
+        check("deepen_oldprot_rt_windows_restore_with_saved_succeeds", restored != 0);
+#if !VMHOOK_OS_IOS
+        if (restored != 0)
+        {
+            // Prior state was readable; after restoring with the saved flags the
+            // page is readable again (fault-safe probe).
+            check("deepen_oldprot_rt_windows_restored_state_readable",
+                  byte_is_readable(block));
+        }
+#endif
+#else
+        // POSIX: `saved` is ALWAYS 0 by contract.  Pin it.
+        check("deepen_oldprot_rt_posix_saved_is_zero", saved == 0u);
+        // The TRAP, encoded as a pure value check (no kernel call): a caller that
+        // naively round-tripped `saved` through the portable enum would get
+        // no_access and brick the page on restore.  We assert that equivalence
+        // to make the hazard explicit, then DO NOT perform it.
+        check("deepen_oldprot_rt_posix_saved_equals_no_access",
+              static_cast<vmhook::os::memory_protection>(saved)
+                  == vmhook::os::memory_protection::no_access);
+#endif
+    }
+
+    // Restore writable the portable-safe way regardless of platform, then verify.
+    check("deepen_oldprot_rt_restore_writable", make_writable(block, page));
+    bytes[0] = 0x5E;
+    check("deepen_oldprot_rt_writable_after", bytes[0] == 0x5E);
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// Across a chain of distinct prior protections, the saved old_prot is captured
+// per step and its element-type / per-platform value invariants are pinned over
+// a real array of saved values.  decltype(saved_values[i]) is a REFERENCE, so
+// the element-type assertion uses std::remove_cvref_t (NOT remove_cv_t).  On
+// Windows every saved value is a non-zero native PAGE_* (and the four read /
+// read_write / execute_read prior states yield distinct-or-equal native masks
+// that are all non-zero); on POSIX every saved value is exactly 0.  This widens
+// the single-pattern witness above into a per-step ledger without re-checking
+// the body's existing chain test (that one never inspects the saved array's
+// element type, nor demonstrates the restore-usability framing).
+// ---------------------------------------------------------------------------
+static auto test_old_prot_saved_values_array_invariants() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deepen_oldprot_arr_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x01;
+
+    // Prior states whose old_prot we capture as we transition AWAY from each.
+    // Avoids no_access and execute_rw so every step succeeds on every CI host.
+    const vmhook::os::memory_protection prior_states[]{
+        vmhook::os::memory_protection::read,
+        vmhook::os::memory_protection::read_write,
+        vmhook::os::memory_protection::execute_read,
+    };
+
+    std::uint32_t saved_values[3]{ 0u, 0u, 0u };
+
+    // The saved-array element type must be the plain 32-bit out-param type the
+    // protect() signature writes.  decltype on an indexed element is a reference,
+    // hence remove_cvref_t to strip the reference + cv before comparing.
+    static_assert(std::is_same_v<
+                      std::remove_cvref_t<decltype(saved_values[0])>,
+                      std::uint32_t>,
+                  "saved old_prot array element type must be std::uint32_t");
+
+    bool all_steps_ok{ true };
+    std::size_t idx{ 0 };
+    for (const auto prior : prior_states)
+    {
+        // Establish `prior`, then transition to read_write capturing old_prot.
+        if (!vmhook::os::protect(block, page, prior, nullptr))
+        {
+            all_steps_ok = false;
+            continue;
+        }
+        if (!vmhook::os::protect(block, page,
+                                 vmhook::os::memory_protection::read_write,
+                                 &saved_values[idx]))
+        {
+            all_steps_ok = false;
+        }
+        ++idx;
+    }
+    check("deepen_oldprot_arr_all_steps_succeed", all_steps_ok);
+
+    bool platform_values_ok{ true };
+    for (const std::uint32_t sv : saved_values)
+    {
+#if VMHOOK_OS_WINDOWS
+        // Genuine prior PAGE_* — never zero.
+        if (sv == 0u)
+        {
+            platform_values_ok = false;
+        }
+#else
+        // POSIX contract: always exactly 0.
+        if (sv != 0u)
+        {
+            platform_values_ok = false;
+        }
+#endif
+    }
+#if VMHOOK_OS_WINDOWS
+    check("deepen_oldprot_arr_windows_every_saved_nonzero", platform_values_ok);
+#else
+    check("deepen_oldprot_arr_posix_every_saved_zero", platform_values_ok);
+#endif
+
+    check("deepen_oldprot_arr_restore_writable", make_writable(block, page));
+    bytes[0] = 0x02;
+    check("deepen_oldprot_arr_writable_after", bytes[0] == 0x02);
+    vmhook::os::release(block, page);
+}
+
+} // namespace deepen_old_prot_roundtrip
+
 int main()
 {
     test_granularity_relationship();
@@ -2451,6 +2656,9 @@ int main()
     deepen_safe_read::test_safe_read_from_released_memory();
     deepen_safe_read::test_safe_read_repeated_fallback_stays_healthy();
 #endif
+
+    deepen_old_prot_roundtrip::test_old_prot_save_work_restore_pattern();
+    deepen_old_prot_roundtrip::test_old_prot_saved_values_array_invariants();
 
     if (failures == 0)
     {

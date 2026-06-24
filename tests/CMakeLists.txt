@@ -146,3 +146,4 @@ vmhook_add_test(klass_introspection_nojvm      SOURCES test_klass_introspection_
 vmhook_add_test(constantpool_access_nojvm      SOURCES test_constantpool_access_nojvm.cpp)
 vmhook_add_test(instanceklass_methods_walk_nojvm SOURCES test_instanceklass_methods_walk_nojvm.cpp)
 vmhook_add_test(hook_verify_repair_nojvm       SOURCES test_hook_verify_repair_nojvm.cpp)
+vmhook_add_test(dllmain_bootstrap_nojvm        SOURCES test_dllmain_bootstrap_nojvm.cpp)

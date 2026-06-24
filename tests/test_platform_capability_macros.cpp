@@ -1720,5 +1720,186 @@ int main()
         }
     }
 
+    // =======================================================================
+    // ADDITIVE WAVE 4: source-derived surfaces NOT pinned by waves 1-3.  Pure
+    // compile-time / value logic only -- no memory is ever dereferenced.  Every
+    // expected value is traced directly from vmhook/ext/vmhook/vmhook.hpp cited
+    // inline.  Distinct names (suffix "_w4"); strictly additive, no existing
+    // assertion touched.
+    // =======================================================================
+    {
+        // -- (1) data_breakpoint_kind code STRUCTURE (vmhook.hpp:1210-1214) -----
+        // write=0b01, read_write=0b11.  Source-derived structure not yet pinned:
+        // read_write == write WITH the "read" bit (0b10) added, i.e. read_write
+        // equals (write | 0b10), and write is exactly the low "writes" bit alone.
+        // Both codes are <= 0b11 (fit the 2-bit DR7 R/W field) and execute(0b00)
+        // is deliberately absent.
+        {
+            using vmhook::os::data_breakpoint_kind;
+            const std::uint8_t kw{ static_cast<std::uint8_t>(data_breakpoint_kind::write) };
+            const std::uint8_t krw{ static_cast<std::uint8_t>(data_breakpoint_kind::read_write) };
+            check("dr_kind_read_write_is_write_plus_read_bit_w4",
+                  krw == static_cast<std::uint8_t>(kw | 0b10u));
+            check("dr_kind_write_is_low_bit_only_w4", kw == 0b01u);
+            check("dr_kind_codes_fit_two_bit_field_w4",
+                  (kw & ~0b11u) == 0u && (krw & ~0b11u) == 0u);
+            // Neither code is the absent execute encoding 0b00.
+            check("dr_kind_codes_exclude_execute_zero_w4", kw != 0u && krw != 0u);
+        }
+
+        // -- (2) data_breakpoint_length code <-> guarded BYTE-WIDTH bijection ---
+        // The Intel-SDM LEN encoding is intentionally non-monotonic
+        // (one_byte=0b00, two_bytes=0b01, eight_bytes=0b10, four_bytes=0b11,
+        // vmhook.hpp:1219-1225).  Map each enumerator to the byte width it guards
+        // and assert the code->width function is exactly the SDM table -- a
+        // width-swap (two_bytes<->four_bytes) would break this even though both
+        // remain valid 2-bit codes.  Pure compile-time arithmetic.
+        {
+            using vmhook::os::data_breakpoint_length;
+            struct row { data_breakpoint_length len; std::uint8_t code; std::size_t width; };
+            const row table[]{
+                { data_breakpoint_length::one_byte,    0b00u, 1u },
+                { data_breakpoint_length::two_bytes,   0b01u, 2u },
+                { data_breakpoint_length::eight_bytes, 0b10u, 8u },
+                { data_breakpoint_length::four_bytes,  0b11u, 4u },
+            };
+            bool table_matches{ true };
+            std::size_t width_product{ 1u };
+            for (const row& r : table)
+            {
+                if (static_cast<std::uint8_t>(r.len) != r.code) { table_matches = false; }
+                width_product *= r.width;
+            }
+            check("dr_length_code_to_byte_width_table_w4", table_matches);
+            // The four guarded widths are exactly {1,2,4,8}: their product is 64
+            // (1*2*4*8) -- an independent witness that no width is duplicated or
+            // wrong (any swap within {1,2,4,8} keeps the product; a wrong width
+            // changes it).
+            check("dr_length_guarded_widths_product_is_64_w4", width_product == 64u);
+            // The non-monotonic property made explicit: the numeric CODE order
+            // (0,1,2,3) does NOT match ascending byte width -- code 0b10 guards 8
+            // bytes while the larger code 0b11 guards only 4.  Pin that inversion.
+            check("dr_length_encoding_is_non_monotonic_w4",
+                  static_cast<std::uint8_t>(data_breakpoint_length::eight_bytes)
+                      < static_cast<std::uint8_t>(data_breakpoint_length::four_bytes));
+        }
+
+        // -- (3) is_valid_pointer: ALIGNMENT gate rejects EVERY odd in-range
+        // value, independent of the low32 sentinel switch (vmhook.hpp:2059).
+        // Sweep a handful of odd, in-range, NON-sentinel low32 values: all must
+        // be rejected purely by (addr & 1).  Pure value inspection -- the
+        // function never reads through the pointer.
+        {
+            namespace hs4 = vmhook::hotspot;
+            const std::uintptr_t odd_in_range[]{
+                0x00010001ull, 0x00020003ull, 0x12345679ull, 0x00007FFE0000DDDFull };
+            bool all_odd_rejected{ true };
+            for (const std::uintptr_t a : odd_in_range)
+            {
+                if (hs4::is_valid_pointer(reinterpret_cast<const void*>(a)) != false)
+                {
+                    all_odd_rejected = false;
+                }
+            }
+            check("ivp_every_odd_in_range_rejected_w4", all_odd_rejected);
+            // The even counterpart of each (clear bit 0) is in range, non-sentinel
+            // -> ACCEPTED, isolating the low bit as the sole reason.
+            bool all_even_accepted{ true };
+            for (const std::uintptr_t a : odd_in_range)
+            {
+                if (hs4::is_valid_pointer(reinterpret_cast<const void*>(a & ~std::uintptr_t{ 1 })) != true)
+                {
+                    all_even_accepted = false;
+                }
+            }
+            check("ivp_even_counterparts_accepted_w4", all_even_accepted);
+        }
+
+        // -- (4) memory_protection: bound and width consistency ----------------
+        // Wave 1 pinned the ordinals/distinctness; here pin that EVERY value fits
+        // in its uint32 underlying type and that the maximum value (execute_rw=4)
+        // needs only 3 bits -- so the whole enum lives in the low byte, no value
+        // ever needs the high bits the OS-protection mapping table does not index.
+        {
+            using mp = vmhook::os::memory_protection;
+            const std::uint32_t values[]{
+                static_cast<std::uint32_t>(mp::no_access),
+                static_cast<std::uint32_t>(mp::read),
+                static_cast<std::uint32_t>(mp::read_write),
+                static_cast<std::uint32_t>(mp::execute_read),
+                static_cast<std::uint32_t>(mp::execute_rw) };
+            std::uint32_t max_val{ 0 };
+            for (const std::uint32_t v : values) { if (v > max_val) { max_val = v; } }
+            check("memory_protection_max_value_is_4_w4", max_val == 4u);
+            // All five fit in the low byte (< 256) -- no value escapes the
+            // single-byte index space the protection lookup uses.
+            bool all_in_low_byte{ true };
+            for (const std::uint32_t v : values) { if (v >= 256u) { all_in_low_byte = false; } }
+            check("memory_protection_values_fit_low_byte_w4", all_in_low_byte);
+        }
+
+        // -- (5) build_dr7: read_write/one_byte popcount is 3 (gated) ----------
+        // Complements wave-2's write/one_byte popcount==2: a read_write watch
+        // sets BOTH R/W bits (0b11 at 16+4*slot) plus the L-enable bit, and a
+        // one_byte LEN adds zero bits (0b00), so exactly THREE bits are set for
+        // every slot.  Independent witness that the R/W field width is 2, not 1.
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+        {
+            using vmhook::os::data_breakpoint_kind;
+            using vmhook::os::data_breakpoint_length;
+            bool popcount3_ok{ true };
+            for (int slot{ 0 }; slot < 4; ++slot)
+            {
+                std::uint64_t v{ vmhook::os::detail_dr::build_dr7(
+                    slot, data_breakpoint_kind::read_write,
+                    data_breakpoint_length::one_byte) };
+                int bits{ 0 };
+                while (v) { v &= (v - 1); ++bits; }
+                if (bits != 3) { popcount3_ok = false; }
+            }
+            check("build_dr7_read_write_one_byte_popcount_is_3_w4", popcount3_ok);
+            // And the L-enable bit is the LOWEST set bit for every slot's
+            // write/one_byte word (bit 2*slot < 16, below the R/W field) -- pins
+            // that the enable bit and the field bits never reorder.
+            bool enable_is_lowest{ true };
+            for (int slot{ 0 }; slot < 4; ++slot)
+            {
+                const std::uint64_t v{ vmhook::os::detail_dr::build_dr7(
+                    slot, data_breakpoint_kind::write,
+                    data_breakpoint_length::one_byte) };
+                // lowest set bit == enable bit (2*slot).
+                const std::uint64_t lowest{ v & (~v + 1) };
+                if (lowest != (std::uint64_t{ 1 } << (slot * 2))) { enable_is_lowest = false; }
+            }
+            check("build_dr7_enable_is_lowest_set_bit_w4", enable_is_lowest);
+        }
+#endif
+
+        // -- (6) page geometry: granularity is a power-of-two multiple of page,
+        // and the quotient is itself a power of two (vmhook.hpp os layer) -------
+        // Wave 1 pinned remainder==0 and (POSIX) equality; wave 3 pinned the
+        // quotient >= 1.  Here pin that the quotient (granularity / page_size) is
+        // a power of two -- true on every supported host (POSIX: quotient 1;
+        // Windows: 64K/4K = 16, a power of two).  Pure host-property arithmetic.
+        {
+            const std::size_t ps4{ vmhook::os::page_size() };
+            const std::size_t gran4{ vmhook::os::allocation_granularity() };
+            const std::size_t quotient{ (ps4 != 0) ? (gran4 / ps4) : 0u };
+            check("granularity_quotient_is_power_of_two_w4",
+                  ps4 != 0 && (gran4 % ps4) == 0
+                      && quotient != 0 && (quotient & (quotient - 1)) == 0);
+            // On POSIX the quotient is exactly 1 (granularity forwards to
+            // page_size, vmhook.hpp os layer); pin the stronger equality through
+            // the quotient form, complementing wave 1's gran==ps.
+#if VMHOOK_OS_POSIX
+            check("posix_granularity_quotient_is_one_w4", quotient == 1u);
+#else
+            // On Windows the quotient is >= 1 and a power of two (already pinned
+            // above); restate the multiple relation through the quotient form.
+            check("windows_granularity_quotient_at_least_one_w4", quotient >= 1u);
+#endif
+        }
+    }
+
     return failures == 0 ? 0 : 1;
 }

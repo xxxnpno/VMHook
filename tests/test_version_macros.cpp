@@ -683,6 +683,131 @@ static_assert(vm_deepen3::lex_cmp("0.6.0", "0.5.9") > 0, "lex_cmp orders minor d
 static_assert(vm_deepen3::lex_cmp(VMHOOK_VERSION_STRING, "0.5.3") == 0,
               "live VMHOOK_VERSION_STRING is lexically exactly \"0.5.3\"");
 
+// ===========================================================================
+// FOURTH DEEPENING SECTION (additive, namespaced).  Closes the EXACT remaining
+// OPEN gaps the coverage ledger names for version_macros that no block above
+// pins as its own distinct angle: (G1) the int-overflow CEILING at the FIRST
+// overflowing major -- the file pins 2147 (representable) and notes 2147.999.999
+// via the oracle, but never pins that MAKE(2148,0,0) would land at 2'148'000'000
+// > INT_MAX, i.e. the first whole major the int-arithmetic macro CANNOT hold
+// (flaw #1); (G2) a COMPILE-TIME reparse of VMHOOK_VERSION_STRING's digits back
+// to the packed integer (the existing reparse is runtime std::stoi -- this is a
+// constexpr twin that ties the stringize path to the pack at the compiler);
+// (G3) a SIMULATED second-translation-unit idempotence proof -- a real two-TU
+// harness needs a CMake change (out of scope: EDIT ONLY this file / don't run
+// cmake), so an isolated anonymous-namespace reader re-reads the four tokens
+// through a separate function and must agree with the file-scope view, the
+// in-TU analogue of a second TU's independent macro expansion.  All expected
+// values are from vmhook.hpp:67-82 (MAJOR=0, MINOR=5, PATCH=3; pack
+// major*1e6 + minor*1e3 + patch; two-level stringize -> "0.5.3").  PURE
+// preprocessor + integer arithmetic + constexpr char math: no JVM, no memory
+// reads, no fabricated pointers, no value_t casts, no narrowing.
+// ===========================================================================
+namespace
+{
+    // 64-bit oracle (independent of the macro) so the ceiling proof below is
+    // computed without ever invoking VMHOOK_MAKE_VERSION on an out-of-range
+    // major -- the macro's bare `int` literals would make 2148*1000000 overflow
+    // (UB in a constant expression -> hard compile error), which is precisely
+    // the cap being documented; the oracle stays in `long long`.
+    constexpr long long vm_tu_oracle(long long major, long long minor, long long patch)
+    {
+        return (major * 1000000LL) + (minor * 1000LL) + patch;
+    }
+
+    // (G2 helper) Parse a "M.m.p" string literal back to its packed integer at
+    // COMPILE time.  Single-digit fields only is NOT assumed -- this accumulates
+    // multi-digit numbers per field -- so it stays correct if a future bump makes
+    // a field two or three digits.  Used purely to cross-check the live string.
+    constexpr long long vm_tu_parse_packed(const char* s)
+    {
+        long long fields[3]{ 0, 0, 0 };
+        int        field{ 0 };
+        for (std::size_t i{ 0 }; s[i] != '\0'; ++i)
+        {
+            const char c{ s[i] };
+            if (c == '.')
+            {
+                ++field;
+                continue;
+            }
+            // digits only by construction (the string is "0.5.3"); fold in.
+            fields[field] = fields[field] * 10 + static_cast<long long>(c - '0');
+        }
+        return (fields[0] * 1000000LL) + (fields[1] * 1000LL) + fields[2];
+    }
+
+    // (G3 helper) An isolated reader of the four version tokens, compiled in its
+    // own anonymous-namespace function -- the in-TU stand-in for a SECOND
+    // translation unit's independent expansion of the (object-like) macros.
+    struct vm_tu_view
+    {
+        int  major;
+        int  minor;
+        int  patch;
+        long packed;
+    };
+    constexpr vm_tu_view vm_tu_read_tokens()
+    {
+        return vm_tu_view{ VMHOOK_VERSION_MAJOR,
+                           VMHOOK_VERSION_MINOR,
+                           VMHOOK_VERSION_PATCH,
+                           VMHOOK_VERSION };
+    }
+}
+
+// (G1) Int-overflow CEILING: the highest representable major is 2147 (packs to
+// 2'147'000'000 < INT_MAX 2'147'483'647); the FIRST whole major that overflows
+// a signed 32-bit int is 2148 (packs to 2'148'000'000 > INT_MAX).  Proven with
+// the long-long oracle so the assertion itself never triggers the very UB it
+// documents.  Locks the cap so a future widen to `long` is test-visible (flaw #1).
+static_assert(vm_tu_oracle(2147, 0, 0) == 2147000000LL,
+              "MAKE(2147,0,0) is the top in-range major pack");
+static_assert(vm_tu_oracle(2147, 0, 0) <= 2147483647LL,
+              "MAKE(2147,0,0) still fits a signed 32-bit int");
+static_assert(vm_tu_oracle(2148, 0, 0) == 2148000000LL,
+              "MAKE(2148,0,0) would pack to 2'148'000'000");
+static_assert(vm_tu_oracle(2148, 0, 0) > 2147483647LL,
+              "MAKE(2148,0,0) overflows a signed 32-bit int -- the first major the "
+              "int-arithmetic macro cannot represent (flaw #1 ceiling)");
+
+// (G2) COMPILE-TIME reparse of the live string back to the packed integer.  The
+// constexpr parser must reproduce VMHOOK_VERSION (5003) and the literal -- a
+// compiler-evaluated twin of the runtime std::stoi reparse in main().
+static_assert(vm_tu_parse_packed("0.5.3") == 5003,
+              "constexpr reparse of \"0.5.3\" must pack to 5003");
+static_assert(vm_tu_parse_packed(VMHOOK_VERSION_STRING) == VMHOOK_VERSION,
+              "reparsing the LIVE version string must reproduce VMHOOK_VERSION");
+static_assert(vm_tu_parse_packed(VMHOOK_VERSION_STRING)
+                  == VMHOOK_MAKE_VERSION(VMHOOK_VERSION_MAJOR,
+                                         VMHOOK_VERSION_MINOR,
+                                         VMHOOK_VERSION_PATCH),
+              "string reparse must equal MAKE(live components)");
+// The parser is multi-digit aware (would survive a two-digit field), proven on
+// synthetic dotted strings that the live single-digit string cannot exercise.
+static_assert(vm_tu_parse_packed("1.10.0") == 1010000,
+              "reparse folds a two-digit minor field correctly");
+static_assert(vm_tu_parse_packed("12.34.56") == 12034056,
+              "reparse folds multi-digit fields in every position");
+
+// (G3) SIMULATED second-TU idempotence: the isolated anonymous-namespace reader
+// must see the SAME four tokens as the file-scope view and as the live macros.
+// (A genuine second .cpp would need a CMake target edit, which is out of scope;
+// this is the in-TU analogue -- independent function-local expansion.)
+static_assert(vm_tu_read_tokens().major == VMHOOK_VERSION_MAJOR,
+              "isolated reader sees the same MAJOR (TU-independent macro)");
+static_assert(vm_tu_read_tokens().minor == VMHOOK_VERSION_MINOR,
+              "isolated reader sees the same MINOR (TU-independent macro)");
+static_assert(vm_tu_read_tokens().patch == VMHOOK_VERSION_PATCH,
+              "isolated reader sees the same PATCH (TU-independent macro)");
+static_assert(vm_tu_read_tokens().packed == VMHOOK_VERSION,
+              "isolated reader sees the same packed VMHOOK_VERSION");
+static_assert(vm_tu_read_tokens().packed
+                  == VMHOOK_MAKE_VERSION(vm_tu_read_tokens().major,
+                                         vm_tu_read_tokens().minor,
+                                         vm_tu_read_tokens().patch),
+              "the isolated view's own pack relation must hold (cross-TU stable)");
+
 int main()
 {
     // -----------------------------------------------------------------------
@@ -1457,6 +1582,46 @@ int main()
             if (version_text[4] != static_cast<char>('0' + v_patch)) { digit_map_ok = false; }
         }
         check("deepen3_live_string_digit_char_map", digit_map_ok);
+    }
+
+    // =======================================================================
+    // FOURTH DEEPENING RUNTIME SECTION (additive).  Runtime twins of the
+    // file-scope G-block with NO overlap of the first (R), second (S), or third
+    // (T) runtime blocks: the int-overflow ceiling proven via a runtime long-long
+    // oracle, the constexpr string reparse re-exercised at runtime, and the
+    // simulated second-TU view read at runtime.  Values from vmhook.hpp:67-82.
+    // =======================================================================
+    {
+        // (U1) Int-overflow ceiling at runtime: 2147 fits, 2148 does not.  Uses
+        // the long-long oracle so the runtime path never executes the int wrap
+        // it documents (flaw #1).  INT_MAX written as a literal to avoid <climits>.
+        const long long int_max{ 2147483647LL };
+        check("deepen4_major_2147_fits_int", vm_tu_oracle(2147, 0, 0) <= int_max);
+        check("deepen4_major_2148_overflows_int", vm_tu_oracle(2148, 0, 0) > int_max);
+        check("deepen4_major_2147_pack_value",
+              vm_tu_oracle(2147, 0, 0) == 2147000000LL);
+        check("deepen4_major_2148_pack_value",
+              vm_tu_oracle(2148, 0, 0) == 2148000000LL);
+
+        // (U2) Runtime string reparse: the live string folds back to VMHOOK_VERSION
+        // (compile-time twin is G2).  Cross-checks the stringize path against the
+        // pack through a digit-accumulating parser, not std::stoi.
+        check("deepen4_string_reparse_is_version",
+              vm_tu_parse_packed(VMHOOK_VERSION_STRING) == VMHOOK_VERSION);
+        check("deepen4_string_reparse_is_5003",
+              vm_tu_parse_packed(VMHOOK_VERSION_STRING) == 5003);
+
+        // (U3) Simulated second-TU view at runtime: the isolated reader's four
+        // tokens equal the live macros and the file-scope packed value.
+        const vm_tu_view view{ vm_tu_read_tokens() };
+        check("deepen4_tu_view_major_matches", view.major == VMHOOK_VERSION_MAJOR);
+        check("deepen4_tu_view_minor_matches", view.minor == VMHOOK_VERSION_MINOR);
+        check("deepen4_tu_view_patch_matches", view.patch == VMHOOK_VERSION_PATCH);
+        check("deepen4_tu_view_packed_matches", view.packed == VMHOOK_VERSION);
+        check("deepen4_tu_view_self_pack_relation",
+              view.packed == (static_cast<long>(view.major) * 1000000L)
+                           + (static_cast<long>(view.minor) * 1000L)
+                           + static_cast<long>(view.patch));
     }
 
     std::printf("\n%d checks failed\n", failures);

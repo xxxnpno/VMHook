@@ -3235,6 +3235,207 @@ static auto test_build_dr7_constexpr_oracle_matches_runtime() -> void
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// build_dr7 APPLIER ROUND-TRIP layer (additive — pure logic, Windows + x86_64).
+//
+// The _exhaustive / _deepening / constexpr-oracle suites prove build_dr7's
+// output is correct AND that every bit it sets is *contained* within
+// refresh_thread_drs's per-slot merge mask (angle 6).  What none of them does
+// is exercise the actual read-modify-write the applier performs:
+//
+//     ctx.Dr7 = (ctx.Dr7 & ~mask) | (dr7_bits & mask);   // refresh_thread_drs
+//     ctx.Dr7 &= ~mask;                                  // clear_thread_drs
+//
+// where  mask = (0b11 << slot*2) | (0xF << 16+slot*4)  is reproduced VERBATIM
+// from the header.  Containment is necessary but not sufficient: this layer
+// simulates the merge on a pure std::uint64_t register image (no CONTEXT, no
+// thread, no JVM) and asserts the STRONGER properties the live trap depends on:
+//
+//   * Arming slot N installs build_dr7(N,...)'s exact field bits, byte-for-byte
+//     (the masked-OR neither drops nor adds a bit vs. the raw build_dr7 value).
+//   * Arming slot N into a register that ALREADY holds slot M leaves M's bits
+//     completely untouched, and each slot's R/W & LEN are independently
+//     RE-EXTRACTABLE from the co-resident word (post-merge field recoverability
+//     — the round-trip refresh_thread_drs/clear_thread_drs actually rely on).
+//   * clear_thread_drs's inverse mask removes exactly slot N's bits and nothing
+//     of slot M's (disarm is the precise inverse of arm).
+//   * R/W and LEN are disjoint 2-bit neighbours: changing the kind never
+//     perturbs the LEN bits and changing the length never perturbs the R/W bits
+//     (a one-off shift between the adjacent fields would bleed across — neither
+//     field-placement test isolates this cross-field independence).
+//
+// All arithmetic is on owned `std::uint64_t` register images; nothing is
+// dereferenced.  Same capability gate as the rest of the suite.
+// ---------------------------------------------------------------------------
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+static auto test_build_dr7_applier_roundtrip() -> void
+{
+    using namespace vmhook::os;
+    using namespace vmhook::os::detail_dr;
+
+    struct kind_entry { data_breakpoint_kind k; std::uint64_t bits; };
+    struct len_entry  { data_breakpoint_length l; std::uint64_t bits; };
+
+    const std::array<kind_entry, 2> kinds{
+        kind_entry{ data_breakpoint_kind::write,      0b01ull },
+        kind_entry{ data_breakpoint_kind::read_write, 0b11ull } };
+    const std::array<len_entry, 4> lengths{
+        len_entry{ data_breakpoint_length::one_byte,    0b00ull },
+        len_entry{ data_breakpoint_length::two_bytes,   0b01ull },
+        len_entry{ data_breakpoint_length::eight_bytes, 0b10ull },
+        len_entry{ data_breakpoint_length::four_bytes,  0b11ull } };
+
+    // The per-slot merge mask, reproduced EXACTLY from refresh_thread_drs and
+    // clear_thread_drs in vmhook.hpp (slot_mask_local | slot_mask_rwlen).
+    const auto merge_mask{ [](int slot) -> std::uint64_t
+    {
+        return (std::uint64_t{ 0b11 } << (slot * 2))
+             | (std::uint64_t{ 0xF }  << (16 + slot * 4));
+    } };
+
+    // --- (A) ARM-FROM-ZERO IS LOSSLESS: merging build_dr7 into an all-zero
+    // register reproduces build_dr7's value exactly.  Since build_dr7's bits
+    // are all inside the mask (proven by the deepening suite), the masked-OR
+    // must be the identity here -- catches a future build_dr7 bit that escapes
+    // the applier mask by asserting equality, not just containment.
+    bool arm_from_zero_lossless{ true };
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        const std::uint64_t mask{ merge_mask(slot) };
+        for (const auto& ke : kinds)
+        {
+            for (const auto& le : lengths)
+            {
+                const std::uint64_t dr7_bits{ build_dr7(slot, ke.k, le.l) };
+                const std::uint64_t reg{ (std::uint64_t{ 0 } & ~mask)
+                                         | (dr7_bits & mask) };
+                if (reg != dr7_bits)
+                {
+                    arm_from_zero_lossless = false;
+                }
+            }
+        }
+    }
+    check("build_dr7_applier_arm_from_zero_is_lossless", arm_from_zero_lossless);
+
+    // --- (B) ARM ONE SLOT, PRESERVE THE OTHER + POST-MERGE RECOVERABILITY:
+    // pre-load the register with slot M (read_write/eight_bytes = max bits),
+    // then arm slot N (N != M) via the masked-OR.  M's bits must survive intact,
+    // N's exact build_dr7 bits must be present, and BOTH slots' R/W & LEN fields
+    // must be independently re-extractable from the co-resident word -- the
+    // property refresh_thread_drs relies on to not clobber a sibling slot.
+    bool merge_preserves_sibling{ true };
+    bool fields_recoverable_post_merge{ true };
+    for (int m{ 0 }; m < 4; ++m)
+    {
+        const std::uint64_t base{ build_dr7(m, data_breakpoint_kind::read_write,
+                                            data_breakpoint_length::eight_bytes) };
+        for (int n{ 0 }; n < 4; ++n)
+        {
+            if (n == m) { continue; }
+            const std::uint64_t mask_n{ merge_mask(n) };
+            for (const auto& ke : kinds)
+            {
+                for (const auto& le : lengths)
+                {
+                    const std::uint64_t armed_n{ build_dr7(n, ke.k, le.l) };
+                    const std::uint64_t reg{ (base & ~mask_n) | (armed_n & mask_n) };
+
+                    // Slot M's entire footprint is untouched.
+                    if ((reg & merge_mask(m)) != (base & merge_mask(m)))
+                    {
+                        merge_preserves_sibling = false;
+                    }
+                    // Slot N's footprint is exactly the freshly-armed bits.
+                    if ((reg & mask_n) != (armed_n & mask_n))
+                    {
+                        merge_preserves_sibling = false;
+                    }
+                    // Both slots' fields re-extract correctly from the merged word.
+                    const std::uint64_t n_rw { (reg >> (16 + n * 4)) & 0b11ull };
+                    const std::uint64_t n_len{ (reg >> (18 + n * 4)) & 0b11ull };
+                    const std::uint64_t m_rw { (reg >> (16 + m * 4)) & 0b11ull };
+                    const std::uint64_t m_len{ (reg >> (18 + m * 4)) & 0b11ull };
+                    if (n_rw != ke.bits || n_len != le.bits) { fields_recoverable_post_merge = false; }
+                    if (m_rw != 0b11ull || m_len != 0b10ull) { fields_recoverable_post_merge = false; }
+                    // Both local-enable bits are present together.
+                    if ((reg & (std::uint64_t{ 1 } << (n * 2))) == 0ull) { merge_preserves_sibling = false; }
+                    if ((reg & (std::uint64_t{ 1 } << (m * 2))) == 0ull) { merge_preserves_sibling = false; }
+                }
+            }
+        }
+    }
+    check("build_dr7_applier_merge_preserves_sibling_slot", merge_preserves_sibling);
+    check("build_dr7_applier_fields_recoverable_post_merge", fields_recoverable_post_merge);
+
+    // --- (C) DISARM IS THE PRECISE INVERSE OF ARM: with slots M and N both
+    // armed, clear_thread_drs's `reg &= ~mask_n` must zero slot N's footprint
+    // entirely while leaving slot M's bits exactly as they were.
+    bool disarm_clean{ true };
+    for (int m{ 0 }; m < 4; ++m)
+    {
+        const std::uint64_t armed_m{ build_dr7(m, data_breakpoint_kind::read_write,
+                                               data_breakpoint_length::eight_bytes) };
+        for (int n{ 0 }; n < 4; ++n)
+        {
+            if (n == m) { continue; }
+            const std::uint64_t mask_n{ merge_mask(n) };
+            const std::uint64_t armed_n{ build_dr7(n, data_breakpoint_kind::write,
+                                                   data_breakpoint_length::four_bytes) };
+            const std::uint64_t both{ armed_m | armed_n };
+            const std::uint64_t after_clear{ both & ~mask_n };
+            // Slot N's footprint is fully gone.
+            if ((after_clear & mask_n) != 0ull) { disarm_clean = false; }
+            // Slot M is byte-for-byte unchanged.
+            if ((after_clear & merge_mask(m)) != (armed_m & merge_mask(m))) { disarm_clean = false; }
+            // Re-arming N after the clear reproduces the both-armed register.
+            if (((after_clear & ~mask_n) | (armed_n & mask_n)) != both) { disarm_clean = false; }
+        }
+    }
+    check("build_dr7_applier_disarm_is_clean_inverse", disarm_clean);
+
+    // --- (D) R/W and LEN ARE INDEPENDENT NEIGHBOURING FIELDS: holding the slot
+    // and length fixed while toggling the kind must change ONLY the 2 R/W bits
+    // (16+slot*4), never the 2 LEN bits (18+slot*4); and symmetrically toggling
+    // the length must change ONLY the LEN bits.  A single off-by-one in either
+    // shift would let one field bleed into the other -- something the per-field
+    // placement tests cannot see because they vary one field at a time.
+    bool rw_isolated_from_len{ true };
+    bool len_isolated_from_rw{ true };
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        const std::uint64_t len_shift{ static_cast<std::uint64_t>(18 + slot * 4) };
+        const std::uint64_t rw_shift { static_cast<std::uint64_t>(16 + slot * 4) };
+        // Toggle kind, hold length: LEN field must be stable across kinds.
+        for (const auto& le : lengths)
+        {
+            const std::uint64_t a{ build_dr7(slot, data_breakpoint_kind::write,      le.l) };
+            const std::uint64_t b{ build_dr7(slot, data_breakpoint_kind::read_write, le.l) };
+            if (((a >> len_shift) & 0b11ull) != ((b >> len_shift) & 0b11ull))
+            {
+                rw_isolated_from_len = false;
+            }
+        }
+        // Toggle length, hold kind: R/W field must be stable across lengths.
+        for (const auto& ke : kinds)
+        {
+            std::uint64_t first_rw{ (build_dr7(slot, ke.k, data_breakpoint_length::one_byte)
+                                     >> rw_shift) & 0b11ull };
+            for (const auto& le : lengths)
+            {
+                const std::uint64_t v{ build_dr7(slot, ke.k, le.l) };
+                if (((v >> rw_shift) & 0b11ull) != first_rw)
+                {
+                    len_isolated_from_rw = false;
+                }
+            }
+        }
+    }
+    check("build_dr7_applier_rw_field_isolated_from_len", rw_isolated_from_len);
+    check("build_dr7_applier_len_field_isolated_from_rw", len_isolated_from_rw);
+}
+#endif
+
 int main()
 {
     test_version_macros();
@@ -3280,6 +3481,7 @@ int main()
     test_build_dr7_exhaustive();
     test_build_dr7_deepening();
     test_build_dr7_constexpr_oracle_matches_runtime();
+    test_build_dr7_applier_roundtrip();
 #endif
     test_factory_registry_roundtrip();
     test_jni_signature_for_arg_exhaustive();

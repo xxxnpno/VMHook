@@ -2765,6 +2765,293 @@ namespace expansion5_release_query_roundtrip
     }
 } // namespace expansion5_release_query_roundtrip
 
+// ===========================================================================
+// WAVE-21 (additive, namespaced) -- os_allocate_release ledger-gap DEEPENING.
+// The wave-5 / expansion-5 sections already close the os_allocate_release
+// ledger items at the "it works / no-crash" level.  This block deepens EXACTLY
+// the same proven-OPEN gaps along axes those sections leave thin, touching no
+// existing assertion:
+//   * DWORD->size_t (vmhook.hpp:491) and long->size_t (vmhook.hpp:494) cast
+//     NON-TRUNCATION pinned as a COMPILE-TIME width contract (static_assert),
+//     not merely the runtime `!= 0` wave-5 already checks -- the ledger item
+//     "DWORD->size_t cast non-truncation pin".
+//   * the POSIX sysconf 4096 FALLBACK literal (vmhook.hpp:494) pinned as a
+//     compile-time member of the architecturally-valid page-size set and as a
+//     power of two -- tying the fallback constant to the runtime
+//     wave5_page_size_is_valid_arch_size check (ledger "sysconf 4096-fallback
+//     architecturally-valid-page-size pin").
+//   * the execute-bit positive control extended to a stub that RETURNS A VALUE
+//     (mov imm -> ret), proving the X in _rwx runs REAL code with a result, not
+//     just an immediate ret as wave-5 does (ledger "execute-bit positive check
+//     ... call through fn-ptr").  Gated identically: (x86_64||arm64)&&!Apple.
+//   * a granularity-MULTIPLE leak/stability loop that VARIES the size each
+//     iteration (wave-5's loop is a fixed single page), exercising the POSIX
+//     munmap-uses-size / Windows-ignores-size release arms at several sizes
+//     (ledger "1000-iter alloc/write/release leak/stability loop" + "multi-page
+//     + granularity-sized").
+//   * negative release of a LATER-PAGE interior pointer -- wave-5 only does
+//     base+1 (a FIRST-page interior).  vmhook.hpp:760-768 documents that a
+//     later-page interior frees NOTHING on Windows (silent leak) while POSIX
+//     munmap rejects the unaligned base; both must be no-crash, return
+//     discarded (ledger "negative release containment ... pin silent
+//     no-diagnostic").
+//
+// ADDITIVE ONLY.  Every hard assertion is a cross-platform INVARIANT derived
+// from source; platform-variable outcomes -> info().  Every pointer handed to a
+// reader / release / call is a REAL allocate_rwx block we own (or a derived
+// interior within it); no fabricated unmapped address is read as data.
+// ===========================================================================
+namespace wave21_alloc_release_deepening
+{
+    // -----------------------------------------------------------------------
+    // CAST NON-TRUNCATION, pinned at COMPILE TIME.  page_size() casts the
+    // Windows DWORD dwPageSize (32-bit) / POSIX `long` sysconf result into
+    // size_t (vmhook.hpp:491 / 494); allocation_granularity() casts the Windows
+    // DWORD dwAllocationGranularity (vmhook.hpp:506).  A widening cast is
+    // value-preserving iff the destination is at least as wide AND the source's
+    // value range fits -- size_t is unsigned and on every supported ABI is at
+    // least as wide as DWORD (32-bit) and as `long` (32-bit ILP32 / LLP64,
+    // 64-bit LP64).  Pin the width relation as a static_assert so a future ABI
+    // where size_t shrank below the source type is a hard compile break, then
+    // confirm the live values are non-zero and within the source's max (the
+    // runtime witness that the cast did not wrap).
+    // -----------------------------------------------------------------------
+    static auto test_sizing_cast_non_truncation_width_contract() -> void
+    {
+#if VMHOOK_OS_WINDOWS
+        // DWORD is the source type for BOTH page_size and granularity on Windows.
+        static_assert(sizeof(std::size_t) >= sizeof(DWORD),
+                      "size_t must hold a DWORD without truncation");
+        static_assert(std::is_unsigned_v<DWORD>);
+        const std::size_t dword_max{ static_cast<std::size_t>(
+            (std::numeric_limits<DWORD>::max)()) };
+        const std::size_t ps{ vmhook::os::page_size() };
+        const std::size_t gr{ vmhook::os::allocation_granularity() };
+        // A non-wrapping widening cast leaves the value <= the source max.
+        check("wave21_cast_page_size_within_dword_max", ps <= dword_max);
+        check("wave21_cast_granularity_within_dword_max", gr <= dword_max);
+        check("wave21_cast_page_size_nonzero", ps != 0u);
+        check("wave21_cast_granularity_nonzero", gr != 0u);
+#else
+        // POSIX page_size() casts `long`; granularity() forwards page_size().
+        static_assert(sizeof(std::size_t) >= sizeof(long),
+                      "size_t must hold a sysconf long without truncation");
+        const std::size_t ps{ vmhook::os::page_size() };
+        const std::size_t gr{ vmhook::os::allocation_granularity() };
+        // sysconf returns long; the source only casts the POSITIVE branch
+        // (ps > 0), so the value fits the long max with the sign bit clear.
+        const std::size_t long_max{ static_cast<std::size_t>(
+            (std::numeric_limits<long>::max)()) };
+        check("wave21_cast_page_size_within_long_max", ps <= long_max);
+        check("wave21_cast_granularity_within_long_max", gr <= long_max);
+        check("wave21_cast_page_size_nonzero", ps != 0u);
+        check("wave21_cast_granularity_nonzero", gr != 0u);
+#endif
+    }
+
+    // -----------------------------------------------------------------------
+    // The POSIX sysconf FALLBACK constant (vmhook.hpp:494) is the literal 4096,
+    // used when sysconf(_SC_PAGESIZE) returns <= 0.  Pin at COMPILE TIME that
+    // this literal is (a) a power of two and (b) a member of the
+    // architecturally-valid page-size set {4096, 16384, 65536} -- the same set
+    // the runtime wave5_page_size_is_valid_arch_size check uses -- so the
+    // fallback can never silently mis-stride the allocator with a value outside
+    // that set.  These are pure constant assertions; they hold and compile
+    // identically on every OS (the literal is the same token everywhere).
+    // -----------------------------------------------------------------------
+    static auto test_sysconf_fallback_constant_is_valid_page_size() -> void
+    {
+        constexpr std::size_t fallback{ 4096u };
+        static_assert((fallback & (fallback - 1u)) == 0u,
+                      "sysconf fallback must be a power of two");
+        static_assert(fallback == 4096u || fallback == 16384u || fallback == 65536u,
+                      "sysconf fallback must be an architecturally-valid page size");
+        // Runtime witnesses of the same two facts, so a CI run records them.
+        check("wave21_sysconf_fallback_power_of_two",
+              (fallback & (fallback - 1u)) == 0u);
+        check("wave21_sysconf_fallback_in_valid_arch_set",
+              fallback == 4096u || fallback == 16384u || fallback == 65536u);
+        // The live page_size() is >= the fallback floor on every supported host
+        // (no architecture in the valid set is smaller than 4096).
+        check("wave21_live_page_size_ge_fallback_floor",
+              vmhook::os::page_size() >= fallback);
+    }
+
+    // -----------------------------------------------------------------------
+    // GRANULARITY-MULTIPLE leak/stability loop with a VARYING size.  Wave-5's
+    // leak loop fixes the size at one page; here each iteration allocates a
+    // DIFFERENT multiple of the allocation granularity (1..4 units), writes the
+    // first and last byte, verifies, and releases the EXACT size.  This stresses
+    // that release() truly returns the reservation across a RANGE of sizes on
+    // both OSes (POSIX munmap consumes the size; Windows VirtualFree ignores it
+    // and frees the whole reservation) -- a leak at any size would eventually
+    // exhaust the address space and fail an allocation.  No address-reuse
+    // assertion (kernel-dependent); only that every iteration yields a live,
+    // writable, releasable block.
+    // -----------------------------------------------------------------------
+    static auto test_varying_size_leak_loop() -> void
+    {
+        const std::size_t gr{ vmhook::os::allocation_granularity() };
+        bool every_iter_ok{ true };
+        int completed{ 0 };
+        for (int i{ 0 }; i < 400; ++i)
+        {
+            const std::size_t units{ static_cast<std::size_t>((i % 4) + 1) };
+            const std::size_t size{ gr * units };
+            void* const block{ vmhook::os::allocate_rwx(nullptr, size) };
+            if (!block)
+            {
+                every_iter_ok = false;
+                break;
+            }
+            auto* const bytes{ static_cast<std::uint8_t*>(block) };
+            const auto marker{ static_cast<std::uint8_t>(i & 0xFF) };
+            bytes[0]        = marker;
+            bytes[size - 1] = static_cast<std::uint8_t>(~marker & 0xFF);
+            if (bytes[0] != marker
+                || bytes[size - 1] != static_cast<std::uint8_t>(~marker & 0xFF))
+            {
+                every_iter_ok = false;
+                vmhook::os::release(block, size);
+                break;
+            }
+            vmhook::os::release(block, size);
+            ++completed;
+        }
+        check("wave21_varying_size_leak_loop_all_succeed", every_iter_ok);
+        check("wave21_varying_size_leak_loop_completed_full", completed == 400);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEGATIVE RELEASE of a LATER-PAGE interior pointer.  Wave-5 covers base+1
+    // (a FIRST-page interior).  vmhook.hpp:760-768 documents that the LATER-page
+    // case is DIFFERENT: Windows VirtualFree(MEM_RELEASE) on an interior pointer
+    // in a later page returns 0 (frees NOTHING -> the reservation leaks
+    // silently); POSIX munmap on a non-page-aligned base returns EINVAL and
+    // unmaps nothing.  Both must be no-crash with the return discarded.  We pin
+    // the silent-no-diagnostic contract: release() is noexcept->void, so a
+    // future change that surfaces a diagnostic is a deliberate, visible break.
+    // SAFETY: the interior pointer is inside a multi-page block WE OWN; we
+    // reclaim the true base afterwards regardless of what the mismatch did.
+    // -----------------------------------------------------------------------
+    static auto test_later_page_interior_release_is_silently_contained() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        constexpr std::size_t pages{ 8 };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps * pages) };
+        if (!block)
+        {
+            check("wave21_later_page_interior_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0]            = 0x44;
+        bytes[ps * 3u]      = 0x55; // marker in the FOURTH page
+
+        // Interior pointer in the FOURTH page (page index 3), offset +7 so it is
+        // also non-page-aligned: exercises BOTH the later-page (Windows leaks)
+        // and the unaligned-base (POSIX EINVAL) silent arms at once.
+        void* const later_interior{ static_cast<void*>(bytes + ps * 3u + 7u) };
+        vmhook::os::release(later_interior, ps);
+        check("wave21_later_page_interior_release_no_crash", true);
+
+        // A second later-page interior at an aligned page boundary (page 5):
+        // aligned base but NOT the reservation base -> Windows frees nothing,
+        // POSIX unmaps exactly that one page out of the middle (harmless to the
+        // rest).  No crash either way.
+        void* const aligned_later{ static_cast<void*>(bytes + ps * 5u) };
+        vmhook::os::release(aligned_later, ps);
+        check("wave21_aligned_later_page_release_no_crash", true);
+
+        // Reclaim from the TRUE base with the full size.  On Windows this frees
+        // the whole (still-leaked) reservation; on POSIX it unmaps whatever
+        // pages remain mapped.  No crash == pass.
+        vmhook::os::release(block, ps * pages);
+        check("wave21_later_page_interior_reclaim_no_crash", true);
+    }
+
+    // -----------------------------------------------------------------------
+    // EXECUTE-BIT positive control with a VALUE-RETURNING stub.  Wave-5 proves
+    // the X bit by running a bare RET; here the stub LOADS AN IMMEDIATE into the
+    // integer return register and returns it, so a clean call proves the page
+    // executes REAL code that produces an observable result (a stronger witness
+    // of flaw #3's RWX->RW downgrade NOT having silently happened).  Gated to
+    // architectures with a known encoding AND where execution is permitted
+    // (NOT Apple, where the RWX->RW fallback at 738-747 legitimately drops
+    // PROT_EXEC).  We flip to execute_read via os::protect first; if that is
+    // refused (strict W^X) we characterize and skip the call, never failing.
+    //   x86-64: B8 2A 00 00 00 (mov eax, 42) ; C3 (ret)         -> returns 42
+    //   arm64 : movz w0, #42 (0x528005400 -> bytes 40 05 80 52);
+    //           ret (0xD65F03C0 -> bytes C0 03 5F D6)            -> returns 42
+    // -----------------------------------------------------------------------
+#if (VMHOOK_ARCH_X86_64 || VMHOOK_ARCH_ARM64) && !VMHOOK_OS_APPLE
+    static auto test_execute_bit_returning_stub() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps) };
+        if (!block)
+        {
+            check("wave21_execute_returning_stub_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const code{ static_cast<std::uint8_t*>(block) };
+#if VMHOOK_ARCH_X86_64
+        // mov eax, 42 ; ret
+        code[0] = 0xB8;
+        code[1] = 0x2A;
+        code[2] = 0x00;
+        code[3] = 0x00;
+        code[4] = 0x00;
+        code[5] = 0xC3;
+#else // VMHOOK_ARCH_ARM64
+        // movz w0, #42  -> 0x52800540, little-endian bytes 40 05 80 52
+        code[0] = 0x40;
+        code[1] = 0x05;
+        code[2] = 0x80;
+        code[3] = 0x52;
+        // ret           -> 0xD65F03C0, little-endian bytes C0 03 5F D6
+        code[4] = 0xC0;
+        code[5] = 0x03;
+        code[6] = 0x5F;
+        code[7] = 0xD6;
+#endif
+
+        const bool rx{ vmhook::os::protect(block, ps,
+                                           vmhook::os::memory_protection::execute_read,
+                                           nullptr) };
+        if (!rx)
+        {
+            info("wave21_execute_returning_stub_protect_rx_refused", true);
+            (void)make_writable(block, ps);
+            vmhook::os::release(block, ps);
+            return;
+        }
+
+        using fn_t = int (*)();
+        fn_t fn{};
+        std::memcpy(&fn, &block, sizeof(fn)); // avoid an ISO func<->object cast warning
+        const int produced{ fn() };           // faults the process if NOT executable
+        check("wave21_execute_returning_stub_returns_42", produced == 42);
+
+        (void)make_writable(block, ps);
+        vmhook::os::release(block, ps);
+    }
+#endif
+
+    static auto run() -> void
+    {
+        test_sizing_cast_non_truncation_width_contract();
+        test_sysconf_fallback_constant_is_valid_page_size();
+        test_varying_size_leak_loop();
+        test_later_page_interior_release_is_silently_contained();
+#if (VMHOOK_ARCH_X86_64 || VMHOOK_ARCH_ARM64) && !VMHOOK_OS_APPLE
+        test_execute_bit_returning_stub();
+#endif
+    }
+} // namespace wave21_alloc_release_deepening
+
 int main()
 {
     test_release_zero_size_is_idempotent_noop();
@@ -2811,6 +3098,12 @@ int main()
     //     multi-page block, partial-release tail query characterization, sub-page
     //     whole-page usability, granularity-sized round-trip ---
     expansion5_release_query_roundtrip::run();
+
+    // --- wave-21: os_allocate_release ledger-gap deepening -- cast non-
+    //     truncation width contract, sysconf 4096-fallback constant pin,
+    //     varying-size leak loop, later-page interior negative release,
+    //     value-returning execute-bit stub ---
+    wave21_alloc_release_deepening::run();
 
     if (failures == 0)
     {

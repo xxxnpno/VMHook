@@ -2214,6 +2214,120 @@ int main()
 #endif
     }
 
+    // =====================================================================
+    // DEEPENING WAVE 4 (additive) — a FOURTH namespaced section ("dw4_")
+    // closing the LAST proven-OPEN ledger gaps the first three waves did NOT
+    // touch (audit/COVERAGE_LEDGER.md, logging_format row):
+    //   * the SUBNORMAL double (denorm_min) through {:.17g} / {:e} / {:f}
+    //     (the one float-special the ledger lists that dw_/dw2_/dw3_ omit),
+    //   * the sign flags '+' and ' ' combined with a BASE spec on INT_MIN
+    //     (the sign flag only affects NON-negatives, so a negative under
+    //     {:+x}/{: x} still renders '-' + magnitude — pin that),
+    //   * the space flag on a positive DECIMAL ({: d}),
+    //   * alt-form {:#x} at the UINT_MAX and INT_MIN boundaries (the two
+    //     boundary values the int sweep printed in plain decimal but not in
+    //     alt-form hex).
+    // PURE LOGIC ONLY — no memory reads, no pointer fabrication, no value_t
+    // casts, no narrowing.  Every expected value is derived from source and
+    // was confirmed against libstdc++ std::format:
+    //   * VMHOOK_HAS_STD_FORMAT==1 -> format_log == std::vformat(fmt, args);
+    //     the {:e}/{:.17g} digit counts are FIXED (not shortest-round-trip),
+    //     so they are byte-identical on libstdc++ AND the MSVC STL, and the
+    //     subnormal {:f} expansion (implementation-length) is asserted as a
+    //     round-trip PROPERTY rather than a byte string.
+    //   * VMHOOK_HAS_STD_FORMAT==0 -> format_log == std::string{ fmt }.
+    // =====================================================================
+#if VMHOOK_HAS_STD_FORMAT
+    // --- Subnormal double: denorm_min == 2^-1074, the smallest positive value.
+    // {:.17g} prints a FIXED 17 significant digits (standard-pinned, not
+    // shortest), so assert the exact spelling AND that it round-trips back to
+    // the same subnormal double (the STL-invariant property).
+    check("dw4_subnormal_full_precision_g17",
+        vmhook::detail::format_log(
+            "{:.17g}", std::numeric_limits<double>::denorm_min())
+            == "4.9406564584124654e-324");
+    check("dw4_subnormal_full_precision_roundtrips",
+        fpinv::parses_to(
+            vmhook::detail::format_log(
+                "{:.17g}", std::numeric_limits<double>::denorm_min()),
+            std::numeric_limits<double>::denorm_min()));
+    // {:.2e} on the subnormal: a FIXED 2-fraction-digit scientific layout with
+    // the three-digit exponent — byte-pinned by the standard.
+    check("dw4_subnormal_scientific_precision",
+        vmhook::detail::format_log(
+            "{:.2e}", std::numeric_limits<double>::denorm_min())
+            == "4.94e-324");
+    // {:.0e} rounds to a single significant digit (still byte-pinned).
+    check("dw4_subnormal_scientific_zero_precision",
+        vmhook::detail::format_log(
+            "{:.0e}", std::numeric_limits<double>::denorm_min())
+            == "5e-324");
+    // {:f} on the subnormal yields a (very long) all-decimal expansion whose
+    // exact length is implementation-defined; assert only that it is non-empty,
+    // contains a decimal point, and is sign-free (positive value).
+    {
+        const std::string sub_fixed{
+            vmhook::detail::format_log(
+                "{:f}", std::numeric_limits<double>::denorm_min()) };
+        check("dw4_subnormal_fixed_nonempty_pointed",
+            !sub_fixed.empty()
+                && sub_fixed.front() == '0'
+                && sub_fixed.find('.') != std::string::npos);
+    }
+
+    // --- Sign flags ('+' / ' ') COMBINED with a base spec on INT_MIN. ---------
+    // The sign flag governs only NON-negative values, so a negative under
+    // {:+x}/{: x} still renders '-' + base-magnitude (NOT '+'/' ').  INT_MIN's
+    // magnitude in hex is 0x80000000.  Pin that the sign flag does NOT alter the
+    // negative form.
+    check("dw4_int_min_plus_flag_hex_still_minus",
+        vmhook::detail::format_log("{:+x}", INT_MIN) == "-80000000");
+    check("dw4_int_min_space_flag_hex_still_minus",
+        vmhook::detail::format_log("{: x}", INT_MIN) == "-80000000");
+    // The space flag on a POSITIVE decimal emits a single leading space.
+    check("dw4_space_flag_positive_decimal",
+        vmhook::detail::format_log("{: d}", 7) == " 7");
+    // The space flag on a NEGATIVE decimal still uses '-' (never a space).
+    check("dw4_space_flag_negative_decimal",
+        vmhook::detail::format_log("{: d}", -7) == "-7");
+    // The '+' flag on a positive decimal forces a leading '+'.
+    check("dw4_plus_flag_positive_decimal",
+        vmhook::detail::format_log("{:+d}", 7) == "+7");
+
+    // --- Alt-form {:#x} at the UINT_MAX / INT_MIN boundaries. -----------------
+    // UINT_MAX is unsigned -> no sign, "0x" + all-f's.
+    check("dw4_uint_max_alt_hex",
+        vmhook::detail::format_log("{:#x}", UINT_MAX) == "0xffffffff");
+    // INT_MIN is signed -> '-' precedes the "0x" prefix, then the magnitude.
+    check("dw4_int_min_alt_hex_sign_before_prefix",
+        vmhook::detail::format_log("{:#x}", INT_MIN) == "-0x80000000");
+#else
+    // Fallback leg: every dw4_ std-format input above returns the fmt verbatim,
+    // ignoring all arguments and specifiers — mirror the spec-bearing strings so
+    // the pre-std::format MinGW/Clang CI legs exercise the same surface.  The
+    // subnormal value is still referenced (passed as the ignored argument) so no
+    // const is unused on this leg either.
+    check("dw4_fb_subnormal_g17_verbatim",
+        vmhook::detail::format_log(
+            "{:.17g}", std::numeric_limits<double>::denorm_min()) == "{:.17g}");
+    check("dw4_fb_subnormal_scientific_verbatim",
+        vmhook::detail::format_log(
+            "{:.2e}", std::numeric_limits<double>::denorm_min()) == "{:.2e}");
+    check("dw4_fb_subnormal_fixed_verbatim",
+        vmhook::detail::format_log(
+            "{:f}", std::numeric_limits<double>::denorm_min()) == "{:f}");
+    check("dw4_fb_int_min_plus_hex_verbatim",
+        vmhook::detail::format_log("{:+x}", INT_MIN) == "{:+x}");
+    check("dw4_fb_int_min_space_hex_verbatim",
+        vmhook::detail::format_log("{: x}", INT_MIN) == "{: x}");
+    check("dw4_fb_space_decimal_verbatim",
+        vmhook::detail::format_log("{: d}", 7) == "{: d}");
+    check("dw4_fb_uint_max_alt_hex_verbatim",
+        vmhook::detail::format_log("{:#x}", UINT_MAX) == "{:#x}");
+    check("dw4_fb_int_min_alt_hex_verbatim",
+        vmhook::detail::format_log("{:#x}", INT_MIN) == "{:#x}");
+#endif
+
     std::printf("\n%d checks failed\n", failures);
     return failures == 0 ? 0 : 1;
 }
