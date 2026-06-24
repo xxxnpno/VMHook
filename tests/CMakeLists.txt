@@ -143,3 +143,6 @@ vmhook_add_test(seh_invoke_detour              SOURCES test_seh_invoke_detour.cp
 vmhook_add_test(dont_inline_dont_compile       SOURCES test_dont_inline_dont_compile.cpp)
 vmhook_add_test(hook_common_detour_dispatch    SOURCES test_hook_common_detour_dispatch.cpp)
 vmhook_add_test(klass_introspection_nojvm      SOURCES test_klass_introspection_nojvm.cpp)
+vmhook_add_test(constantpool_access_nojvm      SOURCES test_constantpool_access_nojvm.cpp)
+vmhook_add_test(instanceklass_methods_walk_nojvm SOURCES test_instanceklass_methods_walk_nojvm.cpp)
+vmhook_add_test(hook_verify_repair_nojvm       SOURCES test_hook_verify_repair_nojvm.cpp)
