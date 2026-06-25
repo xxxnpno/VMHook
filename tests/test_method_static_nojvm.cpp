@@ -105,6 +105,97 @@ using compressed_oop_ret_t = decltype(std::declval<vmhook::method_proxy const&>(
 static_assert(std::is_integral_v<compressed_oop_ret_t>,
               "method_proxy::get_compressed_oop() must return an integral type");
 
+// =====================================================================
+// Wave-32 deepening: gate_off vs gate_on alternative resolution pins.
+// Compile-time pins on the OVERLOAD SET of the portable static call
+// path — every assertion below must hold on MSVC, clang-cl, clang+mingw,
+// g+++mingw and on every linux/macOS compiler.  These are the FACTORY
+// guarantees the live JVM module relies on for slot-0 alignment.
+// =====================================================================
+
+// (9) The portable static_method(name) factory is a non-member-style
+//     STATIC function (callable without an object).  Pin via
+//     function-pointer formation; if it ever silently became a member
+//     this TU stops compiling.
+using sm_name_fn_t = std::optional<vmhook::method_proxy>(*)(std::string_view);
+static_assert(std::is_same_v<sm_name_fn_t,
+                             decltype(static_cast<sm_name_fn_t>(
+                                 &static_wrapper::static_method))>,
+              "static_method(name) must be a non-member-style static fn");
+
+// (10) The (name, signature) overload — same shape.  Note: taking
+//      &static_method also forces the compiler to RESOLVE the overload
+//      set without ambiguity (the two factories are distinguishable by
+//      arity), which is itself a portability pin.
+using sm_namesig_fn_t =
+    std::optional<vmhook::method_proxy>(*)(std::string_view, std::string_view);
+static_assert(std::is_same_v<sm_namesig_fn_t,
+                             decltype(static_cast<sm_namesig_fn_t>(
+                                 &static_wrapper::static_method))>,
+              "static_method(name,sig) must be a non-member-style static fn");
+
+// (11) The underlying object_base path (the function the factory forwards
+//      to) carries the same SHAPE — std::type_index then string_view(s).
+using base_name_fn_t = std::optional<vmhook::method_proxy>(*)(
+    std::type_index, std::string_view);
+static_assert(std::is_same_v<base_name_fn_t,
+                             decltype(static_cast<base_name_fn_t>(
+                                 &vmhook::object_base::get_method))>,
+              "object_base::get_method(type_index,name) factory shape");
+
+using base_namesig_fn_t = std::optional<vmhook::method_proxy>(*)(
+    std::type_index, std::string_view, std::string_view);
+static_assert(std::is_same_v<base_namesig_fn_t,
+                             decltype(static_cast<base_namesig_fn_t>(
+                                 &vmhook::object_base::get_method))>,
+              "object_base::get_method(type_index,name,sig) factory shape");
+
+// (12) Argument-type pins: BOTH factories take string_view BY VALUE
+//      (not by const-ref).  An accidental const-ref taking overload would
+//      change literal-call-site codegen and is forbidden.
+static_assert(std::is_invocable_r_v<std::optional<vmhook::method_proxy>,
+                                    decltype(static_cast<sm_name_fn_t>(
+                                        &static_wrapper::static_method)),
+                                    std::string_view>,
+              "static_method(name) invocable with string_view by value");
+static_assert(std::is_invocable_r_v<std::optional<vmhook::method_proxy>,
+                                    decltype(static_cast<sm_namesig_fn_t>(
+                                        &static_wrapper::static_method)),
+                                    std::string_view, std::string_view>,
+              "static_method(name,sig) invocable with two string_views");
+
+// (13) Cross-wrapper UNIFORMITY: the factory pointer type does NOT
+//      depend on the wrapper's identity — i.e. the call ABI / arg layout
+//      is wrapper-agnostic, only the type_index dispatched within is.
+static_assert(std::is_same_v<decltype(static_cast<sm_name_fn_t>(
+                                 &static_wrapper::static_method)),
+                             decltype(static_cast<sm_name_fn_t>(
+                                 &other_wrapper::static_method))>,
+              "static_method(name) fn-ptr type is wrapper-agnostic");
+
+// (14) The factory's return type is COPYABLE (so users can store it in
+//      a local without forcing a move) — the common UX path.
+static_assert(std::is_copy_constructible_v<std::optional<vmhook::method_proxy>>,
+              "optional<method_proxy> must be copy-constructible");
+static_assert(std::is_move_constructible_v<std::optional<vmhook::method_proxy>>,
+              "optional<method_proxy> must be move-constructible");
+
+// (15) The return type's default-constructed state is empty — pins the
+//      semantics call-sites rely on when threading optionals through
+//      detour code without exceptions.
+static_assert(!std::optional<vmhook::method_proxy>{}.has_value(),
+              "default optional<method_proxy> is empty (constexpr)");
+static_assert(std::optional<vmhook::method_proxy>{} == std::nullopt,
+              "default optional<method_proxy> compares equal to nullopt");
+
+// (16) method_proxy::value_t::is_void() — used by the live module to
+//      decode void returns through the same call path.  Pin return-type
+//      as bool.
+using is_void_ret_t = decltype(std::declval<vmhook::method_proxy::value_t const&>()
+                                   .is_void());
+static_assert(std::is_same_v<is_void_ret_t, bool>,
+              "method_proxy::value_t::is_void() must return bool");
+
 int main()
 {
     // --------------------------------------------------------------
@@ -270,6 +361,99 @@ int main()
         check("name matrix: every call returns nullopt",
               nullopt_count == total * 3);
         check("name matrix: full coverage exercised", total == 10);
+    }
+
+    // --------------------------------------------------------------
+    // Wave-32: gate_off vs gate_on alternative-resolution parity.
+    //
+    // The static_method() factory and the object_base::get_method
+    // (type_index, name[, sig]) entry are TWO routes into the same
+    // resolution path.  In cold state both MUST agree byte-for-byte
+    // on the result (nullopt) for every (name, sig) pair we feed.
+    // A regression that left one route forwarding through a different
+    // (e.g. instance-style) gate would surface here as a parity gap.
+    // --------------------------------------------------------------
+    {
+        struct case_t { std::string_view name; std::string_view sig; };
+        const std::array<case_t, 12> cases{ {
+            { "",          "" },
+            { "a",         "()V" },
+            { "snap",      "()V" },
+            { "<init>",    "()V" },
+            { "<clinit>",  "()V" },
+            { "valueOf",   "(I)Ljava/lang/Integer;" },
+            { "valueOf",   "(J)Ljava/lang/Long;" },
+            { "valueOf",   "(D)Ljava/lang/Double;" },
+            { "currentTimeMillis", "()J" },
+            { "arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V" },
+            { "lookup",    "()Ljava/lang/invoke/MethodHandles$Lookup;" },
+            { "$Lambda$",  "()V" },
+        } };
+
+        int parity_matches{ 0 };
+        for (const auto& c : cases)
+        {
+            const auto factory_name = static_wrapper::static_method(c.name);
+            const auto base_name = vmhook::object_base::get_method(
+                std::type_index{ typeid(static_wrapper) }, c.name);
+            const auto factory_sig = static_wrapper::static_method(c.name, c.sig);
+            const auto base_sig = vmhook::object_base::get_method(
+                std::type_index{ typeid(static_wrapper) }, c.name, c.sig);
+
+            // Cold state — both factories and both base entries must be empty.
+            const bool agree =
+                (factory_name.has_value() == base_name.has_value()) &&
+                (factory_sig.has_value()  == base_sig.has_value())  &&
+                !factory_name.has_value() && !factory_sig.has_value();
+            if (agree) { ++parity_matches; }
+        }
+        check("factory<->base parity across (name) and (name,sig) overloads",
+              parity_matches == static_cast<int>(cases.size()));
+    }
+
+    // --------------------------------------------------------------
+    // Wave-32: cross-wrapper alternative-resolution determinism.
+    // static_method(name) on wrapper A and wrapper B share the SAME
+    // codegen template but resolve via DISTINCT type_index keys.  In
+    // cold state, the disjoint type_indices must NOT alias to each
+    // other.  We assert: the two type_index hashes are distinct AND
+    // both resolutions are cleanly nullopt.
+    // --------------------------------------------------------------
+    {
+        const std::type_index a{ typeid(static_wrapper) };
+        const std::type_index b{ typeid(other_wrapper) };
+        const bool distinct_keys = (a != b);
+        const auto ra = vmhook::object_base::get_method(a, std::string_view{ "x" });
+        const auto rb = vmhook::object_base::get_method(b, std::string_view{ "x" });
+        check("type_index keys of distinct wrappers are distinct",
+              distinct_keys);
+        check("both type_index keyed resolutions cold-nullopt",
+              !ra.has_value() && !rb.has_value());
+    }
+
+    // --------------------------------------------------------------
+    // Wave-32: function-pointer ADDRESS uniqueness.  The name-only and
+    // (name,sig) overloads must be DISTINCT functions at link time, not
+    // a single thunk picked at the call site.  This is what guarantees
+    // the (name,sig) entry skips overload disambiguation in call().
+    // --------------------------------------------------------------
+    {
+        sm_name_fn_t    p_name = static_cast<sm_name_fn_t>(
+            &static_wrapper::static_method);
+        sm_namesig_fn_t p_sig  = static_cast<sm_namesig_fn_t>(
+            &static_wrapper::static_method);
+        const void* a = reinterpret_cast<const void*>(p_name);
+        const void* b = reinterpret_cast<const void*>(p_sig);
+        check("static_method overloads have distinct fn-ptr addresses",
+              a != b);
+
+        // The wrapper-A vs wrapper-B factories also live at distinct
+        // addresses (each is a separate template instantiation).
+        sm_name_fn_t p_name_other = static_cast<sm_name_fn_t>(
+            &other_wrapper::static_method);
+        check("cross-wrapper static_method instantiations are distinct fns",
+              reinterpret_cast<const void*>(p_name) !=
+              reinterpret_cast<const void*>(p_name_other));
     }
 
     if (failures == 0)

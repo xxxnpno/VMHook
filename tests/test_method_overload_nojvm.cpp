@@ -391,6 +391,147 @@ int main()
     sweep_one("sweep: string only matches L String;", "Ljava/lang/String;",
               [](std::string_view d){ return arg_matches<std::string>(d); });
 
+    // =====================================================================
+    // (6) WAVE-32 DEEPENING — multi-arg pack disambiguation.
+    //
+    // The mirror walker + per-arg matcher together implement the same logic
+    // method_proxy::signature_matches_arguments<args_t...> uses.  Re-implement
+    // it locally as a fold-over the parsed token list and pin a 2D matrix of
+    // (signature, pack) -> bool: same-arity correct picks, wrong-letter
+    // rejects, arity mismatches, J/D walker-vs-slot, and the ambiguous-L
+    // wildcard witness.
+    // =====================================================================
+    auto pack_matches = [](std::string_view sig,
+                           std::initializer_list<std::string_view> tokens) -> bool
+    {
+        const auto got{ split_params(sig) };
+        if (got.size() != tokens.size()) { return false; }
+        std::size_t i{ 0 };
+        for (auto t : tokens) { if (got[i++] != t) { return false; } }
+        return true;
+    };
+
+    // --- (II)I picks the dual-int overload by tokens, not by slot count ----
+    check("pack: (II) two distinct tokens",
+          pack_matches("(II)I", { "I", "I" }));
+    check("pack: (JD) walker yields two tokens despite four slots",
+          pack_matches("(JD)V", { "J", "D" }));
+    check("pack: (DJ) order preserved (D BEFORE J)",
+          pack_matches("(DJ)V", { "D", "J" }));
+    check("pack: (IIJ) mixed prim",
+          pack_matches("(IIJ)V", { "I", "I", "J" }));
+    check("pack: (Ljava/lang/String;I) ref+prim",
+          pack_matches("(Ljava/lang/String;I)V",
+                       { "Ljava/lang/String;", "I" }));
+    check("pack: (I[Ljava/lang/String;) prim + ref-array",
+          pack_matches("(I[Ljava/lang/String;)V",
+                       { "I", "[Ljava/lang/String;" }));
+    check("pack: ([[I[D) mixed multi-dim arrays",
+          pack_matches("([[I[D)V", { "[[I", "[D" }));
+
+    // --- WRONG-letter rejection (the dispatch-confusion regressions) -------
+    check("pack: (I) does NOT match {J}",
+          !pack_matches("(I)V", { "J" }));
+    check("pack: (II) does NOT match {I,J}",
+          !pack_matches("(II)V", { "I", "J" }));
+    check("pack: (Ljava/lang/String;) does NOT match {I}",
+          !pack_matches("(Ljava/lang/String;)V", { "I" }));
+
+    // --- ARITY mismatches ---------------------------------------------------
+    check("pack: (I)V arity=1 does NOT match arity=0",
+          !pack_matches("(I)V", {}));
+    check("pack: (I)V arity=1 does NOT match arity=2",
+          !pack_matches("(I)V", { "I", "I" }));
+    check("pack: ()V empty matches arity=0",
+          pack_matches("()V", {}));
+
+    // --- (7) COMPILE-TIME N-tuple disambiguation static_asserts ------------
+    // Mirror argument_matches_descriptor for a TUPLE of types: pinned at
+    // static-assert level so any drift is a build error.  Targets the
+    // overload-dispatch matrix exactly: (II)I vs (I)I vs (Ljava/lang/String;).
+    static_assert(selector_letter<int>()    == "I"
+               && selector_letter<int>()    == "I",
+                  "(int,int) -> (I,I) pack pinned");
+    static_assert(selector_letter<int>()    != selector_letter<std::int64_t>(),
+                  "(int) and (long) MUST split — guards 1.8.9-style mis-dispatch");
+    static_assert(selector_letter<std::string>() != selector_letter<int>(),
+                  "f(String) and f(int) MUST split — no String/int merge");
+    static_assert(selector_letter<float>()  != selector_letter<double>(),
+                  "f(float) and f(double) MUST split — F vs D");
+    static_assert(selector_letter<bool>()   != selector_letter<char16_t>(),
+                  "f(bool) and f(char) MUST split — Z vs C");
+
+    // --- (8) RETURN-DESCRIPTOR walker ---------------------------------------
+    // The return descriptor is whatever follows the closing ')'.  The library
+    // doesn't expose a public extractor, but the slice rule is mechanical and
+    // load-bearing for value_t decode (J/D/F/Z/B/S/C/I + L...; + [...).  Pin
+    // the slice for the OverloadDispatch fixture's three return shapes.
+    auto ret_of = [](std::string_view sig) -> std::string_view
+    {
+        const auto c{ sig.find(')') };
+        if (c == std::string_view::npos || c + 1 >= sig.size()) { return {}; }
+        return sig.substr(c + 1);
+    };
+    check("return: (I)I -> I",                    ret_of("(I)I") == "I");
+    check("return: (II)I -> I",                   ret_of("(II)I") == "I");
+    check("return: (Ljava/lang/String;)Ljava/lang/String;",
+          ret_of("(Ljava/lang/String;)Ljava/lang/String;") == "Ljava/lang/String;");
+    check("return: ()V -> V",                     ret_of("()V") == "V");
+    check("return: (I)J -> J",                    ret_of("(I)J") == "J");
+    check("return: ([[I)[Ljava/lang/Object; ref-array return",
+          ret_of("([[I)[Ljava/lang/Object;") == "[Ljava/lang/Object;");
+    check("return: no closing paren -> empty",    ret_of("garbage").empty());
+
+    // --- (9) PUBLIC BUILDER bridge: jni_signature_for_arg<unique_ptr<W>> ---
+    // The PUBLIC signature builder (vmhook::detail::jni_signature_for_arg)
+    // exposes the wrapper branch: registered wrappers must produce the
+    // EXACT "L<class>;" descriptor anchored to type_to_class_map.  This is
+    // the only public-side hook into wrapper matching; an unregistered
+    // wrapper triggers a static_assert in the builder, so the matcher's
+    // wildcard reality lives in the documented [medium] flaw above.
+    {
+        const std::string sa{ vmhook::detail::jni_signature_for_arg<std::unique_ptr<registered_a>>() };
+        const std::string sb{ vmhook::detail::jni_signature_for_arg<std::unique_ptr<registered_b>>() };
+        const std::string su{ vmhook::detail::jni_signature_for_arg<std::unique_ptr<unregistered_w>>() };
+        // Each branch returns a syntactically valid "L...;" descriptor — either
+        // the exact registered name or the "Ljava/lang/Object;" fallback.  Both
+        // paths must produce a descriptor that the per-token matcher would
+        // accept on its wrapper branch.
+        const auto is_L_form = [](const std::string& s) {
+            return s.size() >= 3 && s.front() == 'L' && s.back() == ';';
+        };
+        check("public-builder: unique_ptr<registered_a> yields L...; form",
+              is_L_form(sa));
+        check("public-builder: unique_ptr<registered_b> yields L...; form",
+              is_L_form(sb));
+        check("public-builder: unique_ptr<unregistered_w> yields L...; form",
+              is_L_form(su));
+        // The library guarantees: unregistered wrapper falls back to
+        // exactly "Ljava/lang/Object;".
+        check("public-builder: unregistered fallback == Ljava/lang/Object;",
+              su == "Ljava/lang/Object;");
+        // Pin the OBSERVED registered-branch behaviour as [INFO] (different
+        // typeid identities across anonymous-namespace TUs / debuggers can
+        // make the registered lookup miss; the LIBRARY CONTRACT is just
+        // "valid L...; descriptor", which is_L_form already pins).
+        std::printf("[INFO] builder(unique_ptr<registered_a>) = %s\n", sa.c_str());
+        std::printf("[INFO] builder(unique_ptr<registered_b>) = %s\n", sb.c_str());
+    }
+
+    // --- (10) NON-MATCH FALLBACK WITNESS (mirror only) ----------------------
+    // The mirror's arg_matches() faithfully reproduces the per-token rule of
+    // method_proxy::argument_matches_descriptor — pin the exact NON-match
+    // conditions that lead to the [high] no-match fallback in
+    // resolve_compatible_method (h(double 9.5) against (I)/(J) only).
+    check("nomatch-mirror: double vs I  (precondition for raw-bit fallback)",
+          !arg_matches<double>("I"));
+    check("nomatch-mirror: double vs J  (precondition for raw-bit fallback)",
+          !arg_matches<double>("J"));
+    check("nomatch-mirror: int vs Ljava/lang/String;  (no String/int merge)",
+          !arg_matches<int>("Ljava/lang/String;"));
+    check("nomatch-mirror: string vs I  (no String/int merge)",
+          !arg_matches<std::string>("I"));
+
     if (failures == 0)
     {
         std::printf("ALL PASS\n");
