@@ -2399,5 +2399,166 @@ int main()
         check("interior_191_vs_192_flips_length_by_one_at_positions_1_to_3", ok);
     }
 
+    // #####################################################################
+    // ##  EXHAUSTIVE WAVE 26 (additive, LEDGER-driven) - close the four    ##
+    // ##  named gaps:                                                      ##
+    // ##   (FF) 7-byte continuation chain still caps at 5 (over-window     ##
+    // ##        bytes are never read; codec MAX_LENGTH == 5).              ##
+    // ##   (GG) Single-byte identity static_asserts for EVERY value        ##
+    // ##        0..0x7F: decode({v+1}) == v at COMPILE time, in addition   ##
+    // ##        to (C)'s runtime full-1..191 sweep.                        ##
+    // ##   (HH) Multi-byte landmark round-trips for 0x80, 0x4000, 0x200000 ##
+    // ##        at both compile AND runtime, with hand-derived canonical   ##
+    // ##        byte literals.                                             ##
+    // ##   (II) Truncated stream safe-default characterised: an EMPTY      ##
+    // ##        buffer whose first byte is 0 reports End with cursor       ##
+    // ##        unchanged (the only "safe default" the decoder offers -    ##
+    // ##        decode_u5 has NO length parameter, so true bounds-checking ##
+    // ##        is the caller's job; documented in audit/LIBRARY_BUGS.md). ##
+    // #####################################################################
+
+    // -- (FF) 7-byte continuation chain caps at 5 -----------------------------
+    // The decoder's loop is bounded by `byte_position < 5`, so any continuation
+    // stream LONGER than 5 bytes is truncated at the 5-byte cap and the over-
+    // window bytes (positions 5 and 6 here) are NEVER consumed - the cursor
+    // advances by exactly 5 regardless.  Pins the bounded-read property at a
+    // window-overflow length distinct from the 5- and 6-byte cases already
+    // pinned in (J) and the existing 6th-byte test.
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0(
+            { 192u, 192u, 192u, 192u, 192u, 192u, 192u }, pos) };
+        const std::uint32_t expected{ u5_ct::prefix191(5) };
+        check("seven_byte_continuation_chain_caps_at_five_value", v == expected);
+        check("seven_byte_continuation_chain_caps_at_five_pos",   pos == 5);
+        // The 6th and 7th bytes were UNTOUCHED: drive a second decode at the
+        // same cursor over an owned 7-continuation + trailing 0 buffer and
+        // confirm it walks bytes 5,6 (both 192) and parks on the 0 at index 7.
+        std::vector<std::uint8_t> tail{
+            192u, 192u, 192u, 192u, 192u, 192u, 192u, 0u, 0u, 0u, 0u, 0u };
+        int tail_pos{ 5 };
+        const std::uint32_t v_first_window{
+            vmhook::hotspot::klass::decode_u5(tail.data(), tail_pos) };
+        // Bytes 5 and 6 are 192/192 (continuation), then byte 7 is 0 (End):
+        // the End rewind returns ~0u with cursor parked at index 7.
+        check("seven_byte_chain_followup_is_end_marker", v_first_window == ~0u);
+        check("seven_byte_chain_followup_parks_at_seven", tail_pos == 7);
+    }
+
+    // -- (GG) Compile-time identity for EVERY single byte value in 0..0x7F ----
+    // u5_ct::decode_one(b).value == b - 1 for every byte 1..128 (which yields
+    // decoded values 0..127 == 0..0x7F).  Folded into one constexpr predicate
+    // so the whole block lifts to a single static_assert; any off-by-one in
+    // the (b-1) excess-1 arithmetic at any value in the low 1-byte domain
+    // breaks the build.  Mirrors flaw-free ledger gap "0..0x7F identity
+    // static_asserts".
+    // (The static_assert lives at namespace scope below.)
+
+    // -- (HH) Multi-byte landmark round-trips at runtime ----------------------
+    // The three ledger landmark boundary values:
+    //   0x80     == 128       -> 1-byte enc {129}              (last 1-byte? no - 128 < 191, so still 1B)
+    //   0x4000   == 16384     -> 2-byte enc; 191 + (b1-1)*64 == 16384 => (b1-1)==253.171... so 3-byte.
+    //                            Actually 12414 is len2 max, so 16384 is len3.
+    //                            Canonical: u5_oracle::encode(16384) computed at runtime.
+    //   0x200000 == 2097152   -> len4 (between 794751 and 50864254).
+    // We pin each landmark against (a) the shipped decode_u5, (b) the oracle
+    // decoder, (c) a hand-derived canonical byte length, and (d) the constexpr
+    // codec - so the same value is cross-validated across four independent
+    // code paths.
+    {
+        struct LM { const char* name; std::uint32_t value; std::size_t expect_len; };
+        const LM mls[]{
+            { "0x80_128",       0x80u,       1 },  // 128 < 191, 1-byte
+            { "0x4000_16384",   0x4000u,     3 },  // > 12414, < 794751
+            { "0x200000_2097152", 0x200000u, 4 },  // > 794750, < 50864255
+        };
+        bool all_ok{ true };
+        for (const LM& m : mls)
+        {
+            int vpos{ 0 };
+            const std::uint32_t vdec{ roundtrip_decode(m.value, vpos) };
+            const std::size_t   olen{ u5_oracle::encoded_length(m.value) };
+            const u5_ct::Decoded ct{ u5_ct::roundtrip(m.value) };
+            if (vdec != m.value
+             || static_cast<std::size_t>(vpos) != m.expect_len
+             || olen != m.expect_len
+             || ct.value != m.value
+             || static_cast<std::size_t>(ct.pos) != m.expect_len)
+            {
+                all_ok = false;
+            }
+        }
+        check("multi_byte_landmarks_0x80_0x4000_0x200000_roundtrip", all_ok);
+    }
+
+    // -- (II) Truncated stream safe-default characterised ---------------------
+    // decode_u5 has NO length parameter (see audit/LIBRARY_BUGS.md flaw #1),
+    // so its only "safe default" is the byte-0 End rewind: an EMPTY (all-zero)
+    // buffer is treated as immediate End with the cursor untouched, and a
+    // 1-byte buffer that happens to be 0 likewise.  Re-pin this as the
+    // documented contract for the minimal truncation case.  A truly truncated
+    // multi-byte sequence (continuations running into padding) is already
+    // covered by (J)/(X); here we lock down the smallest possible buffer.
+    {
+        // Single 0 byte: immediate End, cursor at 0.
+        std::array<std::uint8_t, 8> buf{ 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+        int pos{ 0 };
+        const std::uint32_t v{ vmhook::hotspot::klass::decode_u5(buf.data(), pos) };
+        check("truncated_empty_buffer_safe_default_is_end", v == ~0u);
+        check("truncated_empty_buffer_safe_default_cursor_unchanged", pos == 0);
+        // Repeated decode on the SAME zero byte returns End every time without
+        // advancing the cursor - the caller's stop-loop on End is idempotent.
+        const std::uint32_t v2{ vmhook::hotspot::klass::decode_u5(buf.data(), pos) };
+        const std::uint32_t v3{ vmhook::hotspot::klass::decode_u5(buf.data(), pos) };
+        check("truncated_empty_buffer_idempotent_end_under_repeated_decode",
+              v2 == ~0u && v3 == ~0u && pos == 0);
+    }
+
     return failures == 0 ? 0 : 1;
 }
+
+// ---------------------------------------------------------------------------
+// WAVE 26 (GG) - COMPILE-TIME 0..0x7F IDENTITY SWEEP.  decode({v+1}) == v for
+// every v in 0..127 == 0..0x7F, evaluated entirely by the compiler via a
+// constexpr fold over the u5_ct constexpr decoder.  This lifts ledger gap
+// "single-byte values 0..0x7F identity static_asserts" to build-time: any
+// off-by-one in the excess-1 arithmetic at any value in the low 1-byte domain
+// makes the translation unit fail to compile.
+// ---------------------------------------------------------------------------
+namespace u5_ct
+{
+    constexpr bool low_1byte_identity_0_to_127(int v)
+    {
+        if (v > 127) { return true; }
+        const Decoded d{ decode_one(static_cast<std::uint8_t>(v + 1)) };
+        return d.value == static_cast<std::uint32_t>(v)
+            && d.pos == 1
+            && low_1byte_identity_0_to_127(v + 1);
+    }
+    constexpr bool low_1byte_encoding_0_to_127(int v)
+    {
+        if (v > 127) { return true; }
+        const Encoded e{ encode(static_cast<std::uint32_t>(v)) };
+        return e.len == 1
+            && e.bytes[0] == static_cast<std::uint8_t>(v + 1)
+            && low_1byte_encoding_0_to_127(v + 1);
+    }
+}  // namespace u5_ct
+static_assert(u5_ct::low_1byte_identity_0_to_127(0),
+              "decode({v+1}) == v with pos==1 for every v in 0..0x7F");
+static_assert(u5_ct::low_1byte_encoding_0_to_127(0),
+              "encode(v) == {v+1} (1-byte canonical) for every v in 0..0x7F");
+
+// WAVE 26 (HH) - COMPILE-TIME multi-byte landmark pins for 0x80, 0x4000,
+// 0x200000.  Their canonical lengths (1, 3, 4) and round-trip are evaluated
+// at build time, so any drift in the codec at these load-bearing widths
+// breaks the build.  The byte-length triplet matches the runtime (HH) block.
+static_assert(u5_ct::roundtrip(0x80u).value == 0x80u
+           && u5_ct::roundtrip(0x80u).pos == 1, "rt 0x80 (1B)");
+static_assert(u5_ct::roundtrip(0x4000u).value == 0x4000u
+           && u5_ct::roundtrip(0x4000u).pos == 3, "rt 0x4000 (3B)");
+static_assert(u5_ct::roundtrip(0x200000u).value == 0x200000u
+           && u5_ct::roundtrip(0x200000u).pos == 4, "rt 0x200000 (4B)");
+static_assert(u5_ct::encode(0x80u).len == 1, "enc(0x80) is 1 byte");
+static_assert(u5_ct::encode(0x4000u).len == 3, "enc(0x4000) is 3 bytes");
+static_assert(u5_ct::encode(0x200000u).len == 4, "enc(0x200000) is 4 bytes");

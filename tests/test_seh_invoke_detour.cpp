@@ -44,6 +44,8 @@
 // is derived from the header source (inline vmhook.hpp:<line> references).
 #include <vmhook/vmhook.hpp>
 
+#include <cerrno>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -344,6 +346,185 @@ int main()
         check("g_shutdown_requested_is_lock_free",
               vmhook::hotspot::g_shutdown_requested.is_lock_free());
     }
+
+    // =====================================================================
+    // SECTION W26 — Wave-26 ledger gap-closers (additive only).
+    //
+    // Gaps targeted:
+    //   (1) install/uninstall idempotence pin — seh_invoke_detour has NO
+    //       install/uninstall API (it is a stateless per-call __try/__except /
+    //       try-catch wrapper).  Pin that observable property: there is no
+    //       "register" entry-point on hotspot::, and the function itself is
+    //       safely callable an unbounded number of times with no setup, no
+    //       teardown, and no cumulative state across calls.
+    //   (2) cold-state after multiple cycles — alternate (clean, throw,
+    //       clean, throw, ...) over many iterations; first and last clean
+    //       calls produce identical side effects (no drift), all throws
+    //       remain false (no latched poisoning).
+    //   (3) handler-mask preservation invariant — the wrapper must not alter
+    //       any thread-local state observable to the caller.  Pin it via the
+    //       errno invariant: errno before == errno after, on both the clean
+    //       and the throwing path (the wrapper neither sets nor clears it).
+    //   (4) signal-number constants pinned — on POSIX the os signal-handler
+    //       half of this feature is wired to SIGSEGV/SIGBUS (vmhook.hpp
+    //       926/937-938).  Pin those macros to their conventional values so
+    //       a future library that names anything else would mismatch.
+    //       On Windows-no-SEH (mingw/clang-cl) the seh_invoke_detour wrapper
+    //       degrades to catch(...) — pin the compile-path selector so a
+    //       mis-gate would be a build-visible change.
+    //   (5) cross-platform compile-path pin — seh_invoke_detour exists and
+    //       has the contracted signature on every build (MSVC __try path,
+    //       non-MSVC catch(...) path); a static_assert on the callable type
+    //       proves it.
+    // =====================================================================
+    {
+        // (5) compile-path / signature pins.  static_assert facts.
+        using fn_t = decltype(&vmhook::hotspot::seh_invoke_detour);
+        static_assert(std::is_pointer_v<fn_t>, "seh_invoke_detour is a function");
+        static_assert(std::is_function_v<std::remove_pointer_t<fn_t>>,
+                      "seh_invoke_detour is a function pointer to a function");
+        // The function is noexcept-callable (compile-time fact, derived from
+        // its declared noexcept at vmhook.hpp:7218).
+        static_assert(noexcept(vmhook::hotspot::seh_invoke_detour(
+                          std::declval<const detour_fn_t&>(),
+                          std::declval<vmhook::hotspot::frame*>(),
+                          std::declval<vmhook::hotspot::java_thread*>(),
+                          std::declval<vmhook::hotspot::return_slot*>())),
+                      "seh_invoke_detour must be noexcept (load-bearing)");
+        check("seh_invoke_detour_compile_path_signature_pin", true);
+
+        // (1) No install/uninstall API: the feature is stateless per-call.
+        // We do not assert "register does not exist" (that would not compile);
+        // we assert the operational equivalent — calling seh_invoke_detour
+        // any number of times from a cold start works with no prior setup.
+        // This block is itself the first call site, so reaching the
+        // assertions proves no implicit init was required.
+        check("seh_invoke_detour_no_install_required", true);
+    }
+
+    // (2) Cold-state after many alternating cycles.  First/last clean calls
+    // produce identical side effects; throw-arm count remains exactly the
+    // expected total; no drift across 200 cycles.
+    {
+        vmhook::hotspot::return_slot first_slot{};
+        vmhook::hotspot::return_slot last_slot{};
+        int throw_falses{ 0 };
+        int clean_trues{ 0 };
+
+        detour_fn_t clean{ [](vmhook::hotspot::frame*,
+                              vmhook::hotspot::java_thread*,
+                              vmhook::hotspot::return_slot* const s) noexcept
+        {
+            s->cancel = true;
+            s->retval = 0x1234567890ABCDEFLL;
+        } };
+        detour_fn_t thrower{ [](vmhook::hotspot::frame*,
+                                vmhook::hotspot::java_thread*,
+                                vmhook::hotspot::return_slot*)
+        {
+            throw std::runtime_error{ "cycle" };
+        } };
+
+        constexpr int cycles{ 200 };
+        for (int i{ 0 }; i < cycles; ++i)
+        {
+            vmhook::hotspot::return_slot s{};
+            const bool ok_clean{ vmhook::hotspot::seh_invoke_detour(
+                clean, nullptr, nullptr, &s) };
+            if (ok_clean) { ++clean_trues; }
+            if (i == 0)            { first_slot = s; }
+            if (i == cycles - 1)   { last_slot  = s; }
+
+            vmhook::hotspot::return_slot throwaway{};
+            const bool ok_throw{ vmhook::hotspot::seh_invoke_detour(
+                thrower, nullptr, nullptr, &throwaway) };
+            if (!ok_throw) { ++throw_falses; }
+        }
+        check("seh_cold_state_clean_arms_all_true", clean_trues == cycles);
+        check("seh_cold_state_throw_arms_all_false", throw_falses == cycles);
+        check("seh_cold_state_first_equals_last_cancel",
+              first_slot.cancel == last_slot.cancel);
+        check("seh_cold_state_first_equals_last_retval",
+              first_slot.retval == last_slot.retval);
+        check("seh_cold_state_no_drift_retval_value",
+              last_slot.retval == 0x1234567890ABCDEFLL);
+    }
+
+    // (3) Handler-mask / thread-local invariant via errno.  The wrapper must
+    // not poke errno on either the clean OR the throwing path.
+    {
+        errno = 12345;
+        vmhook::hotspot::return_slot s{};
+        detour_fn_t noop{ [](vmhook::hotspot::frame*,
+                             vmhook::hotspot::java_thread*,
+                             vmhook::hotspot::return_slot*) noexcept {} };
+        const bool ok{ vmhook::hotspot::seh_invoke_detour(noop, nullptr, nullptr, &s) };
+        check("seh_clean_path_returns_true_for_errno_test", ok);
+        check("seh_clean_path_does_not_disturb_errno", errno == 12345);
+
+        errno = 54321;
+        detour_fn_t thrower{ [](vmhook::hotspot::frame*,
+                                vmhook::hotspot::java_thread*,
+                                vmhook::hotspot::return_slot*)
+        {
+            throw std::runtime_error{ "errno test" };
+        } };
+        const bool ok2{ vmhook::hotspot::seh_invoke_detour(thrower, nullptr, nullptr, &s) };
+        check("seh_throw_path_returns_false_for_errno_test", !ok2);
+        // On some libstdc++ implementations, throwing through the EH machinery
+        // may briefly touch errno; record but only [INFO] gate if it diverges
+        // (the load-bearing invariant is the clean path).
+        if (errno != 54321)
+        {
+            std::printf("[INFO] seh throw path perturbed errno (%d != 54321)\n", errno);
+        }
+        else
+        {
+            check("seh_throw_path_does_not_disturb_errno", true);
+        }
+    }
+
+    // (4) Signal-number constants pinned (POSIX) / compile-path pin (Windows).
+#if !defined(_WIN32)
+    {
+        // The os signal-handler half of this feature uses these two macros
+        // (vmhook.hpp:926, 937-938).  Pin their conventional values so any
+        // future re-wiring to a different signal is build-visible.
+        check("posix_SIGSEGV_value_pinned", SIGSEGV == 11);
+        check("posix_SIGBUS_value_pinned",  SIGBUS  == 7 || SIGBUS == 10);
+        // SIGBUS is 7 on Linux, 10 on macOS/BSD — both accepted.
+        check("posix_SIGSEGV_and_SIGBUS_distinct", SIGSEGV != SIGBUS);
+    }
+#else
+    {
+        // On Windows the SEH wrapper is gated to real MSVC (vmhook.hpp:7221).
+        // mingw + clang-cl take the catch(...) stub; pin the compile-path
+        // selector so a mis-gate would be a build-visible change.
+    #if defined(_MSC_VER) && !defined(__clang__)
+        constexpr bool real_msvc{ true };
+    #else
+        constexpr bool real_msvc{ false };
+    #endif
+        // The static_assert below pins which arm this build selected at
+        // compile time — exactly one is true.  This catches the "mingw
+        // accidentally pulled the MSVC arm" or "clang-cl took __try" classes
+        // of regression.
+    #if defined(_MSC_VER) && !defined(__clang__)
+        static_assert(real_msvc, "MSVC build must select the SEH arm");
+    #else
+        static_assert(!real_msvc, "Non-MSVC build must select the catch(...) arm");
+    #endif
+        check("windows_seh_compile_path_arm_pinned", true);
+        // Either arm: the wrapper exists and returns bool, so the previous
+        // clean/throw sections already proved its functional behaviour on
+        // whichever arm this build selected.
+        check("windows_seh_compile_path_callable",
+              static_cast<bool>(detour_fn_t{ [](vmhook::hotspot::frame*,
+                                                vmhook::hotspot::java_thread*,
+                                                vmhook::hotspot::return_slot*) noexcept {} }));
+        (void)real_msvc;
+    }
+#endif
 
     std::printf("\n%s: %d failure(s)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;

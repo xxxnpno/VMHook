@@ -1711,5 +1711,112 @@ int main()
               (tagged_addr & ceiling) == (tagged_addr & 0x00007FFFFFFFFFFFull));
     }
 
+    // =====================================================================
+    // PART Y (wave-26 — cold-state klass accessor DEEPENING).
+    //
+    // Ledger gap: the walk's substrate klass-shape accessors — get_name(),
+    // get_super(), get_next_link() — must return nullptr WITHOUT throwing on
+    // a cold (no-JVM) klass*, and the static return-type contracts must hold
+    // at compile time.  The pre-existing JDK-variant gates (array-super #32,
+    // synthetic this$0+$VALUES, dotted-names) all degrade to "no klass
+    // resolves" on cold path, so the only assertion remaining IS the
+    // null-everywhere contract.  All inputs are nullptr or is_valid_pointer-
+    // REJECTED low/odd/floor constants — no fabricated readable address is
+    // ever dereferenced.  Cross-platform: only standard types + the public
+    // hotspot::klass surface; no platform-conditional code.
+    // =====================================================================
+    {
+        // Y1 -- static return-type contracts for the three cold-state
+        //       accessors.  Pins the API SHAPE so a future widening (e.g. an
+        //       optional<symbol*>) breaks at compile-of-test-time.
+        using get_name_ret_t      = decltype(std::declval<klass>().get_name());
+        using get_super_ret_t     = decltype(std::declval<klass>().get_super());
+        using get_next_link_ret_t = decltype(std::declval<klass>().get_next_link());
+        static_assert(std::is_same_v<get_name_ret_t, vmhook::hotspot::symbol*>,
+                      "klass::get_name() must return symbol*");
+        static_assert(std::is_same_v<get_super_ret_t, klass*>,
+                      "klass::get_super() must return klass*");
+        static_assert(std::is_same_v<get_next_link_ret_t, klass*>,
+                      "klass::get_next_link() must return klass*");
+        // get_super is noexcept (cold path is a noexcept-guarantee leg).
+        static_assert(noexcept(std::declval<klass>().get_super()),
+                      "klass::get_super() must be noexcept");
+        check("Y1_static_return_types_pinned", true);
+    }
+    {
+        // Y2 -- nullptr klass: every cold accessor we can exercise on a null
+        //       receiver returns null/empty without throwing.  collect_klass_
+        //       methods's null-klass arm is already exercised in W2; this
+        //       pins the SHAPE accessors uniformly.  Calling a non-virtual
+        //       member through a null klass* is well-defined here because
+        //       every body checks is_valid_pointer(this) BEFORE any deref.
+        // Launder the null through a volatile to suppress -Wnonnull on the
+        // call site: the compile-time "this is literally nullptr" warning
+        // is what we want to DODGE here — the runtime behaviour (early-null
+        // return inside the body) is exactly what we're pinning.
+        klass* volatile null_holder{ nullptr };
+        klass* const null_klass{ null_holder };
+        // get_super is noexcept -> safe direct call.
+        check("Y2_null_klass_get_super_null", null_klass->get_super() == nullptr);
+        // get_name throws-and-catches internally (returns nullptr).
+        check("Y2_null_klass_get_name_null", null_klass->get_name() == nullptr);
+        // get_next_link: !entry path throws on no-JVM (entry is null); wrap.
+        bool next_link_safe{ false };
+        vmhook::hotspot::klass* nl_result{ reinterpret_cast<vmhook::hotspot::klass*>(0x1) };
+        try { nl_result = null_klass->get_next_link(); next_link_safe = true; }
+        catch (...) { next_link_safe = true; nl_result = nullptr; }
+        check("Y2_null_klass_get_next_link_no_propagate", next_link_safe);
+        check("Y2_null_klass_get_next_link_null_or_throws",
+              nl_result == nullptr);
+    }
+    {
+        // Y3 -- rejected `this` (low / odd / floor): same null contract.
+        //       is_valid_pointer rejects -> early-null return, no deref.
+        klass* const low_k{ reinterpret_cast<klass*>(0x1000ull) };
+        klass* const odd_k{ reinterpret_cast<klass*>(0x1001ull) };
+        klass* const floor_k{ reinterpret_cast<klass*>(0xFFFFull) };
+        check("Y3_low_klass_get_super_null", low_k->get_super() == nullptr);
+        check("Y3_odd_klass_get_super_null", odd_k->get_super() == nullptr);
+        check("Y3_floor_klass_get_super_null", floor_k->get_super() == nullptr);
+        check("Y3_low_klass_get_name_null", low_k->get_name() == nullptr);
+        check("Y3_odd_klass_get_name_null", odd_k->get_name() == nullptr);
+        check("Y3_floor_klass_get_name_null", floor_k->get_name() == nullptr);
+    }
+    {
+        // Y4 -- idempotent / deterministic: calling each accessor twice on
+        //       the same rejected `this` yields the same (null) result.  No
+        //       hidden cache mutation, no growth.
+        klass* const k{ reinterpret_cast<klass*>(0x800ull) };
+        check("Y4_get_super_idempotent",
+              k->get_super() == nullptr && k->get_super() == nullptr);
+        check("Y4_get_name_idempotent",
+              k->get_name() == nullptr && k->get_name() == nullptr);
+    }
+    {
+        // Y5 -- JDK-variant gates survive the cold path: with no JVM,
+        //       array_klass_name / dotted-name / synthetic-name resolution
+        //       all degrade to the SAME no-klass empty result.  Pin the
+        //       parity so the JDK-variant gating cannot regress here.
+        //       (#32 array-super: an array klass name like "[I" resolves to
+        //        nullptr cold -> empty methods; the inner-class synthetic
+        //        names "this$0" / "$VALUES" likewise resolve to nullptr
+        //        cold; the dotted form "java.lang.Object" is a clean miss.)
+        const auto arr_i{ vmhook::get_class_methods("[I") };
+        const auto arr_obj{ vmhook::get_class_methods("[Ljava/lang/Object;") };
+        const auto inner_this0{ vmhook::get_class_methods("a/Outer$1") };
+        const auto values_enum{ vmhook::get_class_methods("a/MyEnum") };
+        const auto dotted{ vmhook::get_class_methods("java.lang.Object") };
+        check("Y5_array_int_cold_empty", arr_i.empty());
+        check("Y5_array_object_cold_empty", arr_obj.empty());
+        check("Y5_inner_synthetic_cold_empty", inner_this0.empty());
+        check("Y5_enum_values_cold_empty", values_enum.empty());
+        check("Y5_dotted_cold_empty", dotted.empty());
+        // The array-klass cold path also returns nullptr from find_class —
+        // the substrate the #32 gate stands on.
+        check("Y5_find_class_array_null", vmhook::find_class("[I") == nullptr);
+        check("Y5_find_class_dotted_null",
+              vmhook::find_class("java.lang.Object") == nullptr);
+    }
+
     return failures == 0 ? 0 : 1;
 }

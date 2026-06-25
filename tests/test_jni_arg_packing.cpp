@@ -3357,5 +3357,269 @@ int main()
         }
     }
 
+    // =====================================================================
+    // SECTION W26 — wave-26 ledger gaps:
+    //   * 0-arg / 1-arg / 8-arg / max-arg matrices for make_jni_args.
+    //   * slot rules: every JNI jvalue occupies EXACTLY ONE union cell
+    //     regardless of declared Java type — including long and double.
+    //     (The "long/double = 2 slots" rule lives in the *interpreter
+    //     frame*, NOT in the jvalue[] the CallXMethodA APIs consume.)
+    //   * null-jobject (null unique_ptr<wrapper>) arg packs safely.
+    //   * mixed-type encode -> read-back round-trip across one pack.
+    //   * wide-arg slot boundary: a 64-bit value in slot N does not bleed
+    //     into slot N-1 or slot N+1.
+    // =====================================================================
+
+    // ---- (W26-S) compile-time slot-size invariants -------------------------
+    // Every jvalue slot is exactly pointer-sized (= 8 bytes on the CI matrix).
+    // A long arg and a double arg each occupy ONE such slot in jvalue[], same
+    // as a jint or a jboolean — the interpreter-frame double-slot rule does
+    // NOT apply at this layer.  Pin via static_assert so a regression that
+    // splits long/double across two array entries cannot compile.
+    static_assert(sizeof(vmhook::detail::jni_value) == sizeof(void*),
+                  "W26: jvalue cell is pointer-sized");
+    static_assert(sizeof(vmhook::detail::jni_value) >= sizeof(std::int64_t),
+                  "W26: jvalue cell holds a full jlong in one slot");
+    static_assert(sizeof(vmhook::detail::jni_value) >= sizeof(double),
+                  "W26: jvalue cell holds a full jdouble in one slot");
+    static_assert(sizeof(vmhook::detail::jni_value[8]) == 8 * sizeof(void*),
+                  "W26: jvalue[8] has no per-slot padding");
+    static_assert(sizeof(vmhook::detail::jni_value[16]) == 16 * sizeof(void*),
+                  "W26: jvalue[16] has no per-slot padding");
+    // The convert_jni_arg ladder accepts both int64_t and uint64_t through the
+    // `sizeof==8` integral arm — assert at compile time that both are routed.
+    static_assert(jni_arg_accepted_v<std::int64_t>, "W26: int64 accepted");
+    static_assert(jni_arg_accepted_v<std::uint64_t>, "W26: uint64 accepted");
+    static_assert(jni_arg_accepted_v<double>, "W26: double accepted");
+    static_assert(jni_arg_accepted_v<float>, "W26: float accepted");
+
+    // ---- (W26-A) 0-arg pack: make_jni_args with NO args ---------------------
+    // No args -> zero-length values vector, zero-length needs_release vector,
+    // zero-length object_handles vector.  This is the degenerate but valid
+    // arity for parameterless ctors / no-arg methods.
+    {
+        std::vector<void*> object_handles{};
+        std::vector<char>  needs_release{};
+        std::vector<vmhook::detail::jni_value> values{
+            vmhook::detail::make_jni_args(object_handles, needs_release)
+        };
+        check("W26A_zero_arg_values_empty", values.empty());
+        check("W26A_zero_arg_tags_empty", needs_release.empty());
+        check("W26A_zero_arg_object_handles_empty", object_handles.empty());
+    }
+
+    // ---- (W26-B) 1-arg pack: each documented type, in isolation -------------
+    // Every arg type packed alone produces a 1-cell vector with the expected
+    // tag and union member.  This is the minimal arity above zero.
+    {
+        std::vector<void*> oh{};
+        std::vector<char>  nr{};
+        auto vals{ vmhook::detail::make_jni_args(oh, nr, std::int32_t{ 42 }) };
+        check("W26B_1arg_int_size", vals.size() == 1 && nr.size() == 1);
+        check("W26B_1arg_int_i_member", vals[0].i == 42);
+        check("W26B_1arg_int_tag_zero", nr[0] == 0);
+    }
+    {
+        std::vector<void*> oh{};
+        std::vector<char>  nr{};
+        auto vals{ vmhook::detail::make_jni_args(oh, nr, std::int64_t{ 0x0102'0304'0506'0708LL }) };
+        check("W26B_1arg_long_size", vals.size() == 1 && nr.size() == 1);
+        check("W26B_1arg_long_j_member", vals[0].j == 0x0102'0304'0506'0708LL);
+        check("W26B_1arg_long_tag_zero", nr[0] == 0);
+    }
+    {
+        std::vector<void*> oh{};
+        std::vector<char>  nr{};
+        auto vals{ vmhook::detail::make_jni_args(oh, nr, float{ 0.5f }) };
+        check("W26B_1arg_float_size", vals.size() == 1);
+        check("W26B_1arg_float_f_member", bits_eq(vals[0].f, 0.5f));
+    }
+    {
+        std::vector<void*> oh{};
+        std::vector<char>  nr{};
+        auto vals{ vmhook::detail::make_jni_args(oh, nr, double{ -0.25 }) };
+        check("W26B_1arg_double_size", vals.size() == 1);
+        check("W26B_1arg_double_d_member", bits_eq(vals[0].d, -0.25));
+    }
+    {
+        std::vector<void*> oh{};
+        std::vector<char>  nr{};
+        auto vals{ vmhook::detail::make_jni_args(oh, nr, true) };
+        check("W26B_1arg_bool_size", vals.size() == 1);
+        check("W26B_1arg_bool_z_member", vals[0].z == true);
+    }
+
+    // ---- (W26-C) 8-arg pack: the method_proxy::call_jni stack-path cap ------
+    // The stack path's compile-time cap is 8 args (vmhook.hpp:12757-12758).
+    // Pack exactly 8 mixed types through the heap path and confirm every slot
+    // landed in the right union member and every tag is 0.
+    {
+        std::vector<void*> oh{};
+        std::vector<char>  nr{};
+        auto vals{ vmhook::detail::make_jni_args(
+            oh, nr,
+            std::int32_t{ 1 },                               // [0] .i
+            std::int64_t{ 2 },                               // [1] .j
+            float{ 3.0f },                                   // [2] .f
+            double{ 4.0 },                                   // [3] .d
+            true,                                            // [4] .z
+            std::int16_t{ 5 },                               // [5] .i (widened)
+            std::uint8_t{ 6 },                               // [6] .i (zero-ext)
+            std::uint64_t{ 0x7777'7777'7777'7777ULL })       // [7] .j
+        };
+        check("W26C_8arg_value_count", vals.size() == 8);
+        check("W26C_8arg_tag_count", nr.size() == 8);
+        check("W26C_8arg_slot0_i", vals[0].i == 1);
+        check("W26C_8arg_slot1_j", vals[1].j == 2);
+        check("W26C_8arg_slot2_f", bits_eq(vals[2].f, 3.0f));
+        check("W26C_8arg_slot3_d", bits_eq(vals[3].d, 4.0));
+        check("W26C_8arg_slot4_z", vals[4].z == true);
+        check("W26C_8arg_slot5_i_widened", vals[5].i == 5);
+        check("W26C_8arg_slot6_i_zeroext", vals[6].i == 6);
+        check("W26C_8arg_slot7_j",
+              vals[7].j == static_cast<std::int64_t>(0x7777'7777'7777'7777ULL));
+        bool all_tags_zero{ true };
+        for (const char t : nr) { if (t != 0) { all_tags_zero = false; } }
+        check("W26C_8arg_all_tags_zero", all_tags_zero);
+    }
+
+    // ---- (W26-D) max-arg pack: 16-wide mixed pack ---------------------------
+    // The heap path has no compile-time arity bound — push it to 16 args, twice
+    // the call_jni stack cap, and check the contiguous slot count + integrity.
+    {
+        std::vector<void*> oh{};
+        std::vector<char>  nr{};
+        auto vals{ vmhook::detail::make_jni_args(
+            oh, nr,
+            std::int32_t{ 0 },  std::int64_t{ 1 },  float{ 2.0f },  double{ 3.0 },
+            true,               std::int32_t{ 5 },  std::int64_t{ 6 }, float{ 7.0f },
+            double{ 8.0 },      false,              std::int32_t{ 10 }, std::int64_t{ 11 },
+            float{ 12.0f },     double{ 13.0 },     std::int32_t{ 14 }, std::int64_t{ 15 })
+        };
+        check("W26D_16arg_value_count", vals.size() == 16);
+        check("W26D_16arg_tag_count", nr.size() == 16);
+        check("W26D_16arg_slot0_i_zero", vals[0].i == 0);
+        check("W26D_16arg_slot1_j_one", vals[1].j == 1);
+        check("W26D_16arg_slot4_z_true", vals[4].z == true);
+        check("W26D_16arg_slot9_z_false", vals[9].z == false);
+        check("W26D_16arg_slot13_d_thirteen", bits_eq(vals[13].d, 13.0));
+        check("W26D_16arg_slot15_j_fifteen", vals[15].j == 15);
+        bool all_tags_zero_16{ true };
+        for (const char t : nr) { if (t != 0) { all_tags_zero_16 = false; } }
+        check("W26D_16arg_all_tags_zero", all_tags_zero_16);
+    }
+
+    // ---- (W26-E) null-jobject arg packs safely ------------------------------
+    // A null unique_ptr<wrapper> arg must: (a) push a nullptr into the object
+    // handles vector; (b) point value.l at that handles slot (NOT at &storage,
+    // since this is the heap path); (c) leave needs_release at 0.  The
+    // DeleteLocalRef cleanup loop must NOT touch it.
+    {
+        std::vector<void*> oh{};
+        std::vector<char>  nr{};
+        // reserve so the &back() pointer the packer stashes into .l stays valid
+        oh.reserve(2);
+        auto vals{ vmhook::detail::make_jni_args(
+            oh, nr,
+            std::unique_ptr<fake_object>{ nullptr },
+            std::int32_t{ 99 })
+        };
+        check("W26E_null_obj_pack_size", vals.size() == 2);
+        check("W26E_null_obj_handles_size", oh.size() == 1);
+        check("W26E_null_obj_handle_is_null", oh[0] == nullptr);
+        check("W26E_null_obj_l_points_into_handles",
+              vals[0].l == static_cast<void*>(&oh[0]));
+        check("W26E_null_obj_tag_zero", nr[0] == 0);
+        check("W26E_null_obj_following_int_landed", vals[1].i == 99);
+        check("W26E_null_obj_following_int_tag_zero", nr[1] == 0);
+    }
+
+    // ---- (W26-F) mixed-type encode -> read-back round-trip ------------------
+    // Pack a representative pack, then read each slot back through the SAME
+    // union member the packer stored into and confirm bit-exact equality.
+    // This is the "encode then decode" matrix the ledger asks for, scoped to
+    // the union-cell layer (the live-JVM Call*MethodA decode lives in the JVM
+    // module).
+    {
+        const std::int32_t  i32_v{ static_cast<std::int32_t>(0xCAFEBABE) };
+        const std::int64_t  i64_v{ static_cast<std::int64_t>(0xDEADBEEF12345678LL) };
+        const float         f_v{ 12345.6789f };
+        const double        d_v{ -987654.321 };
+        const bool          b_v{ true };
+        const std::int16_t  i16_v{ -31337 };
+        const std::uint16_t u16_v{ 0xABCD };
+
+        std::vector<void*> oh{};
+        std::vector<char>  nr{};
+        auto vals{ vmhook::detail::make_jni_args(
+            oh, nr, i32_v, i64_v, f_v, d_v, b_v, i16_v, u16_v)
+        };
+        check("W26F_roundtrip_size", vals.size() == 7);
+        check("W26F_roundtrip_i32",   vals[0].i == i32_v);
+        check("W26F_roundtrip_i64",   vals[1].j == i64_v);
+        check("W26F_roundtrip_float", bits_eq(vals[2].f, f_v));
+        check("W26F_roundtrip_double",bits_eq(vals[3].d, d_v));
+        check("W26F_roundtrip_bool",  vals[4].z == b_v);
+        check("W26F_roundtrip_i16",   vals[5].i == static_cast<std::int32_t>(i16_v));
+        check("W26F_roundtrip_u16",   vals[6].i == static_cast<std::int32_t>(u16_v));
+        // Cross-check: .c on the u16 slot reads back the source code unit.
+        check("W26F_roundtrip_u16_via_c_member", vals[6].c == u16_v);
+        // Cross-check: .s on the i16 slot reads back the source.
+        check("W26F_roundtrip_i16_via_s_member", vals[5].s == i16_v);
+        // Cross-check: .l on the i64 slot reflects the full 64-bit pattern.
+        check("W26F_roundtrip_i64_via_l_member",
+              vals[1].l == reinterpret_cast<void*>(static_cast<std::uintptr_t>(i64_v)));
+    }
+
+    // ---- (W26-G) wide-arg slot boundary: no bleed across neighbours ---------
+    // A 64-bit value (.j / .d) at slot N must NOT touch slot N-1 or slot N+1.
+    // The neighbours are written with KNOWN, distinct sentinels both BEFORE
+    // and AFTER the wide slot, and the wide slot itself carries an all-ones
+    // pattern that would be the most likely culprit if a wrong-width store
+    // ever spilled.  No bleed -> neighbours read back their sentinels.
+    {
+        std::vector<void*> oh{};
+        std::vector<char>  nr{};
+        const std::int32_t LEFT_SENTINEL{ static_cast<std::int32_t>(0x11111111) };
+        const std::int32_t RIGHT_SENTINEL{ static_cast<std::int32_t>(0x33333333) };
+        const std::int64_t WIDE{ static_cast<std::int64_t>(0xFFFF'FFFF'FFFF'FFFFLL) };
+
+        auto vals{ vmhook::detail::make_jni_args(
+            oh, nr,
+            LEFT_SENTINEL,                    // [0] .i
+            WIDE,                             // [1] .j (8 bytes, all-ones)
+            RIGHT_SENTINEL,                   // [2] .i
+            double{ 1.5 },                    // [3] .d (another wide slot)
+            std::int32_t{ 0x44444444 })       // [4] .i — neighbour to .d
+        };
+        check("W26G_slot_count_five", vals.size() == 5);
+        // Slot 0 untouched by the wide slot 1 write.
+        check("W26G_left_neighbour_intact", vals[0].i == LEFT_SENTINEL);
+        check("W26G_left_neighbour_high_word_zero", (vals[0].j >> 32) == 0);
+        // Slot 1 carries the full 64-bit pattern unchanged.
+        check("W26G_wide_slot_full_width", vals[1].j == WIDE);
+        // Slot 2 untouched by the wide slot 1 write to its left.
+        check("W26G_right_neighbour_intact", vals[2].i == RIGHT_SENTINEL);
+        check("W26G_right_neighbour_high_word_zero", (vals[2].j >> 32) == 0);
+        // Slot 3 (double) carries the IEEE-754 bit pattern of 1.5.
+        check("W26G_double_slot_d_member", bits_eq(vals[3].d, 1.5));
+        // Slot 4 (int neighbour to the double) is intact.
+        check("W26G_double_right_neighbour_intact",
+              vals[4].i == static_cast<std::int32_t>(0x44444444));
+        check("W26G_double_right_neighbour_high_word_zero", (vals[4].j >> 32) == 0);
+
+        // Also verify the 8-byte stride: address arithmetic across the vector
+        // backing store advances by exactly sizeof(jni_value) per slot — no
+        // double-slot for the wide entry.
+        check("W26G_slot_stride_pointer_sized",
+              reinterpret_cast<std::uintptr_t>(&vals[1])
+              - reinterpret_cast<std::uintptr_t>(&vals[0])
+              == sizeof(vmhook::detail::jni_value));
+        check("W26G_slot_stride_constant_across_wide",
+              reinterpret_cast<std::uintptr_t>(&vals[2])
+              - reinterpret_cast<std::uintptr_t>(&vals[1])
+              == sizeof(vmhook::detail::jni_value));
+    }
+
     return failures == 0 ? 0 : 1;
 }

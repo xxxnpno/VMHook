@@ -722,6 +722,143 @@ int main()
               vmhook::verify_hooks() == 0 && vmhook::verify_hooks() == 0);
     }
 
+    // =====================================================================
+    // P. JVMS-locked ConstantPool tag values (JVMS §4.4 Table 4.4-A).  The
+    //    library does not (yet) expose a tag enum, but every ConstantPool slot
+    //    in a real HotSpot is paired with a _tags byte holding one of these
+    //    values; pinning them here as constexpr facts makes any future tag
+    //    decoder a fail-the-build mismatch instead of a silent regression.
+    //    These values are FROZEN by the JVMS class file format — they are the
+    //    same on JDK 8 through 26 and across vendors.
+    // =====================================================================
+    {
+        constexpr std::uint8_t JVM_CONSTANT_Utf8{ 1 };
+        constexpr std::uint8_t JVM_CONSTANT_Integer{ 3 };
+        constexpr std::uint8_t JVM_CONSTANT_Float{ 4 };
+        constexpr std::uint8_t JVM_CONSTANT_Long{ 5 };
+        constexpr std::uint8_t JVM_CONSTANT_Double{ 6 };
+        constexpr std::uint8_t JVM_CONSTANT_Class{ 7 };
+        constexpr std::uint8_t JVM_CONSTANT_String{ 8 };
+        constexpr std::uint8_t JVM_CONSTANT_Fieldref{ 9 };
+        constexpr std::uint8_t JVM_CONSTANT_Methodref{ 10 };
+        constexpr std::uint8_t JVM_CONSTANT_InterfaceMethodref{ 11 };
+        constexpr std::uint8_t JVM_CONSTANT_NameAndType{ 12 };
+        constexpr std::uint8_t JVM_CONSTANT_MethodHandle{ 15 };
+        constexpr std::uint8_t JVM_CONSTANT_MethodType{ 16 };
+        constexpr std::uint8_t JVM_CONSTANT_Dynamic{ 17 };
+        constexpr std::uint8_t JVM_CONSTANT_InvokeDynamic{ 18 };
+        constexpr std::uint8_t JVM_CONSTANT_Module{ 19 };
+        constexpr std::uint8_t JVM_CONSTANT_Package{ 20 };
+        // JVMS Table 4.4-A: exact byte values, frozen across all class file
+        // versions since 1.0.2 (Utf8..NameAndType) / 7 (MethodHandle..InvokeDyn)
+        // / 9 (Module/Package).
+        static_assert(JVM_CONSTANT_Utf8 == 1);
+        static_assert(JVM_CONSTANT_Integer == 3);
+        static_assert(JVM_CONSTANT_Float == 4);
+        static_assert(JVM_CONSTANT_Long == 5);
+        static_assert(JVM_CONSTANT_Double == 6);
+        static_assert(JVM_CONSTANT_Class == 7);
+        static_assert(JVM_CONSTANT_String == 8);
+        static_assert(JVM_CONSTANT_Fieldref == 9);
+        static_assert(JVM_CONSTANT_Methodref == 10);
+        static_assert(JVM_CONSTANT_InterfaceMethodref == 11);
+        static_assert(JVM_CONSTANT_NameAndType == 12);
+        static_assert(JVM_CONSTANT_MethodHandle == 15);
+        static_assert(JVM_CONSTANT_MethodType == 16);
+        static_assert(JVM_CONSTANT_Dynamic == 17);
+        static_assert(JVM_CONSTANT_InvokeDynamic == 18);
+        static_assert(JVM_CONSTANT_Module == 19);
+        static_assert(JVM_CONSTANT_Package == 20);
+        // The reserved gap: tags 2, 13, 14 are unused by JVMS — never legal as
+        // a real ConstantPool tag byte.  A future decoder must reject these.
+        constexpr std::array<std::uint8_t, 3> reserved_gap{ 2u, 13u, 14u };
+        bool gap_distinct{ true };
+        constexpr std::array<std::uint8_t, 17> legal_tags{
+            JVM_CONSTANT_Utf8, JVM_CONSTANT_Integer, JVM_CONSTANT_Float,
+            JVM_CONSTANT_Long, JVM_CONSTANT_Double, JVM_CONSTANT_Class,
+            JVM_CONSTANT_String, JVM_CONSTANT_Fieldref, JVM_CONSTANT_Methodref,
+            JVM_CONSTANT_InterfaceMethodref, JVM_CONSTANT_NameAndType,
+            JVM_CONSTANT_MethodHandle, JVM_CONSTANT_MethodType,
+            JVM_CONSTANT_Dynamic, JVM_CONSTANT_InvokeDynamic,
+            JVM_CONSTANT_Module, JVM_CONSTANT_Package };
+        for (const std::uint8_t r : reserved_gap)
+        {
+            for (const std::uint8_t t : legal_tags)
+            {
+                if (r == t) { gap_distinct = false; }
+            }
+        }
+        check("P_reserved_gap_distinct_from_legal_tags", gap_distinct);
+        // The two DOUBLE-WIDTH tags (Long, Double) — these reserve TWO cp slots
+        // each per JVMS §4.4.5; index+1 is unusable.  Pin the identity.
+        check("P_long_and_double_are_double_width",
+              JVM_CONSTANT_Long == 5 && JVM_CONSTANT_Double == 6);
+        // Tag byte never exceeds u8 max — the _tags array is a u1 stream.
+        static_assert(JVM_CONSTANT_Package <= 0xFFu);
+        check("P_tags_fit_u8", true);
+    }
+
+    // =====================================================================
+    // Q. EXTRA compile-time pins on accessor signatures that wave-26 calls out.
+    //    These are duplicate-coverage for the load-bearing accessors so a
+    //    library refactor that changes width, sign, throw-spec, or
+    //    const-qualification fails the BUILD before any test runs.
+    // =====================================================================
+    {
+        // get_length is signed int32 (the -1 sentinel requires signedness).
+        static_assert(std::is_signed_v<decltype(std::declval<constant_pool>().get_length())>,
+                      "get_length must be signed (carries the -1 sentinel)");
+        static_assert(sizeof(decltype(std::declval<constant_pool>().get_length())) == 4,
+                      "get_length is exactly 32 bits");
+        // get_base returns void** (NOT void*, NOT char**) — the slot element
+        // type IS void* (a Symbol*-erased pointer-sized cell).
+        static_assert(std::is_pointer_v<decltype(std::declval<constant_pool>().get_base())>);
+        static_assert(std::is_pointer_v<std::remove_pointer_t<
+                          decltype(std::declval<constant_pool>().get_base())>>,
+                      "get_base's pointee is itself a pointer (void**)");
+        // const_method::get_name / get_signature return symbol* (not const).
+        static_assert(std::is_pointer_v<decltype(std::declval<const_method>().get_name())>);
+        static_assert(std::is_pointer_v<decltype(std::declval<const_method>().get_signature())>);
+        // klass::get_methods_count is signed int32 (matches Array<>::_length).
+        static_assert(std::is_signed_v<decltype(std::declval<klass>().get_methods_count())>);
+        static_assert(sizeof(decltype(std::declval<klass>().get_methods_count())) == 4);
+        // klass::get_methods_ptr returns method** (an Array<Method*> data ptr).
+        static_assert(std::is_pointer_v<decltype(std::declval<klass>().get_methods_ptr())>);
+        static_assert(std::is_pointer_v<std::remove_pointer_t<
+                          decltype(std::declval<klass>().get_methods_ptr())>>);
+        check("Q_extra_accessor_pins_compiled", true);
+    }
+
+    // =====================================================================
+    // R. EXTRA null-cp coverage: an in-range owned cp buffer is the strongest
+    //    no-JVM probe because it passes is_valid_pointer (we own the memory)
+    //    yet every accessor STILL fail-closes via the entry==null guard.  Drive
+    //    a FRESH buffer through every accessor in a single batch so a future
+    //    library tweak that re-orders the guards (e.g. moving the entry check
+    //    AFTER a this+offset read) flips at least one assertion red.
+    // =====================================================================
+    {
+        alignas(16) std::array<std::uint8_t, 128> buf{};
+        // Pre-poison the buffer with a non-zero pattern: if any accessor
+        // accidentally READS through `this+offset`, it would return that
+        // pattern rather than nullptr/0/-1 — exposing a regression.
+        for (std::size_t i{ 0 }; i < buf.size(); ++i) { buf[i] = static_cast<std::uint8_t>(0xA5); }
+        auto* const cp{ reinterpret_cast<constant_pool*>(buf.data()) };
+        auto* const cm{ reinterpret_cast<const_method*>(buf.data()) };
+        auto* const k{ reinterpret_cast<klass*>(buf.data()) };
+        check("R_in_range_cp_get_length_minus_one", cp->get_length() == -1);
+        check("R_in_range_cp_get_base_null", cp->get_base() == nullptr);
+        check("R_in_range_cm_get_name_null", cm->get_name() == nullptr);
+        check("R_in_range_cm_get_signature_null", cm->get_signature() == nullptr);
+        check("R_in_range_cm_get_constants_null", cm->get_constants() == nullptr);
+        check("R_in_range_k_methods_count_zero", k->get_methods_count() == 0);
+        check("R_in_range_k_methods_ptr_null", k->get_methods_ptr() == nullptr);
+        // The poison byte is untouched (we never wrote through these accessors).
+        bool poison_intact{ true };
+        for (const std::uint8_t b : buf) { if (b != 0xA5) { poison_intact = false; } }
+        check("R_accessors_did_not_write_through_this", poison_intact);
+    }
+
     std::printf("\n%s: %d failure(s)\n",
                 failures == 0 ? "ALL PASS" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;

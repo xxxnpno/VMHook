@@ -3596,5 +3596,189 @@ int main()
         check("narrow_roundtrip_encode_decode_byte_domain_shifts_5_to_8", comp_id);
     }
 
+    // ===================================================================
+    // WW. (WAVE-26 ADDITIVE) Ledger gap closure:
+    //     (WW1) compile-time shift-3 vs shift-0 selection constants (static_assert).
+    //     (WW2) table-driven mass round-trip 0..255 narrow values at shifts
+    //           0/1/2/3 -- the canonical HotSpot shifts the earlier byte-domain
+    //           sweep (VV1) skipped (it covered shifts 5..8).  Both heaps:
+    //           zero-based AND non-zero based.
+    //     (WW3) "cold-state" (no-JVM) decode_oop(0)==null pinned for BOTH heap
+    //           regimes via the shared primitive at (base=0, shift=0) and
+    //           (base=0x8_0000_0000, shift=3) -- compressed-0 short-circuits in
+    //           the wrapper independently of which heap would have been live.
+    //     (WW4) encode(uncompressed_base)==0 boundary at the PRIMITIVE level
+    //           for the four canonical (base, shift) regimes, stating the
+    //           at-base sentinel exhaustively per regime.
+    //     (WW5) non-x64 fall-through documentation: the codec arithmetic is
+    //           pure 64-bit integer math (uint64 + uint32, uint64 - uint64,
+    //           >> / <<) and depends on NOTHING x64-specific; pin a few
+    //           sizeof identities + a constexpr re-derivation that the build
+    //           verifies hold on whatever target this binary was built for
+    //           (ARM64, x64, etc.).  No CPUID, no x86 intrinsic.
+    // ===================================================================
+
+    // (WW1) constexpr selection constants: shift-3 doubles the scale 8x vs
+    // shift-0, and the closed form at compile time matches the runtime
+    // primitive.  These pin the "0 vs 3" decision the HotSpot heap-size
+    // selection feeds into the codec.
+    static_assert(ct::dec(0u, 0u, 1u) == 1ull, "shift0 scale is 1x");
+    static_assert(ct::dec(0u, 3u, 1u) == 8ull, "shift3 scale is 8x");
+    static_assert(ct::dec(0u, 3u, 1u) == ct::dec(0u, 0u, 1u) * 8u,
+                  "shift3 is exactly 8x shift0 at narrow 1");
+    static_assert(ct::dec(0u, 3u, 0x100u) == ct::dec(0u, 0u, 0x100u) * 8u,
+                  "shift3 is exactly 8x shift0 at narrow 0x100");
+    static_assert(ct::dec(0u, 0u, 0xFFFF'FFFFu) == 0xFFFF'FFFFull,
+                  "shift0 max narrow == 4G-1");
+    static_assert(ct::dec(0u, 3u, 0xFFFF'FFFFu) == 0x7'FFFF'FFF8ull,
+                  "shift3 max narrow == 32G-8");
+    static_assert(ct::dec(0u, 3u, 0xFFFF'FFFFu) / 8u
+                      == ct::dec(0u, 0u, 0xFFFF'FFFFu),
+                  "shift3 ceiling / 8 == shift0 ceiling");
+    // shift selection identity by heap regime (zero base):
+    //   <4 GB heap -> shift 0, max addressable narrow * scale == 4G-1
+    //   <=32 GB heap -> shift 3, max addressable narrow * scale == 32G-8
+    static_assert((std::uint64_t{ 1u } << 0) == 1u,  "shift0 unit");
+    static_assert((std::uint64_t{ 1u } << 3) == 8u,  "shift3 unit");
+
+    // (WW2) TABLE-driven mass round-trip 0..255 narrow values at shifts
+    // 0/1/2/3, for BOTH a zero base and a non-zero base.  This is the
+    // explicit "mass round-trip 0..255 narrow values 0/1/2/3-shift each
+    // table-driven" the ledger names.  Each row is (base, shift); we sweep
+    // every c in [0, 255] and require encode(decode(c)) == c at the
+    // primitive AND that decode equals the documented closed form.
+    {
+        struct row { std::uint64_t base; std::uint32_t shift; };
+        constexpr row table[]{
+            { 0u,                              0u },  // zero-based unscaled
+            { 0u,                              1u },
+            { 0u,                              2u },
+            { 0u,                              3u },  // zero-based scaled8
+            { std::uint64_t{ 0x8'0000'0000ull }, 0u },  // based unscaled
+            { std::uint64_t{ 0x8'0000'0000ull }, 1u },
+            { std::uint64_t{ 0x8'0000'0000ull }, 2u },
+            { std::uint64_t{ 0x8'0000'0000ull }, 3u },  // based scaled8
+        };
+        bool table_round_ok{ true };
+        bool table_decode_ok{ true };
+        std::size_t table_cases{ 0 };
+        for (const row r : table)
+        {
+            for (std::uint32_t c{ 0u }; c <= 0xFFu; ++c)
+            {
+                const std::uintptr_t got{ as_uptr(narrow_decode(r.base, r.shift, c)) };
+                const std::uintptr_t want{ static_cast<std::uintptr_t>(
+                    r.base + (static_cast<std::uint64_t>(c) << r.shift)) };
+                if (got != want) { table_decode_ok = false; }
+                const std::uint32_t re{ narrow_encode(
+                    r.base, r.shift, static_cast<std::uint64_t>(got)) };
+                if (re != c) { table_round_ok = false; }
+                ++table_cases;
+            }
+        }
+        check("ww_table_driven_mass_decode_0_to_255_shifts_0_1_2_3",
+              table_decode_ok);
+        check("ww_table_driven_mass_roundtrip_0_to_255_shifts_0_1_2_3",
+              table_round_ok);
+        // 8 rows * 256 values == 2048 cases; pin the magnitude.
+        check("ww_table_driven_sweep_is_complete",
+              table_cases == static_cast<std::size_t>(8) * 0x100u);
+    }
+
+    // (WW3) Cold-state (no-JVM) decode_oop(0) == null pinned for BOTH heap
+    // regimes.  The wrapper short-circuits compressed==0 to nullptr BEFORE
+    // any VMStruct lookup, so the result is null whether the live heap would
+    // have selected (base=0, shift=0) (small heap) or (base!=0, shift=3)
+    // (>32 GB heap).  We confirm the primitive at base 0 agrees with the
+    // wrapper's null, and the primitive at a non-zero base would have
+    // returned base (not null) -- locating the cold-state null precisely in
+    // the wrapper's guard, valid for either heap.
+    {
+        check("ww_cold_decode_oop_zero_null_small_heap_regime",
+              decode_oop_pointer(0u) == nullptr);
+        check("ww_cold_decode_klass_zero_null_small_heap_regime",
+              decode_klass_pointer(0u) == nullptr);
+        // Primitive at (0, 0) == nullptr matches wrapper (small heap).
+        check("ww_cold_primitive_zero_base_zero_matches_wrapper_oop",
+              narrow_decode(0u, 0u, 0u) == decode_oop_pointer(0u));
+        // Primitive at (0, 3) == nullptr also matches (small-shift3 heap).
+        check("ww_cold_primitive_zero_base_shift3_is_null",
+              narrow_decode(0u, 3u, 0u) == nullptr);
+        // Primitive at (non-zero base, 3) is base, NOT null -- so for the
+        // >32 GB heap regime the wrapper's compressed==0 guard is what
+        // converts that base into the null oop semantics expected at the
+        // API.  Re-pinned so both heap regimes' null-handling is explicit.
+        check("ww_cold_primitive_nonzero_base_shift3_returns_base_not_null",
+              narrow_decode(std::uint64_t{ 0x8'0000'0000ull }, 3u, 0u)
+                  == reinterpret_cast<void*>(std::uintptr_t{ 0x8'0000'0000ull }));
+        // And the wrapper STILL returns null even though the would-be live
+        // base is non-zero (the guard runs first).
+        check("ww_cold_wrapper_zero_independent_of_would_be_base",
+              decode_oop_pointer(0u) == nullptr
+              && decode_klass_pointer(0u) == nullptr);
+    }
+
+    // (WW4) encode(uncompressed_base) == 0 boundary at the primitive level
+    // for the four canonical regimes.  addr == base is the "at-base / null
+    // grid point": (addr - base) == 0, so >> shift is 0, regardless of shift.
+    {
+        struct regime { std::uint64_t base; std::uint32_t shift; };
+        constexpr regime regimes[]{
+            { 0u, 0u },
+            { 0u, 3u },
+            { std::uint64_t{ 0x8'0000'0000ull }, 0u },
+            { std::uint64_t{ 0x8'0000'0000ull }, 3u },
+        };
+        bool at_base_all_zero{ true };
+        for (const regime r : regimes)
+        {
+            if (narrow_encode(r.base, r.shift, r.base) != 0u)
+            {
+                at_base_all_zero = false;
+            }
+        }
+        check("ww_encode_uncompressed_base_is_zero_all_regimes",
+              at_base_all_zero);
+        // Compile-time pin: encode(base, shift, base) == 0 for the closed form.
+        static_assert(ct::enc(0u, 0u, 0u) == 0u);
+        static_assert(ct::enc(0u, 3u, 0u) == 0u);
+        static_assert(ct::enc(0x8'0000'0000ull, 0u, 0x8'0000'0000ull) == 0u);
+        static_assert(ct::enc(0x8'0000'0000ull, 3u, 0x8'0000'0000ull) == 0u);
+    }
+
+    // (WW5) Non-x64 fall-through: the codec arithmetic is pure 64-bit
+    // integer math (no SSE / no x86 intrinsic / no CPUID).  Pin the type
+    // invariants the closed form requires on ANY LP64 / LLP64 target the
+    // build supports (ARM64 macOS/Linux/Windows, x64 *, etc.).  If sizeof
+    // changes on a future ILP32 port the static_assert fails LOUDLY at
+    // build time rather than silently truncating decode arithmetic.
+    static_assert(sizeof(std::uint64_t) == 8, "u64 must be 8 bytes");
+    static_assert(sizeof(std::uint32_t) == 4, "u32 must be 4 bytes");
+    static_assert(sizeof(void*) == sizeof(std::uintptr_t),
+                  "void* width must match uintptr_t (LP64/LLP64 only)");
+    static_assert(sizeof(void*) >= 8, "codec assumes 64-bit pointer width");
+    // The codec body uses ONLY: cast to uint64, left-shift by uint32,
+    // 64-bit add, 64-bit subtract, right-shift by uint32, cast to uint32.
+    // All are language-level operations; none are x64-specific.  Re-derive
+    // the formula in constexpr and confirm both heap-regime canonical
+    // values: ARM64 builds (no x64 intrinsics available) take this branch
+    // unchanged.
+    static_assert(ct::dec(0u, 0u, 0x1234u) == 0x1234ull);
+    static_assert(ct::dec(std::uint64_t{ 0x8'0000'0000ull }, 3u, 0x1234u)
+                      == 0x8'0000'0000ull + (std::uint64_t{ 0x1234u } << 3));
+    // Runtime conformance the build target matches the constexpr re-derivation
+    // (i.e. the shipped narrow_decode does the same math the static_asserts
+    // above proved correct, on whatever architecture this binary was built for).
+    check("ww_nonx64_fallthrough_runtime_matches_constexpr",
+          as_uptr(narrow_decode(std::uint64_t{ 0x8'0000'0000ull }, 3u, 0x1234u))
+              == static_cast<std::uintptr_t>(
+                     0x8'0000'0000ull + (std::uint64_t{ 0x1234u } << 3)));
+    // And the per-feature x64-independence: encode is its inverse on the
+    // representable point, again pure integer math.
+    check("ww_nonx64_fallthrough_encode_inverse",
+          narrow_encode(std::uint64_t{ 0x8'0000'0000ull }, 3u,
+                        std::uint64_t{ 0x8'0000'0000ull }
+                            + (std::uint64_t{ 0x1234u } << 3)) == 0x1234u);
+
     return failures == 0 ? 0 : 1;
 }

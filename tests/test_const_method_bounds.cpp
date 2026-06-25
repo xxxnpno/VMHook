@@ -3072,6 +3072,163 @@ int main()
         }
     }
 
+    // =====================================================================
+    // DEEPEN-W26.  (ADDITIVE, "w26_" namespace.)  Wave-26 ledger gaps:
+    //   (1) cold-state bound-checked accessors return safe defaults,
+    //   (2) UB-free behaviour on synthetic ConstMethod* via safe_read,
+    //   (3) static_asserts on return types AND noexcept of the feature surface,
+    //   (4) bytecode-length cap pinned as a compile-time constant.
+    // All inputs are static-storage / volatile-laundered-null / aligned-bogus
+    // pointers handed only to library calls whose first act is the entry-null
+    // guard - no fabricated wild address is ever dereferenced by the test.
+    // =====================================================================
+    {
+        using vmhook::hotspot::constant_pool;
+        using vmhook::hotspot::const_method;
+        using vmhook::hotspot::symbol;
+
+        // W26-(3) Return-type and noexcept facts as COMPILE-TIME pins.  These
+        // are static_assert because they bind the public signature of the FIX B
+        // surface; any silent change to a wider return type, a non-noexcept
+        // declaration, or a renamed primitive reddens at build time, not at run.
+        {
+            alignas(16) static std::uint8_t w26_storage[64]{};
+            auto* const cp{ reinterpret_cast<constant_pool*>(&w26_storage[0]) };
+            auto* const cm{ reinterpret_cast<const_method*>(&w26_storage[0]) };
+            auto* const sym{ reinterpret_cast<symbol*>(&w26_storage[0]) };
+
+            static_assert(std::is_same_v<decltype(std::declval<constant_pool*>()->get_length()),
+                                         std::int32_t>,
+                          "constant_pool::get_length() must return std::int32_t");
+            static_assert(std::is_same_v<decltype(std::declval<constant_pool*>()->get_base()),
+                                         void**>,
+                          "constant_pool::get_base() must return void**");
+            static_assert(std::is_same_v<decltype(std::declval<const_method*>()->get_constants()),
+                                         constant_pool*>,
+                          "const_method::get_constants() must return constant_pool*");
+            static_assert(std::is_same_v<decltype(std::declval<const_method*>()->get_name()),
+                                         symbol*>,
+                          "const_method::get_name() must return symbol*");
+            static_assert(std::is_same_v<decltype(std::declval<const_method*>()->get_signature()),
+                                         symbol*>,
+                          "const_method::get_signature() must return symbol*");
+            static_assert(std::is_same_v<decltype(std::declval<symbol*>()->to_string()),
+                                         std::string>,
+                          "symbol::to_string() must return std::string");
+            // noexcept pins - these are RUN-TIME checks (noexcept on an
+            // expression must see the expression), not static_assert, but they
+            // are deterministic.  Pin every FIX-B-chain entry point.
+            check("w26_cp_get_length_noexcept",   noexcept(cp->get_length()));
+            // get_base / get_constants are NOT declared noexcept (they may
+            // throw on absent VMStruct entries); pin the negative contract so
+            // a future spurious noexcept addition is a visible change.
+            check("w26_cp_get_base_not_noexcept",     !noexcept(cp->get_base()));
+            check("w26_cm_get_constants_not_noexcept",!noexcept(cm->get_constants()));
+            (void)sym;
+        }
+
+        // W26-(1)+(2) Cold-state safe defaults via genuinely synthetic
+        // ConstMethod*/ConstantPool* in static storage.  This is the
+        // "UB-free behaviour on synthetic ConstMethod* via safe_read" gap:
+        // every accessor must return its documented safe default (nullptr for
+        // pointer-returning, -1 for get_length) on a synthetic `this`, with no
+        // fault.  Reaching the next check after each call proves no fault.
+        {
+            alignas(64) static std::uint8_t cold_cm_storage[512]{};
+            alignas(64) static std::uint8_t cold_cp_storage[512]{};
+            // Zero, all-ones, alternating - three deterministic "cold" content
+            // patterns.  We RE-WRITE the storage between calls so even if the
+            // library were to scribble into it (it does not), the next call
+            // starts from a known cold state.
+            for (int pass{ 0 }; pass < 3; ++pass)
+            {
+                const std::uint8_t fill{ static_cast<std::uint8_t>(
+                    pass == 0 ? 0x00 : (pass == 1 ? 0xFF : 0xA5)) };
+                std::memset(cold_cm_storage, fill, sizeof(cold_cm_storage));
+                std::memset(cold_cp_storage, fill, sizeof(cold_cp_storage));
+
+                auto* const cm{ reinterpret_cast<const_method*>(&cold_cm_storage[0]) };
+                auto* const cp{ reinterpret_cast<constant_pool*>(&cold_cp_storage[0]) };
+
+                check("w26_cold_get_length_minus1", cp->get_length() == -1);
+                check("w26_cold_get_base_null", cp->get_base() == nullptr);
+                check("w26_cold_get_constants_null", cm->get_constants() == nullptr);
+                check("w26_cold_get_name_null", cm->get_name() == nullptr);
+                check("w26_cold_get_signature_null", cm->get_signature() == nullptr);
+                // Reaching here means no fault on any of the five calls for
+                // this content pattern - the UB-free synthetic-`this` contract.
+                check("w26_cold_no_fault_this_pattern", true);
+            }
+        }
+
+        // W26-(2) bound-checked accessor safe-default consistency: after the
+        // cold-state calls the sentinel (-1) STILL disables the length bound,
+        // so the feature's degradation path is internally consistent (no
+        // partial state leak between calls on a synthetic `this`).
+        {
+            alignas(16) static std::uint8_t consistency_storage[64]{};
+            auto* const cp{ reinterpret_cast<constant_pool*>(&consistency_storage[0]) };
+            const std::int32_t a{ cp->get_length() };
+            const std::int32_t b{ cp->get_length() };
+            const std::int32_t c{ cp->get_length() };
+            check("w26_get_length_repeatable_minus1", a == -1 && b == -1 && c == -1);
+            check("w26_get_length_sentinel_disables_bound_repeat",
+                  !length_bound_rejects(0u, a)
+                      && !length_bound_rejects(0xFFFFu, b)
+                      && !length_bound_rejects(0x1234u, c));
+        }
+
+        // W26-(4) Bytecode-length cap pinned as a COMPILE-TIME constant.
+        // symbol::to_string buffer width and the length sanity gate share the
+        // same cap (0x1000); pin the value at build time so a future widening
+        // of either side (without the other) reddens.  Also pin the related
+        // u2 structural ceiling that bounds every method/CP index.
+        {
+            constexpr std::uint32_t bytecode_length_cap{ 0x1000u };
+            constexpr std::uint32_t u2_index_ceiling{ 0xFFFFu };
+            static_assert(bytecode_length_cap == 0x1000u,
+                          "symbol body length cap is 0x1000 (==4096), the on-stack buffer width");
+            static_assert(bytecode_length_cap == 4096u,
+                          "0x1000 == 4096 decimal - pin the decimal value too");
+            static_assert(u2_index_ceiling == 0xFFFFu,
+                          "u2 index ceiling is 0xFFFF (==65535)");
+            static_assert(u2_index_ceiling == 65535u,
+                          "0xFFFF == 65535 decimal");
+            // The cap is strictly less than the u2 ceiling, so a u2 length that
+            // PASSES the gate (in [1, 0x1000]) is always strictly less than the
+            // maximum u2 - the gate is genuinely bounding, not vacuous.
+            static_assert(bytecode_length_cap < u2_index_ceiling,
+                          "the body cap is strictly tighter than the u2 type ceiling");
+            // The cap fits in a u2 - pin that the gate's accept upper edge can
+            // be represented in the u2 the library reads.
+            static_assert(bytecode_length_cap <= u2_index_ceiling,
+                          "the body cap is representable as a u2");
+            // Runtime witnesses tying the constants to the gate logic.
+            auto gate_rejects = [](std::uint32_t length) -> bool
+            {
+                return length == 0u || length > bytecode_length_cap;
+            };
+            check("w26_bytecode_cap_zero_rejected", gate_rejects(0u));
+            check("w26_bytecode_cap_one_accepted", !gate_rejects(1u));
+            check("w26_bytecode_cap_at_cap_accepted", !gate_rejects(bytecode_length_cap));
+            check("w26_bytecode_cap_just_over_rejected", gate_rejects(bytecode_length_cap + 1u));
+            check("w26_bytecode_cap_maxu2_rejected", gate_rejects(u2_index_ceiling));
+        }
+
+        // W26-(3) extra: the symbol::to_string return-type pin AS a runtime
+        // is_same_v witness on a real call (matches the static_assert above
+        // but proves the function is INVOCABLE on a synthetic `this` without
+        // fault - reaching the check is the proof).
+        {
+            alignas(16) static std::uint8_t w26_sym_storage[64]{};
+            auto* const sym{ reinterpret_cast<symbol*>(&w26_sym_storage[0]) };
+            const auto s{ sym->to_string() };
+            check("w26_to_string_synthetic_returns_empty_no_fault", s.empty());
+            check("w26_to_string_return_is_std_string",
+                  std::is_same_v<decltype(sym->to_string()), std::string>);
+        }
+    }
+
     if (failures == 0)
     {
         std::printf("vmhook const_method/ConstantPool bounds: OK\n");

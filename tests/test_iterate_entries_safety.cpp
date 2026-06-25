@@ -3624,6 +3624,252 @@ static auto test_w25_fabricated_null_field_skip_surrogate() -> void
     check("w25_fabricated_null_field_skip_deterministic", det_ok);
 }
 
+// ===========================================================================
+// WAVE-26 LEDGER GAP CLOSERS.
+//
+// Targeted at the audit/COVERAGE_LEDGER no-JVM gaps for this feature:
+//   * cold-state lookup returns the documented sentinel (nullptr) for missing
+//     fields and never throws;
+//   * idempotence of the resolved entry pointer (second lookup matches first);
+//   * known-bad name returns sentinel;
+//   * field name with embedded NUL is safe (the C-string API stops at the
+//     first NUL — a longer std::string with an interior NUL must not crash
+//     and must behave exactly like the truncated-at-NUL prefix);
+//   * static_asserts on the sentinel value type and on the function signatures;
+//   * an explicit gHotSpotVMStructs == nullptr early-return pin (the head
+//     pointer is null in this process, so the for-loop never iterates).
+// ===========================================================================
+
+// --- 26A. Signature and sentinel static_asserts -----------------------------
+// Pin the EXACT public signatures of the resolver and getters at compile time.
+// A regression that changed the return type from a pointer (so the sentinel
+// stops being nullptr) or that altered the parameter types would fail to
+// compile here — and that is the whole point.
+static_assert(std::is_same<decltype(vmhook::hotspot::iterate_struct_entries(
+                              static_cast<const char*>(nullptr),
+                              static_cast<const char*>(nullptr))),
+                          vmhook::hotspot::vm_struct_entry_t*>::value,
+              "iterate_struct_entries must return vm_struct_entry_t* (sentinel = nullptr)");
+static_assert(std::is_same<decltype(vmhook::hotspot::iterate_type_entries(
+                              static_cast<const char*>(nullptr))),
+                          vmhook::hotspot::vm_type_entry_t*>::value,
+              "iterate_type_entries must return vm_type_entry_t* (sentinel = nullptr)");
+static_assert(std::is_same<decltype(vmhook::hotspot::get_vm_structs()),
+                          vmhook::hotspot::vm_struct_entry_t*>::value,
+              "get_vm_structs must return vm_struct_entry_t*");
+static_assert(std::is_same<decltype(vmhook::hotspot::get_vm_types()),
+                          vmhook::hotspot::vm_type_entry_t*>::value,
+              "get_vm_types must return vm_type_entry_t*");
+// The sentinel itself is a null pointer of the right type — pinning this at
+// compile time means a regression that swapped nullptr for an out-of-line
+// sentinel object would fail here even before runtime.
+static_assert(static_cast<vmhook::hotspot::vm_struct_entry_t*>(nullptr) == nullptr,
+              "vm_struct_entry_t* nullptr is the documented sentinel");
+static_assert(static_cast<vmhook::hotspot::vm_type_entry_t*>(nullptr) == nullptr,
+              "vm_type_entry_t* nullptr is the documented sentinel");
+// The resolver is declared noexcept — a throwing regression would change the
+// noexcept-ness and this would fail at compile time.
+static_assert(noexcept(vmhook::hotspot::iterate_struct_entries(
+                          static_cast<const char*>(nullptr),
+                          static_cast<const char*>(nullptr))),
+              "iterate_struct_entries must be noexcept");
+static_assert(noexcept(vmhook::hotspot::iterate_type_entries(
+                          static_cast<const char*>(nullptr))),
+              "iterate_type_entries must be noexcept");
+static_assert(noexcept(vmhook::hotspot::get_vm_structs()),
+              "get_vm_structs must be noexcept");
+static_assert(noexcept(vmhook::hotspot::get_vm_types()),
+              "get_vm_types must be noexcept");
+
+// --- 26B. Cold-state miss returns sentinel and never throws -----------------
+static auto test_w26_cold_state_miss_returns_sentinel_no_throw() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    // A representative spread of "known-bad" / missing field names: real type
+    // with a field that does not exist in any HotSpot build, plus a completely
+    // bogus type.  Each must return the nullptr sentinel without throwing.
+    struct miss { const char* type; const char* field; const char* tag; };
+    static const miss misses[]{
+        { "Symbol",        "_definitely_not_a_field",     "w26_miss_symbol_bogus_field" },
+        { "Method",        "_definitely_not_a_field",     "w26_miss_method_bogus_field" },
+        { "InstanceKlass", "_definitely_not_a_field",     "w26_miss_ik_bogus_field" },
+        { "ZZZ_NoType",    "_length",                     "w26_miss_bogus_type_real_field" },
+        { "ZZZ_NoType",    "_no_field",                   "w26_miss_both_bogus" },
+    };
+
+    bool threw{ false };
+    for (const auto& m : misses)
+    {
+        vmhook::hotspot::vm_struct_entry_t* r{ nullptr };
+        try { r = iterate_struct_entries(m.type, m.field); } catch (...) { threw = true; }
+        check(m.tag, r == nullptr);
+    }
+    check("w26_struct_miss_never_throws", !threw);
+
+    // Same for iterate_type_entries.
+    const char* const bogus_types[]{ "ZZZ_NoType", "AbsolutelyNotAType", "" };
+    bool type_threw{ false };
+    for (const char* const t : bogus_types)
+    {
+        vmhook::hotspot::vm_type_entry_t* r{ nullptr };
+        try { r = iterate_type_entries(t); } catch (...) { type_threw = true; }
+        check("w26_type_miss_sentinel", r == nullptr);
+    }
+    check("w26_type_miss_never_throws", !type_threw);
+}
+
+// --- 26C. Idempotence: second lookup returns the same pointer as the first --
+static auto test_w26_lookup_idempotence_cold() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    // Real symbol pairs (would be non-null with a JVM; nullptr here).  The
+    // contract being tested is "second call == first call", which holds for the
+    // nullptr-sentinel case AND would hold for the real-entry case (the same
+    // table is walked deterministically).
+    struct pair { const char* type; const char* field; };
+    static const pair pairs[]{
+        { "Symbol",        "_length" },
+        { "Method",        "_constMethod" },
+        { "InstanceKlass", "_methods" },
+        { "oopDesc",       "_mark" },
+        { "Klass",         "_name" },
+    };
+    bool all_match{ true };
+    for (const auto& p : pairs)
+    {
+        auto* const first{ iterate_struct_entries(p.type, p.field) };
+        auto* const second{ iterate_struct_entries(p.type, p.field) };
+        if (first != second) { all_match = false; }
+    }
+    check("w26_struct_lookup_second_matches_first", all_match);
+
+    const char* const type_names[]{ "Symbol", "Method", "InstanceKlass", "Klass" };
+    bool type_match{ true };
+    for (const char* const t : type_names)
+    {
+        auto* const first{ iterate_type_entries(t) };
+        auto* const second{ iterate_type_entries(t) };
+        if (first != second) { type_match = false; }
+    }
+    check("w26_type_lookup_second_matches_first", type_match);
+
+    // Hammer one specific pair 256 times — every call returns the same pointer.
+    auto* const ref{ iterate_struct_entries("Symbol", "_length") };
+    bool stable{ true };
+    for (int i{ 0 }; i < 256; ++i)
+    {
+        if (iterate_struct_entries("Symbol", "_length") != ref) { stable = false; }
+    }
+    check("w26_struct_lookup_256x_identical", stable);
+}
+
+// --- 26D. Embedded-NUL field name safety ------------------------------------
+// The C-string API uses strcmp, which stops at the first NUL.  Passing a
+// std::string that contains an interior NUL must:
+//   (a) not crash (we only ever read up to the first NUL),
+//   (b) behave identically to the truncated-at-NUL prefix string.
+static auto test_w26_embedded_nul_field_name_safe() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    // Build a std::string with an embedded NUL: "_length\0_garbage_after_nul".
+    std::string embedded{};
+    embedded.append("_length");
+    embedded.push_back('\0');
+    embedded.append("_garbage_after_nul");
+    // Sanity: the .size() includes the bytes AFTER the NUL, but .c_str()
+    // exposes a zero-terminated prefix that strcmp will treat as "_length".
+    check("w26_embedded_nul_string_has_full_length",
+          embedded.size() == (sizeof("_length") - 1u) + 1u + (sizeof("_garbage_after_nul") - 1u));
+
+    auto* const via_embedded{ iterate_struct_entries("Symbol", embedded.c_str()) };
+    auto* const via_prefix{ iterate_struct_entries("Symbol", "_length") };
+    check("w26_embedded_nul_field_matches_truncated_prefix", via_embedded == via_prefix);
+
+    // And the symmetric case on the type slot.
+    std::string embedded_type{};
+    embedded_type.append("Symbol");
+    embedded_type.push_back('\0');
+    embedded_type.append("Garbage");
+    auto* const via_embedded_t{ iterate_struct_entries(embedded_type.c_str(), "_length") };
+    auto* const via_prefix_t{ iterate_struct_entries("Symbol", "_length") };
+    check("w26_embedded_nul_type_matches_truncated_prefix", via_embedded_t == via_prefix_t);
+
+    // Type-only helper, same property.
+    auto* const t_via_embedded{ iterate_type_entries(embedded_type.c_str()) };
+    auto* const t_via_prefix{ iterate_type_entries("Symbol") };
+    check("w26_embedded_nul_type_helper_matches_prefix", t_via_embedded == t_via_prefix);
+
+    // No throw across the whole battery (each call is noexcept; we still wrap
+    // for paranoia in case a future regression added throwing code).
+    bool threw{ false };
+    try
+    {
+        (void)iterate_struct_entries("Symbol", embedded.c_str());
+        (void)iterate_struct_entries(embedded_type.c_str(), "_length");
+        (void)iterate_type_entries(embedded_type.c_str());
+    }
+    catch (...) { threw = true; }
+    check("w26_embedded_nul_never_throws", !threw);
+}
+
+// --- 26E. gHotSpotVMStructs == nullptr early-return pin ---------------------
+// In this no-JVM process get_vm_structs()/get_vm_types() return nullptr.
+// That nullptr is the loop-init expression of the resolver's for-loop, so the
+// `entry && entry->type_name` guard fires on iteration 0 and the body never
+// executes — meaning iterate_*_entries returns nullptr without ANY array
+// dereference.  Pin both the precondition (head is null) and the consequence
+// (every lookup is the sentinel) together as a single invariant.
+static auto test_w26_null_head_pin_early_return() -> void
+{
+    auto* const struct_head{ vmhook::hotspot::get_vm_structs() };
+    auto* const type_head{ vmhook::hotspot::get_vm_types() };
+
+    // Precondition for this process — no JVM is loaded.
+    check("w26_struct_head_is_null_pin", struct_head == nullptr);
+    check("w26_type_head_is_null_pin", type_head == nullptr);
+
+    // Implication: with a null head, EVERY iterate_struct_entries call must
+    // return the sentinel without iterating.  We can't directly observe "did
+    // not iterate", but we CAN observe the universal sentinel return for an
+    // arbitrarily large set of distinct argument pairs (a regression that
+    // dereferenced the null head on the first iteration would SEGV here long
+    // before printing PASS).
+    bool universal_null{ true };
+    for (int t{ 0 }; t < 8; ++t)
+    {
+        char type_buf[16];
+        std::snprintf(type_buf, sizeof(type_buf), "TYPE_%d", t);
+        for (int f{ 0 }; f < 8; ++f)
+        {
+            char field_buf[16];
+            std::snprintf(field_buf, sizeof(field_buf), "_f_%d", f);
+            if (vmhook::hotspot::iterate_struct_entries(type_buf, field_buf) != nullptr)
+            {
+                universal_null = false;
+            }
+        }
+    }
+    check("w26_null_head_implies_universal_sentinel_struct", universal_null);
+
+    bool universal_null_type{ true };
+    for (int t{ 0 }; t < 16; ++t)
+    {
+        char type_buf[16];
+        std::snprintf(type_buf, sizeof(type_buf), "TYPE_%d", t);
+        if (vmhook::hotspot::iterate_type_entries(type_buf) != nullptr)
+        {
+            universal_null_type = false;
+        }
+    }
+    check("w26_null_head_implies_universal_sentinel_type", universal_null_type);
+}
+
 int main()
 {
     test_getters_cache_no_jvm();
@@ -3685,6 +3931,10 @@ int main()
     test_w25_for_each_instance_no_jvm_zero_returns();
     test_w25_iteration_cap_constants_pin();
     test_w25_fabricated_null_field_skip_surrogate();
+    test_w26_cold_state_miss_returns_sentinel_no_throw();
+    test_w26_lookup_idempotence_cold();
+    test_w26_embedded_nul_field_name_safe();
+    test_w26_null_head_pin_early_return();
 
     return failures == 0 ? 0 : 1;
 }
