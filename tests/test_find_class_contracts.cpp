@@ -2079,6 +2079,137 @@ int main()
     }
 
     // ---------------------------------------------------------------------
+    // 30h. LEDGER-GAP: cold-state fallback CHAIN — every tier returns null
+    //      for the same 16 fabricated bad names. The chain is (vmhook.hpp
+    //      ~8241 / ~13620 / ~13623):
+    //           find_class(name)                                  [tier 1: HotSpot graph walk]
+    //        -> jni::find_class(name)                              [tier 2: JNI FindClass slot]
+    //        -> jni::find_class_with_context_loader(name)          [tier 3: thread CL + system CL + Forge]
+    //      With no JVM ALL three tiers null out at their own gates (graph
+    //      head null; ensure_current_java_thread false; ensure_current_java_thread
+    //      false again). The chain is therefore observably null at EACH tier
+    //      INDEPENDENTLY for the same input — i.e. a downstream tier would
+    //      still be null even if the upstream had not been called. We pin
+    //      that per-tier independence here.
+    //
+    //      Signature noexcept pins (vmhook.hpp ~8085, ~12173, ~13620): all
+    //      three resolution entry points + the public wrappers are declared
+    //      noexcept, so a throw would call std::terminate. We static_assert
+    //      noexcept on every relevant signature.
+    // ---------------------------------------------------------------------
+    {
+        // ---- noexcept static_asserts on the fallback signatures.
+        //      Characterization of the ACTUAL declarations in vmhook.hpp:
+        //        * vmhook::find_class (~8146)           — NOT declared noexcept
+        //          (calls into the graph walk which can throw internally; the
+        //          empirical never-throws-in-practice contract is exercised by
+        //          the runtime try/catch helpers above).
+        //        * vmhook::jni::find_class (~13612)            — noexcept.
+        //        * vmhook::jni::find_class_with_context_loader (~13620) — noexcept.
+        //        * vmhook::find_class_via_oop (~13774)        — noexcept.
+        //        * override_class_lookup (~13876)              — noexcept.
+        //        * evict_class_lookup (~13894)                 — noexcept.
+        static_assert(!noexcept(vmhook::find_class(std::string_view{})),
+                      "vmhook::find_class is not declared noexcept (characterization)");
+        static_assert(noexcept(vmhook::jni::find_class(std::string_view{})),
+                      "vmhook::jni::find_class must be noexcept");
+        static_assert(noexcept(vmhook::jni::find_class_with_context_loader(std::string_view{})),
+                      "vmhook::jni::find_class_with_context_loader must be noexcept");
+        static_assert(noexcept(vmhook::find_class_via_oop(nullptr, std::string_view{})),
+                      "vmhook::find_class_via_oop must be noexcept");
+        static_assert(noexcept(vmhook::override_class_lookup(std::string_view{},
+                                  static_cast<vmhook::hotspot::klass*>(nullptr))),
+                      "vmhook::override_class_lookup must be noexcept");
+        static_assert(noexcept(vmhook::evict_class_lookup(std::string_view{})),
+                      "vmhook::evict_class_lookup must be noexcept");
+        check("section30h_fallback_chain_noexcept_static_asserts_compiled", true);
+
+        // ---- 16 fabricated bad names spanning every "bad" shape class.
+        const char* const bad16[]{
+            "",                              //  1. empty (fast-reject in find_class)
+            " ",                             //  2. whitespace-only
+            "java.lang.Object",              //  3. dotted (find_class wants '/')
+            "java/lang/",                    //  4. trailing slash
+            "/java/lang/Object",             //  5. leading slash
+            "java//lang/Object",             //  6. double slash
+            "$",                             //  7. lone dollar
+            "weird$Inner$$",                 //  8. trailing $$
+            "Ljava/lang/String;",            //  9. field descriptor (not a name)
+            "[I",                            // 10. primitive-array descriptor
+            "[Ljava/lang/Object;",           // 11. object-array descriptor
+            "[[[I",                          // 12. nested-array descriptor
+            "()V",                           // 13. method descriptor
+            "(Ljava/lang/String;)V",         // 14. method descriptor w/ ref arg
+            "no/such/Class/Exists/At/All",   // 15. plausible-but-missing
+            "\x01\x02\x03/ctrl",             // 16. control bytes
+        };
+        static_assert(sizeof(bad16) / sizeof(bad16[0]) == 16,
+                      "ledger requires exactly 16 fabricated bad names");
+
+        bool tier1_all_null{ true };   // HotSpot-internal find_class
+        bool tier2_all_null{ true };   // jni::find_class (FindClass)
+        bool tier3_all_null{ true };   // jni::find_class_with_context_loader
+        bool tier1_no_throw{ true };
+        bool tier2_no_throw{ true };
+        bool tier3_no_throw{ true };
+        bool tier1_stable{ true };
+        bool tier2_stable{ true };
+        bool tier3_stable{ true };
+        for (const char* n : bad16)
+        {
+            // Tier 1: the HotSpot graph walk path.
+            try
+            {
+                const auto a{ vmhook::find_class(n) };
+                const auto b{ vmhook::find_class(n) };
+                if (a != nullptr) { tier1_all_null = false; }
+                if (a != b)       { tier1_stable = false; }
+            }
+            catch (...) { tier1_no_throw = false; }
+            // Tier 2: the public JNI FindClass wrapper (void* channel).
+            try
+            {
+                void* const h1{ vmhook::jni::find_class(n) };
+                void* const h2{ vmhook::jni::find_class(n) };
+                if (h1 != nullptr) { tier2_all_null = false; }
+                if (h1 != h2)      { tier2_stable = false; }
+            }
+            catch (...) { tier2_no_throw = false; }
+            // Tier 3: the context-loader fallback helper (klass* channel).
+            try
+            {
+                const auto c1{ vmhook::jni::find_class_with_context_loader(n) };
+                const auto c2{ vmhook::jni::find_class_with_context_loader(n) };
+                if (c1 != nullptr) { tier3_all_null = false; }
+                if (c1 != c2)      { tier3_stable = false; }
+            }
+            catch (...) { tier3_no_throw = false; }
+        }
+        check("ledger_fallback_tier1_find_class_all_16_null", tier1_all_null);
+        check("ledger_fallback_tier2_jni_find_class_all_16_null", tier2_all_null);
+        check("ledger_fallback_tier3_ctx_loader_all_16_null", tier3_all_null);
+        check("ledger_fallback_tier1_no_throw", tier1_no_throw);
+        check("ledger_fallback_tier2_no_throw", tier2_no_throw);
+        check("ledger_fallback_tier3_no_throw", tier3_no_throw);
+        check("ledger_fallback_tier1_stable", tier1_stable);
+        check("ledger_fallback_tier2_stable", tier2_stable);
+        check("ledger_fallback_tier3_stable", tier3_stable);
+
+        // Per-name cross-tier consistency: for EVERY one of the 16 bad names,
+        // all three tiers agree on "not found" (null/null/null). Pins the
+        // ledger claim "returns null at each tier" name-by-name.
+        bool per_name_all_three_null{ true };
+        for (const char* n : bad16)
+        {
+            const bool t1{ vmhook::find_class(n) == nullptr };
+            const bool t2{ vmhook::jni::find_class(n) == nullptr };
+            const bool t3{ vmhook::jni::find_class_with_context_loader(n) == nullptr };
+            if (!(t1 && t2 && t3)) { per_name_all_three_null = false; }
+        }
+        check("ledger_fallback_per_name_all_three_tiers_null", per_name_all_three_null);
+    }
+
+    // ---------------------------------------------------------------------
     // 15. Final invariant: after ALL the cache seeding / eviction churn above,
     //     a brand-new never-touched name still resolves to null and the JVM-
     //     absence preconditions still hold (nothing we did attached a thread or

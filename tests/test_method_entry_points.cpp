@@ -427,6 +427,98 @@ static auto test_layout_contract_runtime() -> void
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// 12. Wave-28 ledger gap: noexcept static_asserts on the FULL recovery
+//     surface (validate_adapter_handler_entry / get_c2i_entry_from_adapter /
+//     detect_adapter_offset_from_method).  Recovery is a crash-proofing
+//     contract; any future signature drift that drops noexcept must turn this
+//     file red.
+// ─────────────────────────────────────────────────────────────────────────
+static_assert(noexcept(vmhook::hotspot::validate_adapter_handler_entry(nullptr, 0u)),
+              "validate_adapter_handler_entry is noexcept");
+static_assert(noexcept(vmhook::hotspot::get_c2i_entry_from_adapter(nullptr)),
+              "get_c2i_entry_from_adapter is noexcept");
+static_assert(noexcept(vmhook::hotspot::detect_adapter_offset_from_method(nullptr)),
+              "detect_adapter_offset_from_method is noexcept");
+
+// ─────────────────────────────────────────────────────────────────────────
+// 13. Wave-28 ledger gap: 32 fabricated bad-entry inputs to
+//     validate_adapter_handler_entry MUST all be rejected.  Sweeps low
+//     sentinels (0x0..0x1F), misaligned bit-patterns, and assorted "looks
+//     plausible" addresses against several c2i offsets.  Belt-and-braces
+//     against any future regression that loosens validation.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_validate_ahe_32_fabricated_bad_inputs() -> void
+{
+    using vmhook::hotspot::validate_adapter_handler_entry;
+
+    constexpr std::uintptr_t bad_addrs[] = {
+        0x0u, 0x1u, 0x2u, 0x3u, 0x4u, 0x7u, 0x8u, 0xFu,
+        0x10u, 0x18u, 0x1Fu, 0x42u, 0x100u, 0x1000u,
+        0xBAADu, 0xDEADu, 0xCAFEu, 0xFEEDu,
+        0xDEADBEEFu, 0xBAADF00Du, 0xCAFEBABEu, 0xFEEDFACEu,
+        0xFFFFFFFFu, 0xFFFF0000u,
+        0xAAAA'AAAAu, 0x5555'5555u,
+        0x1234'5678u, 0x8765'4321u,
+        0x0FFF'FFFFu, 0x7FFF'FFFFu,
+        0x1u << 20, 0x1u << 30,
+    };
+    constexpr std::size_t n = sizeof(bad_addrs) / sizeof(bad_addrs[0]);
+    static_assert(n == 32, "exactly 32 fabricated bad inputs");
+
+    bool all_rejected{ true };
+    for (auto a : bad_addrs)
+    {
+        void* const p{ reinterpret_cast<void*>(a) };
+        // Try several plausible c2i offsets; every shape must be rejected.
+        if (validate_adapter_handler_entry(p, 0))   { all_rejected = false; }
+        if (validate_adapter_handler_entry(p, 8))   { all_rejected = false; }
+        if (validate_adapter_handler_entry(p, 16))  { all_rejected = false; }
+        if (validate_adapter_handler_entry(p, 64))  { all_rejected = false; }
+    }
+    check("validate_ahe_32_fabricated_bad_inputs_all_rejected", all_rejected);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 14. Wave-28 ledger gap: recovery idempotence.  Calling the recovery
+//     surface twice on the same (no-JVM, null/garbage) inputs MUST yield
+//     bit-identical results to a single call.  Guards against any caching
+//     drift between cold first call and subsequent calls.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_recovery_idempotent_twice_equals_once() -> void
+{
+    using vmhook::hotspot::validate_adapter_handler_entry;
+    using vmhook::hotspot::get_c2i_entry_from_adapter;
+    using vmhook::hotspot::detect_adapter_offset_from_method;
+
+    // get_c2i_entry_from_adapter(nullptr): twice == once == nullptr.
+    void* const c2i_a{ get_c2i_entry_from_adapter(nullptr) };
+    void* const c2i_b{ get_c2i_entry_from_adapter(nullptr) };
+    check("c2i_from_adapter_null_idempotent", c2i_a == nullptr && c2i_a == c2i_b);
+
+    // detect_adapter_offset_from_method(nullptr): twice == once == 0.
+    const auto d_a{ detect_adapter_offset_from_method(nullptr) };
+    const auto d_b{ detect_adapter_offset_from_method(nullptr) };
+    check("detect_adapter_offset_null_idempotent", d_a == 0u && d_a == d_b);
+
+    // validate_adapter_handler_entry(nullptr, 0): twice == once == false.
+    const bool v_a{ validate_adapter_handler_entry(nullptr, 0) };
+    const bool v_b{ validate_adapter_handler_entry(nullptr, 0) };
+    check("validate_ahe_null_idempotent", v_a == false && v_a == v_b);
+
+    // On a stable owned buffer the answer must not change between calls.
+    alignas(16) std::array<std::uint8_t, 256> fake_method{};
+    auto* const probe{ reinterpret_cast<vmhook::hotspot::method*>(fake_method.data()) };
+    const auto p_a{ detect_adapter_offset_from_method(probe) };
+    const auto p_b{ detect_adapter_offset_from_method(probe) };
+    check("detect_adapter_offset_owned_probe_idempotent", p_a == p_b);
+
+    // get_adapter() on a fake Method is idempotent across repeated cold calls.
+    void* const ga_a{ probe->get_adapter() };
+    void* const ga_b{ probe->get_adapter() };
+    check("get_adapter_owned_probe_idempotent", ga_a == ga_b);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 //  Driver
 // ─────────────────────────────────────────────────────────────────────────
 auto main() -> int
@@ -444,6 +536,8 @@ auto main() -> int
     test_entry_pointer_alignment_pin();
     test_cold_state_accessors_deterministic();
     test_layout_contract_runtime();
+    test_validate_ahe_32_fabricated_bad_inputs();
+    test_recovery_idempotent_twice_equals_once();
 
     std::printf("[method_entry_points] failures=%d\n", failures);
     return failures == 0 ? 0 : 1;

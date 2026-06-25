@@ -3573,6 +3573,150 @@ static auto test_is_unique_ptr_tag_partition() -> void
           && !vmhook::detail::is_unique_ptr_v<void*>);
 }
 
+// ---------------------------------------------------------------------------
+// Wave-28 deepening: ledger gaps.
+//   * noexcept-ness of the three helpers pinned via static_assert on the
+//     real call expression (set is documented `noexcept`-callable because the
+//     bounds/null guards make it a guaranteed no-fault on rejected inputs;
+//     get_array_element / set_array_element are not declared `noexcept` —
+//     pin BOTH the actual declared spec AND the array_length-`noexcept` spec).
+//   * Primitive-array element-size table cross-checked against the JVM spec:
+//     Z/B = 1, S/C = 2, I/F = 4, J/D = 8 — the very table the get/set helpers
+//     parameterise via sizeof(T).  Use vmhook::detail::jvm_primitive_byte_width.
+//   * BasicType tag constants pinned: T_BOOLEAN=4, T_CHAR=5, T_FLOAT=6,
+//     T_DOUBLE=7, T_BYTE=8, T_SHORT=9, T_INT=10, T_LONG=11, T_OBJECT=12,
+//     T_ARRAY=13, T_VOID=14 — stable across all supported JDKs.
+// ---------------------------------------------------------------------------
+
+// noexcept introspection — array_length is declared `noexcept`; the templated
+// get/set helpers are NOT declared `noexcept` (they may fault on wild memory
+// outside the is_valid_pointer guard, see audit notes).  Pin both facts.
+static_assert(noexcept(vmhook::array_length(static_cast<void*>(nullptr))),
+              "vmhook::array_length must be declared noexcept");
+static_assert(!noexcept(vmhook::get_array_element<std::int32_t>(static_cast<void*>(nullptr), 0)),
+              "vmhook::get_array_element<T> must NOT be declared noexcept (may fault)");
+static_assert(!noexcept(vmhook::set_array_element<std::int32_t>(static_cast<void*>(nullptr), 0, 0)),
+              "vmhook::set_array_element<T> must NOT be declared noexcept (may fault)");
+// Repeat for every primitive width to lock the spec across the template surface.
+static_assert(!noexcept(vmhook::get_array_element<std::uint8_t>(static_cast<void*>(nullptr), 0)),
+              "get_array_element<uint8_t> noexcept-spec");
+static_assert(!noexcept(vmhook::get_array_element<std::int16_t>(static_cast<void*>(nullptr), 0)),
+              "get_array_element<int16_t> noexcept-spec");
+static_assert(!noexcept(vmhook::get_array_element<std::int64_t>(static_cast<void*>(nullptr), 0)),
+              "get_array_element<int64_t> noexcept-spec");
+static_assert(!noexcept(vmhook::get_array_element<float>(static_cast<void*>(nullptr), 0)),
+              "get_array_element<float> noexcept-spec");
+static_assert(!noexcept(vmhook::get_array_element<double>(static_cast<void*>(nullptr), 0)),
+              "get_array_element<double> noexcept-spec");
+
+// Return-type pinning — array_length returns int32, get returns T, set returns void.
+static_assert(std::is_same_v<decltype(vmhook::array_length(static_cast<void*>(nullptr))),
+                             std::int32_t>,
+              "array_length must return int32_t");
+static_assert(std::is_same_v<decltype(vmhook::get_array_element<std::int64_t>(
+                                  static_cast<void*>(nullptr), 0)),
+                             std::int64_t>,
+              "get_array_element<int64_t> must return int64_t");
+static_assert(std::is_same_v<decltype(vmhook::set_array_element<std::int32_t>(
+                                  static_cast<void*>(nullptr), 0, 0)),
+                             void>,
+              "set_array_element must return void");
+
+// Primitive byte-width table and BasicType tag constants are checked at
+// runtime below — the underlying helpers are `inline`-but-not-`constexpr`, so
+// static_assert cannot reach them.  The runtime mirror still locks the values.
+
+// Helpers must accept void* as first arg (not require char* / uint8_t*).
+static_assert(std::is_invocable_v<decltype(&vmhook::array_length), void*>,
+              "array_length must be invocable with void*");
+
+static auto test_wave28_noexcept_and_basic_type_table() -> void
+{
+    // Re-confirm at runtime that the helpers do NOT terminate on the documented
+    // null-guarded path (i.e. their non-`noexcept` declaration is conservative).
+    check("array_length(nullptr) is non-throwing in practice",
+          vmhook::array_length(nullptr) == 0);
+    bool got_throw{ false };
+    try
+    {
+        const auto v = vmhook::get_array_element<std::int32_t>(nullptr, opaque_index(0));
+        (void)v;
+    }
+    catch (...) { got_throw = true; }
+    check("get_array_element<int32>(nullptr) does not throw in practice", !got_throw);
+    bool got_throw_set{ false };
+    try
+    {
+        vmhook::set_array_element<std::int64_t>(nullptr, opaque_index(0), std::int64_t{ 42 });
+    }
+    catch (...) { got_throw_set = true; }
+    check("set_array_element<int64>(nullptr) does not throw in practice", !got_throw_set);
+
+    // Runtime mirror of the primitive width table.  Each width is the stride the
+    // get/set helpers use for the corresponding Java primitive array element.
+    check("jvm_primitive_byte_width Z == sizeof(uint8)",
+          vmhook::detail::jvm_primitive_byte_width("Z") == sizeof(std::uint8_t));
+    check("jvm_primitive_byte_width B == sizeof(int8)",
+          vmhook::detail::jvm_primitive_byte_width("B") == sizeof(std::int8_t));
+    check("jvm_primitive_byte_width S == sizeof(int16)",
+          vmhook::detail::jvm_primitive_byte_width("S") == sizeof(std::int16_t));
+    check("jvm_primitive_byte_width C == sizeof(uint16)",
+          vmhook::detail::jvm_primitive_byte_width("C") == sizeof(std::uint16_t));
+    check("jvm_primitive_byte_width I == sizeof(int32)",
+          vmhook::detail::jvm_primitive_byte_width("I") == sizeof(std::int32_t));
+    check("jvm_primitive_byte_width F == sizeof(float)",
+          vmhook::detail::jvm_primitive_byte_width("F") == sizeof(float));
+    check("jvm_primitive_byte_width J == sizeof(int64)",
+          vmhook::detail::jvm_primitive_byte_width("J") == sizeof(std::int64_t));
+    check("jvm_primitive_byte_width D == sizeof(double)",
+          vmhook::detail::jvm_primitive_byte_width("D") == sizeof(double));
+    check("jvm_primitive_byte_width L == 0", vmhook::detail::jvm_primitive_byte_width("L") == 0);
+    check("jvm_primitive_byte_width [ == 0", vmhook::detail::jvm_primitive_byte_width("[") == 0);
+    check("jvm_primitive_byte_width empty == 0",
+          vmhook::detail::jvm_primitive_byte_width("") == 0);
+    check("jvm_primitive_byte_width multi-char == 0",
+          vmhook::detail::jvm_primitive_byte_width("II") == 0);
+
+    // BasicType tag pin (runtime mirror): T_BOOLEAN=4 .. T_VOID=14.
+    check("T_BOOLEAN(Z) == 4", vmhook::detail::sig_char_to_basic_type('Z') == 4);
+    check("T_CHAR(C)    == 5", vmhook::detail::sig_char_to_basic_type('C') == 5);
+    check("T_FLOAT(F)   == 6", vmhook::detail::sig_char_to_basic_type('F') == 6);
+    check("T_DOUBLE(D)  == 7", vmhook::detail::sig_char_to_basic_type('D') == 7);
+    check("T_BYTE(B)    == 8", vmhook::detail::sig_char_to_basic_type('B') == 8);
+    check("T_SHORT(S)   == 9", vmhook::detail::sig_char_to_basic_type('S') == 9);
+    check("T_INT(I)     == 10", vmhook::detail::sig_char_to_basic_type('I') == 10);
+    check("T_LONG(J)    == 11", vmhook::detail::sig_char_to_basic_type('J') == 11);
+    check("T_OBJECT(L)  == 12", vmhook::detail::sig_char_to_basic_type('L') == 12);
+    check("T_ARRAY([)   == 13", vmhook::detail::sig_char_to_basic_type('[') == 13);
+    check("T_VOID(V)    == 14", vmhook::detail::sig_char_to_basic_type('V') == 14);
+    check("unknown sig falls back to T_OBJECT(12)",
+          vmhook::detail::sig_char_to_basic_type('?') == 12);
+    check("NUL sig falls back to T_OBJECT(12)",
+          vmhook::detail::sig_char_to_basic_type('\0') == 12);
+
+    // Null-array + out-of-bounds-on-null composition: get must return T{} and
+    // set must be a no-op.  Both paths walk through is_valid_pointer(nullptr).
+    check("null oop get<uint8> = 0", vmhook::get_array_element<std::uint8_t>(
+                                          nullptr, opaque_index(0)) == std::uint8_t{ 0 });
+    check("null oop get<int64> = 0", vmhook::get_array_element<std::int64_t>(
+                                          nullptr, opaque_index(-1)) == std::int64_t{ 0 });
+    check("null oop get<double> = 0.0", bits_equal(
+                                          vmhook::get_array_element<double>(
+                                              nullptr, opaque_index(9999)),
+                                          0.0));
+
+    // OOB on a real array: returns T{} and does not throw.
+    const auto buffer = build_fake_array<std::int32_t>({ 11, 22, 33 });
+    void* const oop = static_cast<void*>(const_cast<std::uint8_t*>(buffer.data()));
+    check("OOB get<int32>(-1) = 0",
+          vmhook::get_array_element<std::int32_t>(oop, opaque_index(-1)) == 0);
+    check("OOB get<int32>(3)  = 0",
+          vmhook::get_array_element<std::int32_t>(oop, opaque_index(3)) == 0);
+    check("OOB get<int32>(MAX)= 0",
+          vmhook::get_array_element<std::int32_t>(
+              oop, opaque_index(std::numeric_limits<std::int32_t>::max())) == 0);
+}
+
 int main()
 {
     test_all_widths();
@@ -3624,6 +3768,7 @@ int main()
     test_sentinel_adjacency();
     test_data_region_independence();
     test_is_unique_ptr_tag_partition();
+    test_wave28_noexcept_and_basic_type_table();
 
     if (failures == 0)
     {

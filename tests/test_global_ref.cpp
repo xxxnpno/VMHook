@@ -1083,5 +1083,56 @@ int main()
         check("ctor_alignment_and_width_edges_empty", all_empty);
     }
 
+    // ========================================================================
+    // SECTION W28 -- LEDGER-driven deepening: re-pin the explicit "default ctor
+    //   holds nullptr", "move-only via deleted copy", "reset()/dtor safe on null"
+    //   and the noexcept triad on a FRESH set of static_asserts + runtime checks,
+    //   so a regression cannot quietly remove ANY ONE of them.
+    // ========================================================================
+
+    // Move-only contract via the precise deleted-vs-defined trait pairing.
+    static_assert(std::is_nothrow_move_constructible_v<global_ref>
+                      && std::is_nothrow_move_assignable_v<global_ref>
+                      && !std::is_copy_constructible_v<global_ref>
+                      && !std::is_copy_assignable_v<global_ref>,
+                  "global_ref must be move-only with noexcept moves");
+
+    // Default ctor + dtor + reset() all noexcept (the "safe on null" trio).
+    static_assert(std::is_nothrow_default_constructible_v<global_ref>
+                      && std::is_nothrow_destructible_v<global_ref>
+                      && noexcept(std::declval<global_ref&>().reset()),
+                  "default ctor, destructor, and reset() must all be noexcept");
+
+    // Runtime: default-construct holds nullptr across every accessor.
+    {
+        global_ref g{};
+        check("w28_default_ctor_holds_nullptr",
+              g.handle() == nullptr && g.oop() == nullptr && !static_cast<bool>(g));
+    }
+    // Runtime: reset() on an already-null pin is a no-op (still null, idempotent).
+    {
+        global_ref g{};
+        g.reset();
+        g.reset();
+        g.reset();
+        check("w28_reset_idempotent_on_null",
+              g.handle() == nullptr && g.oop() == nullptr && !static_cast<bool>(g));
+    }
+    // Runtime: destructor on a null pin is safe (exits cleanly).
+    {
+        {
+            global_ref g{};
+            (void)g;
+        }
+        check("w28_dtor_safe_on_null", true);
+    }
+    // Runtime: nullptr ctor matches default ctor's empty state.
+    {
+        global_ref a{};
+        global_ref b{ nullptr };
+        check("w28_nullptr_ctor_matches_default",
+              is_empty(a) && is_empty(b));
+    }
+
     return failures == 0 ? 0 : 1;
 }

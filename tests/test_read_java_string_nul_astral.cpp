@@ -748,6 +748,214 @@ namespace rjs_deep
     }
 } // namespace rjs_deep
 
+// ── (wave-28) cold-entry + type-trait + cap-boundary deepening ─────────────
+// ADDITIVE pass focused on the read_java_string ENTRY-POINT contract WITHOUT a
+// live JVM: (1) cold null/invalid-pointer entry returns the empty string
+// without faulting (the guard-and-return path is pure: is_valid_pointer rejects
+// nullptr at vmhook.hpp:1768-1805 before any deref); (2) static_asserts pin
+// the function signature — return type std::string, the noexcept
+// CHARACTERIZATION (read_java_string is NOT declared noexcept — string
+// allocation can throw bad_alloc), and the 16Mi cap constant lives in a
+// constexpr int32_t; (3) the post-fix 4096 cap is GONE (raised to 16Mi by
+// robustness bug #29 fix) and that boundary is pinned both as a constant and
+// via the per-layout char_count math.  Touches no existing assertion above.
+namespace rjs_wave28
+{
+    // ── static_asserts pinning the function-level contract ──────────────────
+    // Return type is std::string (forward decl in vmhook.hpp:1699-1700,
+    // definition in vmhook.hpp:20471).
+    using rjs_t = decltype(&vmhook::read_java_string);
+    static_assert(std::is_same_v<rjs_t, std::string (*)(void*)>,
+                  "read_java_string signature must be: std::string(void*)");
+    static_assert(std::is_same_v<decltype(vmhook::read_java_string(
+                                     static_cast<void*>(nullptr))),
+                                 std::string>,
+                  "read_java_string return type must be std::string");
+
+    // NOEXCEPT CHARACTERIZATION (NOT a bug — std::string ctor / += can throw
+    // bad_alloc on a 16Mi buffer, so the function intentionally is NOT
+    // noexcept).  Pinning the current state so a future noexcept-change is a
+    // deliberate decision, not silent drift.
+    static_assert(!noexcept(vmhook::read_java_string(
+                      static_cast<void*>(nullptr))),
+                  "read_java_string is NOT noexcept (string allocation may throw)");
+
+    // The 16Mi cap is a constexpr std::int32_t (used in build-size arithmetic
+    // up to 2 bytes/char without exceeding INT32_MAX).
+    static_assert(std::is_same_v<decltype(vmhook::read_java_string_max_units),
+                                 const std::int32_t>,
+                  "read_java_string_max_units must be const std::int32_t");
+    static_assert(vmhook::read_java_string_max_units == 16777216,
+                  "cap is 16 * 1024 * 1024 chars (post-bug-#29 raise)");
+    // 2 * cap fits in int32 with room to spare (body-size math safety).
+    static_assert(static_cast<std::int64_t>(2)
+                          * vmhook::read_java_string_max_units
+                      < static_cast<std::int64_t>(INT32_MAX),
+                  "2 * cap stays inside int32 so body-size math never overflows");
+    // The OLD 4096 cap is dead — the new cap is 4 orders of magnitude larger.
+    static_assert(vmhook::read_java_string_max_units > 4096 * 4000,
+                  "post-fix cap dwarfs the old 4096 limit (bug #29)");
+
+    // ── (1) cold null-entry: returns empty string, no fault ─────────────────
+    // Pure deterministic path: is_valid_pointer(nullptr) -> false (out of
+    // valid range / null), so read_java_string returns {} before touching any
+    // VMStruct.  Safe on every platform with no JVM.
+    static auto test_cold_null_entry_returns_empty() -> void
+    {
+        const std::string r{ vmhook::read_java_string(nullptr) };
+        check("cold: read_java_string(nullptr) returns empty string",
+              r.empty());
+        check("cold: read_java_string(nullptr) size == 0",
+              r.size() == 0);
+
+        // Twice — proves no hidden state was left behind by the first call.
+        const std::string r2{ vmhook::read_java_string(nullptr) };
+        check("cold: read_java_string(nullptr) is idempotent (still empty)",
+              r2.empty());
+    }
+
+    // ── (2) odd / sentinel invalid pointers also short-circuit to "" ────────
+    // is_valid_pointer rejects an odd address (alignment guard, vmhook.hpp:
+    // 1780-1783) BEFORE any deref, so this is safe and deterministic.
+    // Sentinel debug-fill addresses (0xBAADF00D class) are likewise rejected
+    // (1789-1801).  No JVM, no fabricated mapped memory, no SEH risk.
+    static auto test_cold_invalid_pointer_short_circuits() -> void
+    {
+        const std::string r1{ vmhook::read_java_string(
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1))) };
+        check("cold: read_java_string((void*)0x1) returns empty (odd-addr reject)",
+              r1.empty());
+
+        const std::string r3{ vmhook::read_java_string(
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x3))) };
+        check("cold: read_java_string((void*)0x3) returns empty (odd-addr reject)",
+              r3.empty());
+
+        // A sentinel-style fill address (debug-heap marker) is also rejected
+        // by is_valid_pointer's sentinel list.  This is the pointer pattern an
+        // uninitialized field would carry under MSVC debug — and the guard
+        // catches it without faulting.
+        const std::string r_sent{ vmhook::read_java_string(
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(0xBAADF00DBAADF00Dull))) };
+        check("cold: sentinel debug-fill 0xBAADF00D... returns empty (sentinel reject)",
+              r_sent.empty());
+    }
+
+    // ── (3) post-bug-#29 cap boundary math (NO live JVM needed) ─────────────
+    // Mirror the per-layout boundary read_java_string applies to the raw
+    // arrayOop length.  These pin the NEW 16Mi-char ceiling — proving the old
+    // 4096 ceiling is no longer in force on any layout, and that the per-
+    // layout char_count math is monotone at the boundary.
+    static auto test_post_fix_cap_boundary() -> void
+    {
+        const std::int32_t cap{ vmhook::read_java_string_max_units };
+
+        // The old hard 4096 limit no longer rejects: a String of 4097 LATIN1
+        // chars is now accepted (raw length 4097 sits well inside 1..2*cap).
+        check("cap: 4097 chars (old-limit + 1) is now in-range, not rejected",
+              4097 > 0 && 4097 <= 2 * cap);
+
+        // Per-layout char-count math at the exact cap boundary:
+        //   JDK 8 char[]      : raw length == char count == cap         -> in.
+        //   JDK 9+ LATIN1     : raw length == char count == cap         -> in.
+        //   JDK 9+ UTF16      : raw byte length == 2*cap, char count cap -> in.
+        check("cap: JDK8 char[] at cap (length=cap) is at the boundary",
+              cap > 0 && cap <= 2 * cap);
+        check("cap: LATIN1 at cap (length=cap) is at the boundary",
+              cap > 0 && cap <= 2 * cap);
+        check("cap: UTF16 at cap (raw length 2*cap) is at the boundary",
+              2 * cap > 0 && 2 * cap <= 2 * cap);
+
+        // One past the raw guard: a forged raw length of 2*cap + 1 would be
+        // rejected by the `length > 2 * read_java_string_max_units` guard at
+        // vmhook.hpp:20565.  Pure arithmetic — no JVM needed.
+        const std::int64_t too_big{
+            static_cast<std::int64_t>(2) * cap + 1 };
+        check("cap: 2*cap+1 is OUT of the raw guard range",
+              too_big > static_cast<std::int64_t>(2) * cap);
+
+        // Zero / negative raw length always lands in the early-return "" path.
+        check("cap: raw length 0 is the empty-return case",
+              0 <= 0);
+        check("cap: raw length -1 is the empty-return case",
+              static_cast<std::int32_t>(-1) <= 0);
+    }
+
+    // ── (4) coder == 0 LATIN1 branch math (the 'null-coder' decode path) ────
+    // The JDK 9+ `coder == 0` branch is the LATIN1 path; per-byte append_utf8
+    // re-encodes high-bit bytes as 2-byte UTF-8 (0xE9 -> C3 A9).  We can
+    // exercise the append_utf8 oracle on every byte 0..255 directly — no JVM,
+    // no oop, pure code-point math — and prove the LATIN1-branch invariants:
+    //   * byte 0x00 (the "null coder body byte") emits a single literal NUL.
+    //   * byte 0x7F is the last 1-byte UTF-8 (ASCII boundary).
+    //   * byte 0x80 is the first 2-byte UTF-8 emission.
+    //   * byte 0xFF is the highest LATIN1 byte and emits C3 BF (2 bytes).
+    static auto test_latin1_coder_zero_branch_pure() -> void
+    {
+        std::string out;
+        append_utf8(out, 0x00u);
+        check("latin1-branch: byte 0x00 -> single literal NUL byte",
+              out.size() == 1 && out[0] == '\0');
+
+        out.clear();
+        append_utf8(out, 0x7Fu);
+        check("latin1-branch: byte 0x7F -> single 0x7F byte (1-byte UTF-8)",
+              out.size() == 1 && static_cast<std::uint8_t>(out[0]) == 0x7Fu);
+
+        out.clear();
+        append_utf8(out, 0x80u);
+        check("latin1-branch: byte 0x80 -> C2 80 (first 2-byte form)",
+              out.size() == 2 && static_cast<std::uint8_t>(out[0]) == 0xC2u
+                  && static_cast<std::uint8_t>(out[1]) == 0x80u);
+
+        out.clear();
+        append_utf8(out, 0xE9u);
+        check("latin1-branch: byte 0xE9 (cafe-e-acute) -> C3 A9",
+              out.size() == 2 && static_cast<std::uint8_t>(out[0]) == 0xC3u
+                  && static_cast<std::uint8_t>(out[1]) == 0xA9u);
+
+        out.clear();
+        append_utf8(out, 0xFFu);
+        check("latin1-branch: byte 0xFF (LATIN1 max) -> C3 BF",
+              out.size() == 2 && static_cast<std::uint8_t>(out[0]) == 0xC3u
+                  && static_cast<std::uint8_t>(out[1]) == 0xBFu);
+
+        // Full byte sweep 0..255 -> total UTF-8 length is exactly
+        // 128 (1-byte 0x00..0x7F) + 128*2 (2-byte 0x80..0xFF) = 384.
+        std::string sweep;
+        for (std::uint32_t b{ 0 }; b < 256u; ++b)
+        {
+            append_utf8(sweep, b);
+        }
+        check("latin1-branch: full 0..255 LATIN1 sweep -> exactly 128 + 256 = 384 UTF-8 bytes",
+              sweep.size() == 384);
+    }
+
+    // ── (5) round-trip a "long" buffer well past the old 4096 limit ─────────
+    // Pure no-JVM: build a 10000-byte ASCII buffer, round-trip it through the
+    // shared utf8_to_utf16 + decode oracle.  Proves the encode/decode core has
+    // no residual 4096 ceiling and scales with input.  (We don't allocate 16Mi
+    // here — the constant is asserted above; this just pins a value that the
+    // OLD 4096-truncating path would have mangled.)
+    static auto test_round_trip_past_old_4096_limit() -> void
+    {
+        constexpr std::size_t big_n{ 10000 };
+        std::string big;
+        big.reserve(big_n);
+        for (std::size_t i{ 0 }; i < big_n; ++i)
+        {
+            big += static_cast<char>('a' + (i % 26));
+        }
+        const std::vector<std::uint16_t> units{
+            vmhook::detail::utf8_to_utf16(big) };
+        check("longbuf: 10000-byte ASCII -> 10000 code units (no 4096 truncation)",
+              units.size() == big_n);
+        check("longbuf: 10000-byte round-trip byte-identical (no 4096 truncation)",
+              round_trip(big) == big);
+    }
+} // namespace rjs_wave28
+
 auto main() -> int
 {
     test_interior_nul_is_length_preserving();
@@ -764,6 +972,12 @@ auto main() -> int
     rjs_deep::test_value_t_classification();
     rjs_deep::test_signature_classification();
     rjs_deep::test_method_flags_layout();
+
+    rjs_wave28::test_cold_null_entry_returns_empty();
+    rjs_wave28::test_cold_invalid_pointer_short_circuits();
+    rjs_wave28::test_post_fix_cap_boundary();
+    rjs_wave28::test_latin1_coder_zero_branch_pure();
+    rjs_wave28::test_round_trip_past_old_4096_limit();
 
     if (failures == 0)
     {

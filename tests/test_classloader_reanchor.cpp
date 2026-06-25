@@ -1197,6 +1197,165 @@ int main()
               vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) == nullptr);
     }
 
+    // =====================================================================
+    // 14. Wave-28 LEDGER-GAP deepening: cold-state context_loader contract,
+    //     FindClass-with-explicit-context-loader fallback null-safety, loader-
+    //     switching state no-leak across repeated calls, and additional
+    //     static_assert symbol-type-identity pins for the context_loader
+    //     resolver and its detail:: forwardee.  Every assertion below is no-JVM
+    //     deterministic; the section leaves the cache and the host-klass latch
+    //     exactly as it found them.
+    // =====================================================================
+
+    // ---- 14a. COLD-state contract: at first call from this process, with no
+    //      JVM ever started, the public context-loader resolver returns null
+    //      for the canonical "cold" inputs.  ensure_current_java_thread() must
+    //      still be false (no JVM was created by any earlier section either).
+    {
+        check("cold_ensure_current_java_thread_still_false",
+              vmhook::hotspot::ensure_current_java_thread() == false);
+        check("cold_ctx_loader_object_null",
+              vmhook::jni::find_class_with_context_loader("java/lang/Object") == nullptr);
+        check("cold_ctx_loader_app_null",
+              vmhook::jni::find_class_with_context_loader("com/example/App") == nullptr);
+        check("cold_ctx_loader_array_null",
+              vmhook::jni::find_class_with_context_loader("[Ljava/lang/Object;") == nullptr);
+        check("cold_ctx_loader_dotted_null",
+              vmhook::jni::find_class_with_context_loader("java.lang.Object") == nullptr);
+        // Host latch must still be unpublished after these cold calls (the
+        // resolver never reaches capture without a JVM).
+        check("cold_host_latch_unpublished",
+              vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) == nullptr);
+    }
+
+    // ---- 14b. FindClass-with-explicit-context-loader fallback: the resolver's
+    //      three-loader cascade (thread context -> system -> Launch.classLoader)
+    //      collapses to a single nullptr return with no JVM.  Repeated calls
+    //      with varying name shapes must stay null and never throw — the
+    //      "explicit fallback returns null safely" ledger gap.
+    {
+        const char* const fallback_names[]{
+            "java/lang/Object",
+            "java/lang/String",
+            "java/lang/ClassLoader",
+            "net/minecraft/launchwrapper/Launch",  // the documented 3rd fallback
+            "sun/misc/Launcher",
+            "jdk/internal/loader/ClassLoaders",
+            "com/example/Missing",
+            "",
+        };
+        bool all_null{ true };
+        bool none_threw{ true };
+        for (const char* n : fallback_names)
+        {
+            if (vmhook::jni::find_class_with_context_loader(n) != nullptr) { all_null = false; }
+            if (!ctx_loader_never_throws(n))                               { none_threw = false; }
+        }
+        check("fallback_cascade_all_null_no_jvm", all_null);
+        check("fallback_cascade_no_throw", none_threw);
+    }
+
+    // ---- 14c. Loader-switching state NO-LEAK across calls: many repeated
+    //      context-loader resolutions on different names from the same thread
+    //      and from many threads must NOT accumulate any state — the global
+    //      cache size is unchanged, the host latch stays null, and the result
+    //      is deterministic (always null on the no-JVM path).
+    {
+        const std::size_t cache_before{ cache_size() };
+        auto* const latch_before{
+            vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) };
+
+        const char* const cycle[]{
+            "java/lang/Object",
+            "java/lang/String",
+            "java/lang/ClassLoader",
+            "java/util/HashMap",
+            "com/example/Switcher",
+        };
+        bool stable{ true };
+        for (int i{ 0 }; i < 512; ++i)
+        {
+            for (const char* n : cycle)
+            {
+                if (vmhook::jni::find_class_with_context_loader(n) != nullptr) { stable = false; }
+            }
+        }
+        check("loader_switch_repeat_stable_null", stable);
+        check("loader_switch_repeat_no_cache_leak", cache_size() == cache_before);
+        check("loader_switch_repeat_no_latch_leak",
+              vmhook::detail::host_classloader_klass.load(std::memory_order_acquire)
+                  == latch_before);
+
+        // Many threads switching across the same cycle: same no-leak contract.
+        constexpr int thread_count{ 6 };
+        constexpr int iterations{ 128 };
+        std::vector<std::thread> workers{};
+        std::atomic<int> nonnull_hits{ 0 };
+        workers.reserve(static_cast<std::size_t>(thread_count));
+        for (int t{ 0 }; t < thread_count; ++t)
+        {
+            workers.emplace_back([&cycle, &nonnull_hits]() noexcept
+            {
+                for (int i{ 0 }; i < iterations; ++i)
+                {
+                    for (const char* n : cycle)
+                    {
+                        if (vmhook::jni::find_class_with_context_loader(n) != nullptr)
+                        {
+                            nonnull_hits.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) { w.join(); }
+        check("loader_switch_threads_never_resolved",
+              nonnull_hits.load(std::memory_order_acquire) == 0);
+        check("loader_switch_threads_no_cache_leak", cache_size() == cache_before);
+        check("loader_switch_threads_no_latch_leak",
+              vmhook::detail::host_classloader_klass.load(std::memory_order_acquire)
+                  == latch_before);
+    }
+
+    // ---- 14d. ADDITIONAL static_assert symbol-type-identity pins for the
+    //      context_loader resolver and its detail:: forwardee.  These pin
+    //      pointer-to-function identity (catches a silent overload/template
+    //      drift) and the exact noexcept / return-type / arg-type triple.
+    {
+        using ctx_loader_fn_t = vmhook::hotspot::klass*(*)(std::string_view) noexcept;
+        static_assert(std::is_same_v<
+                          decltype(&vmhook::jni::find_class_with_context_loader),
+                          ctx_loader_fn_t>,
+                      "find_class_with_context_loader must be klass*(string_view) noexcept");
+        static_assert(std::is_same_v<
+                          decltype(&vmhook::detail::jni_find_class_with_context_loader),
+                          ctx_loader_fn_t>,
+                      "detail::jni_find_class_with_context_loader must match the public sig");
+        // klass_to_class_loader_oop: void*(klass*) noexcept.
+        using k2l_fn_t = void*(*)(vmhook::hotspot::klass*) noexcept;
+        static_assert(std::is_same_v<
+                          decltype(&vmhook::detail::klass_to_class_loader_oop),
+                          k2l_fn_t>,
+                      "klass_to_class_loader_oop must be void*(klass*) noexcept");
+        // capture_host_classloader_klass: void(klass*) noexcept.
+        using capture_fn_t = void(*)(vmhook::hotspot::klass*) noexcept;
+        static_assert(std::is_same_v<
+                          decltype(&vmhook::detail::capture_host_classloader_klass),
+                          capture_fn_t>,
+                      "capture_host_classloader_klass must be void(klass*) noexcept");
+        // inherit_host_context_classloader_for_current_thread: void() noexcept.
+        using inherit_fn_t = void(*)() noexcept;
+        static_assert(std::is_same_v<
+                          decltype(&vmhook::detail::inherit_host_context_classloader_for_current_thread),
+                          inherit_fn_t>,
+                      "inherit_* must be void() noexcept");
+        // The host-klass atomic is lock-free on every supported platform
+        // (a non-lock-free atomic<klass*> would be a regression worth knowing).
+        info("host_classloader_klass_atomic_is_lock_free",
+             vmhook::detail::host_classloader_klass.is_lock_free());
+        check("section14_static_assert_identity_compiled", true);
+    }
+
     // ---------------------------------------------------------------------
     // 12. Whole-cache cleanliness: after every section above (each of which
     //     save/restored its keys), the cache must be back to its starting size.
