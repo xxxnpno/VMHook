@@ -574,6 +574,81 @@ int main()
               combined_mask == ((1u << 2) | (1u << 12)));
     }
 
+    // =====================================================================
+    // H. Wave-33 deepening: extra static_asserts on the inhibitor signatures
+    //    and additional idempotent / null-noop characterizations.  These pin
+    //    the contract surface the JVM module relies on (cold-state safe no-op
+    //    on null Method*, noexcept set/resolve, NO_COMPILE bitmask exactness).
+    // =====================================================================
+    {
+        // set_dont_inline takes (const method*, bool) -- pin the const-ness and
+        // bool parameter type via a function-pointer cast (compile-time pin).
+        using set_fn_t = void (*)(const vmhook::hotspot::method*, bool);
+        constexpr set_fn_t set_fn{ &vmhook::hotspot::set_dont_inline };
+        static_assert(std::is_same_v<decltype(set_fn), const set_fn_t>,
+                      "set_dont_inline pointer type pin");
+
+        using resolve_fn_t = vmhook::hotspot::method_flags_slot (*)(
+            const vmhook::hotspot::method*);
+        constexpr resolve_fn_t resolve_fn{ &vmhook::hotspot::resolve_method_flags_slot };
+        static_assert(std::is_same_v<decltype(resolve_fn), const resolve_fn_t>,
+                      "resolve_method_flags_slot pointer type pin");
+
+        // is_valid_pointer is noexcept and bool-returning -- the gate for the
+        // null/invalid safe no-op contract.
+        static_assert(noexcept(is_valid_pointer(static_cast<const void*>(nullptr))),
+                      "is_valid_pointer must be noexcept");
+        static_assert(std::is_same_v<
+                          decltype(is_valid_pointer(static_cast<const void*>(nullptr))),
+                          bool>,
+                      "is_valid_pointer must return bool");
+        check("is_valid_pointer_rejects_null", !is_valid_pointer(static_cast<const void*>(nullptr)));
+
+        // Idempotent SAFE no-op: hammer set_dont_inline on null many times and
+        // confirm survival + the slot resolved on null is byte-identical each call.
+        for (int i{ 0 }; i < 64; ++i)
+        {
+            set_dont_inline(nullptr, (i & 1) != 0);
+        }
+        const method_flags_slot a{ resolve_method_flags_slot(nullptr) };
+        const method_flags_slot b{ resolve_method_flags_slot(nullptr) };
+        check("resolve_null_is_pure_repeatable",
+              a.confident == b.confident
+                  && a.address == b.address
+                  && a.width_bytes == b.width_bytes);
+
+        // method_flags_slot POD layout pins.
+        static_assert(std::is_standard_layout_v<vmhook::hotspot::method_flags_slot>,
+                      "method_flags_slot must be standard-layout");
+        static_assert(std::is_same_v<
+                          decltype(vmhook::hotspot::method_flags_slot::confident),
+                          bool>,
+                      "method_flags_slot::confident must be bool");
+
+        // method_flags_layout: a confident layout never reports width 0.
+        constexpr method_flags_layout confident_a{ derive_method_flags_layout(
+            method_flags_evidence{ true, "u2", 48u, false, nullptr, 0u }) };
+        static_assert(confident_a.confident && confident_a.width_bytes > 0,
+                      "confident Path A layout must have positive width");
+
+        // NO_COMPILE bitmask is constexpr-usable: pin its high-bit-only shape at
+        // COMPILE TIME (no stray low bits).
+        static_assert((static_cast<std::uint32_t>(vmhook::hotspot::NO_COMPILE)
+                           & 0x00FFFFFFu) == 0u,
+                      "NO_COMPILE must have no low-24 bits set");
+        static_assert((static_cast<std::uint32_t>(vmhook::hotspot::NO_COMPILE)
+                           & 0xF0000000u) == 0u,
+                      "NO_COMPILE must have no top-nibble bits set");
+
+        // Cold-state characterization on null: set+set+set leaves no observable
+        // diagnostic state in the slot view.
+        set_dont_inline(nullptr, true);
+        set_dont_inline(nullptr, true);
+        const method_flags_slot c{ resolve_method_flags_slot(nullptr) };
+        check("repeated_null_set_then_resolve_still_not_confident", !c.confident);
+        check("repeated_null_set_then_resolve_address_null", c.address == nullptr);
+    }
+
     std::printf("\n%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }
