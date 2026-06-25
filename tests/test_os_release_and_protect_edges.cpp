@@ -3052,6 +3052,441 @@ namespace wave21_alloc_release_deepening
     }
 } // namespace wave21_alloc_release_deepening
 
+// ===========================================================================
+// WAVE-23: os_protect ledger-gap closure -- deeper old_prot/round-trip,
+// out-of-range enum sweep, sub-page no-bleed cross-page boundary, exact-page
+// vs page-1 rounding witnessed via safe_read asymmetry across BOTH pages,
+// no_access+execute_rw behavioural-probe pair, idempotent re-protect with
+// old_prot capture on every call.
+//
+// ADDITIVE. Every assertion below is a cross-platform INVARIANT derived
+// directly from vmhook.hpp protect() body (638-667) and the two
+// to_native_protect overloads (607-632). Platform-variable outcomes are
+// reported via info(), never hard-asserted.
+// ===========================================================================
+namespace wave23_protect_ledger_gaps
+{
+    using vmhook::os::memory_protection;
+
+    // -----------------------------------------------------------------------
+    // Out-of-range enum SWEEP across several distinct garbage encodings. Each
+    // must (a) return true (the switch fallback writes a defined native value
+    // and protect() returns whatever the kernel says, which on a real page is
+    // success), AND (b) the resulting page must NOT be permissively readable
+    // -- the fallback is no_access / PROT_NONE, never RWX. Gated where the
+    // sandbox refuses PROT_NONE.
+    // -----------------------------------------------------------------------
+#if !VMHOOK_OS_IOS
+    static auto test_out_of_range_enum_sweep_never_widens() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("wave23_oor_sweep_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0] = 0x77;
+
+        // Four distinct garbage values across the std::uint32_t range. None of
+        // them is a valid enum encoding (the valid set is 0..4 per the static
+        // asserts at file top). Each must NOT widen access.
+        const std::uint32_t garbage_vals[]{
+            5u, 6u, 99u, 0xFFu, 0xFFFF'FFFFu,
+        };
+
+        bool any_widened_readable{ false };
+        bool any_succeeded{ false };
+        for (const std::uint32_t g : garbage_vals)
+        {
+            // Reset to writable between iterations so each probe starts from a
+            // known state and the previous iteration's no_access is cleared.
+            (void)make_writable(block, page);
+
+            const bool ok{ vmhook::os::protect(block, page,
+                                               static_cast<memory_protection>(g),
+                                               nullptr) };
+            if (ok)
+            {
+                any_succeeded = true;
+                // Fallback maps to no_access -> page must be unreadable.
+                if (byte_is_readable(block))
+                {
+                    any_widened_readable = true;
+                }
+            }
+        }
+        // No garbage value may ever produce a READABLE page; that would mean
+        // the fallback became permissive (the load-bearing safety contract).
+        check("wave23_oor_sweep_never_produces_readable_page",
+              !any_widened_readable);
+        // Characterize: at least one garbage value should succeed somewhere
+        // (Windows VirtualProtect to PAGE_NOACCESS always works; sandboxes can
+        // refuse PROT_NONE). This is informational only.
+        info("wave23_oor_sweep_any_succeeded", any_succeeded);
+
+        check("wave23_oor_sweep_restore_writable", make_writable(block, page));
+        vmhook::os::release(block, page);
+    }
+#endif
+
+    // -----------------------------------------------------------------------
+    // no_access vs execute_rw -- the two enum arms most platform-variable.
+    // Witness the asymmetry via safe_read across the SAME page in one test:
+    //   * after no_access  -> byte_is_readable(p) == false
+    //   * after read       -> byte_is_readable(p) == true
+    //   * after execute_rw -> byte_is_readable(p) == true (when granted)
+    // This pins the contract that flipping back from no_access to a permissive
+    // state restores readability, AND that execute_rw is at-least-readable.
+    // -----------------------------------------------------------------------
+#if !VMHOOK_OS_IOS
+    static auto test_no_access_vs_execute_rw_safe_read_asymmetry() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("wave23_asymmetry_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0] = 0xA9;
+
+        // 1) no_access -> unreadable. Skip if sandbox refuses PROT_NONE.
+        const bool na_ok{ vmhook::os::protect(block, page,
+                                              memory_protection::no_access, nullptr) };
+        if (na_ok)
+        {
+            check("wave23_no_access_byte_unreadable", !byte_is_readable(block));
+        }
+        else
+        {
+            std::printf("[INFO] wave23_no_access skipped: PROT_NONE refused\n");
+        }
+
+        // 2) Flip BACK to read -> readable again. This is the recovery edge.
+        const bool r_ok{ vmhook::os::protect(block, page,
+                                             memory_protection::read, nullptr) };
+        check("wave23_recover_from_no_access_to_read_succeeds", r_ok);
+        if (r_ok)
+        {
+            check("wave23_recovered_page_is_readable", byte_is_readable(block));
+            check("wave23_recovered_page_preserves_byte", bytes[0] == 0xA9);
+        }
+
+        // 3) execute_rw -> readable (when W^X allows). Otherwise [INFO] skip.
+        const bool xrw_ok{ vmhook::os::protect(block, page,
+                                               memory_protection::execute_rw, nullptr) };
+        if (xrw_ok)
+        {
+            check("wave23_execute_rw_is_readable", byte_is_readable(block));
+            // And writable -- distinguishes execute_rw (R+W+X) from execute_read.
+            bytes[0] = 0xB9;
+            check("wave23_execute_rw_is_writable", bytes[0] == 0xB9);
+        }
+        else
+        {
+            std::printf("[INFO] wave23_execute_rw skipped: W^X refused\n");
+        }
+
+        check("wave23_asymmetry_restore_writable", make_writable(block, page));
+        vmhook::os::release(block, page);
+    }
+#endif
+
+    // -----------------------------------------------------------------------
+    // Sub-page protect with a CROSS-PAGE 1-byte request: address = end-of-
+    // page-0 - 0 (i.e. last byte of page 0) and size = 1. This rounds to one
+    // page (just page 0). The neighbour (page 1) must remain WRITABLE. The
+    // existing neighbour witness uses page/3 which stays inside page 0; this
+    // probes the page-0/page-1 boundary edge specifically.
+    // -----------------------------------------------------------------------
+    static auto test_subpage_at_page0_last_byte_no_bleed() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page * 2) };
+        if (!block)
+        {
+            check("wave23_last_byte_no_bleed_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[page - 1] = 0xE1;  // last byte of page 0
+        bytes[page]     = 0xE2;  // first byte of page 1 (must stay writable)
+        bytes[page * 2 - 1] = 0xE3;  // last byte of page 1
+
+        // Protect 1 byte at the very last byte of page 0. Rounds down to base
+        // of page 0, length up to 1 page. Page 1 must remain writable.
+        const bool ok{ vmhook::os::protect(bytes + (page - 1), 1,
+                                           memory_protection::read, nullptr) };
+        check("wave23_last_byte_protect_succeeds", ok);
+
+        // The two markers in page 1 must still be writable.
+        bytes[page]         = 0xF2;
+        bytes[page * 2 - 1] = 0xF3;
+        check("wave23_page1_first_byte_still_writable", bytes[page] == 0xF2);
+        check("wave23_page1_last_byte_still_writable",
+              bytes[page * 2 - 1] == 0xF3);
+
+        // Page 0's marker preserved (protect changes flags, not content).
+        check("wave23_page0_last_byte_marker_preserved", bytes[page - 1] == 0xE1);
+
+        check("wave23_last_byte_restore", make_writable(block, page * 2));
+        vmhook::os::release(block, page * 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotent re-protect with old_prot capture on EVERY call. The Windows
+    // path writes the genuine prior native flags, so the second protect(read)
+    // captured value should be PAGE_READONLY (the state set by the first call)
+    // -- proving the second call really did consult the prior state. POSIX
+    // always writes 0, so both captures must be 0.
+    // -----------------------------------------------------------------------
+    static auto test_idempotent_reprotect_captures_old_prot_each_call() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("wave23_idem_oldprot_skipped_alloc_failed", false);
+            return;
+        }
+
+        // Establish a known starting state: read_write.
+        check("wave23_idem_seed_rw", make_writable(block, page));
+
+        std::uint32_t op1{ 0xCAFEBABEu };
+        std::uint32_t op2{ 0xCAFEBABEu };
+
+        const bool ok1{ vmhook::os::protect(block, page,
+                                            memory_protection::read, &op1) };
+        const bool ok2{ vmhook::os::protect(block, page,
+                                            memory_protection::read, &op2) };
+        check("wave23_idem_first_read_succeeds", ok1);
+        check("wave23_idem_second_read_succeeds", ok2);
+
+#if VMHOOK_OS_WINDOWS
+        // Windows: each call writes the REAL prior native flags. The sentinel
+        // was overwritten on both, and the second call's captured value should
+        // be the native form of the READ state set by the first call. We
+        // assert only "written, not sentinel" -- the exact PAGE_* value is
+        // checked elsewhere; this test focuses on the per-call write contract.
+        check("wave23_idem_op1_overwritten_on_windows", op1 != 0xCAFEBABEu);
+        check("wave23_idem_op2_overwritten_on_windows", op2 != 0xCAFEBABEu);
+        // The first call's prior state (read_write) and the second call's
+        // prior state (read) MAY produce distinct PAGE_* values -- this is
+        // platform-detail and reported only.
+        info("wave23_idem_windows_op1_op2_distinct", op1 != op2);
+#else
+        // POSIX: both captures must be exactly 0 by contract (vmhook.hpp:661-664).
+        check("wave23_idem_op1_is_zero_on_posix", op1 == 0u);
+        check("wave23_idem_op2_is_zero_on_posix", op2 == 0u);
+#endif
+
+        check("wave23_idem_restore_writable", make_writable(block, page));
+        vmhook::os::release(block, page);
+    }
+
+    // -----------------------------------------------------------------------
+    // Size == page (no rounding) vs size == page + 1 (rounds up to 2 pages):
+    // pin BOTH boundaries through a safe_read asymmetry probe across both
+    // pages. Existing tests cover this via writability; this adds the
+    // READABILITY probe (orthogonal axis) by flipping to no_access. On the
+    // exact-page request, page 1 must STAY readable; on the page+1 request,
+    // page 1 must become UNREADABLE (it was included in the rounded-up range).
+    // Gated on iOS / PROT_NONE sandbox.
+    // -----------------------------------------------------------------------
+#if !VMHOOK_OS_IOS
+    static auto test_exact_page_vs_page_plus_one_safe_read_witness() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        // Three pages: page 0 we always protect, page 1 is the witness page,
+        // page 2 is the safety buffer that must always stay writable.
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page * 3) };
+        if (!block)
+        {
+            check("wave23_exact_vs_plus_one_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0]            = 0x10;
+        bytes[page]         = 0x20;
+        bytes[page * 2]     = 0x30;
+
+        // (a) size == page : only page 0 affected. Page 1 stays READABLE.
+        {
+            const bool ok{ vmhook::os::protect(block, page,
+                                               memory_protection::no_access, nullptr) };
+            if (ok)
+            {
+                check("wave23_exact_page_page1_still_readable",
+                      byte_is_readable(bytes + page));
+                check("wave23_exact_page_page0_not_readable",
+                      !byte_is_readable(block));
+            }
+            else
+            {
+                std::printf("[INFO] wave23_exact_page no_access refused\n");
+            }
+            check("wave23_exact_page_restore", make_writable(block, page * 3));
+        }
+
+        // (b) size == page + 1 : rounds up to 2 pages. Page 1 must become
+        // UNREADABLE. Page 2 must stay readable.
+        {
+            const bool ok{ vmhook::os::protect(block, page + 1,
+                                               memory_protection::no_access, nullptr) };
+            if (ok)
+            {
+                check("wave23_page_plus_one_page0_not_readable",
+                      !byte_is_readable(block));
+                check("wave23_page_plus_one_page1_not_readable",
+                      !byte_is_readable(bytes + page));
+                check("wave23_page_plus_one_page2_still_readable",
+                      byte_is_readable(bytes + page * 2));
+            }
+            else
+            {
+                std::printf("[INFO] wave23_page_plus_one no_access refused\n");
+            }
+            check("wave23_page_plus_one_restore", make_writable(block, page * 3));
+        }
+
+        vmhook::os::release(block, page * 3);
+    }
+#endif
+
+    // -----------------------------------------------------------------------
+    // old_prot success-path: pass nullptr and a valid pointer in ALTERNATING
+    // calls on the same page. The nullptr arm tests the `if (old_prot)` guard
+    // (Windows 648 / POSIX 661); the valid-pointer arm tests the write. Both
+    // must succeed; the valid-pointer arm must overwrite a sentinel.
+    // -----------------------------------------------------------------------
+    static auto test_old_prot_alternating_null_and_valid_pointer() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("wave23_alt_null_skipped_alloc_failed", false);
+            return;
+        }
+
+        constexpr std::uint32_t sentinel{ 0x12345678u };
+
+        // null -> valid -> null -> valid, all succeed.
+        const bool ok1{ vmhook::os::protect(block, page,
+                                            memory_protection::read, nullptr) };
+        std::uint32_t op2{ sentinel };
+        const bool ok2{ vmhook::os::protect(block, page,
+                                            memory_protection::read_write, &op2) };
+        const bool ok3{ vmhook::os::protect(block, page,
+                                            memory_protection::read, nullptr) };
+        std::uint32_t op4{ sentinel };
+        const bool ok4{ vmhook::os::protect(block, page,
+                                            memory_protection::read_write, &op4) };
+
+        check("wave23_alt_null_arm1_succeeds", ok1);
+        check("wave23_alt_valid_arm2_succeeds", ok2);
+        check("wave23_alt_null_arm3_succeeds", ok3);
+        check("wave23_alt_valid_arm4_succeeds", ok4);
+
+        // Every valid-pointer arm overwrote the sentinel.
+        check("wave23_alt_op2_overwritten", op2 != sentinel);
+        check("wave23_alt_op4_overwritten", op4 != sentinel);
+
+#if !VMHOOK_OS_WINDOWS
+        // POSIX writes exactly 0 on every success.
+        check("wave23_alt_op2_zero_on_posix", op2 == 0u);
+        check("wave23_alt_op4_zero_on_posix", op4 == 0u);
+#endif
+
+        check("wave23_alt_restore_writable", make_writable(block, page));
+        vmhook::os::release(block, page);
+    }
+
+    // -----------------------------------------------------------------------
+    // POSIX hazard demonstration: capturing old_prot from a successful flip
+    // and feeding it back through the enum produces no_access. This is a
+    // VALUE-only check (no kernel call applying the bogus restore), pinning
+    // that the asymmetric contract is the trap. On Windows the captured value
+    // round-trips correctly through ::VirtualProtect (already tested
+    // elsewhere); here we only nail the POSIX value-equivalence.
+    // -----------------------------------------------------------------------
+#if !VMHOOK_OS_WINDOWS
+    static auto test_posix_old_prot_roundtrip_is_no_access_hazard() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("wave23_posix_hazard_skipped_alloc_failed", false);
+            return;
+        }
+
+        // Flip through every reachable prior state and confirm the captured
+        // op is always 0 (== no_access cast). Each iteration is independent.
+        const memory_protection priors[]{
+            memory_protection::read,
+            memory_protection::read_write,
+            memory_protection::execute_read,
+        };
+
+        bool all_zero{ true };
+        bool all_roundtrip_to_no_access{ true };
+        for (const auto prior : priors)
+        {
+            if (!vmhook::os::protect(block, page, prior, nullptr))
+            {
+                continue;
+            }
+            std::uint32_t op{ 0xFEEDFACEu };
+            if (!vmhook::os::protect(block, page,
+                                     memory_protection::read_write, &op))
+            {
+                continue;
+            }
+            if (op != 0u)
+            {
+                all_zero = false;
+            }
+            if (static_cast<memory_protection>(op) != memory_protection::no_access)
+            {
+                all_roundtrip_to_no_access = false;
+            }
+        }
+        check("wave23_posix_old_prot_always_zero", all_zero);
+        check("wave23_posix_old_prot_roundtrips_to_no_access",
+              all_roundtrip_to_no_access);
+
+        check("wave23_posix_hazard_restore_writable", make_writable(block, page));
+        vmhook::os::release(block, page);
+    }
+#endif
+
+    static auto run() -> void
+    {
+#if !VMHOOK_OS_IOS
+        test_out_of_range_enum_sweep_never_widens();
+        test_no_access_vs_execute_rw_safe_read_asymmetry();
+#endif
+        test_subpage_at_page0_last_byte_no_bleed();
+        test_idempotent_reprotect_captures_old_prot_each_call();
+#if !VMHOOK_OS_IOS
+        test_exact_page_vs_page_plus_one_safe_read_witness();
+#endif
+        test_old_prot_alternating_null_and_valid_pointer();
+#if !VMHOOK_OS_WINDOWS
+        test_posix_old_prot_roundtrip_is_no_access_hazard();
+#endif
+    }
+} // namespace wave23_protect_ledger_gaps
+
 int main()
 {
     test_release_zero_size_is_idempotent_noop();
@@ -3104,6 +3539,13 @@ int main()
     //     varying-size leak loop, later-page interior negative release,
     //     value-returning execute-bit stub ---
     wave21_alloc_release_deepening::run();
+
+    // --- wave-23: os_protect ledger-gap closure -- OOB enum sweep, no_access
+    //     vs execute_rw safe_read asymmetry, page-boundary subpage no-bleed,
+    //     idempotent reprotect with old_prot every call, exact-page vs page+1
+    //     safe_read witness, alternating null/valid old_prot, POSIX old_prot
+    //     hazard pin ---
+    wave23_protect_ledger_gaps::run();
 
     if (failures == 0)
     {

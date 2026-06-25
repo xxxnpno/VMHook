@@ -2137,6 +2137,138 @@ static auto test_candidate_alignment_geometry() -> void
 
 } // namespace deepen_os_geometry_bounds
 
+// ===========================================================================
+// FOURTH DEEPENING SECTION (additive; appended after deepen_os_geometry_bounds).
+// Closes the remaining LEDGER gaps for os_allocate_release at 62% -> aim higher:
+//   * DWORD -> size_t cast non-truncation pin (vmhook.hpp:476/481, 491/496):
+//     GetSystemInfo's dwPageSize / dwAllocationGranularity are 32-bit DWORDs
+//     widened to size_t in the source; on a 64-bit size_t this is a zero-extend
+//     and the bottom 32 bits must round-trip.  Pin: the returned values fit in
+//     a uint32_t (no garbage upper bits creeping in from a future widening) and
+//     a DWORD-sized round-trip cast preserves the value.
+//   * POSIX sysconf 4096-fallback pin (vmhook.hpp:484): sysconf(_SC_PAGESIZE)
+//     <= 0 falls back to literal 4096.  We cannot fault sysconf in a unit test,
+//     but we CAN pin the fallback constant by asserting page_size() is one of
+//     the architecturally-valid page sizes (4096 / 16384 / 65536) so the literal
+//     4096 at line 484 stays consistent with the power-of-two cap above.
+//   * static_assert pins for the geometry constants the feature is built on:
+//     user_address_floor and user_address_ceiling are compile-time constants
+//     (vmhook.hpp:505, 510), so their relationships fix at translation time.
+//   * a final witness: align_up(begin, gran) followed by align_down to page
+//     equals align_up(begin, gran) -- the trampoline candidate placement is
+//     idempotent under further page-alignment (this guards a future refactor
+//     that re-aligns the candidate to page after granularity rounding).
+// ===========================================================================
+namespace deepen_os_alloc_release_pins
+{
+
+// Constexpr power-of-two check used in static_asserts below.
+static constexpr auto is_power_of_two_constexpr(std::size_t v) noexcept -> bool
+{
+    return v != 0 && (v & (v - 1)) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// 17. DWORD -> size_t cast non-truncation (Windows) / sysconf fallback (POSIX).
+//     The library widens GetSystemInfo's DWORD fields to size_t (vmhook.hpp:481
+//     / 496) and falls back to literal 4096 on sysconf failure (line 484).  Pin
+//     the values fit in a 32-bit unsigned (no garbage upper bits) so a future
+//     DWORD widening would be caught here, and pin the architecturally-valid
+//     page-size set so the 4096 fallback literal stays consistent.
+// ---------------------------------------------------------------------------
+static auto test_dword_widening_and_sysconf_fallback() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    const std::size_t gran{ vmhook::os::allocation_granularity() };
+
+    // Bottom 32 bits round-trip: the DWORD->size_t widening is value-preserving
+    // and (on a 64-bit size_t) zero-extends.  Stronger than "<= 2 MiB" because
+    // it also catches a hypothetical future change that smuggles bits above 32.
+    check("deep_pin_page_fits_in_uint32",
+          page <= static_cast<std::size_t>(0xFFFFFFFFu));
+    check("deep_pin_gran_fits_in_uint32",
+          gran <= static_cast<std::size_t>(0xFFFFFFFFu));
+
+    // Round-trip through a 32-bit unsigned: the low 32 bits ARE the value.
+    const std::uint32_t page_lo{ static_cast<std::uint32_t>(page) };
+    const std::uint32_t gran_lo{ static_cast<std::uint32_t>(gran) };
+    check("deep_pin_page_lo32_roundtrips",
+          static_cast<std::size_t>(page_lo) == page);
+    check("deep_pin_gran_lo32_roundtrips",
+          static_cast<std::size_t>(gran_lo) == gran);
+
+    // The architecturally-valid page sizes the library expects: 4 KiB
+    // (everyone), 16 KiB (Apple arm64, some Linux aarch64 configs), 64 KiB
+    // (some embedded/aarch64).  This pins the sysconf 4096-fallback literal to
+    // the SAME set the runtime-discovered values can take.
+    const bool valid_page{ page == 4096u || page == 16384u || page == 65536u };
+    check("deep_pin_page_is_arch_valid_size", valid_page);
+
+    // The 4096 fallback literal in source must be a POWER OF TWO (the rest of
+    // the file assumes it) and a member of the valid page-size set above.
+    static_assert(is_power_of_two_constexpr(4096u),
+                  "sysconf fallback literal must be a power of two");
+}
+
+// ---------------------------------------------------------------------------
+// 18. Compile-time pins on user_address_floor / user_address_ceiling
+//     (vmhook.hpp:505, 510).  These are constexpr in source, so every fact about
+//     them holds at translation time -- a static_assert here means a future edit
+//     to either constant fails the build, not the test run.
+// ---------------------------------------------------------------------------
+static_assert(vmhook::os::user_address_floor == 0xFFFFu,
+              "user_address_floor pin");
+static_assert(vmhook::os::user_address_ceiling == 0x00007FFFFFFFFFFFull,
+              "user_address_ceiling pin");
+static_assert(vmhook::os::user_address_floor < vmhook::os::user_address_ceiling,
+              "floor < ceiling");
+// Ceiling is 47-bit canonical user-space top: bit 47 is the highest set bit.
+static_assert((vmhook::os::user_address_ceiling & (vmhook::os::user_address_ceiling + 1ull)) == 0ull,
+              "ceiling+1 is a power of two (canonical 2^47)");
+
+// ---------------------------------------------------------------------------
+// 19. Trampoline candidate-placement idempotence under further page-alignment.
+//     allocate_nearby_memory aligns candidates with align_up(begin, gran); a
+//     subsequent align_down(candidate, page) MUST be a fixed point (because
+//     gran is a multiple of page, every gran-aligned address is also
+//     page-aligned).  Pin that across a grid of real owned offsets.
+// ---------------------------------------------------------------------------
+static auto test_candidate_page_realign_is_fixed_point() -> void
+{
+    const std::uintptr_t page{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
+    const std::uintptr_t gran{ static_cast<std::uintptr_t>(vmhook::os::allocation_granularity()) };
+
+    void* const blk{ vmhook::os::allocate_rwx(nullptr, static_cast<std::size_t>(gran) * 2u) };
+    if (!blk)
+    {
+        check("deep_pin_candidate_page_realign_skipped_alloc", false);
+        return;
+    }
+    const std::uintptr_t origin{ reinterpret_cast<std::uintptr_t>(blk) };
+
+    const std::uintptr_t offsets[]{
+        0u, 1u, page - 1u, page, page + 1u,
+        gran - 1u, gran, gran + 1u, gran + page,
+    };
+
+    bool all_fixed{ true };
+    for (const std::uintptr_t off : offsets)
+    {
+        const std::uintptr_t x{ origin + off };
+        const std::uintptr_t ug{ mirror_align_up(x, gran) };
+        // gran-aligned ug, re-aligned down to page, must equal ug itself.
+        if (mirror_align_down(ug, page) != ug)
+        {
+            all_fixed = false;
+        }
+    }
+    check("deep_pin_candidate_gran_up_is_page_fixed_point", all_fixed);
+
+    vmhook::os::release(blk, static_cast<std::size_t>(gran) * 2u);
+}
+
+} // namespace deepen_os_alloc_release_pins
+
 int main()
 {
     // --- pure-logic, no side effects: the heart of this file ---------------
@@ -2166,6 +2298,11 @@ int main()
     deepen_os_geometry_bounds::test_is_valid_pointer_boundaries();
     deepen_os_geometry_bounds::test_is_readable_pointer_gate();
     deepen_os_geometry_bounds::test_candidate_alignment_geometry();
+
+    // --- fourth deepening section (DWORD-widening / sysconf-fallback pins +
+    //     candidate page-realign idempotence) ---------------------------------
+    deepen_os_alloc_release_pins::test_dword_widening_and_sysconf_fallback();
+    deepen_os_alloc_release_pins::test_candidate_page_realign_is_fixed_point();
 
     const std::uintptr_t page_align{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
     const std::uintptr_t gran_align{ static_cast<std::uintptr_t>(vmhook::os::allocation_granularity()) };

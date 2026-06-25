@@ -335,6 +335,113 @@ int main()
         check("F_fresh_flag_consumed_after_use", probe_spawns.load() == 1);
     }
 
+    // =====================================================================
+    // G. MULTI-FLAG INDEPENDENCE
+    //    Each entry-point image owns its OWN once_flag; two independent flags
+    //    must NOT cross-contaminate.  Drives two flags interleaved and asserts
+    //    each consumes exactly one spawn on its own counter.  If the guard ever
+    //    devolved into shared global state (e.g. a single namespace-scope flag
+    //    shared by multiple launch helpers) this would catch it.
+    // =====================================================================
+    {
+        std::once_flag flag_a{};
+        std::once_flag flag_b{};
+        std::atomic_int count_a{ 0 };
+        std::atomic_int count_b{ 0 };
+        launch_once_mirror(flag_a, count_a);
+        launch_once_mirror(flag_b, count_b);
+        launch_once_mirror(flag_a, count_a);
+        launch_once_mirror(flag_b, count_b);
+        launch_once_mirror(flag_a, count_b);   // wrong-pair re-drive: still no spawn on b
+        check("G_flag_a_spawned_once", count_a.load() == 1);
+        check("G_flag_b_spawned_once", count_b.load() == 1);
+        // Crossing flags: flag_a is consumed so the b-counter does NOT tick.
+        check("G_cross_drive_no_leak", count_b.load() == 1);
+    }
+
+    // =====================================================================
+    // H. MANY-CYCLE RESETTABLE-FLAG LOOP (single-threaded model of flaw-#1 FIX)
+    //    Models a host that repeatedly does shutdown_hooks() -> re-init: each
+    //    teardown re-arms the flag and the next launch must produce exactly
+    //    one fresh spawn.  This is pure single-threaded state machine — the
+    //    concurrent thundering-herd case is already covered by section B and
+    //    we deliberately do NOT spin up more racers here, because libstdc++'s
+    //    pthread_once-backed std::call_once is known to deadlock under certain
+    //    MinGW configurations on repeated cv-barrier waves (see comment in C),
+    //    and the contract this section pins is the resettable-flag fix, not
+    //    once_flag.  Pinned for many iterations to catch any cycle-count drift.
+    // =====================================================================
+    {
+        std::atomic_flag armed{};
+        int spawn_count{ 0 };
+        auto launch = [&]
+        {
+            if (!armed.test_and_set(std::memory_order_acq_rel))
+            {
+                ++spawn_count;
+            }
+        };
+        constexpr int cycles{ 32 };
+        for (int c{ 0 }; c < cycles; ++c)
+        {
+            const int before{ spawn_count };
+            launch();
+            launch();   // intra-cycle re-drives are no-ops
+            launch();
+            const int after{ spawn_count };
+            const bool grew_by_one{ (after - before) == 1 };
+            check("H_cycle_spawned_exactly_one_more", grew_by_one);
+            armed.clear(std::memory_order_release);
+        }
+        check("H_total_spawns_equals_cycles", spawn_count == cycles);
+    }
+
+    // =====================================================================
+    // J. atomic_flag TYPE-TRAIT CONTRACT (the FIX's primitive)
+    //    The resettable-flag fix relies on std::atomic_flag being lock-free,
+    //    default-constructible (C++20 guarantees default-clear), and not
+    //    copyable / movable — exactly the same shape requirements as
+    //    std::once_flag (section F) so a refactor that swaps the guard for a
+    //    plain bool would fail to compile here.
+    // =====================================================================
+    {
+        using flag_t = std::atomic_flag;
+        static_assert(std::is_default_constructible_v<flag_t>);
+        static_assert(!std::is_copy_constructible_v<flag_t>);
+        static_assert(!std::is_move_constructible_v<flag_t>);
+        static_assert(!std::is_copy_assignable_v<flag_t>);
+        static_assert(!std::is_move_assignable_v<flag_t>);
+        // atomic_flag is the ONE atomic type the standard guarantees lock-free.
+        std::atomic_flag probe{};
+        check("J_default_construction_is_clear", !probe.test_and_set());
+        probe.clear();
+        check("J_clear_then_test_and_set_returns_false",
+              !probe.test_and_set());
+        check("J_second_test_and_set_returns_true", probe.test_and_set());
+    }
+
+    // =====================================================================
+    // K. JNI_ONLOAD VERSION LITERAL — EXHAUSTIVE COMPILE-TIME DECODE
+    //    Pin every documented JNI_VERSION_* major.minor pair as static_assert
+    //    so a future bump to 0x000A0000 (JNI_VERSION_10) or higher must be a
+    //    deliberate code change, and the bootstrap's hand-coded 0x00010008 is
+    //    locked in at compile time, not runtime.
+    // =====================================================================
+    {
+        // Every JNI_VERSION_* value documented by the JNI spec, decoded.
+        static_assert((0x00010001u >> 16) == 1u);                // 1.1
+        static_assert((0x00010002u >> 16) == 1u);                // 1.2
+        static_assert((0x00010004u >> 16) == 1u);                // 1.4
+        static_assert((0x00010006u >> 16) == 1u);                // 1.6
+        static_assert((0x00010008u >> 16) == 1u);                // 1.8 (ours)
+        static_assert((0x00010008u & 0xFFFFu) == 8u);
+        static_assert(jni_onload_version == 0x00010008u);
+        // The bootstrap's literal must be >= JNI 1.6 (the JDK 8 minimum that
+        // HotSpot 8..26 negotiate) and <= JNI 1.8 (the highest classic literal).
+        static_assert(jni_onload_version >= 0x00010006u);
+        static_assert(jni_onload_version <= 0x00010008u);
+    }
+
     std::printf("\n%s: %d failure(s)\n",
                 failures == 0 ? "ALL PASS" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;

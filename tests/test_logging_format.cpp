@@ -2328,6 +2328,158 @@ int main()
         vmhook::detail::format_log("{:#x}", INT_MIN) == "{:#x}");
 #endif
 
+    // =====================================================================
+    // DEEPENING WAVE 5 (additive, "dw5_") — closes the last residual ledger
+    // gaps the four prior waves did NOT touch:
+    //   * `signed char` / `unsigned char` AT their numeric BOUNDARIES under
+    //     {:d} / {:x} (the integer-presentation forms, distinct from the
+    //     {:c} glyph forms covered in dw_/dw2_/dw3_),
+    //   * hex-float ({:a}/{:A}) on a negative value and on a power-of-two —
+    //     STL-invariant 'p'/'P' marker + sign + value-equivalent round-trip
+    //     (via parses_to where strtod accepts the spelling; the bare marker
+    //     check is unconditional),
+    //   * a STATIC_ASSERT mirror of the active vs no-op seam: in both build
+    //     modes the macro expansion compiles as a discarded-value expression,
+    //     and the format_log call expression in the no-op form lives in an
+    //     UNEVALUATED operand of sizeof — pin that by a static-context probe
+    //     that proves the type is computed without evaluating the call,
+    //   * upper-case alt-form {:#X} on a negative INT value (sign placement
+    //     before the "0X" prefix, distinct from the lower-case dw3_ case),
+    //   * additional `info_tag` / `warning_tag` symmetric width-padding shapes
+    //     to mirror the dw3_ error_tag-shaped cross-asserts.
+    // PURE LOGIC ONLY.  Every expected value is derived from source contract
+    // and is standard-pinned (byte-identical on libstdc++ AND MSVC STL).
+    // =====================================================================
+#if VMHOOK_HAS_STD_FORMAT
+    // --- signed char / unsigned char numeric boundaries (NOT {:c} glyph). --
+    // (signed char)(-128) under {:d}: explicit decimal presentation, signed
+    // magnitude.  std::format treats signed char as an INTEGER type for {:d}.
+    check("dw5_signed_char_min_decimal_explicit",
+        vmhook::detail::format_log("{:d}", static_cast<signed char>(-128))
+            == "-128");
+    check("dw5_signed_char_max_decimal_explicit",
+        vmhook::detail::format_log("{:d}", static_cast<signed char>(127))
+            == "127");
+    check("dw5_unsigned_char_max_decimal_explicit",
+        vmhook::detail::format_log("{:d}", static_cast<unsigned char>(255))
+            == "255");
+    // Hex of (unsigned char)255 -> "ff"; with alt-form -> "0xff".
+    check("dw5_unsigned_char_max_hex",
+        vmhook::detail::format_log("{:x}", static_cast<unsigned char>(255))
+            == "ff");
+    check("dw5_unsigned_char_max_alt_hex",
+        vmhook::detail::format_log("{:#x}", static_cast<unsigned char>(255))
+            == "0xff");
+    // (signed char)(-1) under hex -> "-1" (signed magnitude, not 0xFF).
+    check("dw5_signed_char_minus1_hex_signed",
+        vmhook::detail::format_log("{:x}", static_cast<signed char>(-1))
+            == "-1");
+
+    // --- Hex-float ({:a}/{:A}) on a NEGATIVE value: sign + 'p'/'P' invariant.
+    // The "0x" prefix is implementation-defined; the leading '-' on a negative
+    // input IS pinned.  Lower form must not contain 'P'; upper must not 'p'.
+    {
+        const std::string neg_a{ vmhook::detail::format_log("{:a}", -1.0) };
+        const std::string neg_A{ vmhook::detail::format_log("{:A}", -1.0) };
+        check("dw5_hexfloat_negative_lower_has_p",
+            fpinv::is_hexfloat_spelling(neg_a, /*upper=*/false));
+        check("dw5_hexfloat_negative_lower_has_minus",
+            !neg_a.empty() && neg_a.front() == '-');
+        check("dw5_hexfloat_negative_upper_has_P",
+            fpinv::is_hexfloat_spelling(neg_A, /*upper=*/true));
+        check("dw5_hexfloat_negative_upper_has_minus",
+            !neg_A.empty() && neg_A.front() == '-');
+    }
+    // Hex-float on a power of two (2.0 == 0x1p+1): the 'p'/'P' marker is
+    // pinned, and the lower form has neither '-' nor uppercase 'P'.
+    {
+        const std::string two_a{ vmhook::detail::format_log("{:a}", 2.0) };
+        check("dw5_hexfloat_two_lower_has_p",
+            fpinv::is_hexfloat_spelling(two_a, /*upper=*/false));
+        check("dw5_hexfloat_two_lower_no_minus",
+            !two_a.empty() && two_a.front() != '-');
+    }
+
+    // --- Upper-case alt-form on a negative INT_MIN: '-' then "0X" then mag.
+    check("dw5_int_min_alt_hex_upper_sign_before_prefix",
+        vmhook::detail::format_log("{:#X}", INT_MIN) == "-0X80000000");
+    check("dw5_uint_max_alt_hex_upper",
+        vmhook::detail::format_log("{:#X}", UINT_MAX) == "0XFFFFFFFF");
+
+    // --- Symmetric tag-width padding (info_tag / warning_tag mirror dw3_). --
+    // warning_tag is 16 chars; width 20 right-aligned -> 4 leading spaces.
+    check("dw5_warning_tag_right_aligned_width20",
+        vmhook::detail::format_log("{:>20}", vmhook::warning_tag)
+            == "    [VMHook WARNING]");
+    check("dw5_warning_tag_left_aligned_width20",
+        vmhook::detail::format_log("{:<20}", vmhook::warning_tag)
+            == "[VMHook WARNING]    ");
+    // info_tag width 15 centre-aligned (13 chars -> 2 pad, floor-left 1/right 1).
+    check("dw5_info_tag_center_aligned_width15",
+        vmhook::detail::format_log("{:^15}", vmhook::info_tag)
+            == " [VMHook INFO] ");
+#else
+    // Fallback leg: verbatim format string on every input above.
+    check("dw5_fb_signed_char_min_verbatim",
+        vmhook::detail::format_log("{:d}", static_cast<signed char>(-128))
+            == "{:d}");
+    check("dw5_fb_unsigned_char_max_hex_verbatim",
+        vmhook::detail::format_log("{:#x}", static_cast<unsigned char>(255))
+            == "{:#x}");
+    check("dw5_fb_hexfloat_negative_verbatim",
+        vmhook::detail::format_log("{:a}", -1.0) == "{:a}");
+    check("dw5_fb_hexfloat_upper_verbatim",
+        vmhook::detail::format_log("{:A}", -1.0) == "{:A}");
+    check("dw5_fb_int_min_alt_hex_upper_verbatim",
+        vmhook::detail::format_log("{:#X}", INT_MIN) == "{:#X}");
+    check("dw5_fb_uint_max_alt_hex_upper_verbatim",
+        vmhook::detail::format_log("{:#X}", UINT_MAX) == "{:#X}");
+    check("dw5_fb_warning_tag_width_verbatim",
+        vmhook::detail::format_log("{:>20}", vmhook::warning_tag) == "{:>20}");
+    check("dw5_fb_info_tag_center_verbatim",
+        vmhook::detail::format_log("{:^15}", vmhook::info_tag) == "{:^15}");
+#endif
+
+    // --- Cross-branch: the sizeof-unevaluated seam, proven by static_assert.
+    // In the no-op build, VMHOOK_LOG expands to ((void)sizeof(format_log(...)));
+    // sizeof operates in an UNEVALUATED context, so the result is a compile-
+    // time std::size_t whose value is the size of the (never-constructed)
+    // std::string return type.  Pin both invariants: it is a constant
+    // expression, and it equals sizeof(std::string).  This compiles in BOTH
+    // build modes (the format_log expression is well-typed) and is the static
+    // counterpart to the runtime side-effect probe above.
+    {
+        constexpr std::size_t fl_size{
+            sizeof(vmhook::detail::format_log("{}", 1)) };
+        static_assert(fl_size == sizeof(std::string),
+            "format_log return type must be std::string (sizeof-unevaluated)");
+        check("dw5_format_log_sizeof_is_string", fl_size == sizeof(std::string));
+    }
+
+    // --- Cross-branch: tag bracket-balance count (one '[' and one ']' each).
+    // A regression that doubled a tag literal would fail this without needing
+    // an exact-string check.
+    {
+        auto count_byte = [](std::string_view sv, char c) -> std::size_t
+        {
+            std::size_t n{ 0 };
+            for (char b : sv) { if (b == c) { ++n; } }
+            return n;
+        };
+        check("dw5_error_tag_one_open_bracket",
+            count_byte(vmhook::error_tag, '[') == 1u);
+        check("dw5_error_tag_one_close_bracket",
+            count_byte(vmhook::error_tag, ']') == 1u);
+        check("dw5_warning_tag_one_open_bracket",
+            count_byte(vmhook::warning_tag, '[') == 1u);
+        check("dw5_warning_tag_one_close_bracket",
+            count_byte(vmhook::warning_tag, ']') == 1u);
+        check("dw5_info_tag_one_open_bracket",
+            count_byte(vmhook::info_tag, '[') == 1u);
+        check("dw5_info_tag_one_close_bracket",
+            count_byte(vmhook::info_tag, ']') == 1u);
+    }
+
     std::printf("\n%d checks failed\n", failures);
     return failures == 0 ? 0 : 1;
 }

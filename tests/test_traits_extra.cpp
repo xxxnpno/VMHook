@@ -2285,6 +2285,81 @@ int main()
             std::array<std::int32_t, 3>>,
         "java_slot_offsets::value is std::array<std::int32_t, arity> by type");
 
+    // =========================================================================
+    // WAVE-23: noexcept-correctness of the trait accessors.
+    //
+    // The whole function_traits -> tuple_tail -> java_slot_offsets chain is a
+    // pure compile-time type-algebra surface: every accessor is a constexpr
+    // static data member (`::value`), a member-typedef name (`::value_type_t`,
+    // `::args_tuple_t`, `::type_t`), or a constexpr predicate variable
+    // (`is_*_v`).  Reading any of these is a load from a constexpr/static
+    // data path, never a function call, so noexcept(expr) over the accessor
+    // MUST be true on every accepted shape.  This is what lets hook<T>'s
+    // wrapper_detour (vmhook.hpp:8211 onward) instantiate `slot_offsets` and
+    // `extract_frame_arg` inside an unevaluated/constexpr context without
+    // accidentally pulling in a throwing path.  A regression that turned any
+    // of these accessors into a non-constexpr / throwing form would silently
+    // break the static dispatch — pin it here.
+    // =========================================================================
+    {
+        using m3 = std::tuple<std::int32_t, std::int64_t, std::int32_t>;
+        using m_widths = std::tuple<bool, std::int64_t, char16_t, double,
+                                    std::int8_t, std::int32_t>;
+        // java_slot_offsets<...>::value is a constexpr static std::array; reading
+        // it is noexcept on every tuple shape, including the empty tuple.
+        static_assert(noexcept(vmhook::detail::java_slot_offsets<std::tuple<>>::value),
+                      "java_slot_offsets<empty>::value access must be noexcept");
+        static_assert(noexcept(vmhook::detail::java_slot_offsets<m3>::value),
+                      "java_slot_offsets<self,long,int>::value access must be noexcept");
+        static_assert(noexcept(vmhook::detail::java_slot_offsets<m_widths>::value),
+                      "java_slot_offsets<all-widths>::value access must be noexcept");
+        // Element-wise subscript into the constexpr array stays noexcept.
+        static_assert(noexcept(vmhook::detail::java_slot_offsets<m3>::value[0]),
+                      "subscripting the offsets array must remain noexcept");
+        // is_java_double_slot_v / is_unique_ptr_v / is_vector_v are constexpr
+        // bool variable templates: load is noexcept regardless of T.
+        static_assert(noexcept(vmhook::detail::is_java_double_slot_v<std::int64_t>),
+                      "is_java_double_slot_v read must be noexcept");
+        static_assert(noexcept(vmhook::detail::is_java_double_slot_v<std::int32_t>),
+                      "is_java_double_slot_v read must be noexcept for the false case too");
+        static_assert(noexcept(vmhook::detail::is_unique_ptr_v<std::unique_ptr<int>>),
+                      "is_unique_ptr_v read must be noexcept");
+        static_assert(noexcept(vmhook::detail::is_vector_v<std::vector<int>>),
+                      "is_vector_v read must be noexcept");
+        // dependent_false_v is the discarded-branch helper; also a constexpr bool.
+        static_assert(noexcept(vmhook::detail::dependent_false_v<int>),
+                      "dependent_false_v read must be noexcept");
+        // The detector::value reads (std::true_type::value / false_type::value)
+        // used in the SFINAE probes above are also noexcept.
+        static_assert(noexcept(has_args_tuple<decltype(&free_detour)>::value),
+                      "has_args_tuple::value read must be noexcept");
+        static_assert(noexcept(has_tuple_tail<std::tuple<>>::value),
+                      "has_tuple_tail::value read must be noexcept");
+        // Runtime visibility for the same facts (one [PASS] line per accessor).
+        check("noexcept_java_slot_offsets_empty_value",
+              noexcept(vmhook::detail::java_slot_offsets<std::tuple<>>::value));
+        check("noexcept_java_slot_offsets_self_long_int_value",
+              noexcept(vmhook::detail::java_slot_offsets<m3>::value));
+        check("noexcept_java_slot_offsets_all_widths_value",
+              noexcept(vmhook::detail::java_slot_offsets<m_widths>::value));
+        check("noexcept_java_slot_offsets_subscript",
+              noexcept(vmhook::detail::java_slot_offsets<m3>::value[0]));
+        check("noexcept_is_java_double_slot_v_true_case",
+              noexcept(vmhook::detail::is_java_double_slot_v<std::int64_t>));
+        check("noexcept_is_java_double_slot_v_false_case",
+              noexcept(vmhook::detail::is_java_double_slot_v<std::int32_t>));
+        check("noexcept_is_unique_ptr_v",
+              noexcept(vmhook::detail::is_unique_ptr_v<std::unique_ptr<int>>));
+        check("noexcept_is_vector_v",
+              noexcept(vmhook::detail::is_vector_v<std::vector<int>>));
+        check("noexcept_dependent_false_v",
+              noexcept(vmhook::detail::dependent_false_v<int>));
+        check("noexcept_has_args_tuple_value",
+              noexcept(has_args_tuple<decltype(&free_detour)>::value));
+        check("noexcept_has_tuple_tail_value",
+              noexcept(has_tuple_tail<std::tuple<>>::value));
+    }
+
     std::printf("vmhook traits-extra: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

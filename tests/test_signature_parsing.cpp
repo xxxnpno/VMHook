@@ -687,6 +687,184 @@ namespace wave21
     }
 } // namespace wave21
 
+// =====================================================================
+// WAVE-23 ADDITIVE DEEPENING (no-JVM, -Werror gcc/clang/msvc).
+//
+// Extends wave21 with NEW angles closing the wave-23 ledger row:
+//   * ends-in-')' boundary driven through MORE shapes (nested-paren, trailing
+//     primitives, the lone '(' edge, and the well-formed-but-empty "()V")
+//     comparing raw vs guarded ladder outputs side-by-side;
+//   * sig_char_to_basic_type sweep contrasted against jvm_primitive_byte_width
+//     for the 11 known letters (BasicType-vs-width cross-table consistency);
+//   * jvm_primitive_byte_width adversarial: SPACE-PREFIXED-NUL, CR/LF, DEL,
+//     and EVERY high-byte 0x80..0xFF (the signed-char negative-int domain
+//     applied to the WIDTH helper, distinct from wave21's char-classifier
+//     sweep);
+//   * jni_signature_for_arg integral matrix EXTENDED with signed/unsigned
+//     char (the 1-byte branch) AND a generic-ladder cross-check on plain
+//     long/long-long widths on this build;
+//   * full ctor-signature build EXTENDED to the briefing rows
+//     "(IDLjava/lang/String;)V" / "()V" / "(C)V" PLUS a long+double pack
+//     "(JD)V" (two-slot args in JVMS terms — pinned via the reference
+//     parse_method_descriptor walk earlier in this file) and a string-only
+//     pack to confirm String descriptors do not collapse;
+//   * signature_for_arg == jni_signature_for_arg PARITY extended over the
+//     char family AND the integral-width branches (so the public re-export
+//     cannot drift on any sizeof-driven row either).
+//
+// All assertions are HARD — no platform-variant behaviour is exercised here.
+// =====================================================================
+namespace wave23
+{
+    template<typename... args_t>
+    inline auto ctor_sig() -> std::string
+    {
+        std::string s{ "(" };
+        ((s += vmhook::detail::jni_signature_for_arg<std::remove_cvref_t<args_t>>()), ...);
+        s += ")V";
+        return s;
+    }
+
+    inline auto run() -> void
+    {
+        // ---- ENDS-IN-')' BOUNDARY: more shapes through the guarded ladder ----
+        // call_site_result_type is the file's faithful mirror of the guarded
+        // library ladder (vmhook.hpp:17216-17230).  Drive it over signatures
+        // whose final byte is ')' AND through shapes where ')' appears inside a
+        // nested object descriptor.  All ends-in-')' shapes must degrade to
+        // T_VOID(14) with NO out-of-bounds read; the nested-')' shapes must
+        // still pick the LAST ')' (rfind), so "(L)foo;)I" -> ')' is the LAST
+        // paren and the byte after it is 'I' -> T_INT(10).
+        check("wave23_ends_in_rparen_nested_void",
+              call_site_result_type("([Ljava/lang/Object;)") == 14);
+        check("wave23_ends_in_rparen_after_long_void",
+              call_site_result_type("(JJJ)") == 14);
+        check("wave23_only_close_paren_void",
+              call_site_result_type(")") == 14);
+        check("wave23_close_then_open_paren_picks_last",
+              call_site_result_type("()()V") == 14);  // last ')' at idx 3, then 'V'
+        // Well-formed "()V" round-trips through the guarded ladder unchanged.
+        check("wave23_well_formed_void_method_is_14",
+              call_site_result_type("()V") == 14);
+        // Lone '(' has NO ')' at all -> rparen==npos -> 'V' fallback -> 14.
+        check("wave23_lone_open_paren_no_close_void_14",
+              call_site_result_type("(") == 14);
+
+        // ---- BasicType <-> width CROSS-TABLE consistency for the 11 known ----
+        // For each known descriptor letter, the BasicType int from
+        // sig_char_to_basic_type and the byte width from
+        // jvm_primitive_byte_width must agree on which 8 letters are
+        // primitives.  Pin: width!=0 IFF the letter is one of Z/B/S/C/I/F/J/D.
+        {
+            struct row { char c; int bt; std::size_t w; };
+            const row rows[]{
+                { 'Z', 4, 1 }, { 'C', 5, 2 }, { 'F', 6, 4 }, { 'D', 7, 8 },
+                { 'B', 8, 1 }, { 'S', 9, 2 }, { 'I', 10, 4 }, { 'J', 11, 8 },
+                { 'L', 12, 0 }, { '[', 13, 0 }, { 'V', 14, 0 },
+            };
+            bool all_consistent{ true };
+            for (const row& r : rows)
+            {
+                if (vmhook::detail::sig_char_to_basic_type(r.c) != r.bt) { all_consistent = false; }
+                const char one[1]{ r.c };
+                if (vmhook::detail::jvm_primitive_byte_width(std::string_view{ one, 1 }) != r.w)
+                {
+                    all_consistent = false;
+                }
+            }
+            check("wave23_basic_type_and_width_cross_table_agrees_on_11_known",
+                  all_consistent);
+        }
+
+        // ---- jvm_primitive_byte_width: more adversarial single-byte inputs ---
+        // Every byte 0x80..0xFF as a single-byte view (the SIGNED-char negative
+        // domain applied to the WIDTH helper).  None is a known primitive
+        // letter -> all 0.  Also CR/LF/DEL singletons (size==1 but not a
+        // letter) -> 0.  Empty / two-byte NUL-prefixed views -> 0 by size!=1.
+        {
+            bool all_high_zero{ true };
+            for (int b{ 0x80 }; b <= 0xFF; ++b)
+            {
+                const char one[1]{ static_cast<char>(b) };
+                if (vmhook::detail::jvm_primitive_byte_width(std::string_view{ one, 1 }) != 0)
+                {
+                    all_high_zero = false;
+                }
+            }
+            check("wave23_width_every_high_byte_single_is_0", all_high_zero);
+            const char cr[1]{ '\r' };
+            const char lf[1]{ '\n' };
+            const char del[1]{ static_cast<char>(0x7F) };
+            check("wave23_width_cr_singleton_is_0",
+                  vmhook::detail::jvm_primitive_byte_width(std::string_view{ cr, 1 }) == 0);
+            check("wave23_width_lf_singleton_is_0",
+                  vmhook::detail::jvm_primitive_byte_width(std::string_view{ lf, 1 }) == 0);
+            check("wave23_width_del_singleton_is_0",
+                  vmhook::detail::jvm_primitive_byte_width(std::string_view{ del, 1 }) == 0);
+            // NUL-prefix followed by valid letter -> size 2 -> 0.
+            const char nul_then_J[2]{ '\0', 'J' };
+            check("wave23_width_nul_then_J_size2_is_0",
+                  vmhook::detail::jvm_primitive_byte_width(std::string_view{ nul_then_J, 2 }) == 0);
+        }
+
+        // ---- jni_signature_for_arg: signed/unsigned char (1-byte branch) -----
+        // signed char: explicitly a 1-byte SIGNED integral, routes via the
+        // generic is_integral && sizeof==1 -> "B" arm.
+        // unsigned char == uint8_t: hits the explicit uint8 row -> "B".
+        check("wave23_jni_sig_signed_char_is_B",
+              vmhook::detail::jni_signature_for_arg<signed char>() == "B");
+        check("wave23_jni_sig_unsigned_char_is_B",
+              vmhook::detail::jni_signature_for_arg<unsigned char>() == "B");
+        // short / unsigned short: short==int16_t -> "S"; unsigned short ==
+        // uint16_t -> "C" (unsigned-16 split applies to the typedef pair too).
+        check("wave23_jni_sig_short_is_S",
+              vmhook::detail::jni_signature_for_arg<short>() == "S");
+        check("wave23_jni_sig_unsigned_short_is_C",
+              vmhook::detail::jni_signature_for_arg<unsigned short>() == "C");
+
+        // ---- ctor-signature build: briefing rows + JVMS two-slot pack --------
+        // The three named briefing shapes plus a J/D pack and a String-only pack.
+        check("wave23_ctor_IDLString_V_briefing",
+              ctor_sig<int, double, std::string>() == "(IDLjava/lang/String;)V");
+        check("wave23_ctor_void_V_briefing",
+              ctor_sig<>() == "()V");
+        check("wave23_ctor_C_V_briefing",
+              ctor_sig<std::uint16_t>() == "(C)V");
+        // (JD)V: TWO JVMS local-variable slots each, but exactly TWO descriptor
+        // tokens.  The reference walk (parse_method_descriptor) confirms 2 args
+        // and 4 slots, so this also wires the ctor build to the JVMS slot rule.
+        check("wave23_ctor_long_double_is_JD_V",
+              ctor_sig<std::int64_t, double>() == "(JD)V");
+        {
+            const method_descriptor_parse m{ parse_method_descriptor("(JD)V") };
+            check("wave23_ctor_JD_V_walks_to_2_args_4_slots",
+                  m.ok && m.arg_count == 2 && m.arg_slots == 4 && m.return_basic == 14);
+        }
+        // String-only pack: each std::string contributes the FULL String
+        // descriptor with no collapsing or de-duplication.
+        check("wave23_ctor_three_strings",
+              ctor_sig<std::string, std::string, std::string>()
+                  == "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+
+        // ---- signature_for_arg PARITY across more rows -----------------------
+        // Wave-21 pinned parity for the value-distinct branches; here extend to
+        // the integral-width-driven rows so the public re-export cannot drift
+        // on the sizeof-keyed generic arm either.  All compile-time-safe types.
+        {
+            const bool parity{
+                   vmhook::jni::signature_for_arg<signed char>()    == vmhook::detail::jni_signature_for_arg<signed char>()
+                && vmhook::jni::signature_for_arg<unsigned char>()  == vmhook::detail::jni_signature_for_arg<unsigned char>()
+                && vmhook::jni::signature_for_arg<short>()          == vmhook::detail::jni_signature_for_arg<short>()
+                && vmhook::jni::signature_for_arg<unsigned short>() == vmhook::detail::jni_signature_for_arg<unsigned short>()
+                && vmhook::jni::signature_for_arg<char32_t>()       == vmhook::detail::jni_signature_for_arg<char32_t>()
+                && vmhook::jni::signature_for_arg<std::int8_t>()    == vmhook::detail::jni_signature_for_arg<std::int8_t>()
+                && vmhook::jni::signature_for_arg<std::uint8_t>()   == vmhook::detail::jni_signature_for_arg<std::uint8_t>()
+                && vmhook::jni::signature_for_arg<std::int16_t>()   == vmhook::detail::jni_signature_for_arg<std::int16_t>() };
+            check("wave23_signature_for_arg_parity_integral_rows", parity);
+        }
+    }
+} // namespace wave23
+
 int main()
 {
     // ---- detail::sig_char_to_basic_type: HotSpot BasicType ints --------------
@@ -3681,6 +3859,7 @@ int main()
     // widths / integral matrix / enum-not-integral / ctor build / re-export
     // parity) — runs after all existing passes, touches no assertion above.
     wave21::run();
+    wave23::run();
 
     return failures == 0 ? 0 : 1;
 }

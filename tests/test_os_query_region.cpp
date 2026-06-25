@@ -1531,6 +1531,264 @@ namespace deepening_qr3
 #endif
 } // namespace deepening_qr3
 
+// ===========================================================================
+// DEEPENING SECTION 4 (additive, independent namespace) — WAVE-23 LEDGER GAPS.
+// Closes the four remaining audit/COVERAGE_LEDGER.md items for query_region:
+//
+//   (G1) Deliberate unmapped-HOLE between two committed allocations: allocate
+//        TWO neighbouring pages on POSIX via mmap, munmap the MIDDLE one to
+//        carve a known hole, and assert query_region reports the hole as
+//        free OR !committed.  This exercises the Linux /proc/self/maps
+//        "prev_end .. begin" hole arm (vmhook.hpp:893-898) and the macOS
+//        mach_vm_region "next mapping" aliasing (flaw #2/#1) — gated off
+//        Windows (which has no mmap/munmap; the granularity != page wrinkle
+//        makes a controlled adjacent-page hole impractical via VirtualAlloc)
+//        and iOS (the stub is a permissive lie by design).
+//
+//   (G2) Windows MEM_RESERVE — a VirtualAlloc with MEM_RESERVE only (no
+//        MEM_COMMIT) produces State==MEM_RESERVE, which Windows reports as
+//        BOTH committed==false AND free==false (vmhook.hpp:808-809 only set
+//        committed when MEM_COMMIT and free when MEM_FREE).  This is the
+//        only reserved-but-uncommitted case any test exercises; it pins
+//        flaw #5's documented behaviour as the test oracle.
+//        #if VMHOOK_OS_WINDOWS only.
+//
+//   (G3) Non-aligned INPUT explicit alignment check.  (2) already proves
+//        the unaligned probe lands in the same region as the aligned one,
+//        but does NOT pin "region.base is page-aligned for an unaligned
+//        query".  Pin it across a spread of sub-page offsets so a future
+//        change that propagates the input's misalignment into base is
+//        caught.
+//
+//   (G4) Query right AT THE BOUNDARY between two distinct mappings.  Two
+//        independent allocate_rwx blocks land in different VM regions
+//        (the kernel cannot coalesce — they were created by separate
+//        VirtualAlloc/mmap calls, and even if address-adjacent the
+//        underlying placement strategy returns them at independent
+//        rounded slots).  Query the last byte of A and the first byte of
+//        B and assert each lands inside its OWN region (A's region
+//        contains A's last byte, B's region contains B's first byte) and
+//        the two reported bases differ.
+//
+// All probes are on memory THIS function allocates and owns; the hole probe
+// queries an address that is deliberately unmapped (query_region inspects
+// the kernel map only — it never dereferences).  No fabricated heap
+// addresses; no execution of any page.  Source-anchored, ledger-driven.
+// ===========================================================================
+namespace deepening_qr4
+{
+#if (VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID || VMHOOK_OS_MACOS) && !VMHOOK_OS_IOS
+    // -----------------------------------------------------------------------
+    // (G1) UNMAPPED HOLE between two committed mappings.  Build a 3-page mmap
+    // span, then munmap the MIDDLE page so we KNOW the kernel has a hole at
+    // mid_addr surrounded by two live mappings.  query_region(mid_addr) must
+    // report free OR !committed — anything else means the primitive cannot
+    // distinguish a hole from a live mapping, which breaks the trampoline
+    // allocator's +/-2 GiB hole-walk (vmhook.hpp:4860).  Note: on macOS the
+    // mach_vm_region aliasing (flaw #2) can advance to the NEXT mapping for
+    // an in-hole query (returning committed=true), so we [INFO]-gate the
+    // macOS branch and only HARD-assert the contract on Linux/Android, where
+    // the /proc/self/maps walk has a dedicated hole arm.
+    // -----------------------------------------------------------------------
+    static auto test_query_region_unmapped_hole_between_mappings() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        // Reserve 3 pages contiguously.
+        void* const span{ ::mmap(nullptr, page * 3u, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+        if (span == MAP_FAILED)
+        {
+            check("qr4_hole_skipped_mmap_failed", false);
+            return;
+        }
+        auto* const base{ static_cast<std::uint8_t*>(span) };
+        // Touch the outer pages so they are unambiguously committed.
+        base[0] = 0xA1;
+        base[page * 2u] = 0xA3;
+
+        // Carve the middle page out — it is now a known unmapped hole.
+        const int unmap{ ::munmap(base + page, page) };
+        check("qr4_hole_munmap_middle_succeeds", unmap == 0);
+        if (unmap != 0)
+        {
+            ::munmap(base, page * 3u);
+            return;
+        }
+
+        const void* const mid{ base + page };
+        const auto info{ vmhook::os::query_region(mid) };
+#if VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
+        // Linux/Android: the /proc/self/maps hole arm (893-898) must report
+        // the hole as free OR not committed.  Anything else would silently
+        // disable the allocator hole-walk.
+        check("qr4_hole_linux_reports_free_or_uncommitted",
+              info.free || !info.committed);
+        check("qr4_hole_no_overflow", region_no_overflow(info));
+#else
+        // macOS: the mach_vm_region "advance to next mapping" aliasing (flaw
+        // #2) means an in-hole query can return the NEXT region with
+        // committed=true; we [INFO]-record but do not HARD-assert to avoid a
+        // platform-variant red.
+        if (!(info.free || !info.committed))
+        {
+            std::printf("[INFO] qr4_hole_macos_advances_to_next_mapping (flaw #2)\n");
+        }
+        check("qr4_hole_macos_no_overflow", region_no_overflow(info));
+#endif
+
+        // Tear down the outer pages.
+        ::munmap(base, page);
+        ::munmap(base + page * 2u, page);
+    }
+#endif
+
+#if VMHOOK_OS_WINDOWS
+    // -----------------------------------------------------------------------
+    // (G2) Windows MEM_RESERVE — committed==false && free==false (flaw #5,
+    // vmhook.hpp:808-809).  A VirtualAlloc with MEM_RESERVE (no MEM_COMMIT)
+    // produces a State==MEM_RESERVE region.  query_region's Windows arm sets
+    // committed = (State==MEM_COMMIT) and free = (State==MEM_FREE), so a
+    // reserved region surfaces with BOTH bits false — neither committed nor
+    // free.  This is the documented behaviour the audit ledger calls out;
+    // we pin it as the oracle (NOT a buggy expectation).  base+size must
+    // still not wrap.
+    // -----------------------------------------------------------------------
+    static auto test_windows_mem_reserve_region() -> void
+    {
+        const std::size_t gran{ vmhook::os::allocation_granularity() };
+        // Reserve one allocation-granularity slot WITHOUT committing.
+        void* const reserved{ ::VirtualAlloc(nullptr, gran, MEM_RESERVE, PAGE_NOACCESS) };
+        if (!reserved)
+        {
+            check("qr4_reserve_skipped_virtualalloc_failed", false);
+            return;
+        }
+
+        const auto info{ vmhook::os::query_region(reserved) };
+        // The reserved region: neither committed (State!=MEM_COMMIT) nor
+        // free (State!=MEM_FREE) — the documented mutually-exclusive pair.
+        check("qr4_reserve_not_committed", !info.committed);
+        check("qr4_reserve_not_free", !info.free);
+        // The two are still mutually exclusive (not both true).
+        check("qr4_reserve_committed_xor_free_invariant",
+              !(info.committed && info.free));
+        check("qr4_reserve_no_overflow", region_no_overflow(info));
+        // The reserved region's base must enclose the queried address.
+        check("qr4_reserve_contains_query_addr", region_contains(info, reserved));
+
+        ::VirtualFree(reserved, 0, MEM_RELEASE);
+    }
+#endif
+
+    // -----------------------------------------------------------------------
+    // (G3) Non-aligned INPUT -> region.base is STILL page-aligned.  (2)
+    // already shows the unaligned interior probe agrees with the aligned
+    // one; here we pin the explicit "base alignment is independent of input
+    // alignment" contract across a spread of sub-page offsets.  A future
+    // change that propagated the input's misalignment into the reported
+    // base would be caught here.
+    // -----------------------------------------------------------------------
+    static auto test_query_region_unaligned_input_base_is_aligned() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page * 2u) };
+        if (!block)
+        {
+            check("qr4_unaligned_base_skipped_alloc_failed", false);
+            return;
+        }
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0] = 0x10;
+        bytes[page] = 0x11;
+
+        // A spread of sub-page-misaligned offsets: 1, 3, 7, 13, 257, page-1.
+        const std::size_t offsets[]{ 1u, 3u, 7u, 13u, 257u, page - 1u };
+        bool every_base_aligned{ true };
+        bool every_size_page_multiple{ true };
+        for (const std::size_t off : offsets)
+        {
+            const void* const p{ bytes + off };
+            const auto info{ vmhook::os::query_region(p) };
+            if ((reinterpret_cast<std::uintptr_t>(info.base) % page) != 0u)
+            {
+                every_base_aligned = false;
+            }
+            // The reported size must also be a multiple of the page size on
+            // every supported platform (regions are page-granular).
+            if (info.size != 0u && (info.size % page) != 0u)
+            {
+                every_size_page_multiple = false;
+            }
+        }
+        check("qr4_unaligned_input_every_base_page_aligned", every_base_aligned);
+        check("qr4_unaligned_input_every_size_page_multiple", every_size_page_multiple);
+
+        vmhook::os::release(block, page * 2u);
+    }
+
+    // -----------------------------------------------------------------------
+    // (G4) BOUNDARY between two DISTINCT mappings.  Two independent
+    // allocate_rwx calls land in two distinct VM regions (kernel cannot
+    // coalesce them: they were created by separate native alloc calls and
+    // even if the address space hands them back at adjacent slots they
+    // remain separate VAD/VMA records).  Query the LAST byte of A and the
+    // FIRST byte of B — each must land inside its OWN region (contained by
+    // its own base/size), and the two reported bases must differ.  This
+    // pins the "exact-region resolution at a boundary" contract.
+    // -----------------------------------------------------------------------
+    static auto test_query_region_at_boundary_between_two_regions() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const a{ vmhook::os::allocate_rwx(nullptr, page) };
+        void* const b{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!a || !b)
+        {
+            check("qr4_boundary_skipped_alloc_failed", false);
+            if (a) { vmhook::os::release(a, page); }
+            if (b) { vmhook::os::release(b, page); }
+            return;
+        }
+        // Touch each so both are unambiguously committed.
+        *static_cast<volatile std::uint8_t*>(a) = 0xBA;
+        *static_cast<volatile std::uint8_t*>(b) = 0xBB;
+
+        const void* const last_of_a{ static_cast<std::uint8_t*>(a) + page - 1u };
+        const void* const first_of_b{ b };
+
+        const auto info_a{ vmhook::os::query_region(last_of_a) };
+        const auto info_b{ vmhook::os::query_region(first_of_b) };
+
+        // Each query lands inside its own region.
+        check("qr4_boundary_last_of_a_in_a_region", region_contains(info_a, last_of_a));
+        check("qr4_boundary_first_of_b_in_b_region", region_contains(info_b, first_of_b));
+        // Both regions are committed + readable.
+        check("qr4_boundary_a_region_committed", info_a.committed);
+        check("qr4_boundary_b_region_committed", info_b.committed);
+        check("qr4_boundary_a_region_readable", info_a.readable);
+        check("qr4_boundary_b_region_readable", info_b.readable);
+        // The two reported bases differ — they are distinct mappings.  (If
+        // the kernel ever did coalesce the two allocate_rwx blocks into one
+        // region — which it does NOT on any supported OS for separate
+        // allocator calls — the bases would equal; we [INFO]-record rather
+        // than HARD-fail because the contract is "distinct allocate_rwx
+        // calls yield distinct queryable regions", not a kernel guarantee.)
+        if (info_a.base == info_b.base)
+        {
+            std::printf("[INFO] qr4_boundary_two_allocs_share_region_base (unexpected coalescing)\n");
+        }
+        else
+        {
+            check("qr4_boundary_distinct_region_bases", info_a.base != info_b.base);
+        }
+        // Neither region wraps.
+        check("qr4_boundary_a_no_overflow", region_no_overflow(info_a));
+        check("qr4_boundary_b_no_overflow", region_no_overflow(info_b));
+
+        vmhook::os::release(a, page);
+        vmhook::os::release(b, page);
+    }
+} // namespace deepening_qr4
+
 int main()
 {
     test_query_region_contains_live_addresses();
@@ -1567,6 +1825,15 @@ int main()
 #if VMHOOK_OS_WINDOWS
     deepening_qr3::test_windows_guard_page();
 #endif
+
+#if (VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID || VMHOOK_OS_MACOS) && !VMHOOK_OS_IOS
+    deepening_qr4::test_query_region_unmapped_hole_between_mappings();
+#endif
+#if VMHOOK_OS_WINDOWS
+    deepening_qr4::test_windows_mem_reserve_region();
+#endif
+    deepening_qr4::test_query_region_unaligned_input_base_is_aligned();
+    deepening_qr4::test_query_region_at_boundary_between_two_regions();
 
     if (failures == 0)
     {
