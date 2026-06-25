@@ -3577,6 +3577,167 @@ static auto test_w25_collection_list_cold_state() -> void
     static_assert(noexcept(vmhook::array_length(nullptr)));
 }
 
+// ---------------------------------------------------------------------------
+// Wave-31 — hash/tree map specialist cold-state deepening.
+//
+// Owner: collection_hash_tree_map. The wrappers vmhook::map / vmhook::hash_map
+// both route through map::to_entries (the [INFO] in the feature notes).
+// to_entries probes the live OOP's klass for a `table` field (HashMap fast
+// path) first, then a `root` field (TreeMap path). With no JVM loaded, the
+// klass cannot resolve, both probes miss, the walk returns {} — never faults.
+//
+// THIS wave hardens the contract specialist-owners must guarantee on cold
+// state: every entry point is noexcept-safe-by-construction, the safe-default
+// is provably empty, a null `root` (TreeMap) and null `table` (HashMap) both
+// degrade to empty, the size cap constant has the documented value, and the
+// signatures of the specialist's traversal primitives are pinned at compile
+// time by static_assert.
+// ---------------------------------------------------------------------------
+static auto test_w31_hash_tree_map_cold_state() -> void
+{
+    // -- (a) Cold-state safe-default: EVERY map-side entry returns empty. ----
+    // Null OOP, low-bogus OOP (rejected by is_valid_pointer), and an OOP whose
+    // header would decode to "no klass": all three must give entries.empty().
+    vmhook::map      m_null{ nullptr };
+    vmhook::hash_map hm_null{ nullptr };
+    vmhook::map      m_bogus{ reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0x6u)) };
+    vmhook::hash_map hm_bogus{ reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0x8u)) };
+
+    check("w31_map_null_to_entries_empty",
+          (m_null.to_entries<key_w, val_w>().empty()));
+    check("w31_hash_map_null_to_entries_empty",
+          (hm_null.to_entries<key_w, val_w>().empty()));
+    check("w31_map_bogus_to_entries_empty",
+          (m_bogus.to_entries<key_w, val_w>().empty()));
+    check("w31_hash_map_bogus_to_entries_empty",
+          (hm_bogus.to_entries<key_w, val_w>().empty()));
+
+    // size()/is_empty() degrade in lockstep (cold state -> 0 / true).
+    check("w31_map_null_size_zero",     m_null.size() == 0);
+    check("w31_map_null_is_empty_true", m_null.is_empty());
+    check("w31_hash_map_null_size_zero",     hm_null.size() == 0);
+    check("w31_hash_map_null_is_empty_true", hm_null.is_empty());
+    check("w31_map_bogus_size_zero",          m_bogus.size() == 0);
+    check("w31_hash_map_bogus_size_zero",     hm_bogus.size() == 0);
+
+    // -- (b) Cold-state noexcept on the user-reached map entry points. -------
+    // size()/is_empty() are documented noexcept on the map branch (flaw notes
+    // 15079-15092 for size; is_empty inherits via "size()==0").
+    check("w31_map_size_noexcept",            noexcept(m_null.size()));
+    check("w31_map_is_empty_noexcept",        noexcept(m_null.is_empty()));
+    check("w31_hash_map_size_noexcept",       noexcept(hm_null.size()));
+    check("w31_hash_map_is_empty_noexcept",   noexcept(hm_null.is_empty()));
+
+    // to_entries instantiates std::vector<std::pair<unique_ptr<K>, unique_ptr<V>>>,
+    // which is NOT a noexcept operation in libstdc++/MSVC STL (allocator may
+    // throw bad_alloc). Characterize per-platform; do NOT assert.
+    std::printf("[INFO] w31_map_to_entries_noexcept=%d\n",
+                noexcept(m_null.to_entries<key_w, val_w>()) ? 1 : 0);
+    std::printf("[INFO] w31_hash_map_to_entries_noexcept=%d\n",
+                noexcept(hm_null.to_entries<key_w, val_w>()) ? 1 : 0);
+
+    // -- (c) Null root / null table degrade safely via the field_proxy path. -
+    // The implicit user-reached path: get_field("foo")->get().to_entries<K,V>().
+    // A field_proxy over a null field_pointer yields value_t holding int32{0};
+    // the to_entries delegator decodes 0 -> nullptr -> map{nullptr} -> empty.
+    // This pins BOTH the HashMap-shaped signature ("Ljava/util/HashMap;") and
+    // the TreeMap-shaped signature ("Ljava/util/TreeMap;") degrade identically.
+    vmhook::field_proxy hashmap_field{ nullptr, "Ljava/util/HashMap;", false };
+    vmhook::field_proxy treemap_field{ nullptr, "Ljava/util/TreeMap;", false };
+    vmhook::field_proxy map_iface_field{ nullptr, "Ljava/util/Map;",   false };
+    check("w31_hashmap_field_proxy_to_entries_empty",
+          (hashmap_field.get().to_entries<key_w, val_w>().empty()));
+    check("w31_treemap_field_proxy_to_entries_empty",
+          (treemap_field.get().to_entries<key_w, val_w>().empty()));
+    check("w31_map_iface_field_proxy_to_entries_empty",
+          (map_iface_field.get().to_entries<key_w, val_w>().empty()));
+
+    // Static-flagged proxy (the field IS static) over a null pointer also
+    // degrades safely — the static flag does not change the null short-circuit.
+    vmhook::field_proxy static_treemap{ nullptr, "Ljava/util/TreeMap;", true };
+    check("w31_static_treemap_to_entries_empty",
+          (static_treemap.get().to_entries<key_w, val_w>().empty()));
+
+    // -- (d) Size cap CONSTANT — pin the documented red-black walk outer cap.
+    // The TreeMap walk uses (1<<24) as visited cap; HashMap bucket walk uses
+    // (1<<20) per chain. Both must round-trip via k_max_safe_container_elems
+    // (which IS 1<<24) for the cap-driven reserve/loop. Pin compile-time.
+    static_assert(vmhook::k_max_safe_container_elems == (1ull << 24),
+                  "TreeMap visit cap / HashMap reserve cap is 1<<24.");
+    static_assert((1u << 20) < vmhook::k_max_safe_container_elems,
+                  "Per-bucket chain cap (1<<20) must be strictly below the outer cap.");
+    check("w31_size_cap_constant_is_1_24",
+          vmhook::k_max_safe_container_elems == (1ull << 24));
+    check("w31_per_bucket_cap_below_outer_cap",
+          (1u << 20) < vmhook::k_max_safe_container_elems);
+    // The cap clamps every count to a sane reserve bound — re-pin the gate
+    // saturates here so the map walkers cannot drive an unbounded reserve.
+    static_assert(vmhook::clamp_safe_container_count(
+                      (std::numeric_limits<std::int32_t>::max)())
+                  == static_cast<std::int32_t>(vmhook::k_max_safe_container_elems));
+
+    // -- (e) Static_asserts on the specialist's signature surface. -----------
+    // Wrapper construction from oop_t is nothrow for both tags.
+    static_assert(std::is_nothrow_constructible_v<vmhook::map, vmhook::oop_t>);
+    static_assert(std::is_nothrow_constructible_v<vmhook::hash_map, vmhook::oop_t>);
+    // Copy/move noexcept (inherited from object_base) — STL container safety.
+    static_assert(std::is_nothrow_copy_constructible_v<vmhook::map>);
+    static_assert(std::is_nothrow_move_constructible_v<vmhook::map>);
+    static_assert(std::is_nothrow_copy_constructible_v<vmhook::hash_map>);
+    static_assert(std::is_nothrow_move_constructible_v<vmhook::hash_map>);
+    // size() / is_empty() noexcept on both tags.
+    static_assert(noexcept(std::declval<vmhook::map&>().size()));
+    static_assert(noexcept(std::declval<vmhook::map&>().is_empty()));
+    static_assert(noexcept(std::declval<vmhook::hash_map&>().size()));
+    static_assert(noexcept(std::declval<vmhook::hash_map&>().is_empty()));
+    // The two tags MUST stay distinct types AND hash_map MUST derive from map
+    // (otherwise the `[INFO]: same to_entries` routing assumption is violated).
+    static_assert(!std::is_same_v<vmhook::map, vmhook::hash_map>);
+    static_assert(std::is_base_of_v<vmhook::map, vmhook::hash_map>);
+    // The cap CONSTANT has the documented type and width — a regression to
+    // uint32_t would change the saturation arithmetic at the boundary.
+    static_assert(vmhook::k_max_safe_container_elems > 0u);
+    static_assert(static_cast<std::uint64_t>(vmhook::k_max_safe_container_elems)
+                  == 16'777'216ull);
+    // to_entries return type is the documented vector-of-pairs-of-unique_ptr.
+    static_assert(std::is_same_v<
+        decltype(std::declval<vmhook::map&>().to_entries<key_w, val_w>()),
+        std::vector<std::pair<std::unique_ptr<key_w>, std::unique_ptr<val_w>>>>);
+    static_assert(std::is_same_v<
+        decltype(std::declval<vmhook::hash_map&>().to_entries<key_w, val_w>()),
+        std::vector<std::pair<std::unique_ptr<key_w>, std::unique_ptr<val_w>>>>);
+
+    // -- (f) Idempotency: repeated cold-state calls yield identical empties.
+    for (int rep{ 0 }; rep < 3; ++rep)
+    {
+        const bool all_empty{
+            m_null.to_entries<key_w, val_w>().empty()
+            && hm_null.to_entries<key_w, val_w>().empty()
+            && m_bogus.to_entries<key_w, val_w>().empty()
+            && hm_bogus.to_entries<key_w, val_w>().empty()
+            && m_null.size() == 0
+            && hm_null.size() == 0
+        };
+        std::string n{ "w31_cold_state_idempotent_rep" };
+        n += static_cast<char>('0' + rep);
+        check(n.c_str(), all_empty);
+    }
+
+    // -- (g) Substitutability through base ref: hash_map binds as map&. ------
+    // The whole point of the lattice is that a detour declaring `const map&`
+    // accepts hash_map by reference (no slicing) and routes through map's
+    // to_entries — exactly the `[INFO]` shared-dispatch fact.
+    auto route_via_map_ref = [](const vmhook::map& ref) noexcept -> std::size_t
+    {
+        return ref.to_entries<key_w, val_w>().size()
+             + static_cast<std::size_t>(ref.size());
+    };
+    check("w31_route_map_through_map_ref_zero",      route_via_map_ref(m_null) == 0u);
+    check("w31_route_hash_map_through_map_ref_zero", route_via_map_ref(hm_null) == 0u);
+    check("w31_route_hash_map_bogus_through_map_ref_zero",
+          route_via_map_ref(hm_bogus) == 0u);
+}
+
 int main()
 {
     // Registering the element wrappers mirrors real usage; harmless with no JVM.
@@ -3628,6 +3789,7 @@ int main()
     test_jni_signature_width_ladder_and_packing();
     test_decode_u5_threaded_record_walk();
     test_w25_collection_list_cold_state();
+    test_w31_hash_tree_map_cold_state();
 
     return failures == 0 ? 0 : 1;
 }

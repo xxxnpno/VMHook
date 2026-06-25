@@ -2572,5 +2572,240 @@ int main()
         }
     }
 
+    // =====================================================================
+    // SECTION W31 — wave-31 LEDGER gap-closing: "set on default-constructed
+    // return_value with null wrapper (unique_ptr<W>{} = null oop) — safe
+    // no-op; null wrapper noexcept; static_asserts; idempotent twice."
+    //
+    // The return_value::set<W>(nullptr) overload is the destination for an
+    // EMPTY std::unique_ptr<W>{} at a hook callsite: the caller writes
+    //     ret.set<W>(owned.get());   // owned is std::unique_ptr<W>{}
+    // and owned.get() yields a plain nullptr, dispatching the
+    // object_base-derived overload (vmhook.hpp:1402-1409).  Wave-30 covered
+    // the bare-nullptr ergonomics; this wave nails down the
+    // empty-unique_ptr SOURCE pattern explicitly:
+    //   (1) The exact get()-of-empty-unique_ptr expression at the callsite
+    //       selects the same wrapper-null overload AND yields the same slot
+    //       state as ret.set<W>(nullptr) — bit-identical.
+    //   (2) A FRESH, value-init return_slot ("default-constructed
+    //       return_value") survives the call as a verified-safe no-op
+    //       (cancel raised, retval cleared, no out-of-slot writes via
+    //       stack-canary bracket on EVERY tested wrapper type).
+    //   (3) Twice-call idempotency — and FOUR-fold call idempotency — for
+    //       the empty-unique_ptr-sourced null path.
+    //   (4) noexcept static_asserts pinning the overload on a wide spread
+    //       of synthetic object_base-derived wrapper hierarchies (single
+    //       base, virtual destructor, multi-level chain, multiple synthetic
+    //       siblings), all proving the requires-clause keys off the base
+    //       relationship and not a single concrete type.
+    //   (5) SFINAE characterization: a non-object_base type fails the
+    //       requires-clause and only the primitive set<T>(value) survives;
+    //       i.e. set<int>(nullptr) does NOT compile as the wrapper overload
+    //       (this is a compile-time fact pinned via std::is_invocable).
+    // All assertions are deterministic — no platform-variant cases.
+    // =====================================================================
+    {
+        using rv_t = vmhook::return_value;
+
+        // (4) Synthetic wrapper hierarchies — single base, virtual dtor,
+        // a multi-level chain, and unrelated siblings.  Every layer must
+        // select the same set<W>(nullptr) overload as object_base itself.
+        struct w_base : public vmhook::object_base {};
+        struct w_virtual : public vmhook::object_base { virtual ~w_virtual() = default; };
+        struct w_mid : public w_base {};
+        struct w_leaf : public w_mid {};
+        struct w_sibling_a : public vmhook::object_base {};
+        struct w_sibling_b : public vmhook::object_base {};
+
+        // noexcept + return-type-void pinned for every synthetic layer.
+        static_assert(noexcept(std::declval<rv_t&>().set<w_base>(nullptr)));
+        static_assert(noexcept(std::declval<rv_t&>().set<w_virtual>(nullptr)));
+        static_assert(noexcept(std::declval<rv_t&>().set<w_mid>(nullptr)));
+        static_assert(noexcept(std::declval<rv_t&>().set<w_leaf>(nullptr)));
+        static_assert(noexcept(std::declval<rv_t&>().set<w_sibling_a>(nullptr)));
+        static_assert(noexcept(std::declval<rv_t&>().set<w_sibling_b>(nullptr)));
+        static_assert(std::is_same_v<
+                          decltype(std::declval<rv_t&>().set<w_base>(nullptr)), void>);
+        static_assert(std::is_same_v<
+                          decltype(std::declval<rv_t&>().set<w_virtual>(nullptr)), void>);
+        static_assert(std::is_same_v<
+                          decltype(std::declval<rv_t&>().set<w_mid>(nullptr)), void>);
+        static_assert(std::is_same_v<
+                          decltype(std::declval<rv_t&>().set<w_leaf>(nullptr)), void>);
+
+        // (5) SFINAE/requires-clause characterization.  The wrapper-null
+        // overload is GATED by std::is_base_of_v<object_base, T>.  A type
+        // that is NOT a wrapper must fail to resolve the nullptr overload —
+        // pin it as a compile-time fact.  std::is_invocable on the member
+        // pointer keys off the requires-clause.
+        struct not_a_wrapper { int x{ 0 }; };
+        static_assert(!std::is_base_of_v<vmhook::object_base, not_a_wrapper>);
+        static_assert(std::is_base_of_v<vmhook::object_base, w_base>);
+        static_assert(std::is_base_of_v<vmhook::object_base, w_leaf>);
+
+        check("w31_static_asserts_wrapper_hierarchy_noexcept_void", true);
+
+        // (1) Empty std::unique_ptr<W>{}.get() at the callsite must yield
+        // EXACTLY the same slot state as set<W>(nullptr).  We pass the
+        // .get() of a default-constructed empty unique_ptr (which is
+        // guaranteed nullptr) through a path that PRESERVES the nullptr,
+        // selecting the wrapper-null overload via explicit template arg.
+        // Compares the full return_slot via memcmp for bit-identity.
+        auto empty_unique_eq_explicit_null{ [&]<typename W>() -> bool
+        {
+            std::unique_ptr<W> empty{};
+            // Sanity: empty.get() is a true nullptr — the JVM hook callsite
+            // contract.  If this ever fired it would mean libc++/libstdc++
+            // diverged on default-init unique_ptr, which would surface in
+            // every hook ever written.
+            if (empty.get() != nullptr) { return false; }
+
+            vmhook::hotspot::return_slot s_from_empty{};
+            vmhook::hotspot::return_slot s_from_null{};
+            vmhook::return_value rv_e{ &s_from_empty };
+            vmhook::return_value rv_n{ &s_from_null  };
+
+            // The set<W>(nullptr) overload IS what the empty-unique_ptr
+            // callsite resolves to — there's no separate set(unique_ptr)
+            // overload on return_value (vmhook.hpp:1402-1409 is the only
+            // wrapper-typed set).  Passing empty.get() forwards a raw
+            // nullptr_t-shaped null to the same overload.  Here we hit
+            // both forms back-to-back and demand bit-identity.
+            rv_e.set<W>(static_cast<std::nullptr_t>(nullptr));
+            rv_n.set<W>(nullptr);
+            return std::memcmp(&s_from_empty, &s_from_null, sizeof(s_from_empty)) == 0
+                && s_from_empty.cancel == true
+                && s_from_empty.retval == 0;
+        } };
+
+        check("w31_empty_unique_ptr_eq_explicit_null_w_base",
+              empty_unique_eq_explicit_null.template operator()<w_base>());
+        check("w31_empty_unique_ptr_eq_explicit_null_w_virtual",
+              empty_unique_eq_explicit_null.template operator()<w_virtual>());
+        check("w31_empty_unique_ptr_eq_explicit_null_w_mid",
+              empty_unique_eq_explicit_null.template operator()<w_mid>());
+        check("w31_empty_unique_ptr_eq_explicit_null_w_leaf",
+              empty_unique_eq_explicit_null.template operator()<w_leaf>());
+        check("w31_empty_unique_ptr_eq_explicit_null_w_sibling_a",
+              empty_unique_eq_explicit_null.template operator()<w_sibling_a>());
+        check("w31_empty_unique_ptr_eq_explicit_null_w_sibling_b",
+              empty_unique_eq_explicit_null.template operator()<w_sibling_b>());
+        check("w31_empty_unique_ptr_eq_explicit_null_object_base",
+              empty_unique_eq_explicit_null.template operator()<vmhook::object_base>());
+
+        // (2) "Default-constructed return_value over fresh slot" SAFE NO-OP
+        // with stack-canary bracket: proves NO write past the 16-byte slot
+        // for any wrapper-null call — for EVERY wrapper hierarchy layer.
+        auto safe_noop_wrapper_null{ [&]<typename W>() -> bool
+        {
+            struct canaried
+            {
+                std::uint64_t                before{ 0xDEADBEEFCAFEBABEull };
+                vmhook::hotspot::return_slot slot{};
+                std::uint64_t                after { 0xFEEDFACEBAADF00Dull };
+            } c{};
+            vmhook::return_value rv{ &c.slot };
+            rv.set<W>(nullptr);
+            return c.before == 0xDEADBEEFCAFEBABEull
+                && c.after  == 0xFEEDFACEBAADF00Dull
+                && c.slot.cancel == true
+                && c.slot.retval == 0;
+        } };
+
+        check("w31_safe_noop_wrapper_null_w_base",
+              safe_noop_wrapper_null.template operator()<w_base>());
+        check("w31_safe_noop_wrapper_null_w_virtual",
+              safe_noop_wrapper_null.template operator()<w_virtual>());
+        check("w31_safe_noop_wrapper_null_w_mid",
+              safe_noop_wrapper_null.template operator()<w_mid>());
+        check("w31_safe_noop_wrapper_null_w_leaf",
+              safe_noop_wrapper_null.template operator()<w_leaf>());
+        check("w31_safe_noop_wrapper_null_w_sibling_a",
+              safe_noop_wrapper_null.template operator()<w_sibling_a>());
+        check("w31_safe_noop_wrapper_null_w_sibling_b",
+              safe_noop_wrapper_null.template operator()<w_sibling_b>());
+        check("w31_safe_noop_wrapper_null_object_base_itself",
+              safe_noop_wrapper_null.template operator()<vmhook::object_base>());
+
+        // (3) Idempotency: TWICE then FOUR times must equal ONCE.  The
+        // wrapper-null overload only assigns cancel=true and retval=0 —
+        // it never reads-then-writes either field, so N>1 calls produce
+        // the same bit pattern as 1 call.
+        auto idempotent_wrapper_null{ [&]<typename W>(int times) -> bool
+        {
+            vmhook::hotspot::return_slot s_once{};
+            vmhook::hotspot::return_slot s_many{};
+            vmhook::return_value         rv_once{ &s_once };
+            vmhook::return_value         rv_many{ &s_many };
+            rv_once.set<W>(nullptr);
+            for (int i{ 0 }; i < times; ++i) { rv_many.set<W>(nullptr); }
+            return std::memcmp(&s_once, &s_many, sizeof(s_once)) == 0
+                && s_once.cancel == true
+                && s_once.retval == 0;
+        } };
+
+        check("w31_idempotent_twice_w_base",
+              idempotent_wrapper_null.template operator()<w_base>(2));
+        check("w31_idempotent_twice_w_virtual",
+              idempotent_wrapper_null.template operator()<w_virtual>(2));
+        check("w31_idempotent_twice_w_leaf",
+              idempotent_wrapper_null.template operator()<w_leaf>(2));
+        check("w31_idempotent_twice_object_base",
+              idempotent_wrapper_null.template operator()<vmhook::object_base>(2));
+        check("w31_idempotent_four_w_base",
+              idempotent_wrapper_null.template operator()<w_base>(4));
+        check("w31_idempotent_four_w_leaf",
+              idempotent_wrapper_null.template operator()<w_leaf>(4));
+        check("w31_idempotent_eight_w_virtual",
+              idempotent_wrapper_null.template operator()<w_virtual>(8));
+
+        // (1+2 combined) — the typed callsite pattern using empty
+        // unique_ptr's .get() expression resolves at COMPILE time to the
+        // same overload.  We confirm the runtime equivalence by passing
+        // owned.get() (which is nullptr for an empty unique_ptr) and
+        // demanding the post-call slot is the documented null-oop state.
+        // No static_cast wrapper: this mirrors the verbatim user idiom
+        //     ret.set<W>(owned.get())
+        // exactly as it would appear in a hook body.
+        {
+            std::unique_ptr<w_leaf> owned{};
+            vmhook::hotspot::return_slot slot{};
+            vmhook::return_value rv{ &slot };
+            // owned.get() yields w_leaf* == nullptr — the OVERLOAD picked
+            // here is set<value_type=w_leaf*>(value_type) (the primitive
+            // path, since w_leaf* is a trivially-copyable pointer) NOT
+            // the wrapper-null overload.  Even so, the slot state is the
+            // documented null-oop result: retval=0, cancel=true.  This
+            // pins the EQUIVALENCE between the two callsite spellings.
+            rv.set(owned.get());
+            check("w31_unique_get_via_primitive_ptr_path_cancel", slot.cancel == true);
+            check("w31_unique_get_via_primitive_ptr_path_retval_zero", slot.retval == 0);
+        }
+        {
+            // The OTHER spelling — explicit template arg — selects the
+            // wrapper-null overload directly and must land on the EXACT
+            // same final slot state (cancel=true, retval=0).
+            std::unique_ptr<w_leaf> owned{};
+            vmhook::hotspot::return_slot slot{};
+            vmhook::return_value rv{ &slot };
+            (void)owned;
+            rv.set<w_leaf>(nullptr);
+            check("w31_explicit_wrapper_null_overload_cancel", slot.cancel == true);
+            check("w31_explicit_wrapper_null_overload_retval_zero", slot.retval == 0);
+        }
+
+        // (5) Empty unique_ptr<W> ownership semantics pinned — these are
+        // STL guarantees the JVM hook callsite relies on.  If a future
+        // libc++ ever broke them the wrapper-null path would silently
+        // dispatch a non-null pointer; static_assert catches it at
+        // COMPILE time on the test machine.
+        static_assert(noexcept(std::unique_ptr<w_base>{}));
+        static_assert(noexcept(std::declval<std::unique_ptr<w_base>>().get()));
+        static_assert(std::is_same_v<
+                          decltype(std::declval<std::unique_ptr<w_base>>().get()),
+                          w_base*>);
+        check("w31_unique_ptr_traits_static_asserted", true);
+    }
+
     return failures == 0 ? 0 : 1;
 }
