@@ -681,6 +681,126 @@ int main()
                   == false);
     }
 
+    // =====================================================================
+    // M. WAVE-29 DEEPENING — ledger-driven gap closure:
+    //    (1) verify_hooks() cold-state TRIVIALLY-VALID semantics: with nothing
+    //        installed the detector has nothing to drift, so verify_hooks()==0
+    //        IS the "all-intact" answer (no failure could be reported); pin the
+    //        equivalence across long repeat runs and across master-switch toggles.
+    //    (2) Watchdog disabled-by-default in cold state: g_watchdog_running stays
+    //        false through every toggle of the master switch (no install happened),
+    //        AND g_started — the CAS one-shot guard — also stays false because the
+    //        no-live-thread disable branch resets it to false.
+    //    (3) Idempotent install/teardown of the master switch: setting it to the
+    //        SAME value repeatedly is a true no-op; the round-trip lattice never
+    //        leaks g_shutdown_requested up; rapid 64-cycle flip-flop is stable.
+    //    (4) More compile-time signature pins (static_assert) on the watchdog
+    //        atomics and the constant_pool/klass accessors that the cold detector
+    //        funnels through.
+    // =====================================================================
+    {
+        // (4a) Watchdog atomic types are atomic<bool> + lock-free.
+        static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                          vmhook::detail::auto_repair::g_watchdog_running)>,
+                      std::atomic<bool>>,
+                      "g_watchdog_running is atomic<bool>");
+        static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                          vmhook::detail::auto_repair::g_started)>,
+                      std::atomic<bool>>,
+                      "g_started is atomic<bool>");
+        static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                          vmhook::hotspot::g_shutdown_requested)>,
+                      std::atomic<bool>>,
+                      "g_shutdown_requested is atomic<bool>");
+        static_assert(std::atomic<bool>::is_always_lock_free,
+                      "atomic<bool> must be lock-free for signal-safe gating");
+        // (4b) klass accessor signatures the drift detector funnels through.
+        static_assert(std::is_same_v<decltype(std::declval<vmhook::hotspot::klass>()
+                          .get_methods_count()), std::int32_t>,
+                      "klass::get_methods_count returns int32_t");
+        static_assert(noexcept(std::declval<vmhook::hotspot::klass>().get_methods_count()),
+                      "klass::get_methods_count must be noexcept");
+        static_assert(noexcept(std::declval<vmhook::hotspot::klass>().get_methods_ptr()),
+                      "klass::get_methods_ptr must be noexcept");
+        static_assert(noexcept(vmhook::hotspot::set_dont_inline(
+                          static_cast<vmhook::hotspot::method*>(nullptr), true)),
+                      "set_dont_inline must be noexcept");
+        check("M_compile_time_pins_compiled", true);
+
+        // (1) Cold-state TRIVIALLY-VALID: 0 IS the all-intact answer.  Long
+        // repeat (64x) must stay 0; the call must not perturb watchdog state.
+        bool long_repeat_zero{ true };
+        for (int i{ 0 }; i < 64; ++i)
+        {
+            if (vmhook::verify_hooks() != 0) { long_repeat_zero = false; }
+        }
+        check("M_verify_hooks_long_repeat_all_zero", long_repeat_zero);
+        check("M_long_repeat_did_not_spawn_watchdog",
+              vmhook::detail::auto_repair::g_watchdog_running.load(
+                  std::memory_order_acquire) == false);
+        check("M_long_repeat_did_not_raise_shutdown",
+              vmhook::hotspot::g_shutdown_requested.load(
+                  std::memory_order_acquire) == false);
+        // Master-switch flip BEFORE / AFTER verify_hooks() does not perturb its
+        // return — the master switch gates the watchdog, NOT the manual call.
+        vmhook::set_auto_repair_enabled(false);
+        check("M_verify_hooks_zero_while_master_disabled",
+              vmhook::verify_hooks() == 0);
+        vmhook::set_auto_repair_enabled(true);
+        check("M_verify_hooks_zero_while_master_reenabled",
+              vmhook::verify_hooks() == 0);
+
+        // (2) g_started stays false in cold state — no install ever reached the
+        // CAS that flips it true, and the no-live-thread disable branch resets
+        // it.  Pinned for completeness so a regression that pre-arms the CAS
+        // would surface here as a no-JVM failure.
+        check("M_g_started_false_in_cold_state",
+              vmhook::detail::auto_repair::g_started.load(
+                  std::memory_order_acquire) == false);
+
+        // (3) Idempotent SAME-VALUE writes to the master switch.  Setting to
+        // true 8x in a row, then false 8x in a row, leaves enabled==false and
+        // no live thread; flipping back to true 8x lands enabled==true.
+        for (int i{ 0 }; i < 8; ++i) { vmhook::set_auto_repair_enabled(true); }
+        check("M_set_enabled_true_8x_idempotent_value",
+              vmhook::auto_repair_enabled() == true);
+        check("M_set_enabled_true_8x_idempotent_started",
+              vmhook::detail::auto_repair::g_started.load(
+                  std::memory_order_acquire) == false);
+        for (int i{ 0 }; i < 8; ++i) { vmhook::set_auto_repair_enabled(false); }
+        check("M_set_enabled_false_8x_idempotent_value",
+              vmhook::auto_repair_enabled() == false);
+        check("M_set_enabled_false_8x_idempotent_no_shutdown_leak",
+              vmhook::hotspot::g_shutdown_requested.load(
+                  std::memory_order_acquire) == false);
+        check("M_set_enabled_false_8x_idempotent_no_watchdog",
+              vmhook::detail::auto_repair::g_watchdog_running.load(
+                  std::memory_order_acquire) == false);
+
+        // Rapid 64-cycle flip-flop stress: ends on the cycle we choose, and the
+        // shutdown / watchdog gates remain clear throughout (no live thread to
+        // spin up, no thread to shut down).
+        for (int i{ 0 }; i < 64; ++i)
+        {
+            vmhook::set_auto_repair_enabled((i & 1) == 0);
+        }
+        // Last write (i=63, odd) was set_auto_repair_enabled(false).
+        check("M_flipflop_ends_disabled", vmhook::auto_repair_enabled() == false);
+        check("M_flipflop_no_watchdog_leak",
+              vmhook::detail::auto_repair::g_watchdog_running.load(
+                  std::memory_order_acquire) == false);
+        check("M_flipflop_no_shutdown_leak",
+              vmhook::hotspot::g_shutdown_requested.load(
+                  std::memory_order_acquire) == false);
+
+        // FINAL: leave the master switch back to its default (enabled) so the
+        // section-L invariants below still hold for downstream modules.
+        vmhook::set_auto_repair_enabled(true);
+        check("M_final_master_switch_restored_enabled",
+              vmhook::auto_repair_enabled() == true);
+        check("M_final_verify_hooks_still_zero", vmhook::verify_hooks() == 0);
+    }
+
     std::printf("\n%s: %d failure(s)\n",
                 failures == 0 ? "ALL PASS" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;

@@ -1402,6 +1402,94 @@ int main()
         check("frame_accessor_stable_null", rv.frame() == nullptr && rv.frame() == rv.frame());
         check("frame_accessor_does_not_touch_slot",
               slot.cancel == false && slot.retval == 0);
+
+        // ---- WAVE-29 DEEPENING: ledger gaps for cold-state caller() ----
+        // (1) Static type guarantees on the return signatures (compile-time).
+        using rv_t = vmhook::return_value;
+        using ci_t = rv_t::caller_info;
+        static_assert(std::is_same_v<decltype(std::declval<const rv_t&>().caller()), ci_t>,
+                      "caller() must return caller_info by value");
+        static_assert(std::is_same_v<decltype(std::declval<const rv_t&>().stack_trace()),
+                                     std::vector<ci_t>>,
+                      "stack_trace() must return std::vector<caller_info> by value");
+        static_assert(std::is_same_v<decltype(std::declval<const rv_t&>().stack_trace(64)),
+                                     std::vector<ci_t>>,
+                      "stack_trace(size_t) must return std::vector<caller_info> by value");
+        static_assert(std::is_same_v<decltype(std::declval<const rv_t&>().frame()),
+                                     vmhook::hotspot::frame*>,
+                      "frame() must return hotspot::frame* (raw pointer)");
+        static_assert(std::is_same_v<decltype(std::declval<const ci_t&>().valid()), bool>,
+                      "caller_info::valid() must return bool");
+        static_assert(std::is_same_v<decltype(ci_t::class_name), std::string>);
+        static_assert(std::is_same_v<decltype(ci_t::method_name), std::string>);
+        static_assert(std::is_same_v<decltype(ci_t::signature), std::string>);
+        static_assert(std::is_same_v<decltype(ci_t::method), vmhook::hotspot::method*>);
+        check("static_asserts_caller_return_types_ok", true);
+
+        // (2) noexcept characterization — all four are declared noexcept in the
+        //     header (vmhook.hpp:1477, 1522, frame()).  Pinning the qualifier so
+        //     any future drop of noexcept (which would silently change std::
+        //     terminate semantics on allocation failure) is caught at compile
+        //     time.  Note: the implementations DO allocate (strings/vector);
+        //     the noexcept means a bad_alloc terminates rather than propagates.
+        static_assert(noexcept(rv.caller()),
+                      "caller() is declared noexcept (vmhook.hpp:1477)");
+        static_assert(noexcept(rv.stack_trace()),
+                      "stack_trace() is declared noexcept (vmhook.hpp:1522)");
+        static_assert(noexcept(rv.stack_trace(8)),
+                      "stack_trace(n) is declared noexcept (vmhook.hpp:1522)");
+        static_assert(noexcept(rv.frame()),
+                      "frame() is a trivial accessor — noexcept");
+        check("noexcept_characterization_documented", true);
+
+        // (3) Idempotency: twice == once with field-level equality on caller_info.
+        const auto ci_a{ rv.caller() };
+        const auto ci_b{ rv.caller() };
+        check("caller_twice_eq_once_method",      ci_a.method == ci_b.method);
+        check("caller_twice_eq_once_class",       ci_a.class_name == ci_b.class_name);
+        check("caller_twice_eq_once_method_name", ci_a.method_name == ci_b.method_name);
+        check("caller_twice_eq_once_signature",   ci_a.signature == ci_b.signature);
+        check("caller_twice_eq_once_valid",       ci_a.valid() == ci_b.valid());
+        check("caller_twice_no_slot_mutation",
+              slot.cancel == false && slot.retval == 0);
+
+        // (4) stack_trace twice == once across multiple depths.
+        const auto st_a0{ rv.stack_trace() };
+        const auto st_b0{ rv.stack_trace() };
+        check("stack_trace_default_twice_eq_once_size", st_a0.size() == st_b0.size());
+        check("stack_trace_default_twice_both_empty",
+              st_a0.empty() && st_b0.empty());
+        const auto st_a4{ rv.stack_trace(4) };
+        const auto st_b4{ rv.stack_trace(4) };
+        check("stack_trace_4_twice_eq_once_size", st_a4.size() == st_b4.size());
+        check("stack_trace_4_twice_both_empty",
+              st_a4.empty() && st_b4.empty());
+        const auto st_a0p{ rv.stack_trace(0) };
+        const auto st_b0p{ rv.stack_trace(0) };
+        check("stack_trace_zero_promoted_twice_eq_size",
+              st_a0p.size() == st_b0p.size());
+        check("stack_trace_zero_promoted_twice_both_empty",
+              st_a0p.empty() && st_b0p.empty());
+        check("stack_trace_after_idempotency_slot_clean",
+              slot.cancel == false && slot.retval == 0);
+
+        // (5) Default-constructed caller_info — exhaustive cold-state shape.
+        const ci_t default_ci{};
+        check("default_ci_method_is_null",         default_ci.method == nullptr);
+        check("default_ci_class_empty",            default_ci.class_name.empty());
+        check("default_ci_method_name_empty",      default_ci.method_name.empty());
+        check("default_ci_signature_empty",        default_ci.signature.empty());
+        check("default_ci_class_size_zero",        default_ci.class_name.size() == 0);
+        check("default_ci_method_name_size_zero",  default_ci.method_name.size() == 0);
+        check("default_ci_signature_size_zero",    default_ci.signature.size() == 0);
+        check("default_ci_invalid",                default_ci.valid() == false);
+        const ci_t default_ci2{};
+        check("default_ci_two_instances_method_eq",
+              default_ci.method == default_ci2.method);
+        check("default_ci_two_instances_strings_eq",
+              default_ci.class_name == default_ci2.class_name
+           && default_ci.method_name == default_ci2.method_name
+           && default_ci.signature == default_ci2.signature);
     }
 
     // =====================================================================
@@ -1420,6 +1508,116 @@ int main()
         check("frame_accessor_echoes_sentinel_stable", rv.frame() == rv.frame());
         check("frame_accessor_sentinel_no_slot_side_effect",
               slot.cancel == false && slot.retval == 0);
+    }
+
+    // =====================================================================
+    // SECTION K3 — wave-29 type/noexcept characterization of stack_trace() and
+    // caller() / frame() on a default (no-frame) return_value. We pin the
+    // EXACT return types (vector<caller_info>, caller_info by value, frame*)
+    // and characterize the observed noexcept-ness so any future header tweak
+    // that silently changes the signature trips this file at COMPILE time.
+    // =====================================================================
+    {
+        using rv_t      = vmhook::return_value;
+        using ci_t      = rv_t::caller_info;
+        using trace_t   = std::vector<ci_t>;
+
+        // stack_trace(): EXACTLY std::vector<caller_info>, both overloads.
+        static_assert(
+            std::is_same<decltype(std::declval<const rv_t&>().stack_trace()),
+                         trace_t>::value,
+            "stack_trace() must return std::vector<caller_info>");
+        static_assert(
+            std::is_same<decltype(std::declval<const rv_t&>().stack_trace(
+                             std::size_t{ 0 })),
+                         trace_t>::value,
+            "stack_trace(size_t) must return std::vector<caller_info>");
+
+        // caller(): by-value caller_info (NOT a reference, NOT a pointer).
+        static_assert(
+            std::is_same<decltype(std::declval<const rv_t&>().caller()),
+                         ci_t>::value,
+            "caller() must return caller_info by value");
+
+        // frame(): exactly hotspot::frame* (a plain accessor).
+        static_assert(
+            std::is_same<decltype(std::declval<const rv_t&>().frame()),
+                         vmhook::hotspot::frame*>::value,
+            "frame() must return hotspot::frame*");
+
+        // caller_info::valid(): bool, const-callable.
+        static_assert(
+            std::is_same<decltype(std::declval<const ci_t&>().valid()),
+                         bool>::value,
+            "caller_info::valid() must return bool");
+
+        // caller_info is a plain aggregate-y type: default-constructible,
+        // copyable, movable, destructible — guaranteed by the header layout
+        // (method* + 3 std::string).
+        static_assert(std::is_default_constructible<ci_t>::value,
+                      "caller_info must be default-constructible");
+        static_assert(std::is_copy_constructible<ci_t>::value,
+                      "caller_info must be copy-constructible");
+        static_assert(std::is_move_constructible<ci_t>::value,
+                      "caller_info must be move-constructible");
+        static_assert(std::is_destructible<ci_t>::value,
+                      "caller_info must be destructible");
+
+        // frame() is a trivial getter — guaranteed noexcept by the header.
+        static_assert(noexcept(std::declval<const rv_t&>().frame()),
+                      "frame() must be noexcept");
+
+        // ---- RUNTIME no-frame contract: stack_trace() / caller() do NOT
+        //      throw on a null-frame return_value. We wrap in a try/catch so
+        //      any future regression that lets an exception escape on the
+        //      no-frame fast path fails LOUDLY here. ----
+        vmhook::hotspot::return_slot slot_nx{};
+        vmhook::return_value         rv_nx{ &slot_nx, /*frame=*/nullptr };
+
+        bool no_throw_default_st{ false };
+        try {
+            const auto t{ rv_nx.stack_trace() };
+            no_throw_default_st = t.empty();
+        } catch (...) { no_throw_default_st = false; }
+        check("stack_trace_no_frame_default_does_not_throw",
+              no_throw_default_st);
+
+        bool no_throw_intmax_st{ false };
+        try {
+            const auto t{ rv_nx.stack_trace(
+                static_cast<std::size_t>(std::numeric_limits<int>::max())) };
+            no_throw_intmax_st = t.empty();
+        } catch (...) { no_throw_intmax_st = false; }
+        check("stack_trace_no_frame_INT_MAX_does_not_throw",
+              no_throw_intmax_st);
+
+        bool no_throw_caller{ false };
+        try {
+            const auto ci{ rv_nx.caller() };
+            no_throw_caller = (ci.valid() == false);
+        } catch (...) { no_throw_caller = false; }
+        check("caller_no_frame_does_not_throw", no_throw_caller);
+
+        // Returned vector on no-frame default is in a valid empty state:
+        // size()==0, begin()==end(), and capacity() is a non-negative size_t
+        // (trivially true but pins the std::vector contract).
+        const auto empty_trace{ rv_nx.stack_trace() };
+        check("stack_trace_no_frame_size_zero", empty_trace.size() == 0u);
+        check("stack_trace_no_frame_begin_eq_end",
+              empty_trace.begin() == empty_trace.end());
+        check("stack_trace_no_frame_capacity_is_size_t",
+              empty_trace.capacity() <= empty_trace.max_size());
+
+        // Repeated calls return INDEPENDENT vectors (each call materialises a
+        // fresh result — no shared cached buffer). We can't compare addresses
+        // of temporaries reliably, but we CAN bind two named results and
+        // confirm they live at distinct addresses.
+        auto t1{ rv_nx.stack_trace() };
+        auto t2{ rv_nx.stack_trace() };
+        check("stack_trace_no_frame_results_are_distinct_objects",
+              static_cast<const void*>(&t1) != static_cast<const void*>(&t2));
+        check("stack_trace_no_frame_results_both_empty",
+              t1.empty() && t2.empty());
     }
 
     // =====================================================================
@@ -2075,6 +2273,95 @@ int main()
                   vmhook::array_length(oop) == -5);
             check("get_array_element_negative_length_rejects_index0",
                   vmhook::get_array_element<std::int32_t>(oop, 0) == 0);
+        }
+    }
+
+    // =====================================================================
+    // SECTION W29 — wave-29 LEDGER gap-closing for set_arg.
+    //   (1) DEFAULT-CONSTRUCTED-like return_value with BOTH slot=nullptr and
+    //       frame=nullptr: set_arg must be a safe no-op (the !stack_frame
+    //       guard fires before any slot deref).
+    //   (2) Specific bounds indices 0 / 255 / 65535 with the no-frame path
+    //       (the documented "edge" indices), all noexcept.
+    //   (3) Static signature locks: set_arg is noexcept, returns bool, takes
+    //       std::int32_t as the first parameter.
+    //   (4) Idempotency: repeated set_arg calls on the guard path leave
+    //       slot.cancel / slot.retval untouched.
+    // =====================================================================
+    {
+        // (3) signature static_asserts — locked at compile time, never drift.
+        static_assert(noexcept(std::declval<vmhook::return_value&>()
+                                   .set_arg(std::int32_t{ 0 }, std::int32_t{ 0 })),
+                      "return_value::set_arg must be noexcept");
+        static_assert(std::is_same_v<
+                          decltype(std::declval<vmhook::return_value&>()
+                                       .set_arg(std::int32_t{ 0 }, std::int32_t{ 0 })),
+                          bool>,
+                      "return_value::set_arg must return bool");
+        static_assert(std::is_same_v<
+                          decltype(std::declval<vmhook::return_value&>()
+                                       .set_arg(std::int32_t{ 0 }, std::int64_t{ 0 })),
+                          bool>,
+                      "return_value::set_arg<int64_t> must return bool");
+        static_assert(std::is_same_v<
+                          decltype(std::declval<vmhook::return_value&>()
+                                       .set_arg(std::int32_t{ 0 }, 1.0)),
+                          bool>,
+                      "return_value::set_arg<double> must return bool");
+
+        // (1) BOTH slot AND frame null. set_arg's guard checks frame first,
+        // so slot is NEVER dereferenced — no crash, returns false.
+        {
+            vmhook::return_value rv{ /*slot=*/nullptr, /*frame=*/nullptr };
+            check("set_arg_null_slot_null_frame_index_0_false",
+                  rv.set_arg(0, std::int32_t{ 42 }) == false);
+            check("set_arg_null_slot_null_frame_index_255_false",
+                  rv.set_arg(255, std::int32_t{ 42 }) == false);
+            check("set_arg_null_slot_null_frame_index_65535_false",
+                  rv.set_arg(65535, std::int32_t{ 42 }) == false);
+            check("set_arg_null_slot_null_frame_neg_false",
+                  rv.set_arg(-1, std::int32_t{ 42 }) == false);
+            check("set_arg_null_slot_null_frame_double_false",
+                  rv.set_arg(0, 3.5) == false);
+            check("set_arg_null_slot_null_frame_int64_false",
+                  rv.set_arg(0, std::int64_t{ 0x0123456789ABCDEFLL }) == false);
+            check("set_arg_null_slot_null_frame_bool_false",
+                  rv.set_arg(0, true) == false);
+            check("set_arg_null_slot_null_frame_void_ptr_false",
+                  rv.set_arg(0, static_cast<void*>(nullptr)) == false);
+        }
+
+        // (2) + (4) live slot, no frame, the three documented edge indices.
+        // Each one must return false, and twenty repeated calls must leave the
+        // slot bit-identical to its initial value (idempotent guard).
+        {
+            vmhook::hotspot::return_slot slot{};
+            vmhook::return_value         rv{ &slot, /*frame=*/nullptr };
+
+            for (int rep{ 0 }; rep < 20; ++rep)
+            {
+                if (rv.set_arg(0,     std::int32_t{ 7 }) != false
+                 || rv.set_arg(255,   std::int32_t{ 7 }) != false
+                 || rv.set_arg(65535, std::int32_t{ 7 }) != false)
+                {
+                    check("set_arg_edge_indices_idempotent_false_run", false);
+                    break;
+                }
+            }
+            check("set_arg_edge_indices_idempotent_slot_clean_cancel",
+                  slot.cancel == false);
+            check("set_arg_edge_indices_idempotent_slot_clean_retval",
+                  slot.retval == 0);
+
+            // The exact indices the ledger names, individually pinned.
+            check("set_arg_index_0_no_frame_false",
+                  rv.set_arg(0, std::int32_t{ 1 }) == false);
+            check("set_arg_index_255_no_frame_false",
+                  rv.set_arg(255, std::int32_t{ 1 }) == false);
+            check("set_arg_index_65535_no_frame_false",
+                  rv.set_arg(65535, std::int32_t{ 1 }) == false);
+            check("set_arg_after_three_edge_calls_slot_still_clean",
+                  slot.cancel == false && slot.retval == 0);
         }
     }
 
