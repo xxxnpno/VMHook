@@ -865,6 +865,227 @@ namespace wave23
     }
 } // namespace wave23
 
+// =====================================================================
+// WAVE-24 ADDITIVE DEEPENING (no-JVM, -Werror gcc/clang/msvc).
+//
+// Closes the wave-24 ledger gaps NOT yet pinned above:
+//   * modified-UTF-8 class names in object descriptors (the JVMS § 4.4.7
+//     "Lname;" name field has very loose grammar — anything except '.' '[' '/'
+//     ';' is legal in a binary internal name, and the descriptor parser must
+//     accept BCEL-style mangled names like LfooBAR_$1; or names with the
+//     "$" / "_" / digits that javac emits for inner/synthetic classes); walked
+//     through parse_one_field_descriptor and used to build a method descriptor
+//     with such an L-name as a parameter token;
+//   * nested array signatures [[[I (dimension == 3) walked end-to-end: 3 '[',
+//     component basic 'I' (T_INT == 10), array_dims == 3, consumed == 4; and
+//     pinned through a method descriptor "([[[I)[[[I" with both the parameter
+//     AND the return at dim==3;
+//   * jvm_primitive_byte_width adversarial: TAB and LF single-byte views (size
+//     1, but NOT a primitive letter) -> 0 (pinning the default arm rejects
+//     non-letter ASCII whitespace; complements wave23's CR/LF coverage at the
+//     standalone bare-byte level);
+//   * descriptor with EMBEDDED NUL byte explicitly handled: an unterminated
+//     'L' whose run hits a '\0' (instead of the required ';') causes the
+//     reference walker to scan to size and report ok=false — the '\0' is NOT
+//     a descriptor terminator, the only legal one is ';'.  Also a sig with an
+//     embedded NUL inside an L-name's run-to-';' is currently accepted (NUL
+//     is not listed in the JVMS' forbidden set for the name field) — pin
+//     CURRENT BEHAVIOUR so any tightening is conscious;
+//   * deep ctor "(IDLjava/lang/String;[I[[LFoo;)V" full walk: 5 arg tokens
+//     I / D / Ljava/lang/String; / [I / [[LFoo; — each individually verified
+//     via parse_one_field_descriptor (consumed/dims/basic) AND the whole-
+//     method walk confirms arg_count==5, arg_slots==6 (D adds 2, rest add 1).
+// =====================================================================
+namespace wave24
+{
+    inline auto run() -> void
+    {
+        // ---- modified-UTF-8 / mangled class names in object descriptors ------
+        // JVMS § 4.2.1 binary internal names allow any Unicode char except
+        // '.' '[' '/' ';' — so synthetic names javac emits ($1, $$Lambda$, _,
+        // mixed-case, digits) MUST parse.  Walk a representative spread.
+        {
+            struct lname_case { const char* sig; int expect_consumed; };
+            const lname_case rows[]{
+                { "LfooBAR_$1;",                       11 }, // synthetic suffix
+                { "Lcom/example/Outer$Inner;",         25 }, // inner class
+                { "L_underscore_only_;",               19 }, // leading underscore
+                { "L$$Lambda$42/0;",                   15 }, // anonymous lambda
+                { "Lcom/x/$Mangled$42$;",              20 }, // multiple $
+                { "La;",                                3 }, // shortest valid L-name
+            };
+            bool all_ok{ true };
+            for (const lname_case& r : rows)
+            {
+                const field_descriptor_parse f{
+                    parse_one_field_descriptor(std::string_view{ r.sig }, 0) };
+                if (!(f.ok && f.basic_type == 12 /*T_OBJECT*/
+                      && f.array_dims == 0
+                      && f.component_basic == 12
+                      && static_cast<int>(f.consumed) == r.expect_consumed))
+                {
+                    all_ok = false;
+                }
+            }
+            check("wave24_mangled_modified_utf8_class_names_parse_as_T_OBJECT", all_ok);
+        }
+        // The mangled L-name as a parameter inside a real method descriptor.
+        {
+            const method_descriptor_parse m{
+                parse_method_descriptor("(LfooBAR_$1;)V") };
+            check("wave24_mangled_lname_as_param_walks",
+                  m.ok && m.arg_count == 1 && m.arg_slots == 1
+                  && m.return_basic == 14);
+        }
+
+        // ---- nested array [[[I (depth == 3) ----------------------------------
+        // parse_one_field_descriptor: 3 '[' then 'I' -> ok, T_ARRAY (13),
+        // array_dims == 3, component_basic == 10 (T_INT), consumed == 4.
+        {
+            const field_descriptor_parse f{ parse_one_field_descriptor("[[[I", 0) };
+            check("wave24_nested_array_depth_3_walk",
+                  f.ok && f.basic_type == 13 && f.array_dims == 3
+                  && f.component_basic == 10 && f.consumed == 4);
+        }
+        // And the same shape in BOTH parameter and return position.
+        {
+            const method_descriptor_parse m{
+                parse_method_descriptor("([[[I)[[[I") };
+            check("wave24_nested_array_depth_3_both_sides",
+                  m.ok && m.arg_count == 1 && m.arg_slots == 1
+                  && m.return_basic == 13 && m.return_dims == 3);
+        }
+        // Depth 1 / 2 / 3 progression — basic_type stays T_ARRAY, only dims grow.
+        {
+            const field_descriptor_parse d1{ parse_one_field_descriptor("[I", 0) };
+            const field_descriptor_parse d2{ parse_one_field_descriptor("[[I", 0) };
+            const field_descriptor_parse d3{ parse_one_field_descriptor("[[[I", 0) };
+            check("wave24_array_depth_1_2_3_progression",
+                  d1.ok && d1.array_dims == 1 && d1.consumed == 2
+                  && d2.ok && d2.array_dims == 2 && d2.consumed == 3
+                  && d3.ok && d3.array_dims == 3 && d3.consumed == 4);
+        }
+        // Nested array of object — [[[LFoo; depth 3 with object component.
+        {
+            const field_descriptor_parse f{ parse_one_field_descriptor("[[[LFoo;", 0) };
+            check("wave24_nested_array_of_object_depth_3",
+                  f.ok && f.basic_type == 13 && f.array_dims == 3
+                  && f.component_basic == 12 && f.consumed == 8);
+        }
+
+        // ---- jvm_primitive_byte_width: TAB / LF single-byte non-letter -------
+        // size==1 but the byte is NOT one of Z/B/S/C/I/F/J/D -> 0 by the default
+        // arm.  Pins the rejection happens on CONTENT for the lone-whitespace
+        // case (not just on size!=1), complementing wave23's CR/DEL coverage.
+        {
+            const char tab[1]{ '\t' };
+            const char lf[1]{ '\n' };
+            const char sp[1]{ ' ' };
+            check("wave24_width_tab_singleton_is_0",
+                  vmhook::detail::jvm_primitive_byte_width(std::string_view{ tab, 1 }) == 0);
+            check("wave24_width_lf_singleton_is_0",
+                  vmhook::detail::jvm_primitive_byte_width(std::string_view{ lf, 1 }) == 0);
+            check("wave24_width_space_singleton_is_0",
+                  vmhook::detail::jvm_primitive_byte_width(std::string_view{ sp, 1 }) == 0);
+        }
+
+        // ---- descriptor with EMBEDDED NUL byte -------------------------------
+        // (a) Unterminated 'L' whose contents include a '\0' but no ';' -> the
+        // reference walk runs to end and reports ok=false (NUL is NOT a legal
+        // descriptor terminator; only ';' is).  Built into an explicit buffer
+        // so the NUL is in the middle of the view, not a C-string accident.
+        {
+            const char unterm[6]{ 'L', 'a', '\0', 'b', 'c', '\0' };  // size 6, no ';'
+            const std::string_view sv{ unterm, 5 };  // exclude final NUL for clarity
+            const field_descriptor_parse f{ parse_one_field_descriptor(sv, 0) };
+            check("wave24_unterminated_L_with_embedded_nul_is_malformed",
+                  !f.ok);
+        }
+        // (b) A method descriptor whose ARGS region contains an embedded NUL
+        // BEFORE the ')' makes the walker fail at the bad parameter byte (NUL
+        // is not a valid leading descriptor byte for a parameter).
+        {
+            const char with_nul[6]{ '(', '\0', ')', 'V', '\0', '\0' };
+            const std::string_view sv{ with_nul, 4 };  // "(\0)V"
+            const method_descriptor_parse m{ parse_method_descriptor(sv) };
+            check("wave24_method_with_embedded_nul_param_is_rejected", !m.ok);
+        }
+        // (c) CURRENT-BEHAVIOUR pin: an L-name's run-to-';' that crosses an
+        // embedded NUL is CURRENTLY accepted by the reference walker because
+        // the only sentinel is ';' (the JVMS forbidden set for the name field
+        // is '.' '[' '/' ';' — NUL is NOT in that set).  Documenting this so
+        // any future tightening is a conscious test-visible change.
+        {
+            const char nul_in_name[6]{ 'L', 'a', '\0', 'b', ';', '\0' };
+            const std::string_view sv{ nul_in_name, 5 };
+            const field_descriptor_parse f{ parse_one_field_descriptor(sv, 0) };
+            check("wave24_lname_with_embedded_nul_currently_accepted_consume_5",
+                  f.ok && f.basic_type == 12 && f.consumed == 5);
+        }
+
+        // ---- deep ctor "(IDLjava/lang/String;[I[[LFoo;)V" full walk ----------
+        // Five arg tokens: I (1 byte), D (1 byte, 2 slots), Ljava/lang/String;
+        // (18 bytes, 1 slot), [I (2 bytes, 1 slot), [[LFoo; (7 bytes, 1 slot).
+        // Total descriptor body 1+1+18+2+7 = 29 bytes, +"()V" framing = 33.
+        // arg_count = 5, arg_slots = 1+2+1+1+1 = 6.
+        const std::string_view deep_sig{ "(IDLjava/lang/String;[I[[LFoo;)V" };
+        check("wave24_deep_ctor_descriptor_total_length_is_32",
+              deep_sig.size() == 32);
+        {
+            const method_descriptor_parse m{ parse_method_descriptor(deep_sig) };
+            check("wave24_deep_ctor_walks_to_5_args_6_slots_void_return",
+                  m.ok && m.arg_count == 5 && m.arg_slots == 6
+                  && m.return_basic == 14 && m.return_dims == 0);
+        }
+        // Token-by-token walk: independently verify each parameter slice using
+        // parse_one_field_descriptor, advancing a cursor that mirrors the
+        // method-descriptor walker.  This exposes the per-arg consume / dims /
+        // basic-type values that the aggregate method walk only summarises.
+        {
+            std::size_t pos{ 1 };  // skip '('
+            struct expect { int basic; int dims; int comp; std::size_t consumed; };
+            const expect ex[]{
+                { 10, 0, 10, 1 },   // I
+                {  7, 0,  7, 1 },   // D
+                { 12, 0, 12, 18 },  // Ljava/lang/String;
+                { 13, 1, 10, 2 },   // [I
+                { 13, 2, 12, 7 },   // [[LFoo;
+            };
+            bool every_token_ok{ true };
+            int  collected{ 0 };
+            for (const expect& e : ex)
+            {
+                const field_descriptor_parse f{ parse_one_field_descriptor(deep_sig, pos) };
+                if (!(f.ok && f.basic_type == e.basic && f.array_dims == e.dims
+                      && f.component_basic == e.comp && f.consumed == e.consumed))
+                {
+                    every_token_ok = false;
+                }
+                pos += f.consumed;
+                ++collected;
+            }
+            // After consuming all 5 tokens, the cursor must land on the ')'.
+            check("wave24_deep_ctor_token_walk_collects_5_tokens_lands_on_rparen",
+                  every_token_ok && collected == 5
+                  && pos < deep_sig.size() && deep_sig[pos] == ')');
+        }
+        // Cross-check via the live jni_signature_for_arg fold: a C++ pack that
+        // tokenises to the same 5 PRIMITIVE+STRING prefix produces the same
+        // leading bytes.  We cannot express [I or [[LFoo; through
+        // jni_signature_for_arg (no array/wrapper-vector mapping in scope), but
+        // the I/D/String prefix is exact: "(IDLjava/lang/String;" matches the
+        // first 21 bytes of the deep signature.
+        {
+            const std::string prefix{ ctor_signature_of<int, double, std::string>() };
+            // "(IDLjava/lang/String;)V" -> first 21 bytes are "(IDLjava/lang/String;"
+            check("wave24_deep_ctor_IDLString_prefix_matches_via_jni_fold",
+                  prefix.size() == 23
+                  && std::string_view{ prefix }.substr(0, 21)
+                       == deep_sig.substr(0, 21));
+        }
+    }
+} // namespace wave24
+
 int main()
 {
     // ---- detail::sig_char_to_basic_type: HotSpot BasicType ints --------------
@@ -3860,6 +4081,7 @@ int main()
     // parity) — runs after all existing passes, touches no assertion above.
     wave21::run();
     wave23::run();
+    wave24::run();
 
     return failures == 0 ? 0 : 1;
 }

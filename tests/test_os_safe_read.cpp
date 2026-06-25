@@ -1414,6 +1414,250 @@ static auto test_safe_read_fast_parity_on_no_access() -> void
 
 } // namespace deepen_os_signal_handler
 
+// ===========================================================================
+// DEEPENING SECTION 3 (wave-24, additive only).  Ledger gap-closing:
+//   W1) 5-page mixed-protection span: alternating mapped/unmapped pages,
+//       safe_read of the full span returns false; per-page probe pins the
+//       FIRST-FAIL position so a regression that read past the boundary names
+//       itself.
+//   W2) 16-thread interleaved shared-valid + poisoned safe_read: no handler
+//       exhaustion, every valid read produces exact bytes, every poisoned read
+//       returns false, process survives.
+//   W3) safe_read does NOT modify src memory: read a known pattern and assert
+//       the source bytes are byte-identical after.
+//   W4) safe_read(dst, dst, n) self-overlap: best-effort doc — returns true,
+//       no crash, src/dst bytes consistent post-call.
+// All gated off iOS where appropriate.
+// ===========================================================================
+namespace deepen_wave24
+{
+
+#if !VMHOOK_OS_IOS
+// ---------------------------------------------------------------------------
+// W1) 5*page mixed mapped/unmapped layout: pages 0,2,4 readable, pages 1,3
+//     no_access.  Probing the FULL span returns false (cannot satisfy all
+//     bytes); probing each page in isolation pins the first-fail position
+//     (page 1) so a regression that silently over-reads names its offset.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_mixed_5_page_first_fail_position() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    const std::size_t total{ page * 5 };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, total) };
+    if (!block)
+    {
+        check("mixed_5page_skipped_alloc_failed", false);
+        return;
+    }
+    auto* const base{ static_cast<std::uint8_t*>(block) };
+    fill_pattern(base, total);
+
+    // Lock pages 1 and 3 (odd indices) as no_access.
+    const bool lock1{ vmhook::os::protect(base + page * 1, page,
+                                          vmhook::os::memory_protection::no_access, nullptr) };
+    const bool lock3{ vmhook::os::protect(base + page * 3, page,
+                                          vmhook::os::memory_protection::no_access, nullptr) };
+    if (!lock1 || !lock3)
+    {
+        std::printf("[INFO] mixed_5page skipped: PROT_NONE refused\n");
+        (void)make_writable(block, total);
+        vmhook::os::release(block, total);
+        return;
+    }
+
+    std::vector<std::uint8_t> dst(total, 0u);
+
+    // Full 5-page read MUST fail (spans into unreadable pages).
+    const bool full_ok{ vmhook::os::safe_read(dst.data(), base, total) };
+    check("mixed_5page_full_span_returns_false", !full_ok);
+
+    // Per-page probe: pages 0,2,4 succeed; pages 1,3 fail.  This pins the
+    // FIRST-FAIL position at page 1 — any regression that read past it would
+    // either make page 1 spuriously succeed or shift the boundary.
+    std::vector<std::uint8_t> page_dst(page, 0u);
+    const bool p0{ vmhook::os::safe_read(page_dst.data(), base + page * 0, page) };
+    const bool p1{ vmhook::os::safe_read(page_dst.data(), base + page * 1, page) };
+    const bool p2{ vmhook::os::safe_read(page_dst.data(), base + page * 2, page) };
+    const bool p3{ vmhook::os::safe_read(page_dst.data(), base + page * 3, page) };
+    const bool p4{ vmhook::os::safe_read(page_dst.data(), base + page * 4, page) };
+    check("mixed_5page_page0_succeeds", p0);
+    check("mixed_5page_page1_first_fail", !p1);
+    check("mixed_5page_page2_succeeds", p2);
+    check("mixed_5page_page3_second_fail", !p3);
+    check("mixed_5page_page4_succeeds", p4);
+
+    // Restore + release.
+    (void)vmhook::os::protect(base + page * 1, page,
+                              vmhook::os::memory_protection::read_write, nullptr);
+    (void)vmhook::os::protect(base + page * 3, page,
+                              vmhook::os::memory_protection::read_write, nullptr);
+    (void)make_writable(block, total);
+    vmhook::os::release(block, total);
+}
+
+// ---------------------------------------------------------------------------
+// W2) 16-thread interleaved: shared valid src + per-thread poisoned src.  No
+//     handler exhaustion (every iteration's bool is the expected one); both
+//     groups' final state correct; process survives.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_16_thread_interleaved() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const valid_block{ vmhook::os::allocate_rwx(nullptr, page) };
+    void* const poison_block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!valid_block || !poison_block)
+    {
+        check("16thread_skipped_alloc_failed", false);
+        if (valid_block)  vmhook::os::release(valid_block, page);
+        if (poison_block) vmhook::os::release(poison_block, page);
+        return;
+    }
+    auto* const shared_src{ static_cast<std::uint8_t*>(valid_block) };
+    fill_pattern(shared_src, page);
+
+    *static_cast<volatile std::uint8_t*>(poison_block) = 0x11;
+    const bool locked{ vmhook::os::protect(poison_block, page,
+                                           vmhook::os::memory_protection::no_access, nullptr) };
+    if (!locked)
+    {
+        std::printf("[INFO] 16thread skipped: PROT_NONE refused\n");
+        vmhook::os::release(valid_block, page);
+        vmhook::os::release(poison_block, page);
+        return;
+    }
+
+    constexpr int thread_count{ 16 };
+    constexpr int iterations{ 1500 };
+    std::atomic<int> valid_mismatches{ 0 };
+    std::atomic<int> poison_unexpected_true{ 0 };
+    std::atomic<int> valid_failed{ 0 };
+
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+    for (int t{ 0 }; t < thread_count; ++t)
+    {
+        threads.emplace_back([&]() {
+            std::uint8_t dst[32];
+            for (int i{ 0 }; i < iterations; ++i)
+            {
+                // Interleave: even -> shared valid; odd -> poisoned.
+                if ((i & 1) == 0)
+                {
+                    if (!vmhook::os::safe_read(dst, shared_src, sizeof(dst)))
+                    {
+                        valid_failed.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    else if (std::memcmp(dst, shared_src, sizeof(dst)) != 0)
+                    {
+                        valid_mismatches.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                else
+                {
+                    if (vmhook::os::safe_read(dst, poison_block, sizeof(dst)))
+                    {
+                        poison_unexpected_true.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+    for (auto& th : threads)
+    {
+        th.join();
+    }
+
+    check("16thread_valid_all_succeeded",      valid_failed.load() == 0);
+    check("16thread_valid_bytes_exact",        valid_mismatches.load() == 0);
+    check("16thread_poison_all_false",         poison_unexpected_true.load() == 0);
+    check("16thread_no_handler_exhaustion",    true); // reached here = survived
+
+    // Final state: a fresh valid read still works, a fresh poisoned read still
+    // fails — handler not exhausted by the storm.
+    {
+        std::uint8_t dst[16]{};
+        const bool good{ vmhook::os::safe_read(dst, shared_src, sizeof(dst)) };
+        const bool bad{ vmhook::os::safe_read(dst, poison_block, sizeof(dst)) };
+        check("16thread_final_valid_ok", good && std::memcmp(dst, shared_src, sizeof(dst)) == 0);
+        check("16thread_final_poison_false", !bad);
+    }
+
+    (void)vmhook::os::protect(poison_block, page,
+                              vmhook::os::memory_protection::read_write, nullptr);
+    vmhook::os::release(poison_block, page);
+    vmhook::os::release(valid_block, page);
+}
+#endif // !VMHOOK_OS_IOS
+
+// ---------------------------------------------------------------------------
+// W3) safe_read does NOT modify the SRC bytes — pin via a checksum/byte-equal
+//     snapshot before vs after across several widths.  Runs on every platform
+//     (purely uses owned buffers).
+// ---------------------------------------------------------------------------
+static auto test_safe_read_does_not_modify_src() -> void
+{
+    alignas(std::uint64_t) std::uint8_t src[128];
+    fill_pattern(src, sizeof(src));
+
+    std::uint8_t snapshot[128];
+    std::memcpy(snapshot, src, sizeof(src));
+
+    std::uint8_t dst[128]{};
+    const std::size_t widths[]{ std::size_t{ 1 }, std::size_t{ 7 }, std::size_t{ 8 },
+                                std::size_t{ 16 }, std::size_t{ 64 }, std::size_t{ 128 } };
+    bool any_modified{ false };
+    for (const std::size_t w : widths)
+    {
+        const bool ok{ vmhook::os::safe_read(dst, src, w) };
+        (void)ok;
+        if (std::memcmp(src, snapshot, sizeof(src)) != 0)
+        {
+            any_modified = true;
+        }
+    }
+    check("safe_read_does_not_modify_src", !any_modified);
+}
+
+// ---------------------------------------------------------------------------
+// W4) safe_read(dst, dst, n) self-overlap (dst == src).  Best-effort doc: the
+//     call must not crash; behaviour is "copy bytes onto themselves" which is
+//     a no-op semantically.  Pin that the bytes equal a pre-call snapshot
+//     after the call, and that the call returns true.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_dst_equals_src_no_crash() -> void
+{
+    alignas(std::uint64_t) std::uint8_t buf[64];
+    fill_pattern(buf, sizeof(buf));
+
+    std::uint8_t snapshot[64];
+    std::memcpy(snapshot, buf, sizeof(buf));
+
+    const std::size_t widths[]{ std::size_t{ 1 }, std::size_t{ 8 }, std::size_t{ 32 },
+                                std::size_t{ 64 } };
+    bool all_ok{ true };
+    bool all_consistent{ true };
+    for (const std::size_t w : widths)
+    {
+        const bool ok{ vmhook::os::safe_read(buf, buf, w) };
+        if (!ok)
+        {
+            all_ok = false;
+        }
+        // After dst==src copy, the first w bytes must still match snapshot
+        // (a no-op semantically; on every backend a same-region copy is a
+        // defined identity transform).
+        if (std::memcmp(buf, snapshot, w) != 0)
+        {
+            all_consistent = false;
+        }
+    }
+    check("safe_read_dst_equals_src_succeeds", all_ok);
+    check("safe_read_dst_equals_src_bytes_consistent", all_consistent);
+    check("safe_read_dst_equals_src_process_survives", true);
+}
+
+} // namespace deepen_wave24
+
 int main()
 {
     // Positive / parity (run on every platform, iOS included — these are valid
@@ -1453,6 +1697,14 @@ int main()
     deepen_os_signal_handler::test_safe_write_roundtrip_owned_page();
     deepen_os_signal_handler::test_safe_write_no_access_page_false();
     deepen_os_signal_handler::test_safe_read_fast_parity_on_no_access();
+#endif
+
+    // Wave-24 ledger gap-closers.
+    deepen_wave24::test_safe_read_does_not_modify_src();
+    deepen_wave24::test_safe_read_dst_equals_src_no_crash();
+#if !VMHOOK_OS_IOS
+    deepen_wave24::test_safe_read_mixed_5_page_first_fail_position();
+    deepen_wave24::test_safe_read_16_thread_interleaved();
 #endif
 
     // Fault-safety cases that require the fault-safe read path — gated off iOS,

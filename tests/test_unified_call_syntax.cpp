@@ -2093,6 +2093,302 @@ namespace ucs_deepen_rt2
     const runner_t g_runner{};
 }
 
+// =============================================================================
+// 34. DEEPEN (wave-24) -- name-argument REJECTION BREADTH + arity matrix closure
+//      + static_method vs instance disambiguation
+// =============================================================================
+// Wave-24 ledger gaps for unified_call_syntax:
+//   (a) Pointer/enum/user-defined non-wrapper arg-type REJECTION breadth on the
+//       NAME parameter of every accessor: section 18/28 hit int/double/int*; here
+//       we close it to every reasonable non-name spelling -- raw enum, scoped
+//       enum, a user-defined non-wrapper struct, pointer-to-member, function
+//       pointer, std::nullptr_t, std::vector<int>.  None of these have a
+//       conversion to char const* / string_view, so EVERY accessor overload that
+//       takes a name must be SFINAE-non-viable.  The detector idiom (concepts
+//       via requires-expressions, exactly std::void_t-detector-equivalent under
+//       C++20) gives a clean compile-time negative oracle.
+//   (b) NO-arg call shape: Section 4a already covered call() with zero arguments.
+//       Close it under the unified spellings: the 1-line idiom
+//       get_method(name)->call() and static_method(name)->call() must each yield
+//       method_proxy::value_t with the empty argument pack, from BOTH idioms.
+//   (c) >2-arg / 3-arg / 4-arg accessor PROBES: section 18/28 hit static_field
+//       3-arg, static_method 3/4-arg; complete the matrix on the gated get_field
+//       / get_method statics too (gate-aware), and the INSTANCE get_field /
+//       get_method overloads (1-arg field; 1-arg and 2-arg method; >2-arg is
+//       ill-formed everywhere).
+//   (d) static_method vs INSTANCE disambiguation: pin via static_assert that an
+//       instance-style call qualified on the TYPE without an object is ill-formed
+//       (for get_field/get_method WHEN gate OFF -- non-static members), and that
+//       static_field/static_method are CALLABLE both qualified on the TYPE
+//       (object-less) AND through an instance, since they are static members.
+//       This is the structural "static-vs-instance" disambiguation oracle.
+//
+// EVERY assertion below is purely compile-time / SFINAE-observable; nothing
+// instantiates a call() body and nothing touches a JVM.  All probes use the
+// detection idiom: a concept that wraps the call expression in a requires-clause,
+// which is equivalent to the void_t detector trick under C++20.
+namespace ucs_w24
+{
+    using vmhook::field_proxy;
+    using vmhook::method_proxy;
+
+    // ---- User-defined NAME spellings that must NOT be accepted --------------
+    enum            plain_name_enum  { pne0 };
+    enum class      scoped_name_enum { sne0 };
+    struct          non_wrapper_pod  { int x; };   // NOT a vmhook wrapper
+    class           non_wrapper_cls  { int y; };   // not derived from object_base
+
+    // ---- Detector concepts (void_t-detector idiom, expressed via requires) --
+    // Instance get_field / get_method with a non-name argument.
+    template<typename w, typename name_t>
+    concept inst_get_field_with =
+        requires(w& obj, name_t n) { { obj.get_field(n) }; };
+    template<typename w, typename name_t>
+    concept inst_get_method_with =
+        requires(w& obj, name_t n) { { obj.get_method(n) }; };
+    template<typename w, typename name_t, typename sig_t>
+    concept inst_get_method2_with =
+        requires(w& obj, name_t n, sig_t s) { { obj.get_method(n, s) }; };
+
+    // Portable static_field / static_method with a non-name argument.
+    template<typename w, typename name_t>
+    concept static_field_with =
+        requires(name_t n) { { w::static_field(n) }; };
+    template<typename w, typename name_t>
+    concept static_method_with =
+        requires(name_t n) { { w::static_method(n) }; };
+    template<typename w, typename name_t, typename sig_t>
+    concept static_method2_with =
+        requires(name_t n, sig_t s) { { w::static_method(n, s) }; };
+
+    // Arity probes (no-arg / 3-arg / 4-arg).
+    template<typename w> concept inst_get_field_zero =
+        requires(w& obj) { { obj.get_field() }; };
+    template<typename w> concept inst_get_method_zero =
+        requires(w& obj) { { obj.get_method() }; };
+    template<typename w> concept inst_get_field_three =
+        requires(w& obj, const char* n) { { obj.get_field(n, n, n) }; };
+    template<typename w> concept inst_get_method_three =
+        requires(w& obj, const char* n) { { obj.get_method(n, n, n) }; };
+    template<typename w> concept inst_get_method_four =
+        requires(w& obj, const char* n) { { obj.get_method(n, n, n, n) }; };
+    template<typename w> concept static_field_three =
+        requires(const char* n) { { w::static_field(n, n, n) }; };
+    template<typename w> concept static_field_four =
+        requires(const char* n) { { w::static_field(n, n, n, n) }; };
+    template<typename w> concept static_method_three =
+        requires(const char* n) { { w::static_method(n, n, n) }; };
+    template<typename w> concept static_method_four =
+        requires(const char* n) { { w::static_method(n, n, n, n) }; };
+}
+
+// 34a. RAW int / pointer / enum / struct / nullptr / container as a NAME ARGUMENT
+//      must be SFINAE-rejected by every accessor overload.  None of these has a
+//      conversion to char const* OR std::string_view, so overload resolution
+//      finds no viable get_field / static_field overload.
+//      INSTANCE get_field:
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, int>,
+              "instance get_field(int) is ill-formed (int has no conversion to name)");
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, ucs_w24::plain_name_enum>,
+              "instance get_field(unscoped enum) is ill-formed (no conversion to name)");
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, ucs_w24::scoped_name_enum>,
+              "instance get_field(scoped enum class) is ill-formed (no conversion to name)");
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, ucs_w24::non_wrapper_pod>,
+              "instance get_field(non-wrapper POD) is ill-formed (no conversion to name)");
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, ucs_w24::non_wrapper_cls>,
+              "instance get_field(non-wrapper class) is ill-formed");
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, std::nullptr_t>,
+              "instance get_field(nullptr_t) is ill-formed");
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, std::vector<int>>,
+              "instance get_field(std::vector<int>) is ill-formed");
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, int*>,
+              "instance get_field(int*) is ill-formed (non-char pointer is not a name)");
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, void*>,
+              "instance get_field(void*) is ill-formed");
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, void(*)()>,
+              "instance get_field(function pointer) is ill-formed");
+static_assert(!ucs_w24::inst_get_field_with<wrapper_class, int wrapper_class::*>,
+              "instance get_field(pointer-to-data-member) is ill-formed");
+
+//      INSTANCE get_method (1-arg) — same matrix:
+static_assert(!ucs_w24::inst_get_method_with<wrapper_class, int>,
+              "instance get_method(int) is ill-formed");
+static_assert(!ucs_w24::inst_get_method_with<wrapper_class, ucs_w24::plain_name_enum>,
+              "instance get_method(unscoped enum) is ill-formed");
+static_assert(!ucs_w24::inst_get_method_with<wrapper_class, ucs_w24::scoped_name_enum>,
+              "instance get_method(scoped enum class) is ill-formed");
+static_assert(!ucs_w24::inst_get_method_with<wrapper_class, ucs_w24::non_wrapper_pod>,
+              "instance get_method(non-wrapper POD) is ill-formed");
+static_assert(!ucs_w24::inst_get_method_with<wrapper_class, std::nullptr_t>,
+              "instance get_method(nullptr_t) is ill-formed");
+static_assert(!ucs_w24::inst_get_method_with<wrapper_class, std::vector<int>>,
+              "instance get_method(std::vector<int>) is ill-formed");
+static_assert(!ucs_w24::inst_get_method_with<wrapper_class, int*>,
+              "instance get_method(int*) is ill-formed");
+
+//      INSTANCE get_method(name, sig) — non-name in either slot:
+static_assert(!ucs_w24::inst_get_method2_with<wrapper_class, int, const char*>,
+              "instance get_method(int, const char*) — int name is ill-formed");
+static_assert(!ucs_w24::inst_get_method2_with<wrapper_class, const char*, int>,
+              "instance get_method(const char*, int) — int sig is ill-formed");
+static_assert(!ucs_w24::inst_get_method2_with<wrapper_class, ucs_w24::scoped_name_enum, const char*>,
+              "instance get_method(scoped enum, const char*) is ill-formed");
+static_assert(!ucs_w24::inst_get_method2_with<wrapper_class, const char*, ucs_w24::non_wrapper_pod>,
+              "instance get_method(const char*, non-wrapper POD) is ill-formed");
+static_assert(!ucs_w24::inst_get_method2_with<wrapper_class, std::nullptr_t, std::nullptr_t>,
+              "instance get_method(nullptr_t, nullptr_t) is ill-formed");
+
+//      PORTABLE static_field / static_method — same matrix on the TYPE-qualified
+//      call site (no object).  Mirrors the instance rejection contract.
+static_assert(!ucs_w24::static_field_with<wrapper_class, int>,
+              "static_field(int) is ill-formed");
+static_assert(!ucs_w24::static_field_with<wrapper_class, ucs_w24::plain_name_enum>,
+              "static_field(unscoped enum) is ill-formed");
+static_assert(!ucs_w24::static_field_with<wrapper_class, ucs_w24::scoped_name_enum>,
+              "static_field(scoped enum class) is ill-formed");
+static_assert(!ucs_w24::static_field_with<wrapper_class, ucs_w24::non_wrapper_pod>,
+              "static_field(non-wrapper POD) is ill-formed");
+static_assert(!ucs_w24::static_field_with<wrapper_class, std::nullptr_t>,
+              "static_field(nullptr_t) is ill-formed");
+static_assert(!ucs_w24::static_field_with<wrapper_class, std::vector<int>>,
+              "static_field(std::vector<int>) is ill-formed");
+static_assert(!ucs_w24::static_field_with<wrapper_class, int*>,
+              "static_field(int*) is ill-formed");
+static_assert(!ucs_w24::static_field_with<wrapper_class, void(*)()>,
+              "static_field(function pointer) is ill-formed");
+static_assert(!ucs_w24::static_method_with<wrapper_class, int>,
+              "static_method(int) is ill-formed");
+static_assert(!ucs_w24::static_method_with<wrapper_class, ucs_w24::scoped_name_enum>,
+              "static_method(scoped enum class) is ill-formed");
+static_assert(!ucs_w24::static_method_with<wrapper_class, ucs_w24::non_wrapper_pod>,
+              "static_method(non-wrapper POD) is ill-formed");
+static_assert(!ucs_w24::static_method_with<wrapper_class, std::vector<int>>,
+              "static_method(std::vector<int>) is ill-formed");
+static_assert(!ucs_w24::static_method2_with<wrapper_class, int, const char*>,
+              "static_method(int, const char*) — int name is ill-formed");
+static_assert(!ucs_w24::static_method2_with<wrapper_class, const char*, ucs_w24::scoped_name_enum>,
+              "static_method(const char*, scoped enum) is ill-formed");
+static_assert(!ucs_w24::static_method2_with<wrapper_class, ucs_w24::non_wrapper_pod, ucs_w24::non_wrapper_pod>,
+              "static_method(POD, POD) is ill-formed");
+
+// 34b. NO-ARG call() under the unified spellings: confirm the empty arg pack
+//      yields method_proxy::value_t through BOTH idioms (Section 4a only proved
+//      it on a bare method_proxy; here we close it at the call-site spelling).
+static_assert(std::is_same_v<
+                  decltype(std::declval<wrapper_class&>().get_method("m")->call()),
+                  vmhook::method_proxy::value_t>,
+              "no-arg: instance get_method(name)->call() yields value_t (empty pack)");
+static_assert(std::is_same_v<
+                  decltype(wrapper_class::static_method("m")->call()),
+                  vmhook::method_proxy::value_t>,
+              "no-arg: static_method(name)->call() yields value_t (empty pack)");
+static_assert(std::is_same_v<
+                  decltype(std::declval<wrapper_class&>().get_method("m", "()V")->call()),
+                  vmhook::method_proxy::value_t>,
+              "no-arg: instance get_method(name,sig)->call() yields value_t");
+static_assert(std::is_same_v<
+                  decltype(wrapper_class::static_method("m", "()V")->call()),
+                  vmhook::method_proxy::value_t>,
+              "no-arg: static_method(name,sig)->call() yields value_t");
+// (the accessors themselves are NOT noexcept — see Section 16 — so we cannot
+//  pin noexcept on the chained one-liner without inheriting that.  call() alone
+//  IS noexcept, pinned in Section 16.)
+
+// 34c. ARITY closure: 0/3/4-arg accessor probes — wave-24 thinned coverage
+//      around 0/1/2; close the >2-arg side too.  Every accessor's documented
+//      arity is 1 or 2 (name [+ sig]).  Zero / 3 / 4 must be SFINAE-non-viable
+//      across BOTH the instance overloads and the portable statics.
+static_assert(!ucs_w24::inst_get_field_zero<wrapper_class>,
+              "instance get_field() with zero args is ill-formed");
+static_assert(!ucs_w24::inst_get_method_zero<wrapper_class>,
+              "instance get_method() with zero args is ill-formed");
+static_assert(!ucs_w24::inst_get_field_three<wrapper_class>,
+              "instance get_field(a,b,c) — no 3-arg field accessor exists");
+static_assert(!ucs_w24::inst_get_method_three<wrapper_class>,
+              "instance get_method(a,b,c) — no 3-arg method accessor exists");
+static_assert(!ucs_w24::inst_get_method_four<wrapper_class>,
+              "instance get_method(a,b,c,d) — no 4-arg method accessor exists");
+static_assert(!ucs_w24::static_field_three<wrapper_class>,
+              "static_field(a,b,c) — no 3-arg static field accessor exists");
+static_assert(!ucs_w24::static_field_four<wrapper_class>,
+              "static_field(a,b,c,d) — no 4-arg static field accessor exists");
+static_assert(!ucs_w24::static_method_three<wrapper_class>,
+              "static_method(a,b,c) — no 3-arg static method accessor exists");
+static_assert(!ucs_w24::static_method_four<wrapper_class>,
+              "static_method(a,b,c,d) — no 4-arg static method accessor exists");
+// Positive control: the documented 1-arg and 2-arg shapes ARE viable.
+static_assert(probe::has_static_field_accessor<wrapper_class, const char*>,
+              "positive control: static_field(name) IS viable (the documented 1-arg shape)");
+static_assert(probe::has_static_method_accessor2<wrapper_class, const char*, const char*>,
+              "positive control: static_method(name,sig) IS viable (the documented 2-arg shape)");
+
+// 34d. static_method vs INSTANCE disambiguation -- the structural oracle.
+//      static_field / static_method are STATIC members: callable on the TYPE
+//      WITHOUT an object on every toolchain (gate-invariant).  They are ALSO
+//      callable through an instance (any static member is, via member access).
+//      Conversely, when the gate is OFF, the inherited get_field / get_method
+//      are NON-static members: callable on an INSTANCE but ill-formed when
+//      qualified on the TYPE without an object.  These two facts together are
+//      the static-vs-instance disambiguation contract.
+namespace ucs_w24_disambig
+{
+    // Static member: viable WITHOUT an object (TYPE-qualified call).
+    template<typename w> concept static_field_objectless =
+        requires { { w::static_field(std::string_view{ "a" }) }
+                       -> std::same_as<std::optional<vmhook::field_proxy>>; };
+    template<typename w> concept static_method_objectless =
+        requires { { w::static_method(std::string_view{ "m" }) }
+                       -> std::same_as<std::optional<vmhook::method_proxy>>; };
+    // Static member: viable THROUGH an instance too (any static is reachable via .).
+    template<typename w> concept static_field_through_instance =
+        requires(w& obj) { { obj.static_field(std::string_view{ "a" }) }
+                              -> std::same_as<std::optional<vmhook::field_proxy>>; };
+    template<typename w> concept static_method_through_instance =
+        requires(w& obj) { { obj.static_method(std::string_view{ "m" }) }
+                              -> std::same_as<std::optional<vmhook::method_proxy>>; };
+    // Non-static member qualified on the TYPE without an object: ill-formed.
+    template<typename w> concept inst_get_field_objectless =
+        requires { { w::get_field(std::string_view{ "a" }) }; };
+    template<typename w> concept inst_get_method_objectless =
+        requires { { w::get_method(std::string_view{ "m" }) }; };
+}
+// The portable statics are TYPE-callable on every toolchain (the gate-agnostic
+// half of the disambiguation contract):
+static_assert(ucs_w24_disambig::static_field_objectless<wrapper_class>,
+              "disambig: static_field is callable WITHOUT an object on every toolchain");
+static_assert(ucs_w24_disambig::static_method_objectless<wrapper_class>,
+              "disambig: static_method is callable WITHOUT an object on every toolchain");
+// And they are STILL reachable through an instance (static members always are):
+static_assert(ucs_w24_disambig::static_field_through_instance<wrapper_class>,
+              "disambig: static_field is reachable through an instance too (any static is)");
+static_assert(ucs_w24_disambig::static_method_through_instance<wrapper_class>,
+              "disambig: static_method is reachable through an instance too");
+// Gate-aware half of the disambiguation: only with the deducing-this gate ON
+// does a same-name STATIC get_field / get_method exist; with gate OFF the
+// inherited get_field / get_method are non-static and the object-less form is
+// ill-formed.  This is exactly the disambiguation that makes static_field /
+// static_method the gate-agnostic portable spelling.
+#if VMHOOK_HAS_DEDUCING_THIS
+static_assert(ucs_w24_disambig::inst_get_field_objectless<wrapper_class>,
+              "[gate ON] get_field(string_view) IS callable without an object "
+              "(the same-name STATIC fallback) — must disambiguate from the instance "
+              "deducing-this overload at the same call site");
+static_assert(ucs_w24_disambig::inst_get_method_objectless<wrapper_class>,
+              "[gate ON] get_method(string_view) IS callable without an object");
+#else
+static_assert(!ucs_w24_disambig::inst_get_field_objectless<wrapper_class>,
+              "[gate OFF] get_field qualified on the TYPE without an object is ill-formed "
+              "(the inherited member is non-static) — authors must use static_field");
+static_assert(!ucs_w24_disambig::inst_get_method_objectless<wrapper_class>,
+              "[gate OFF] get_method qualified on the TYPE without an object is ill-formed "
+              "— authors must use static_method");
+#endif
+// The disambiguation also holds on a SECOND wrapper type (not a quirk of wrapper_class):
+static_assert(ucs_w24_disambig::static_field_objectless<other_wrapper>,
+              "disambig: static_field type-call holds on other_wrapper too");
+static_assert(ucs_w24_disambig::static_method_objectless<other_wrapper>,
+              "disambig: static_method type-call holds on other_wrapper too");
+
 // -----------------------------------------------------------------------------
 // main(): runs the small deterministic runtime lane, then reports.  All the
 // heavy coverage above is in static_asserts the compiler already evaluated.

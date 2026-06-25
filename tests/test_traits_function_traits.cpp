@@ -1240,6 +1240,270 @@ int main()
     static_assert(!vmhook::detail::is_java_double_slot_v<double*>,
                   "a pointer-to-double is a single-slot pointer, not a double");
 
+    // =========================================================================
+    // WAVE-24: ledger gap closing — ref-qualified operator(), reference / cv
+    // parameter offset parity, std::tuple<int,long,double> tuple_element_t
+    // round-trip, and the function_traits<void(*)()> degenerate empty case.
+    //
+    // Every fact is type-algebra-only (no JVM, no frame) and deterministic; HARD
+    // asserts throughout, with a static_assert pin on the load-bearing identities
+    // so a regression breaks the build on every CI compiler/STL before runtime.
+    // =========================================================================
+    {
+        // 30.  ref-qualified operator() — &-qualified ("lvalue-only call") and
+        //      &&-qualified ("rvalue-only call") functors.  The VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC
+        //      matrix in vmhook.hpp adds dedicated specialisations for every
+        //      cv x ref x noexcept member-pointer form, so both must decompose
+        //      cleanly through the SFINAE probe (args_tuple_t PRESENT) and yield
+        //      the identical method tuple as the unqualified shape.  The const&-
+        //      and noexcept-bearing variants come along for free.
+        struct lvalue_call_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) & {}
+        };
+        struct rvalue_call_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) && {}
+        };
+        struct const_lvalue_call_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) const& {}
+        };
+        struct const_rvalue_noexcept_call_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) const&& noexcept {}
+        };
+
+        // Detector reports PRESENT for every ref-qualified shape.
+        check("ref_qualified_lvalue_operator_has_args_tuple",
+              has_args_tuple<lvalue_call_functor>::value);
+        check("ref_qualified_rvalue_operator_has_args_tuple",
+              has_args_tuple<rvalue_call_functor>::value);
+        check("ref_qualified_const_lvalue_operator_has_args_tuple",
+              has_args_tuple<const_lvalue_call_functor>::value);
+        check("ref_qualified_const_rvalue_noexcept_operator_has_args_tuple",
+              has_args_tuple<const_rvalue_noexcept_call_functor>::value);
+        // Method tuple identical across every ref/cv/noexcept qualifier spelling.
+        using expected_m = std::tuple<std::int32_t, std::int64_t>;
+        check("ref_qualified_lvalue_method_tuple_matches_unqualified",
+              std::is_same_v<method_args_of<lvalue_call_functor>, expected_m>);
+        check("ref_qualified_rvalue_method_tuple_matches_unqualified",
+              std::is_same_v<method_args_of<rvalue_call_functor>, expected_m>);
+        check("ref_qualified_const_lvalue_method_tuple_matches_unqualified",
+              std::is_same_v<method_args_of<const_lvalue_call_functor>, expected_m>);
+        check("ref_qualified_const_rvalue_noexcept_method_tuple_matches_unqualified",
+              std::is_same_v<method_args_of<const_rvalue_noexcept_call_functor>, expected_m>);
+
+        static_assert(has_args_tuple<lvalue_call_functor>::value,
+                      "&-qualified operator() must be accepted by function_traits");
+        static_assert(has_args_tuple<rvalue_call_functor>::value,
+                      "&&-qualified operator() must be accepted by function_traits");
+        static_assert(std::is_same_v<method_args_of<lvalue_call_functor>, expected_m>,
+                      "lvalue-ref-qualified call decomposes to the same method tuple as "
+                      "the unqualified shape");
+        static_assert(std::is_same_v<method_args_of<rvalue_call_functor>, expected_m>,
+                      "rvalue-ref-qualified call decomposes to the same method tuple as "
+                      "the unqualified shape");
+    }
+
+    {
+        // 31.  Reference parameters (int&, const int&, int&&) — function_traits
+        //      preserves each arg's cv/ref qualifiers VERBATIM in args_tuple_t,
+        //      and java_slot_offsets / is_java_double_slot_v normalise via
+        //      remove_cvref_t internally.  The offset table is therefore
+        //      IDENTICAL across by-value, lvalue-ref, const-lvalue-ref, and
+        //      rvalue-ref spellings of the same logical Java parameter list.
+        auto by_val   = [](vmhook::return_value&, std::int32_t,        std::int64_t,        std::int32_t       ) {};
+        auto by_lref  = [](vmhook::return_value&, std::int32_t&,       std::int64_t&,       std::int32_t&      ) {};
+        auto by_clref = [](vmhook::return_value&, const std::int32_t&, const std::int64_t&, const std::int32_t&) {};
+        auto by_rref  = [](vmhook::return_value&, std::int32_t&&,      std::int64_t&&,      std::int32_t&&     ) {};
+
+        using mv  = method_args_of<decltype(by_val)>;
+        using ml  = method_args_of<decltype(by_lref)>;
+        using mcl = method_args_of<decltype(by_clref)>;
+        using mr  = method_args_of<decltype(by_rref)>;
+
+        // (a) the trait preserves each spelling distinctly in the tuple element type.
+        check("ref_param_lref_element0_is_int_lref",
+              std::is_same_v<std::tuple_element_t<0, ml>, std::int32_t&>);
+        check("ref_param_clref_element0_is_const_int_clref",
+              std::is_same_v<std::tuple_element_t<0, mcl>, const std::int32_t&>);
+        check("ref_param_rref_element0_is_int_rref",
+              std::is_same_v<std::tuple_element_t<0, mr>, std::int32_t&&>);
+        check("ref_param_tuples_all_distinct_from_byvalue",
+              !std::is_same_v<mv, ml>
+              && !std::is_same_v<mv, mcl>
+              && !std::is_same_v<mv, mr>
+              && !std::is_same_v<ml, mcl>);
+
+        // (b) the SLOT TABLE is identical across all four spellings — the trailing
+        //     int must still land at slot 3 (past the long's two slots) regardless
+        //     of whether the long was spelled `long`, `long&`, `const long&` or
+        //     `long&&`.  This is the load-bearing property: hook<T>() reads the
+        //     same frame slots whichever way the user spelled the parameter.
+        using offsets_arr = std::array<std::int32_t, 3>;
+        const offsets_arr expected_int_long_int{ 0, 1, 3 };
+        check("ref_param_offsets_byvalue",
+              vmhook::detail::java_slot_offsets<mv>::value == expected_int_long_int);
+        check("ref_param_offsets_lref",
+              vmhook::detail::java_slot_offsets<ml>::value == expected_int_long_int);
+        check("ref_param_offsets_const_lref",
+              vmhook::detail::java_slot_offsets<mcl>::value == expected_int_long_int);
+        check("ref_param_offsets_rref",
+              vmhook::detail::java_slot_offsets<mr>::value == expected_int_long_int);
+        check("ref_param_offsets_all_four_spellings_agree",
+              vmhook::detail::java_slot_offsets<mv>::value
+                  == vmhook::detail::java_slot_offsets<ml>::value
+              && vmhook::detail::java_slot_offsets<ml>::value
+                  == vmhook::detail::java_slot_offsets<mcl>::value
+              && vmhook::detail::java_slot_offsets<mcl>::value
+                  == vmhook::detail::java_slot_offsets<mr>::value);
+
+        static_assert(vmhook::detail::java_slot_offsets<ml>::value
+                          == vmhook::detail::java_slot_offsets<mv>::value,
+                      "lvalue-ref parameters must yield the same slot table as by-value");
+        static_assert(vmhook::detail::java_slot_offsets<mr>::value
+                          == vmhook::detail::java_slot_offsets<mv>::value,
+                      "rvalue-ref parameters must yield the same slot table as by-value");
+    }
+
+    {
+        // 32.  cv-qualified (top-level) value parameters — `const int`.
+        //      In a function PARAMETER, top-level cv on a by-value type is
+        //      dropped by the language itself (function-type signature
+        //      equivalence), so function_traits should observe the BARE element
+        //      type AND the slot table must be identical to the unqualified
+        //      by-value spelling — offset parity holds.  (We omit a
+        //      volatile-by-value variant because `volatile`-qualified parameters
+        //      are deprecated since C++20 [-Wvolatile], an error under -Werror.)
+        auto by_val       = [](vmhook::return_value&,        std::int32_t,        std::int64_t,        std::int32_t) {};
+        auto by_const_val = [](vmhook::return_value&, const  std::int32_t, const  std::int64_t, const  std::int32_t) {};
+
+        using mv = method_args_of<decltype(by_val)>;
+        using mc = method_args_of<decltype(by_const_val)>;
+
+        // (a) top-level const on a by-value parameter is dropped: the tuple
+        //     element IS the bare type, not the cv-qualified type.
+        check("cv_param_const_drops_top_level_qualifier_int",
+              std::is_same_v<std::tuple_element_t<0, mc>, std::int32_t>);
+        check("cv_param_const_drops_top_level_qualifier_long",
+              std::is_same_v<std::tuple_element_t<1, mc>, std::int64_t>);
+        check("cv_param_method_tuple_equals_byvalue_method_tuple",
+              std::is_same_v<mc, mv>);
+
+        // (b) offset parity: trailing int at slot 3 (past the long's two slots)
+        //     for the const spelling, identical to the unqualified by-value tuple.
+        const std::array<std::int32_t, 3> expected_int_long_int{ 0, 1, 3 };
+        check("cv_param_offsets_byvalue",
+              vmhook::detail::java_slot_offsets<mv>::value == expected_int_long_int);
+        check("cv_param_offsets_const_byvalue",
+              vmhook::detail::java_slot_offsets<mc>::value == expected_int_long_int);
+        check("cv_param_offsets_const_match_byvalue",
+              vmhook::detail::java_slot_offsets<mc>::value
+                  == vmhook::detail::java_slot_offsets<mv>::value);
+
+        static_assert(std::is_same_v<mc, mv>,
+                      "top-level const on a by-value parameter is dropped by the "
+                      "language, so the method tuple equals the unqualified form");
+        static_assert(vmhook::detail::java_slot_offsets<mc>::value
+                          == vmhook::detail::java_slot_offsets<mv>::value,
+                      "const-by-value parameters share the by-value slot table");
+    }
+
+    {
+        // 33.  std::tuple<int, long, double> as Args round-trip via tuple_element_t.
+        //      Build a detour whose Java parameter list IS (int, long, double),
+        //      strip return_value& via tuple_tail, and verify each element type
+        //      AND the slot table match the canonical hand-built tuple.  This is
+        //      the exact lookup hook<T>() performs at instantiation
+        //      (extract_frame_arg<tuple_element_t<k, method_args>>(...)).
+        using canonical = std::tuple<std::int32_t, std::int64_t, double>;
+        auto detour = [](vmhook::return_value&, std::int32_t, std::int64_t, double) {};
+        using m = method_args_of<decltype(detour)>;
+
+        check("intLongDouble_method_tuple_arity_3",
+              std::tuple_size_v<m> == 3);
+        check("intLongDouble_method_tuple_equals_canonical",
+              std::is_same_v<m, canonical>);
+        // tuple_element_t round-trip: every k matches the declared k-th param.
+        check("intLongDouble_element0_is_int",
+              std::is_same_v<std::tuple_element_t<0, m>, std::int32_t>);
+        check("intLongDouble_element1_is_long",
+              std::is_same_v<std::tuple_element_t<1, m>, std::int64_t>);
+        check("intLongDouble_element2_is_double",
+              std::is_same_v<std::tuple_element_t<2, m>, double>);
+        // The canonical tuple round-trips through tuple_element_t identically.
+        check("intLongDouble_canonical_element0_is_int",
+              std::is_same_v<std::tuple_element_t<0, canonical>, std::int32_t>);
+        check("intLongDouble_canonical_element1_is_long",
+              std::is_same_v<std::tuple_element_t<1, canonical>, std::int64_t>);
+        check("intLongDouble_canonical_element2_is_double",
+              std::is_same_v<std::tuple_element_t<2, canonical>, double>);
+        // Slot table: int@0(+1) -> 0, long@1(+2) -> 1, double@3(+2) -> 3.
+        check("intLongDouble_slot_table",
+              (vmhook::detail::java_slot_offsets<m>::value
+               == std::array<std::int32_t, 3>{ 0, 1, 3 }));
+        check("intLongDouble_canonical_slot_table_matches_deduced",
+              vmhook::detail::java_slot_offsets<m>::value
+                  == vmhook::detail::java_slot_offsets<canonical>::value);
+
+        static_assert(std::is_same_v<m, canonical>,
+                      "function_traits + tuple_tail of (return_value&, int, long, double) "
+                      "must equal std::tuple<int, long, double>");
+        static_assert(std::is_same_v<std::tuple_element_t<1, m>, std::int64_t>,
+                      "tuple_element_t<1> of the (int,long,double) method tuple is long");
+        static_assert(vmhook::detail::java_slot_offsets<m>::value
+                          == std::array<std::int32_t, 3>{ 0, 1, 3 },
+                      "the (int,long,double) tuple widens the trailing double past the "
+                      "long's two slots: {0,1,3}");
+    }
+
+    {
+        // 34.  function_traits<void(*)()> — the degenerate empty Args case.
+        //      A C-style function pointer that takes zero parameters and returns
+        //      void: args_tuple_t MUST be std::tuple<> exactly.  This is the
+        //      smallest legal free-function-pointer shape the trait accepts.
+        //      (Note: such a detour cannot be installed via hook<T>() because the
+        //      first parameter must be vmhook::return_value& — but the TRAIT
+        //      itself MUST still decompose it cleanly; tuple_tail on the empty
+        //      tuple then yields std::tuple<>, java_slot_offsets yields an empty
+        //      offset table.  All three links of the chain handle the empty case.)
+        using empty_fn_t = void(*)();
+        using all_empty   = args_of<empty_fn_t>;
+        using method_empty = method_args_of<empty_fn_t>;
+
+        check("degenerate_void_void_fn_has_args_tuple",
+              has_args_tuple<empty_fn_t>::value);
+        check("degenerate_void_void_fn_args_tuple_is_empty",
+              std::is_same_v<all_empty, std::tuple<>>);
+        check("degenerate_void_void_fn_args_tuple_arity_0",
+              std::tuple_size_v<all_empty> == 0);
+        // tuple_tail<tuple<>> yields tuple<> by the empty-tuple base specialisation.
+        check("degenerate_void_void_fn_method_tuple_is_empty",
+              std::is_same_v<method_empty, std::tuple<>>);
+        // java_slot_offsets on the empty method tuple yields an empty array.
+        check("degenerate_void_void_fn_offset_table_is_empty",
+              vmhook::detail::java_slot_offsets<method_empty>::value.size() == 0);
+        // The noexcept variant decomposes the same way (separate specialisation).
+        using empty_fn_noexcept_t = void(*)() noexcept;
+        check("degenerate_void_void_noexcept_fn_args_tuple_is_empty",
+              std::is_same_v<args_of<empty_fn_noexcept_t>, std::tuple<>>);
+        // A non-void return type, still zero args, still decomposes to tuple<>.
+        using int_void_fn_t = int(*)();
+        check("degenerate_int_void_fn_args_tuple_is_empty",
+              std::is_same_v<args_of<int_void_fn_t>, std::tuple<>>);
+
+        static_assert(has_args_tuple<empty_fn_t>::value,
+                      "function_traits must accept void(*)() (the degenerate empty-Args case)");
+        static_assert(std::is_same_v<args_of<empty_fn_t>, std::tuple<>>,
+                      "function_traits<void(*)()>::args_tuple_t must be std::tuple<>");
+        static_assert(std::is_same_v<method_args_of<empty_fn_t>, std::tuple<>>,
+                      "tuple_tail<tuple<>>::type_t must be std::tuple<> (empty-tuple base spec)");
+        static_assert(vmhook::detail::java_slot_offsets<
+                          method_args_of<empty_fn_t>>::value.size() == 0,
+                      "java_slot_offsets on the empty method tuple must yield a zero-length array");
+    }
+
     std::printf("vmhook traits-function_traits: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

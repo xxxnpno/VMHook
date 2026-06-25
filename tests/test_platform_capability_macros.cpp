@@ -1901,5 +1901,179 @@ int main()
         }
     }
 
+    // =======================================================================
+    // ADDITIVE WAVE 5 (wave-24 ledger closeout): pin the LEDGER GAPS as
+    // pure-compile-time / pure-arithmetic invariants, with names suffixed
+    // "_w5".  Every claim is traced back to vmhook.hpp source cited inline.
+    // =======================================================================
+    {
+        // -- (1) OS base-flag XOR sum is exactly 1 ----------------------------
+        // Restating the "exactly one" invariant in XOR form: a 2-element subset
+        // (which would still SUM to 2, caught by wave 1) does not XOR to 1, so
+        // this is an INDEPENDENT witness on parity.  The all-zero error state
+        // also XORs to 0; only a singleton XORs to 1.  Compile-time pin.
+        static_assert((VMHOOK_OS_WINDOWS ^ VMHOOK_OS_LINUX ^ VMHOOK_OS_MACOS
+                       ^ VMHOOK_OS_IOS ^ VMHOOK_OS_ANDROID) == 1,
+                      "exactly one VMHOOK_OS_* base flag must be set (XOR sum == 1)");
+        check("os_base_flags_xor_sum_is_one_w5",
+              (VMHOOK_OS_WINDOWS ^ VMHOOK_OS_LINUX ^ VMHOOK_OS_MACOS
+               ^ VMHOOK_OS_IOS ^ VMHOOK_OS_ANDROID) == 1);
+
+        // -- (2) Arch XOR == 1 (compile-time form) ----------------------------
+        // Wave 1 used arithmetic sum and the runtime mirror used XOR; this adds
+        // the XOR form as a static_assert so a future arm that set BOTH arch
+        // flags (sum 2, XOR 0) fails the build.
+        static_assert((VMHOOK_ARCH_X86_64 ^ VMHOOK_ARCH_ARM64) == 1,
+                      "exactly one VMHOOK_ARCH_* must be selected (XOR == 1)");
+        check("arch_flags_xor_sum_is_one_w5",
+              (VMHOOK_ARCH_X86_64 ^ VMHOOK_ARCH_ARM64) == 1);
+
+        // -- (3) Compiler XOR == 1 *when a recognized compiler is in use* -----
+        // The three families do NOT form a strict partition (an unrecognized
+        // compiler legally yields all three 0).  But on EVERY CI cell we ship,
+        // one of MSVC/CLANG/GCC is detected -- which is exactly the condition
+        // (VMHT_HAS_MSC_VER || VMHT_HAS_CLANG || VMHT_HAS_GNUC).  Under that
+        // gate, the XOR partition holds.  This is the strongest form the
+        // ledger gap admits without breaking exotic toolchains.
+#if VMHT_HAS_MSC_VER || VMHT_HAS_CLANG || VMHT_HAS_GNUC
+        static_assert((VMHOOK_COMPILER_MSVC ^ VMHOOK_COMPILER_CLANG
+                       ^ VMHOOK_COMPILER_GCC) == 1,
+                      "exactly one compiler family is selected on every supported host");
+        check("compiler_xor_sum_is_one_on_recognized_host_w5",
+              (VMHOOK_COMPILER_MSVC ^ VMHOOK_COMPILER_CLANG
+               ^ VMHOOK_COMPILER_GCC) == 1);
+        // And the arithmetic SUM is also exactly 1 (not just <=1): the at-most-
+        // one bound from wave 1 was the conservative form; combined with the
+        // recognized-host gate it tightens to ==1.
+        static_assert(VMHOOK_COMPILER_MSVC + VMHOOK_COMPILER_CLANG
+                          + VMHOOK_COMPILER_GCC == 1,
+                      "compiler-family sum is exactly 1 on a recognized host");
+        check("compiler_sum_is_one_on_recognized_host_w5",
+              VMHOOK_COMPILER_MSVC + VMHOOK_COMPILER_CLANG
+                  + VMHOOK_COMPILER_GCC == 1);
+#endif
+
+        // -- (4) RUNTIME_HOOKING_AVAILABLE consistency with arch -------------
+        // Wave 1 pinned: available iff (x86_64 && !iOS), arm64 forces off, iOS
+        // forces off, and availability implies x86_64.  Add the bidirectional
+        // restatement in the arch dimension SPECIFICALLY: on a non-iOS target
+        // the availability flag EQUALS the x86_64 flag exactly (a stricter
+        // identity than the implication).  Vacuous on iOS.
+        static_assert(VMHOOK_OS_IOS
+                          || VMHOOK_RUNTIME_HOOKING_AVAILABLE == VMHOOK_ARCH_X86_64,
+                      "on a non-iOS target runtime hooking availability tracks arch exactly");
+        check("runtime_hooking_equals_x86_64_on_non_ios_w5",
+              VMHOOK_OS_IOS
+                  || VMHOOK_RUNTIME_HOOKING_AVAILABLE == VMHOOK_ARCH_X86_64);
+        // And the contrapositive of wave 1's "availability implies x86_64":
+        // arm64 implies UN-availability (no exception for OS).  Wave 1 framed it
+        // as "arm64 && available is false"; restate as the direct implication.
+        static_assert(!VMHOOK_ARCH_ARM64 || VMHOOK_RUNTIME_HOOKING_AVAILABLE == 0,
+                      "arm64 implies runtime hooking unavailable, regardless of OS");
+        check("arm64_implies_runtime_hooking_unavailable_w5",
+              !VMHOOK_ARCH_ARM64 || VMHOOK_RUNTIME_HOOKING_AVAILABLE == 0);
+
+        // -- (5) build_dr7: per-slot bit-position pins for the 4*slot stride --
+        // Wave 1 / wave 2 / wave 3 pinned the FIELD masks and disjointness for
+        // ALL slots, and the closed-form matrix.  Here add explicit numeric
+        // pins on the bit positions themselves -- for every slot s in 0..3,
+        // the L-enable bit is at position 2*s, the R/W field's low bit at
+        // 16+4*s, and the LEN field's low bit at 18+4*s -- so a refactor of the
+        // 4*slot stride to (say) 3*slot fails on every slot, not only at the
+        // endpoints.  These are pure integer identities, gated on the symbol
+        // being declared (Windows/x86_64 only).
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+        {
+            using vmhook::os::data_breakpoint_kind;
+            using vmhook::os::data_breakpoint_length;
+            // Expected bit positions per slot, traced from build_dr7's source
+            // (vmhook.hpp:1035-1043).
+            const int expected_enable_bit[4]{ 0,  2,  4,  6 };
+            const int expected_rw_low_bit[4]{ 16, 20, 24, 28 };
+            const int expected_len_low_bit[4]{ 18, 22, 26, 30 };
+            bool positions_ok{ true };
+            for (int slot{ 0 }; slot < 4; ++slot)
+            {
+                // write/one_byte: R/W = 0b01, LEN = 0b00.  The R/W field's low
+                // bit (the "writes" bit) is the only R/W bit set, so it lands
+                // at expected_rw_low_bit[slot] exactly.
+                const std::uint64_t v{ vmhook::os::detail_dr::build_dr7(
+                    slot, data_breakpoint_kind::write,
+                    data_breakpoint_length::one_byte) };
+                // L-enable bit is at the expected position.
+                if ((v & (std::uint64_t{ 1 } << expected_enable_bit[slot])) == 0)
+                {
+                    positions_ok = false;
+                }
+                // R/W low bit is at the expected position.
+                if ((v & (std::uint64_t{ 1 } << expected_rw_low_bit[slot])) == 0)
+                {
+                    positions_ok = false;
+                }
+                // LEN is 0b00, so neither LEN bit is set.
+                if ((v & (std::uint64_t{ 1 } << expected_len_low_bit[slot])) != 0)
+                {
+                    positions_ok = false;
+                }
+                if ((v & (std::uint64_t{ 1 } << (expected_len_low_bit[slot] + 1))) != 0)
+                {
+                    positions_ok = false;
+                }
+            }
+            check("build_dr7_bit_positions_per_slot_stride_4_w5", positions_ok);
+
+            // The L-enable bits across the 4 slots, taken together, occupy
+            // exactly bits 0,2,4,6 -- a 4-bit comb in the low byte.  Build the
+            // OR of every slot's enable bit (with R/W=write, LEN=one_byte so no
+            // other bits set above bit 16) and mask to the low 8 bits; it must
+            // equal 0b01010101.
+            std::uint64_t enable_comb_low8{ 0 };
+            for (int slot{ 0 }; slot < 4; ++slot)
+            {
+                const std::uint64_t v{ vmhook::os::detail_dr::build_dr7(
+                    slot, data_breakpoint_kind::write,
+                    data_breakpoint_length::one_byte) };
+                enable_comb_low8 |= (v & 0xFFull);
+            }
+            check("build_dr7_enable_comb_is_0b01010101_w5",
+                  enable_comb_low8 == 0b01010101ull);
+
+            // Each slot's CONTROL REGION (enable | rw | len) occupies exactly
+            // 5 distinct bit positions: 1 + 2 + 2.  Confirm via popcount of
+            // the all-ones mask: read_write/four_bytes (R/W=0b11, LEN=0b11)
+            // fills every field bit AND the enable bit -> popcount 5 per slot.
+            bool popcount5_ok{ true };
+            for (int slot{ 0 }; slot < 4; ++slot)
+            {
+                std::uint64_t v{ vmhook::os::detail_dr::build_dr7(
+                    slot, data_breakpoint_kind::read_write,
+                    data_breakpoint_length::four_bytes) };
+                int bits{ 0 };
+                while (v) { v &= (v - 1); ++bits; }
+                if (bits != 5) { popcount5_ok = false; }
+            }
+            check("build_dr7_full_control_region_popcount_is_5_w5", popcount5_ok);
+
+            // The OR of all 4 slots' full read_write/four_bytes words lights
+            // up exactly 20 distinct bits: 4 enable + 4*2 R/W + 4*2 LEN = 20.
+            // An overlap (wrong stride) would reduce the popcount.
+            std::uint64_t union_word{ 0 };
+            for (int slot{ 0 }; slot < 4; ++slot)
+            {
+                union_word |= vmhook::os::detail_dr::build_dr7(
+                    slot, data_breakpoint_kind::read_write,
+                    data_breakpoint_length::four_bytes);
+            }
+            int union_bits{ 0 };
+            {
+                std::uint64_t u{ union_word };
+                while (u) { u &= (u - 1); ++union_bits; }
+            }
+            check("build_dr7_union_across_4_slots_has_20_bits_w5",
+                  union_bits == 20);
+        }
+#endif
+    }
+
     return failures == 0 ? 0 : 1;
 }

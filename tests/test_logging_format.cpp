@@ -45,6 +45,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdlib>      // std::strtod for the FP round-trip companion checks
+#include <clocale>
 
 // ---------------------------------------------------------------------------
 // Platform-invariant floating-point helpers.
@@ -195,6 +196,13 @@ namespace
 
 int main()
 {
+    // Pin the C locale BEFORE any format_log call: std::format is documented to
+    // be LOCALE-INDEPENDENT (no thousands separator unless {:L}), so we want
+    // the "1234" / "1234.5" spellings observed regardless of how the host CI
+    // image's default locale is configured.  Setting "C" here makes that
+    // contract observable downstream in the dw6_ locale-pin asserts.
+    std::setlocale(LC_ALL, "C");
+
     // ---------------------------------------------------------------------
     // error_tag / warning_tag / info_tag — stable, non-empty string literals.
     // The header declares them as `inline constexpr std::string_view`.
@@ -2479,6 +2487,164 @@ int main()
         check("dw5_info_tag_one_close_bracket",
             count_byte(vmhook::info_tag, ']') == 1u);
     }
+
+    // =====================================================================
+    // DEEPENING WAVE 6 (additive, "dw6_") — round-2 ledger gaps:
+    //   * `char` argument under the EXPLICIT {:c} spec (distinct from bare {}),
+    //   * `bool` argument under the STRING presentation {:s} (textual form,
+    //     same bytes as the default but explicitly spec'd),
+    //   * pointer-to-const-char vs std::string_view divergence at the format
+    //     site — a const char* is rendered as a STRING (its bytes), a void*
+    //     is rendered as an ADDRESS; assert the two are distinct under {} and
+    //     that string_view matches the const char* spelling exactly,
+    //   * locale-independence pin: {:d} on 1234 in C-locale renders "1234",
+    //     never "1,234" (std::format ignores the global locale unless {:L}),
+    //   * very-wide integer right-pad invariants ({:>20} / {:>30}) — exact
+    //     leading-space count for one and two-digit values,
+    //   * std::string_view ARGUMENT round-trip (plain {} ) — matches the
+    //     bytes; covers the format-site type-deduction path,
+    //   * static_assert that the NO-OP form of VMHOOK_LOG yields a noexcept
+    //     discarded-value expression — sizeof(...) is a constant noexcept
+    //     operand even when the inner call would itself throw.
+    // PURE LOGIC ONLY.
+    // =====================================================================
+#if VMHOOK_HAS_STD_FORMAT
+    // --- char under {:c}: explicit character presentation of a char value. ---
+    // Distinct from the default {} which already produces the glyph for a char
+    // (covered in dw_); {:c} is the EXPLICIT spelling and must match.
+    check("dw6_char_arg_c_spec_glyph",
+        vmhook::detail::format_log("{:c}", 'Q') == "Q");
+    check("dw6_char_arg_c_spec_digit",
+        vmhook::detail::format_log("{:c}", '7') == "7");
+    // {:c} with width + fill on a char arg pads the single glyph.
+    check("dw6_char_arg_c_width_fill",
+        vmhook::detail::format_log("{:->5c}", 'X') == "----X");
+
+    // --- bool under {:s}: explicit string presentation (textual). ----------
+    // {:s} on bool is the EXPLICIT form of the default textual rendering.
+    check("dw6_bool_true_s_spec",
+        vmhook::detail::format_log("{:s}", true) == "true");
+    check("dw6_bool_false_s_spec",
+        vmhook::detail::format_log("{:s}", false) == "false");
+    // {:s} on bool with width + alignment pads the textual form.
+    check("dw6_bool_true_s_width",
+        vmhook::detail::format_log("{:>7s}", true) == "   true");
+    check("dw6_bool_false_s_left",
+        vmhook::detail::format_log("{:<7s}", false) == "false  ");
+
+    // --- const char* vs std::string_view vs void* DIVERGENCE at format site.
+    // const char* and std::string_view both render their bytes (STRING
+    // formatter); void* renders an ADDRESS (pointer formatter).  They must
+    // diverge for the same underlying buffer.
+    {
+        const char* cstr{ "abc" };
+        std::string_view sv{ cstr };
+        const std::string s_cstr{ vmhook::detail::format_log("{}", cstr) };
+        const std::string s_sv{ vmhook::detail::format_log("{}", sv) };
+        const std::string s_void{ vmhook::detail::format_log(
+            "{}", static_cast<const void*>(cstr)) };
+        // const char* and string_view view the SAME bytes -> identical output.
+        check("dw6_cstr_eq_string_view_bytes", s_cstr == "abc" && s_sv == "abc");
+        check("dw6_cstr_string_view_match", s_cstr == s_sv);
+        // void* renders as an address -> distinct from the bytes form.
+        check("dw6_void_ptr_distinct_from_string", s_void != s_cstr);
+        check("dw6_void_ptr_nonempty", !s_void.empty());
+        // Under {:s} the string_view explicitly takes the string formatter.
+        check("dw6_string_view_s_spec",
+            vmhook::detail::format_log("{:s}", sv) == "abc");
+    }
+
+    // --- Locale independence: std::format ignores the global locale unless
+    // the {:L} flag is set.  We pinned C-locale at main() entry; here pin that
+    // a large integer under {:d} renders WITHOUT a thousands separator on
+    // every STL, regardless of host locale.
+    check("dw6_locale_independent_no_thousands_sep",
+        vmhook::detail::format_log("{:d}", 1234) == "1234");
+    check("dw6_locale_independent_no_thousands_sep_big",
+        vmhook::detail::format_log("{:d}", 1234567) == "1234567");
+    // Float in C-locale: no grouping, '.' as the decimal point.
+    check("dw6_locale_independent_float_dot",
+        vmhook::detail::format_log("{:.1f}", 1234.5) == "1234.5");
+    // The result must NOT contain a comma (thousands separator) anywhere.
+    {
+        const std::string big{ vmhook::detail::format_log("{:d}", 1234567) };
+        check("dw6_locale_no_comma_byte",
+            big.find(',') == std::string::npos);
+    }
+
+    // --- Very-wide integer right-pad invariants. ---------------------------
+    // {:>20} on 7: 19 spaces + '7' (already covered partially in dw_; here pin
+    // the byte count explicitly and add a 30-wide case).
+    {
+        const std::string w20{ vmhook::detail::format_log("{:>20}", 7) };
+        check("dw6_width20_total_length", w20.size() == 20u);
+        check("dw6_width20_value_at_end",
+            !w20.empty() && w20.back() == '7');
+        check("dw6_width20_leading_spaces",
+            w20.find_first_not_of(' ') == 19u);
+    }
+    {
+        const std::string w30{ vmhook::detail::format_log("{:>30}", 42) };
+        check("dw6_width30_total_length", w30.size() == 30u);
+        check("dw6_width30_value_at_end",
+            w30.size() >= 2u && w30.substr(28) == "42");
+        check("dw6_width30_leading_spaces",
+            w30.find_first_not_of(' ') == 28u);
+    }
+    // Very-wide on a string argument (string_view).
+    {
+        std::string_view sv{ "hi" };
+        const std::string ws{ vmhook::detail::format_log("{:>20}", sv) };
+        check("dw6_width20_string_view_length", ws.size() == 20u);
+        check("dw6_width20_string_view_tail",
+            ws.size() >= 2u && ws.substr(18) == "hi");
+    }
+#else
+    // Fallback leg: every dw6_ spec input above returns the fmt verbatim.
+    check("dw6_fb_char_c_verbatim",
+        vmhook::detail::format_log("{:c}", 'Q') == "{:c}");
+    check("dw6_fb_bool_s_verbatim",
+        vmhook::detail::format_log("{:s}", true) == "{:s}");
+    check("dw6_fb_bool_s_width_verbatim",
+        vmhook::detail::format_log("{:>7s}", true) == "{:>7s}");
+    {
+        const char* cstr{ "abc" };
+        std::string_view sv{ cstr };
+        check("dw6_fb_cstr_verbatim",
+            vmhook::detail::format_log("{}", cstr) == "{}");
+        check("dw6_fb_string_view_verbatim",
+            vmhook::detail::format_log("{}", sv) == "{}");
+        check("dw6_fb_string_view_s_verbatim",
+            vmhook::detail::format_log("{:s}", sv) == "{:s}");
+    }
+    check("dw6_fb_locale_int_verbatim",
+        vmhook::detail::format_log("{:d}", 1234567) == "{:d}");
+    check("dw6_fb_locale_float_verbatim",
+        vmhook::detail::format_log("{:.1f}", 1234.5) == "{:.1f}");
+    check("dw6_fb_width20_verbatim",
+        vmhook::detail::format_log("{:>20}", 7) == "{:>20}");
+    check("dw6_fb_width30_verbatim",
+        vmhook::detail::format_log("{:>30}", 42) == "{:>30}");
+#endif
+
+    // --- static_assert: the NO-OP form's discarded-value sizeof(...) is a
+    // noexcept constant expression.  sizeof never evaluates its operand, so
+    // even though format_log itself is NOT marked noexcept, the expression
+    // `sizeof(format_log(...))` IS noexcept (an unevaluated operand cannot
+    // throw).  This is the static counterpart to the runtime side-effect
+    // probe in dw3_: the no-op macro form is provably exception-safe at
+    // compile time.
+    static_assert(
+        noexcept(sizeof(vmhook::detail::format_log("{}", 1))),
+        "no-op VMHOOK_LOG form (sizeof(format_log(...))) must be noexcept");
+    static_assert(
+        noexcept(sizeof(vmhook::detail::format_log(
+            "{} v={}", vmhook::error_tag, 1))),
+        "no-op VMHOOK_LOG with multi-arg fmt must also be noexcept");
+    static_assert(
+        noexcept((void)sizeof(vmhook::detail::format_log("{}", 1))),
+        "the exact (void)sizeof(...) shape the macro emits must be noexcept");
+    check("dw6_noop_form_static_noexcept_verified", true);
 
     std::printf("\n%d checks failed\n", failures);
     return failures == 0 ? 0 : 1;

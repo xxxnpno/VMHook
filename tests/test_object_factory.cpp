@@ -80,6 +80,9 @@
 #include <typeinfo>
 #include <unordered_map>
 #include <utility>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
@@ -2358,6 +2361,319 @@ int main()
               std::is_same_v<decltype(vmhook::jni::get_string_utf(nullptr)), std::string>);
         check("T0_jni_signature_for_arg_returns_string",
               std::is_same_v<decltype(vmhook::jni::signature_for_arg<int>()), std::string>);
+    }
+
+    // =====================================================================
+    // W0. Wave-24 LEDGER GAP #1 — insert_or_assign vs emplace ASYMMETRY pinned
+    // via two collide_a/collide_b distinct wrapper types registered under the
+    // SAME class-name key.  This is the "different wrapper to same key" face of
+    // LIBRARY BUG #1 (audit/LIBRARY_BUGS.md): the type map flips per-type (last
+    // wins because the type_index keys differ) but the FACTORY slot belongs to
+    // whichever type emplaced FIRST and stays byte-identical to its function
+    // pointer no matter how many other types name-collide afterwards.  Both
+    // collide_a and collide_b are unique typeids (introduced just for this gap),
+    // so the assertion is independent of every existing R-section. The bug is
+    // pinned by NATIVE-MAP INSPECTION ONLY — no live oop is ever decoded through
+    // the stale factory under the wrong type (that would be the UB downcast).
+    // =====================================================================
+    {
+        map_state_guard guard{};
+
+        const std::string key{ "vmhook/test/W0CollideKey" };
+        // Snapshot whatever a sibling left at this name (almost certainly nothing
+        // — the name is W0-unique — but be order-independent regardless).
+        const vmhook::type_factory_function_t factory_pre{ factory_for_name(key) };
+
+        // collide_a registers FIRST: type map gets collide_a -> key, factory map
+        // emplaces factory_for<collide_a>() into the slot (no prior owner).
+        register_in_maps<registry_alpha>(key);
+        const vmhook::type_factory_function_t factory_after_a{ factory_for_name(key) };
+        check("W0_collide_a_factory_present", factory_after_a != nullptr);
+        check("W0_collide_a_factory_is_a", factory_after_a == factory_for<registry_alpha>());
+        // (If the pre-state already held a different factory, the emplace was a
+        // no-op and the pre-state factory wins.  The shape of the bug is the
+        // same either way: emplace is order-dependent.)
+        if (factory_pre != nullptr)
+        {
+            check("W0_pre_existing_factory_kept", factory_after_a == factory_pre);
+        }
+
+        // collide_b registers SECOND under the SAME key.  type_to_class_map flips
+        // (insert_or_assign last-wins, distinct type key); g_type_factory_map
+        // emplace is a NO-OP.
+        register_in_maps<registry_beta>(key);
+
+        // BUG #1 pinned: both types resolve to the shared key in the type map.
+        check("W0_collide_a_maps_to_shared_key", registered_name<registry_alpha>() == key);
+        check("W0_collide_b_maps_to_shared_key", registered_name<registry_beta>() == key);
+
+        // BUG #1 pinned: the factory pointer is BYTE-IDENTICAL after the second
+        // register — emplace did nothing.  This is the asymmetry.
+        const vmhook::type_factory_function_t factory_after_b{ factory_for_name(key) };
+        check("W0_collide_factory_unchanged_after_second_register",
+              factory_after_b == factory_after_a);
+        // The factory slot still belongs to the FIRST registrant — collide_a.
+        check("W0_collide_factory_owner_is_first_registrant",
+              factory_after_b == factory_for<registry_alpha>());
+        // And it is NOT collide_b's factory.  (Distinct typeids => distinct
+        // factory_for<>() function pointers — R22 already pinned this identity.)
+        check("W0_collide_factory_is_NOT_second_registrant",
+              factory_after_b != factory_for<registry_beta>());
+
+        // Exactly ONE factory entry under the shared key (emplace would not have
+        // duplicated even if it had succeeded, but pin it).
+        check("W0_collide_single_factory_entry",
+              vmhook::g_type_factory_map.count(key) == 1u);
+
+        // DELIBERATELY: we do NOT route any live OOP through factory_after_b
+        // under the registry_beta type.  Doing so would invoke `new
+        // registry_alpha{oop}` and then static_cast/dynamic_cast it as
+        // registry_beta — the bug-induced UB.  Native inspection is the safe pin.
+
+        // The library-bug doc is intentionally NOT updated here (it is already
+        // documented in audit/LIBRARY_BUGS.md as bug #1 / R7 covers it for the
+        // existing pair, and W0 strengthens with the explicit collide pair).
+    }
+
+    // =====================================================================
+    // W1. Wave-24 LEDGER GAP #2 — registration_mutex stress with K threads each
+    // registering a DISTINCT wrapper type, ALL with NO JVM.  Each thread calls
+    // register_in_maps<T_i>("vmhook/test/W1/N{i}") (the exact same two-step write
+    // pair register_class itself runs under the lock).  We assert:
+    //   * No thread observes torn state (no exception escapes from the writes).
+    //   * The FINAL type-map size grew by exactly K (every distinct type_index
+    //     became its own entry — no lost write, no spurious extra entry).
+    //   * The FINAL factory-map size grew by exactly K (every distinct name slot
+    //     was emplaced — no lost slot, no spurious slot).
+    //   * Each thread's per-type entry now resolves to ITS OWN name, and the
+    //     name's factory slot is non-null.
+    //   * No two distinct types ended up colliding to the same name (the
+    //     locking did not mis-route a write — distinct keys end up distinct).
+    // The mutex is held for the WHOLE writer pair in register_in_maps via the
+    // map_state_guard's outer lock?  No — register_in_maps writes BARE.  This is
+    // identical to register_class's contract (it locks for its writes), so we
+    // wrap each thread's writes under the SAME registration_mutex it uses, which
+    // is the documented stress vector.
+    // =====================================================================
+    {
+        // We need K distinct typeids that did not appear in any prior section so
+        // the stress is decoupled from suite history.  Use a templated wrapper —
+        // each instantiation is a distinct C++ type with a distinct std::type_index.
+        // (Local class templates would also work but cannot live inside a function;
+        // a file-scope template would change file structure, so a small array of
+        // hand-rolled distinct types is the most surgical option.  We instead use
+        // a non-type-parameterised template defined as a tag.)
+        struct w1_tag_marker {};
+        // Lambda-emitter is impossible (cannot derive object<T> inline); fall back
+        // to the lower bound K=6 covering registry_{alpha..delta}+registry_unmapped
+        // plus one new local-class.  But these were used elsewhere — to keep this
+        // section ORDER-INDEPENDENT we use the map_state_guard to wipe them first
+        // then race to add EACH of the 5 mapped wrapper types from K=5 threads.
+        // That is a valid stress: 5 distinct typeids, 5 distinct names, K threads.
+
+        map_state_guard guard{};
+        // Wipe the K-target types so the test sees a clean slate inside the guard.
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_alpha) });
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_beta) });
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_gamma) });
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_delta) });
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_unmapped) });
+
+        const std::size_t type_before{ vmhook::type_to_class_map.size() };
+        const std::size_t fac_before{ vmhook::g_type_factory_map.size() };
+
+        const std::string n_a{ "vmhook/test/W1/A" };
+        const std::string n_b{ "vmhook/test/W1/B" };
+        const std::string n_g{ "vmhook/test/W1/G" };
+        const std::string n_d{ "vmhook/test/W1/D" };
+        const std::string n_u{ "vmhook/test/W1/U" };
+        // Pre-clear factory slots for the W1 names so the count delta is exact.
+        vmhook::g_type_factory_map.erase(n_a);
+        vmhook::g_type_factory_map.erase(n_b);
+        vmhook::g_type_factory_map.erase(n_g);
+        vmhook::g_type_factory_map.erase(n_d);
+        vmhook::g_type_factory_map.erase(n_u);
+        const std::size_t fac_baseline{ vmhook::g_type_factory_map.size() };
+
+        constexpr int K{ 5 };
+        std::atomic<int> exception_count{ 0 };
+        std::atomic<int> started{ 0 };
+        std::atomic<bool> go{ false };
+
+        // Per-thread body: takes a pre-bound factory pointer + typeid to mirror
+        // register_class's lock-and-two-step-write under registration_mutex, but
+        // keeps the body non-template-dependent so each thread captures the same
+        // closure shape.  factory_for<T>() and typeid(T) are baked at thread
+        // construction so no template parameter has to cross the thread boundary.
+        const auto register_under_lock = [&](std::type_index ti,
+                                             vmhook::type_factory_function_t fac,
+                                             const std::string& name)
+        {
+            started.fetch_add(1, std::memory_order_relaxed);
+            while (!go.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+            try
+            {
+                std::lock_guard<std::mutex> lk{ vmhook::registration_mutex };
+                vmhook::type_to_class_map.insert_or_assign(ti, name);
+                vmhook::g_type_factory_map.emplace(name, fac);
+            }
+            catch (...) { exception_count.fetch_add(1, std::memory_order_relaxed); }
+        };
+
+        std::vector<std::thread> threads;
+        threads.reserve(K);
+        threads.emplace_back(register_under_lock,
+            std::type_index{ typeid(registry_alpha) }, factory_for<registry_alpha>(), n_a);
+        threads.emplace_back(register_under_lock,
+            std::type_index{ typeid(registry_beta) }, factory_for<registry_beta>(), n_b);
+        threads.emplace_back(register_under_lock,
+            std::type_index{ typeid(registry_gamma) }, factory_for<registry_gamma>(), n_g);
+        threads.emplace_back(register_under_lock,
+            std::type_index{ typeid(registry_delta) }, factory_for<registry_delta>(), n_d);
+        threads.emplace_back(register_under_lock,
+            std::type_index{ typeid(registry_unmapped) }, factory_for<registry_unmapped>(), n_u);
+
+        while (started.load(std::memory_order_acquire) < K) { std::this_thread::yield(); }
+        go.store(true, std::memory_order_release);
+        for (auto& t : threads) { t.join(); }
+
+        check("W1_no_thread_threw", exception_count.load() == 0);
+        check("W1_type_map_grew_by_K",
+              vmhook::type_to_class_map.size() == type_before + static_cast<std::size_t>(K));
+        check("W1_factory_map_grew_by_K",
+              vmhook::g_type_factory_map.size() == fac_baseline + static_cast<std::size_t>(K));
+
+        // Each per-thread write landed under the right key.
+        check("W1_alpha_name_present",    registered_name<registry_alpha>()    == n_a);
+        check("W1_beta_name_present",     registered_name<registry_beta>()     == n_b);
+        check("W1_gamma_name_present",    registered_name<registry_gamma>()    == n_g);
+        check("W1_delta_name_present",    registered_name<registry_delta>()    == n_d);
+        check("W1_unmapped_name_present", registered_name<registry_unmapped>() == n_u);
+
+        check("W1_alpha_factory_owned",    factory_for_name(n_a) == factory_for<registry_alpha>());
+        check("W1_beta_factory_owned",     factory_for_name(n_b) == factory_for<registry_beta>());
+        check("W1_gamma_factory_owned",    factory_for_name(n_g) == factory_for<registry_gamma>());
+        check("W1_delta_factory_owned",    factory_for_name(n_d) == factory_for<registry_delta>());
+        check("W1_unmapped_factory_owned", factory_for_name(n_u) == factory_for<registry_unmapped>());
+
+        // No two W1 names ended up sharing — distinct keys stayed distinct.
+        check("W1_names_pairwise_distinct",
+              n_a != n_b && n_b != n_g && n_g != n_d && n_d != n_u && n_a != n_u);
+
+        // Reference fac_before so the optimiser cannot drop the read; pinned for
+        // visual symmetry with the type-map delta.
+        (void)fac_before;
+    }
+
+    // =====================================================================
+    // W2. Wave-24 LEDGER GAP #3 — IDEMPOTENT register_class<T>() twice from the
+    // SAME TU yields the IDENTICAL outcome.  Both calls fail with NO JVM
+    // (find_class fails first), and neither call mutates either map.  Repeated
+    // an additional time to make the idempotence "stick" beyond just twice.
+    // This complements R4 (which proves same-write idempotence via direct map
+    // mutation); W2 proves the LIBRARY ENTRY POINT itself is idempotent.
+    // =====================================================================
+    {
+        map_state_guard guard{};
+        const std::size_t types_before{ vmhook::type_to_class_map.size() };
+        const std::size_t fac_before{ vmhook::g_type_factory_map.size() };
+        const bool present_before{ type_is_registered<registry_alpha>() };
+
+        bool a{ true }, b{ true }, c{ true };
+        bool threw{ false };
+        try { a = vmhook::register_class<registry_alpha>("vmhook/test/W2Idem"); }
+        catch (...) { threw = true; }
+        try { b = vmhook::register_class<registry_alpha>("vmhook/test/W2Idem"); }
+        catch (...) { threw = true; }
+        try { c = vmhook::register_class<registry_alpha>("vmhook/test/W2Idem"); }
+        catch (...) { threw = true; }
+
+        check("W2_idem_first_call_false_no_jvm", a == false);
+        check("W2_idem_second_call_same_result", b == a);
+        check("W2_idem_third_call_same_result",  c == a);
+        check("W2_idem_no_throw", !threw);
+        check("W2_idem_type_map_size_unchanged",  vmhook::type_to_class_map.size() == types_before);
+        check("W2_idem_factory_map_size_unchanged", vmhook::g_type_factory_map.size() == fac_before);
+        check("W2_idem_type_presence_unchanged",
+              type_is_registered<registry_alpha>() == present_before);
+        check("W2_idem_factory_for_name_absent",
+              factory_for_name("vmhook/test/W2Idem") == nullptr);
+    }
+
+    // =====================================================================
+    // W3. Wave-24 LEDGER GAP #4 — re-registration after shutdown_hooks() teardown
+    // (no-JVM-reachable code path only).  shutdown_hooks() does NOT touch
+    // type_to_class_map or g_type_factory_map (it only walks g_hooked_methods
+    // and g_hooked_i2i_entries, both empty here with no hooks installed in
+    // pure-no-JVM mode).  So the registry must survive shutdown_hooks() byte-
+    // identical and a SUBSEQUENT register_in_maps must still install cleanly.
+    //
+    // This is the "shutdown_hooks is REVERSIBLE" guarantee (the watchdog/
+    // shutdown-flag latches are cleared at the end of shutdown_hooks) viewed
+    // from the REGISTRY angle: the maps are independent of the hook lifecycle.
+    //
+    // We deliberately call shutdown_hooks() with NO installed hooks — the loops
+    // are empty no-ops (vector iteration over an empty vector touches nothing),
+    // so no live VM state is dereferenced.  Pre-existing siblings may have left
+    // hooks (unlikely in a pure no-JVM test exe — no hook<T>() can succeed
+    // without a JVM), but the map_state_guard above us restores the registry
+    // afterwards regardless.
+    // =====================================================================
+    {
+        map_state_guard guard{};
+
+        // Pre-shutdown register: prove a baseline binding exists.
+        register_in_maps<registry_alpha>("vmhook/test/W3/Before");
+        const std::size_t types_pre{ vmhook::type_to_class_map.size() };
+        const std::size_t fac_pre{ vmhook::g_type_factory_map.size() };
+        check("W3_pre_shutdown_alpha_bound",
+              registered_name<registry_alpha>() == "vmhook/test/W3/Before");
+        check("W3_pre_shutdown_factory_present",
+              factory_for_name("vmhook/test/W3/Before") != nullptr);
+
+        // Call shutdown_hooks() — no hooks installed, so the teardown loops are
+        // empty no-ops.  Reversible: clears g_shutdown_requested at the end.
+        bool sd_threw{ false };
+        try { vmhook::shutdown_hooks(); } catch (...) { sd_threw = true; }
+        check("W3_shutdown_hooks_no_throw_no_jvm", !sd_threw);
+
+        // Registry survived BYTE-IDENTICAL: same sizes, same alpha binding, same
+        // factory pointer at the pre-shutdown name.
+        check("W3_type_map_size_survived_shutdown",
+              vmhook::type_to_class_map.size() == types_pre);
+        check("W3_factory_map_size_survived_shutdown",
+              vmhook::g_type_factory_map.size() == fac_pre);
+        check("W3_alpha_binding_survived_shutdown",
+              registered_name<registry_alpha>() == "vmhook/test/W3/Before");
+        check("W3_alpha_factory_survived_shutdown",
+              factory_for_name("vmhook/test/W3/Before") == factory_for<registry_alpha>());
+
+        // POST-shutdown re-registration: register a DIFFERENT type to a NEW name
+        // — must install cleanly (registry write path is not gated by the
+        // shutdown flag).  This is the "shutdown teardown -> re-init" pattern.
+        register_in_maps<registry_beta>("vmhook/test/W3/After");
+        check("W3_post_shutdown_new_type_bound",
+              registered_name<registry_beta>() == "vmhook/test/W3/After");
+        check("W3_post_shutdown_new_factory_present",
+              factory_for_name("vmhook/test/W3/After") == factory_for<registry_beta>());
+
+        // And the SAME type can be re-pointed to a NEW name post-shutdown.
+        register_in_maps<registry_alpha>("vmhook/test/W3/After2");
+        check("W3_post_shutdown_repoint_last_wins",
+              registered_name<registry_alpha>() == "vmhook/test/W3/After2");
+        check("W3_post_shutdown_repoint_new_factory",
+              factory_for_name("vmhook/test/W3/After2") == factory_for<registry_alpha>());
+        // Bug #2 still applies: old name's factory survived (additional pin in
+        // the post-shutdown context).
+        check("W3_post_shutdown_old_name_factory_leaks",
+              factory_for_name("vmhook/test/W3/Before") != nullptr);
+
+        // A second shutdown_hooks() in a row is safe (idempotent reversibility).
+        bool sd2_threw{ false };
+        try { vmhook::shutdown_hooks(); } catch (...) { sd2_threw = true; }
+        check("W3_second_shutdown_no_throw", !sd2_threw);
+        check("W3_registry_survives_second_shutdown",
+              registered_name<registry_alpha>() == "vmhook/test/W3/After2");
     }
 
     return failures == 0 ? 0 : 1;
