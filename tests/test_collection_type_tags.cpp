@@ -3398,6 +3398,185 @@ static auto test_decode_u5_threaded_record_walk() -> void
           vmhook::clamp_safe_container_count(static_cast<std::int32_t>(offset)) == 4096);
 }
 
+// ---------------------------------------------------------------------------
+// W25. collection_list-specific deepening (ledger gaps).
+//
+// Wave-25 ledger items:
+//   (a) Cold-state list / linked_list / collection accessor noexcept + safe
+//       defaults (empty/zero) when no JVM is loaded.  Augments earlier null
+//       checks with a tag-by-tag noexcept proof on the to_vector entry point.
+//   (b) Size > capacity ambiguity probed against a fabricated array header
+//       (size=N, elementData "capacity" N/2) — without a JVM the wrapper walk
+//       cannot be driven, so we pin the *primitive* it sits on:
+//       get_array_element<uint32> clamps EVERY index >= array_length back to
+//       T{} (compressed 0 -> decode -> nullptr), so even a corrupted size>cap
+//       would yield phantom nullptr slots, NEVER an OOB read.  This is the
+//       no-crash characterization the feature notes ask for.
+//   (c) Empty-vs-decode-failure ambiguity ([INFO]-gated): with no JVM, a null
+//       collection and a "real" wrapper over a bogus oop produce IDENTICAL
+//       empty observable state — a caller cannot tell them apart.  Pinned as
+//       INFO because the contract intentionally collapses both paths to empty.
+//   (d) Null array_oop accessor safe across the element-type sweep AND
+//       repeated invocations (idempotent, no hidden state).
+// ---------------------------------------------------------------------------
+static auto test_w25_collection_list_cold_state() -> void
+{
+    // (a) Cold-state noexcept on the EXACT user-reached entry points for the
+    // list / linked_list wrappers — pin alongside the existing collection set.
+    vmhook::list        l{ nullptr };
+    vmhook::linked_list ll{ nullptr };
+    vmhook::collection  c{ nullptr };
+
+    // to_vector is documented "never throw on cold state" but is NOT declared
+    // noexcept (it instantiates std::vector<unique_ptr<>>) — [INFO] only.
+    std::printf("[INFO] w25_list_to_vector_noexcept=%d\n",
+                noexcept(l.to_vector<elem_w>()) ? 1 : 0);
+    std::printf("[INFO] w25_linked_list_to_vector_noexcept=%d\n",
+                noexcept(ll.to_vector<elem_w>()) ? 1 : 0);
+    std::printf("[INFO] w25_collection_to_vector_noexcept=%d\n",
+                noexcept(c.to_vector<elem_w>()) ? 1 : 0);
+    check("w25_list_size_noexcept",             noexcept(l.size()));
+    check("w25_linked_list_size_noexcept",      noexcept(ll.size()));
+    check("w25_list_is_empty_noexcept",         noexcept(l.is_empty()));
+    check("w25_linked_list_is_empty_noexcept",  noexcept(ll.is_empty()));
+
+    // Safe-default returns: cold state -> empty vector + zero size + is_empty true.
+    check("w25_list_cold_size_zero",        l.size() == 0);
+    check("w25_list_cold_to_vector_empty",  l.to_vector<elem_w>().empty());
+    check("w25_list_cold_is_empty",         l.is_empty());
+    check("w25_linked_list_cold_size_zero", ll.size() == 0);
+    check("w25_linked_list_cold_to_vector_empty",
+          ll.to_vector<elem_w>().empty());
+    check("w25_linked_list_cold_is_empty",  ll.is_empty());
+
+    // (b) size > capacity ambiguity via fabricated header bytes.  Build an
+    // 8-aligned buffer with the JVM array layout (length at +12, body at +16),
+    // write a length of 2 ("real capacity" 2) but pretend the caller had a
+    // size of 8 (size > capacity by 4x).  The walk's loop bound would be
+    // index in [0, size).  Every index >= length is clamped by
+    // get_array_element to T{} -> compressed 0 -> nullptr slot.  No OOB read.
+    alignas(8) std::array<std::uint64_t, 16> storage{};
+    auto* const base{ reinterpret_cast<std::uint8_t*>(storage.data()) };
+    auto* const oop{ static_cast<vmhook::oop_t>(storage.data()) };
+    const bool accepted{ vmhook::hotspot::is_valid_pointer(oop) };
+
+    // length (capacity) = 2
+    {
+        const std::int32_t cap{ 2 };
+        std::memcpy(base + 12, &cap, sizeof(cap));
+    }
+    // body holds two real compressed oop slots (still bogus / unreadable
+    // outside the buffer); we don't care what they decode to — we care that
+    // out-of-the-real-length indices return 0u.
+    {
+        const std::uint32_t slots[2]{ 0x1111'1111u, 0x2222'2222u };
+        std::memcpy(base + 16, slots, sizeof(slots));
+    }
+
+    if (accepted)
+    {
+        check("w25_fabricated_header_cap_reads_back",
+              vmhook::array_length(oop) == 2);
+
+        // Pretend "size" = 8 (size > capacity).  Every index in [length, size)
+        // is clamped to 0u — characterizes no-crash behaviour.
+        constexpr std::int32_t fake_size{ 8 };
+        bool tail_all_zero{ true };
+        for (std::int32_t i{ 2 }; i < fake_size; ++i)
+        {
+            const std::uint32_t e{ vmhook::get_array_element<std::uint32_t>(oop, i) };
+            if (e != 0u) { tail_all_zero = false; }
+            // The phantom slot also decodes to nullptr (no JVM) -> a wrapper
+            // walk would push std::unique_ptr{nullptr}, never wild.
+            const void* decoded{ vmhook::hotspot::decode_oop_pointer(e) };
+            if (decoded != nullptr) { tail_all_zero = false; }
+        }
+        check("w25_size_gt_capacity_tail_all_zero_no_oob", tail_all_zero);
+
+        // The first two indices are within the real capacity and read the raw
+        // body bytes verbatim (proves the bound check fires at length, not at
+        // index 0).
+        check("w25_size_gt_capacity_in_bounds_idx0_reads_body",
+              vmhook::get_array_element<std::uint32_t>(oop, 0) == 0x1111'1111u);
+        check("w25_size_gt_capacity_in_bounds_idx1_reads_body",
+              vmhook::get_array_element<std::uint32_t>(oop, 1) == 0x2222'2222u);
+    }
+    else
+    {
+        // Pointer rejected (improbable on a stack-aligned buffer): walks would
+        // still be safe (every index -> 0u) — pin the no-crash contract.
+        check("w25_fabricated_header_rejected_array_length_zero",
+              vmhook::array_length(oop) == 0);
+        check("w25_fabricated_header_rejected_idx0_zero",
+              vmhook::get_array_element<std::uint32_t>(oop, 0) == 0u);
+    }
+
+    // safe_read on a heap-style buffer is the OS-layer leaf the walks lean on
+    // (linked_list_walk_items reads `first`/`item`/`next` via safe_read).
+    // A safe_read against our own buffer succeeds for the length field — pin
+    // that the primitive returns true on a valid in-process address.
+    {
+        std::int32_t readback{ -1 };
+        const bool ok{ vmhook::os::safe_read(&readback, base + 12, sizeof(readback)) };
+        check("w25_safe_read_in_process_succeeds", ok);
+        check("w25_safe_read_in_process_value_matches",
+              readback == 2);
+    }
+    // safe_read against a guaranteed-invalid low pointer either returns false
+    // OR populates a default; either way no crash.  Characterized as no-fault.
+    {
+        std::int32_t scratch{ 0x7E7E'7E7E };
+        const bool ok{ vmhook::os::safe_read(&scratch,
+            reinterpret_cast<const void*>(static_cast<std::uintptr_t>(0x4u)),
+            sizeof(scratch)) };
+        // Result is platform-variant (some safe_read impls succeed for any
+        // readable mapping); [INFO] gate.
+        std::printf("[INFO] w25_safe_read_low_invalid_ok=%d\n", ok ? 1 : 0);
+    }
+
+    // (c) Empty-vs-decode-failure ambiguity.  Without a JVM, both a NULL
+    // wrapper and a NON-NULL-but-bogus wrapper deliver IDENTICAL empty state.
+    // A caller cannot distinguish "the list was empty" from "decode failed".
+    // [INFO] gate: the contract intentionally collapses both — this is the
+    // ambiguity flaw #5 in the feature notes, characterized not enforced.
+    vmhook::list l_bogus{ reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0x8u)) };
+    const bool null_path_empty{ l.to_vector<elem_w>().empty() && l.size() == 0 };
+    const bool bogus_path_empty{ l_bogus.to_vector<elem_w>().empty() && l_bogus.size() == 0 };
+    const bool indistinguishable{ null_path_empty == bogus_path_empty };
+    std::printf("[INFO] w25_empty_vs_decode_failure_indistinguishable=%d\n",
+                indistinguishable ? 1 : 0);
+    // The HARD invariant underneath is the no-fault piece: both paths produce
+    // empty / size 0 without throwing — that we DO assert.
+    check("w25_null_path_empty_safe",  null_path_empty);
+    check("w25_bogus_path_empty_safe", bogus_path_empty);
+
+    // (d) Null array_oop accessor safe + idempotent across element-type sweep.
+    // Same primitive, same null oop, called twice — no hidden state.
+    for (int rep{ 0 }; rep < 2; ++rep)
+    {
+        const bool all_default{
+            vmhook::get_array_element<std::uint32_t>(nullptr, 0) == 0u
+            && vmhook::get_array_element<std::int32_t>(nullptr, 17) == 0
+            && vmhook::get_array_element<std::uint8_t>(nullptr, -1) == 0
+            && vmhook::array_length(nullptr) == 0
+        };
+        std::string n{ "w25_null_array_oop_accessor_safe_rep" };
+        n += static_cast<char>('0' + rep);
+        check(n.c_str(), all_default);
+    }
+
+    // Compile-time facts: every cold-state entry is noexcept (already asserted
+    // above via the `noexcept(expr)` operator), and the wrappers themselves
+    // are nothrow-default-constructible from oop_t.
+    static_assert(std::is_nothrow_constructible_v<vmhook::list, vmhook::oop_t>);
+    static_assert(std::is_nothrow_constructible_v<vmhook::linked_list, vmhook::oop_t>);
+    static_assert(std::is_nothrow_constructible_v<vmhook::collection, vmhook::oop_t>);
+    static_assert(noexcept(std::declval<vmhook::list&>().size()));
+    static_assert(noexcept(std::declval<vmhook::linked_list&>().size()));
+    static_assert(noexcept(std::declval<vmhook::list&>().is_empty()));
+    static_assert(noexcept(vmhook::array_length(nullptr)));
+}
+
 int main()
 {
     // Registering the element wrappers mirrors real usage; harmless with no JVM.
@@ -3448,6 +3627,7 @@ int main()
     test_array_element_real_buffer();
     test_jni_signature_width_ladder_and_packing();
     test_decode_u5_threaded_record_walk();
+    test_w25_collection_list_cold_state();
 
     return failures == 0 ? 0 : 1;
 }

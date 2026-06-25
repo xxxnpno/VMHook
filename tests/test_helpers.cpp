@@ -335,6 +335,159 @@ static auto test_build_dr7() -> void
         std::snprintf(tag, sizeof(tag), "build_dr7_local_enable_slot%d", slot);
         check(tag, (dr7 & expected_local) == expected_local);
     }
+
+    // ---- Wave-25 deepening: pure-logic invariants ----
+
+    // (a) build_dr7 NEVER sets any bit outside the documented mask area.
+    //     Allowed bits per slot s: L_s (bit 2*s), R/W_s (bits 16+4s..17+4s),
+    //     LEN_s (bits 18+4s..19+4s). Anything else — upper 32 bits, the
+    //     odd "global enable" bits 1/3/5/7, LE/GE bits 8/9, GD bit 13,
+    //     reserved bits 10-15 — must be zero.
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        const std::uint64_t allowed{
+            (std::uint64_t{ 1 } << (slot * 2)) |
+            (std::uint64_t{ 0xF } << (16 + slot * 4)) };
+        for (auto rw : { data_breakpoint_kind::write,
+                         data_breakpoint_kind::read_write })
+        {
+            for (auto len : { data_breakpoint_length::one_byte,
+                              data_breakpoint_length::two_bytes,
+                              data_breakpoint_length::four_bytes,
+                              data_breakpoint_length::eight_bytes })
+            {
+                const std::uint64_t dr7{ build_dr7(slot, rw, len) };
+                char tag[80];
+                std::snprintf(tag, sizeof(tag),
+                              "build_dr7_no_stray_bits_slot%d_rw%u_len%u",
+                              slot,
+                              static_cast<unsigned>(rw),
+                              static_cast<unsigned>(len));
+                check(tag, (dr7 & ~allowed) == 0ull);
+
+                // Upper 32 bits MUST be zero (DR7 high half is reserved / RTM).
+                char tag2[80];
+                std::snprintf(tag2, sizeof(tag2),
+                              "build_dr7_upper32_zero_slot%d_rw%u_len%u",
+                              slot,
+                              static_cast<unsigned>(rw),
+                              static_cast<unsigned>(len));
+                check(tag2, (dr7 >> 32) == 0ull);
+
+                // Global-enable + LE/GE + GD must never be set.
+                constexpr std::uint64_t forbidden{
+                    (1ull << 1) | (1ull << 3) | (1ull << 5) | (1ull << 7) |
+                    (1ull << 8) | (1ull << 9) | (1ull << 13) };
+                char tag3[80];
+                std::snprintf(tag3, sizeof(tag3),
+                              "build_dr7_no_global_enable_slot%d_rw%u_len%u",
+                              slot,
+                              static_cast<unsigned>(rw),
+                              static_cast<unsigned>(len));
+                check(tag3, (dr7 & forbidden) == 0ull);
+            }
+        }
+    }
+
+    // (b) Idempotence: same inputs => bit-identical output (pure function).
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        const auto a{ build_dr7(slot, data_breakpoint_kind::read_write,
+                                data_breakpoint_length::four_bytes) };
+        const auto b{ build_dr7(slot, data_breakpoint_kind::read_write,
+                                data_breakpoint_length::four_bytes) };
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "build_dr7_idempotent_slot%d", slot);
+        check(tag, a == b);
+    }
+
+    // (c) Pure / side-effect-free witness: 1000 calls return the same value.
+    {
+        const std::uint64_t ref{
+            build_dr7(2, data_breakpoint_kind::write,
+                      data_breakpoint_length::two_bytes) };
+        bool all_equal{ true };
+        for (int i{ 0 }; i < 1000; ++i)
+        {
+            if (build_dr7(2, data_breakpoint_kind::write,
+                          data_breakpoint_length::two_bytes) != ref)
+            {
+                all_equal = false;
+                break;
+            }
+        }
+        check("build_dr7_pure_1000_calls_constant", all_equal);
+    }
+
+    // (d) Non-collision matrix: build a flat list of 24 distinct
+    //     (slot, kind, length) selections. OR of any two distinct entries
+    //     must have popcount == popcount(a)+popcount(b) — i.e. no bit
+    //     collision between different selections within the SAME slot
+    //     (different fields) or across slots. NOTE: same-slot pairs share
+    //     the local-enable bit, so collisions DO happen there; the
+    //     non-collision invariant applies strictly to DIFFERENT slots.
+    {
+        struct sel { int slot; data_breakpoint_kind rw; data_breakpoint_length len; };
+        sel selections[24];
+        int n{ 0 };
+        for (int s{ 0 }; s < 4; ++s)
+            for (auto rw : { data_breakpoint_kind::write,
+                             data_breakpoint_kind::read_write })
+                for (auto len : { data_breakpoint_length::one_byte,
+                                  data_breakpoint_length::two_bytes,
+                                  data_breakpoint_length::four_bytes })
+                    selections[n++] = sel{ s, rw, len };
+        check("build_dr7_selection_matrix_count", n == 24);
+
+        auto popcount = [](std::uint64_t v) {
+            int c{ 0 };
+            while (v) { c += static_cast<int>(v & 1ull); v >>= 1; }
+            return c;
+        };
+
+        bool cross_slot_clean{ true };
+        for (int i{ 0 }; i < n && cross_slot_clean; ++i)
+        {
+            for (int j{ i + 1 }; j < n && cross_slot_clean; ++j)
+            {
+                if (selections[i].slot == selections[j].slot) continue;
+                const auto a{ build_dr7(selections[i].slot,
+                                        selections[i].rw,
+                                        selections[i].len) };
+                const auto b{ build_dr7(selections[j].slot,
+                                        selections[j].rw,
+                                        selections[j].len) };
+                if (popcount(a | b) != popcount(a) + popcount(b))
+                    cross_slot_clean = false;
+            }
+        }
+        check("build_dr7_cross_slot_no_bit_collision", cross_slot_clean);
+    }
+
+    // (e) Compile-time pin of the hand-derived expected value via
+    //     static_assert on an independently recomputed mask. build_dr7
+    //     itself is `inline` (not constexpr today — see audit), so we pin
+    //     the *formula* it must agree with at compile time and confirm the
+    //     runtime call matches in a switch.
+    {
+        constexpr int pin_slot{ 0 };
+        constexpr std::uint64_t pin_expected{
+            (std::uint64_t{ 1 } << (pin_slot * 2)) |
+            (std::uint64_t{ 0b01 } << (16 + pin_slot * 4)) |
+            (std::uint64_t{ 0b11 } << (18 + pin_slot * 4)) };
+        static_assert(pin_expected == 0xD0001ull,
+                      "DR7 slot0/write/4B formula must be 0xD0001");
+        const std::uint64_t pin_rt{ build_dr7(
+            pin_slot, data_breakpoint_kind::write,
+            data_breakpoint_length::four_bytes) };
+        int pin_hit{ 0 };
+        switch (pin_rt)
+        {
+            case pin_expected: pin_hit = 1; break;
+            default:           pin_hit = -1; break;
+        }
+        check("build_dr7_runtime_matches_constexpr_formula", pin_hit == 1);
+    }
 }
 #endif
 

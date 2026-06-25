@@ -47,9 +47,11 @@
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -1205,6 +1207,92 @@ int main()
         rv.cancel();
         check("cancel_on_already_cancelled_keeps_retval",
               static_cast<std::uint64_t>(slot.retval) == 0xC0FFEEC0FFEEC0FFull && slot.cancel == true);
+    }
+
+    // =====================================================================
+    // SECTION J1b — Wave-25 ledger gaps: cancel() compile-time contract
+    // and platform-availability fall-through.
+    // =====================================================================
+    {
+        // cancel() is documented noexcept (vmhook.hpp:1411). Lock it.
+        static_assert(noexcept(std::declval<vmhook::return_value&>().cancel()),
+                      "vmhook::return_value::cancel() must be noexcept");
+
+        // return_slot layout invariants the x64 trampoline hard-codes:
+        // cancel at offset 0 (cmp byte ptr [rsp],0) and retval at +8
+        // (mov rax,[rsp+8]). If these ever drift, the cancel epilogue
+        // silently returns garbage.
+        static_assert(sizeof(bool) == 1,
+                      "trampoline cmp byte ptr [rsp],0 assumes sizeof(bool)==1");
+        static_assert(offsetof(vmhook::hotspot::return_slot, cancel) == 0,
+                      "trampoline reads cancel at slot offset 0");
+        static_assert(offsetof(vmhook::hotspot::return_slot, retval) == 8,
+                      "trampoline reads retval at slot offset +8");
+        static_assert(sizeof(vmhook::hotspot::return_slot) == 16,
+                      "return_slot is exactly two 8-byte cells");
+
+        // Twice-call idempotence on a fresh slot (no prior set) — full
+        // post-condition: cancel stays true, retval stays exactly 0, and
+        // a third call is still a no-op. This is the canonical void-method
+        // cancel sequence the trampoline relies on.
+        {
+            vmhook::hotspot::return_slot s{};
+            vmhook::return_value rv{ &s };
+            rv.cancel();
+            rv.cancel();
+            check("cancel_twice_fresh_slot_flag_set", s.cancel == true);
+            check("cancel_twice_fresh_slot_retval_zero", s.retval == 0);
+            rv.cancel();
+            check("cancel_thrice_fresh_slot_still_clean",
+                  s.cancel == true && s.retval == 0);
+        }
+
+        // cancel() on a return_value carrying a slot but NO live frame
+        // (frame == nullptr — the ctor default at vmhook.hpp:1347) must
+        // not consult the frame at all: it is a pure 1-byte flag write.
+        // Proves "no live frame" is irrelevant to cancel semantics.
+        {
+            vmhook::hotspot::return_slot s{};
+            vmhook::return_value rv{ &s, /*frame=*/nullptr };
+            check("cancel_no_frame_precondition_frame_null", rv.frame() == nullptr);
+            rv.cancel();
+            check("cancel_no_frame_sets_flag", s.cancel == true);
+            check("cancel_no_frame_retval_untouched", s.retval == 0);
+            check("cancel_no_frame_frame_still_null", rv.frame() == nullptr);
+        }
+
+        // Platform-availability probe: on every supported build target
+        // (x64 win64/sysv) VMHOOK_RUNTIME_HOOKING_AVAILABLE is 1; on a
+        // hypothetical non-x64 build it is 0, and the midi2i trampoline
+        // is never emitted (vmhook.hpp:5375-5383). The C++-level
+        // return_slot/cancel() machinery is identical either way — the
+        // setter is just a 1-byte store with no hooking dependency.
+        // Verify the macro is defined and that cancel() on a synthetic
+        // slot works the same regardless of its value.
+#if defined(VMHOOK_RUNTIME_HOOKING_AVAILABLE)
+        constexpr bool runtime_hooking_macro_defined{ true };
+#else
+        constexpr bool runtime_hooking_macro_defined{ false };
+#endif
+        check("runtime_hooking_macro_is_defined", runtime_hooking_macro_defined);
+#if !VMHOOK_RUNTIME_HOOKING_AVAILABLE
+        // Non-x64 fall-through: cancel() is still a deterministic no-op
+        // on retval — only the trampoline epilogue is absent.
+        {
+            vmhook::hotspot::return_slot s{};
+            s.retval = static_cast<std::int64_t>(0xDEADBEEFCAFEBABEull);
+            vmhook::return_value rv{ &s };
+            rv.cancel();
+            check("cancel_non_x64_flag_set", s.cancel == true);
+            check("cancel_non_x64_retval_preserved",
+                  static_cast<std::uint64_t>(s.retval) == 0xDEADBEEFCAFEBABEull);
+        }
+#else
+        // x64 build: positively assert the macro is 1 so a future flip
+        // to 0 on a supported target is caught at test time.
+        check("runtime_hooking_available_on_x64",
+              VMHOOK_RUNTIME_HOOKING_AVAILABLE == 1);
+#endif
     }
 
     // =====================================================================

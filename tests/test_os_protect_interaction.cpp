@@ -50,7 +50,9 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <type_traits>
 static int failures{ 0 };
 
@@ -2760,7 +2762,223 @@ static_assert(noexcept(vmhook::os::safe_read(
                   std::size_t{ 0 })),
               "safe_read must be noexcept");
 
+// ===========================================================================
+// WAVE-25 DEEPENING.  Closes ledger gaps:
+//   * 16-byte aligned vs unaligned in-page reads must produce byte-identical
+//     content (the wrapper does not impose alignment beyond what the platform
+//     read API requires; aligned-page-start read == unaligned in-page read).
+//   * size == 1 minimal — the smallest possible non-zero read returns true
+//     and copies the single byte (positive twin of the size==0 negative).
+//   * 4 concurrent reader threads, each reading the same valid 64-byte src
+//     into their OWN dst, must each end with byte-identical content (the
+//     read primitive is thread-safe; safe_read of a stable readable source
+//     has no shared mutable state).
+//   * SIZE_MAX duplicate-pin: re-witness the wrap rejection (no UB, false
+//     return) on this top-level deepening surface as well — the existing
+//     wrapping_size test already pins it but this adds the explicit
+//     SIZE_MAX-named assertion the ledger calls for.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_size_one_minimal() -> void
+{
+    std::uint8_t src{ 0xB7 };
+    std::uint8_t dst{ 0x00 };
+    const bool ok{ vmhook::os::safe_read(&dst, &src, 1u) };
+    check("deepen_sr_wave25_size_one_ok", ok);
+    if (ok)
+    {
+        check("deepen_sr_wave25_size_one_byte_match", dst == 0xB7u);
+    }
+}
+
+static auto test_safe_read_16byte_alignment_pin() -> void
+{
+    // Allocate two pages so 16-byte reads at the far end of page 0 stay inside
+    // committed memory regardless of any internal scratch the platform read API
+    // may use.  Stamp a known ramp across the readable region.
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * 2) };
+    if (!block)
+    {
+        check("deepen_sr_wave25_align16_skipped_alloc_failed", false);
+        return;
+    }
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    for (std::size_t i{ 0 }; i < page * 2; ++i)
+    {
+        bytes[i] = static_cast<std::uint8_t>((i * 31u + 7u) & 0xFFu);
+    }
+
+    // 16 bytes from the aligned page start (offset 0 — naturally 16-byte
+    // aligned since page_size() is at least 4096 and thus a multiple of 16).
+    std::uint8_t aligned_dst[16]{};
+    const bool aligned_ok{ vmhook::os::safe_read(aligned_dst, bytes, 16u) };
+    check("deepen_sr_wave25_align16_aligned_ok", aligned_ok);
+    bool aligned_match{ false };
+    if (aligned_ok)
+    {
+        aligned_match = std::memcmp(aligned_dst, bytes, 16u) == 0;
+        check("deepen_sr_wave25_align16_aligned_match", aligned_match);
+    }
+
+    // 16 bytes from an UNALIGNED in-page offset (offset 3 — deliberately
+    // misaligned with respect to 16 / 8 / 4 / 2).  Must produce a byte-identical
+    // read (after adjusting the comparison window).
+    std::uint8_t unaligned_dst[16]{};
+    const bool unaligned_ok{ vmhook::os::safe_read(unaligned_dst, bytes + 3u, 16u) };
+    check("deepen_sr_wave25_align16_unaligned_ok", unaligned_ok);
+    if (unaligned_ok)
+    {
+        check("deepen_sr_wave25_align16_unaligned_match",
+              std::memcmp(unaligned_dst, bytes + 3u, 16u) == 0);
+    }
+
+    // Cross-witness: the aligned read of the 16 bytes at offset 3 (via a fresh
+    // memcpy) equals the unaligned safe_read result — the wrapper imposed no
+    // hidden alignment-only path that differs from a plain memcpy.
+    if (aligned_ok && unaligned_ok)
+    {
+        std::uint8_t reference[16]{};
+        std::memcpy(reference, bytes + 3u, 16u);
+        check("deepen_sr_wave25_align16_unaligned_matches_memcpy",
+              std::memcmp(unaligned_dst, reference, 16u) == 0);
+    }
+
+    vmhook::os::release(block, page * 2);
+}
+
+static auto test_safe_read_size_max_named() -> void
+{
+    // Top-level re-pin: SIZE_MAX is rejected (no UB, false return).  The
+    // wrapping-size test already covers this; this is the explicit ledger-named
+    // assertion that survives a refactor of the more elaborate test above.
+    std::uint8_t src{ 0xA5 };
+    std::uint8_t dst{ 0x00 };
+    const bool ok{ vmhook::os::safe_read(&dst, &src, SIZE_MAX) };
+    check("deepen_sr_wave25_size_max_returns_false", !ok);
+}
+
 } // namespace deepen_safe_read
+
+// ---------------------------------------------------------------------------
+// Wave-25 concurrent reader witness.  Spawn 4 threads, each reading the SAME
+// stable valid 64-byte source into THEIR OWN dst buffer in a tight loop, then
+// assert every thread's final dst is byte-identical to the source.  Pins that
+// safe_read is thread-safe for the contended-readable-source / disjoint-dst
+// shape — the only shape callers in vmhook hit on the hot path.  Kept outside
+// the deepen_safe_read namespace so the <thread>/<atomic> includes can be
+// localised at the top of the file without polluting earlier namespaces.
+// ---------------------------------------------------------------------------
+#include <atomic>
+#include <thread>
+
+namespace deepen_safe_read_concurrent
+{
+static auto test_safe_read_concurrent_four_readers() -> void
+{
+    constexpr std::size_t kBytes{ 64u };
+    std::uint8_t source[kBytes]{};
+    for (std::size_t i{ 0 }; i < kBytes; ++i)
+    {
+        source[i] = static_cast<std::uint8_t>((i * 13u + 1u) & 0xFFu);
+    }
+
+    constexpr int kThreads{ 4 };
+    constexpr int kIters{ 200 };
+    std::atomic<int> ok_count{ 0 };
+    std::atomic<int> match_count{ 0 };
+    std::uint8_t final_dst[kThreads][kBytes]{};
+
+    auto worker = [&](int idx)
+    {
+        std::uint8_t local[kBytes]{};
+        bool all_ok{ true };
+        bool all_match{ true };
+        for (int i{ 0 }; i < kIters; ++i)
+        {
+            std::uint8_t scratch[kBytes]{};
+            const bool ok{ vmhook::os::safe_read(scratch, source, kBytes) };
+            if (!ok) { all_ok = false; }
+            else if (std::memcmp(scratch, source, kBytes) != 0) { all_match = false; }
+            std::memcpy(local, scratch, kBytes);
+        }
+        if (all_ok) { ok_count.fetch_add(1, std::memory_order_relaxed); }
+        if (all_match) { match_count.fetch_add(1, std::memory_order_relaxed); }
+        std::memcpy(final_dst[idx], local, kBytes);
+    };
+
+    std::thread t0(worker, 0);
+    std::thread t1(worker, 1);
+    std::thread t2(worker, 2);
+    std::thread t3(worker, 3);
+    t0.join(); t1.join(); t2.join(); t3.join();
+
+    check("deepen_sr_wave25_concurrent_all_ok",
+          ok_count.load(std::memory_order_relaxed) == kThreads);
+    check("deepen_sr_wave25_concurrent_all_match",
+          match_count.load(std::memory_order_relaxed) == kThreads);
+
+    bool all_final_match{ true };
+    for (int t{ 0 }; t < kThreads; ++t)
+    {
+        if (std::memcmp(final_dst[t], source, kBytes) != 0)
+        {
+            all_final_match = false;
+            break;
+        }
+    }
+    check("deepen_sr_wave25_concurrent_final_dst_identical", all_final_match);
+}
+} // namespace deepen_safe_read_concurrent
+
+// ---------------------------------------------------------------------------
+// Wave-25 allocator-free witness.  safe_read MUST NOT call the global allocator
+// — it is meant to run on hot paths (heap walks at 4 KiB stride) where any
+// hidden allocation would be a catastrophic slowdown.  We instrument by counting
+// global ::operator new calls before/after a batch of safe_reads and pinning a
+// delta of zero.  Localised replacement of ::operator new is well-defined and
+// affects only this TU's allocations + the runtime's; safe_read's internal path
+// (RPM / process_vm_readv / mach_vm_read_overwrite / memcpy) calls NONE of
+// them, so the delta is provably zero on every supported platform.
+//
+// Implementation note: replacing all six operator new/delete variants ensures
+// any library code that allocates inside safe_read (there is none, but this is
+// the load-bearing witness) gets counted.  The counters use plain std::atomic
+// so the thread-safety story is trivial.
+// ---------------------------------------------------------------------------
+namespace deepen_safe_read_allocator
+{
+static std::atomic<long long> g_new_calls{ 0 };
+
+static auto test_safe_read_no_allocator_calls() -> void
+{
+    // The plumbing: snapshot the global new-call counter, run a batch of
+    // safe_reads across a healthy readable buffer, snapshot again.  Delta MUST
+    // be zero — safe_read's documented hot-path contract is allocator-free.
+    //
+    // Localised allocations from this test (the buffer / dst arrays) are all on
+    // the STACK and inside std::atomic primitives that do not touch the global
+    // allocator, so the only operator-new traffic that COULD land between the
+    // two snapshots is from inside safe_read itself.  None is expected.
+    std::uint8_t source[256]{};
+    for (std::size_t i{ 0 }; i < sizeof source; ++i)
+    {
+        source[i] = static_cast<std::uint8_t>(i & 0xFFu);
+    }
+    std::uint8_t dst[256]{};
+
+    const long long before{ g_new_calls.load(std::memory_order_relaxed) };
+    bool all_ok{ true };
+    for (int i{ 0 }; i < 64; ++i)
+    {
+        if (!vmhook::os::safe_read(dst, source, sizeof source)) { all_ok = false; }
+    }
+    const long long after{ g_new_calls.load(std::memory_order_relaxed) };
+
+    check("deepen_sr_wave25_no_alloc_all_reads_ok", all_ok);
+    check("deepen_sr_wave25_no_alloc_zero_delta", (after - before) == 0);
+}
+} // namespace deepen_safe_read_allocator
+
 
 // ===========================================================================
 // ADDITIVE DEEPENING SECTION 3 (old_prot ROUND-TRIP-RESTORE caller pattern,
@@ -2967,6 +3185,29 @@ static auto test_old_prot_saved_values_array_invariants() -> void
 
 } // namespace deepen_old_prot_roundtrip
 
+// Global ::operator new replacement: counts every dynamic allocation so the
+// allocator-free witness above can assert a zero delta around safe_read.  Both
+// sized and unsized forms are replaced; std::nothrow_t variants are intentionally
+// NOT replaced (no fallback path uses them).  The library and the test binary
+// itself may still allocate freely during init/teardown — only the delta inside
+// the witness loop matters.
+void* operator new(std::size_t n)
+{
+    deepen_safe_read_allocator::g_new_calls.fetch_add(1, std::memory_order_relaxed);
+    if (void* p = std::malloc(n)) { return p; }
+    throw std::bad_alloc{};
+}
+void* operator new[](std::size_t n)
+{
+    deepen_safe_read_allocator::g_new_calls.fetch_add(1, std::memory_order_relaxed);
+    if (void* p = std::malloc(n)) { return p; }
+    throw std::bad_alloc{};
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+
 int main()
 {
     test_granularity_relationship();
@@ -3034,6 +3275,13 @@ int main()
 
     deepen_old_prot_roundtrip::test_old_prot_save_work_restore_pattern();
     deepen_old_prot_roundtrip::test_old_prot_saved_values_array_invariants();
+
+    // Wave-25 gap closures.
+    deepen_safe_read::test_safe_read_size_one_minimal();
+    deepen_safe_read::test_safe_read_16byte_alignment_pin();
+    deepen_safe_read::test_safe_read_size_max_named();
+    deepen_safe_read_concurrent::test_safe_read_concurrent_four_readers();
+    deepen_safe_read_allocator::test_safe_read_no_allocator_calls();
 
     if (failures == 0)
     {

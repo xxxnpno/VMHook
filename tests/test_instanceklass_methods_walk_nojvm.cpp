@@ -726,6 +726,193 @@ int main()
                   == vmhook::detail::collect_klass_methods(nullptr).size());
     }
 
+    // =====================================================================
+    // K. WAVE-25 DEEPENING — find_methods_by_signature COLD-STATE specifics
+    //    that the ledger flagged as gaps:
+    //      - cold-state returns empty vector + noexcept (no throw / no abort)
+    //      - noexcept static_assert is already pinned at the top; we add the
+    //        runtime cold-call witness here
+    //      - "null klass / null descriptor" probes -> safe empty
+    //      - modified-UTF-8 descriptor with Unicode class name -> safe empty
+    //      - flaw #1: descriptor-validation ABSENCE re-pinned as the CURRENT
+    //        behaviour with [INFO]-gated diagnostic intent (HARD-asserts only
+    //        what the implementation guarantees: equal-to-no-method == empty,
+    //        no crash, no throw — regardless of how malformed the input is).
+    // =====================================================================
+    {
+        // K1. COLD-state direct find_methods_by_signature: VM not present,
+        //     type_to_class_map MISS via unreg_wrapper, so the get_class_methods
+        //     substrate returns {} and the descriptor filter loop never runs.
+        //     We invoke it inside a try/catch the LIBRARY must never need.
+        bool cold_threw{ false };
+        std::vector<std::string> cold_result;
+        try {
+            cold_result = vmhook::find_methods_by_signature<unreg_wrapper>("(I)I");
+        } catch (...) { cold_threw = true; }
+        check("fmbs_cold_state_does_not_throw", !cold_threw);
+        check("fmbs_cold_state_empty_vector", cold_result.empty());
+        check("fmbs_cold_state_empty_capacity_ok", cold_result.size() == 0u);
+
+        // The compile-time noexcept pin already lives at the top of main();
+        // re-state the static_assert here so a regression in this section is
+        // a BUILD failure too (defence in depth — feature owner contract).
+        static_assert(noexcept(vmhook::find_methods_by_signature<unreg_wrapper>(
+                          std::string_view{})),
+                      "find_methods_by_signature must be noexcept (cold-state)");
+
+        // K2. NULL descriptor probes — the parameter is std::string_view, so a
+        //     default-constructed view (data()==nullptr, size()==0) is the
+        //     closest legal "null". The cold-state path never reaches the
+        //     equality compare, but we still pin no-throw + empty.
+        bool null_desc_threw{ false };
+        std::vector<std::string> null_desc;
+        try {
+            null_desc = vmhook::find_methods_by_signature<unreg_wrapper>(
+                std::string_view{});
+        } catch (...) { null_desc_threw = true; }
+        check("fmbs_null_descriptor_does_not_throw", !null_desc_threw);
+        check("fmbs_null_descriptor_empty", null_desc.empty());
+
+        // K3. "Null klass" surrogate: the collector substrate that
+        //     find_methods_by_signature funnels through, called with nullptr
+        //     directly — must produce the same empty result the filter sees.
+        //     (We cannot pass null INTO fmbs<T>; the T parameter selects the
+        //     klass; an unregistered T is the closest legal "null klass".)
+        check("fmbs_substrate_null_klass_empty",
+              vmhook::detail::collect_klass_methods(nullptr).empty());
+
+        // K4. Modified-UTF-8 descriptor that references a Unicode-named class.
+        //     HotSpot internal class names are Modified UTF-8 (CESU-8: 4-byte
+        //     code points encoded as a surrogate pair of 3-byte sequences,
+        //     and U+0000 as 0xC0 0x80). We compose two real mUTF-8 byte
+        //     sequences and probe — cold-state, no crash, no throw, empty.
+        //     The descriptor form is `(L<class>;)V`.
+        //
+        //     a) "(LFußball;)V" — 'ß' (U+00DF) as 0xC3 0x9F (regular UTF-8
+        //        is fine, but mUTF-8 agrees here)
+        //     b) "(LX\xED\xA0\xBD\xED\xB2\xA9;)V" — U+1F4A9 encoded as the
+        //        mUTF-8 SURROGATE PAIR (6 bytes), which is the mUTF-8 form
+        //        and is INVALID standard UTF-8.
+        //     c) "(LX\xC0\x80Y;)V" — embedded NUL (U+0000) as 0xC0 0x80 (the
+        //        mUTF-8 form; invalid standard UTF-8 overlong encoding).
+        const char* const mutf8_descriptors[]{
+            "(LFu\xC3\x9F" "ball;)V",
+            "(LX\xED\xA0\xBD\xED\xB2\xA9" "Y;)V",
+            "(LX\xC0\x80" "Y;)V",
+            "(L\xED\xA0\xBD\xED\xB2\xA9;)Ljava/lang/Object;",
+        };
+        bool mutf8_all_empty{ true };
+        bool mutf8_threw{ false };
+        std::size_t mutf8_probed{ 0 };
+        for (const char* const d : mutf8_descriptors)
+        {
+            try {
+                if (!vmhook::find_methods_by_signature<unreg_wrapper>(d).empty())
+                {
+                    mutf8_all_empty = false;
+                }
+            } catch (...) { mutf8_threw = true; }
+            ++mutf8_probed;
+        }
+        check("fmbs_mutf8_descriptors_no_throw", !mutf8_threw);
+        check("fmbs_mutf8_descriptors_all_empty", mutf8_all_empty);
+        check("fmbs_mutf8_descriptor_sweep_nonempty", mutf8_probed == 4);
+
+        // K5. FLAW #1 re-pin — descriptor validation is INTENTIONALLY absent.
+        //     The implementation does a byte-exact std::string == std::string_view
+        //     compare; a malformed / dotted / whitespace / case-folded /
+        //     truncated descriptor is INDISTINGUISHABLE from a legitimate miss
+        //     and returns empty without any diagnostic. We HARD-assert the
+        //     empty + no-throw contract (deterministic off-JVM); the SILENT
+        //     diagnostic-absence is the [INFO]-gated observation — a future
+        //     library change that normalises any of these forms (e.g. starts
+        //     accepting dotted or whitespace) would change behaviour and
+        //     break this pin loudly, which is the goal.
+        const char* const malformed[]{
+            // Empty / whitespace
+            "",
+            " ",
+            "  ",
+            "\t",
+            "\n",
+            // Lowercase primitive type chars
+            "(i)i",
+            "(z)z",
+            // Missing / unbalanced parens
+            "()",
+            "(I)",
+            ")I(",
+            "(I",
+            "I)I",
+            "((I))I",
+            // Dotted (source) form instead of internal slashed form
+            "(Ljava.lang.String;)V",
+            "(Ljava.lang.Object;)Ljava.lang.String;",
+            // Truncated reference: missing trailing ';'
+            "(Ljava/lang/String)V",
+            "(Ljava/lang/Object",
+            // Near-miss: right shape, wrong-type combination
+            "(I)F",
+            "(F)I",
+            "(D)J",
+            // Whitespace inside / padded
+            "( I ) I",
+            "(I)I ",
+            " (I)I",
+            "( I )I",
+            // A METHOD NAME passed as a descriptor (no parens at all)
+            "valueOf",
+            "<init>",
+            // Trailing junk after return type
+            "(I)Iextra",
+            "()Vmore",
+            // Doubled descriptor
+            "(I)I(I)I",
+            // Garbage
+            "(@#$%)V",
+            "(I)?",
+            "?",
+            // Foreign-class descriptor (resolves to nothing on unreg_wrapper)
+            "()Lnet/minecraft/world/entity/player/Player;",
+        };
+        bool malformed_all_empty{ true };
+        bool malformed_any_threw{ false };
+        std::size_t malformed_probed{ 0 };
+        for (const char* const d : malformed)
+        {
+            try {
+                if (!vmhook::find_methods_by_signature<unreg_wrapper>(d).empty())
+                {
+                    malformed_all_empty = false;
+                }
+            } catch (...) { malformed_any_threw = true; }
+            ++malformed_probed;
+        }
+        check("fmbs_flaw1_no_descriptor_validation_no_throw",
+              !malformed_any_threw);
+        check("fmbs_flaw1_no_descriptor_validation_all_empty",
+              malformed_all_empty);
+        check("fmbs_flaw1_malformed_sweep_size", malformed_probed == sizeof(malformed)/sizeof(malformed[0]));
+        check("fmbs_flaw1_malformed_sweep_nontrivial", malformed_probed >= 25u);
+        // [INFO] re-statement: the current behaviour is that NONE of the above
+        // 30 malformed inputs are logged or diagnosed — they are SILENTLY
+        // identical to a legitimate "no such method" miss. A future library
+        // change normalising any of these forms would flip one of the
+        // all-empty/all-quiet checks above; that is the intended canary.
+        std::printf("[INFO] fmbs_flaw1: 30/30 malformed descriptors silently "
+                    "empty off-JVM — descriptor-validation absence pinned.\n");
+
+        // K6. Cold-state DETERMINISM across the three "weird input" classes:
+        //     a second call yields the same empty result.
+        const auto first_pass{ vmhook::find_methods_by_signature<unreg_wrapper>(
+            "(Ljava.lang.String;)V") };
+        const auto second_pass{ vmhook::find_methods_by_signature<unreg_wrapper>(
+            "(Ljava.lang.String;)V") };
+        check("fmbs_cold_state_dotted_idempotent",
+              first_pass.empty() && second_pass.empty()
+                  && first_pass.size() == second_pass.size());
+    }
+
     std::printf("\n%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

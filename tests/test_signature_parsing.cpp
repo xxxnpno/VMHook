@@ -1086,6 +1086,196 @@ namespace wave24
     }
 } // namespace wave24
 
+// =====================================================================
+// WAVE-25 ADDITIVE DEEPENING (no-JVM, -Werror gcc/clang/msvc).
+//
+// LEDGER ROUND-3 closure — per-letter cross-table EXHAUSTIVENESS lock and
+// the structural method-descriptor guards:
+//   * For each of the 9 JVMS field/return descriptor letters B C D F I J S Z V,
+//     pin BOTH sig_char_to_basic_type(c) AND jvm_primitive_byte_width("c")
+//     simultaneously in a single table-driven block — so any future drift on
+//     ONE side is caught against the OTHER (cross-table closure).  V is the
+//     interesting row: BasicType==14 but width==0, the only "valid" letter
+//     that is NOT a primitive byte-width.
+//   * Total 0x00..0xFF sweep through sig_char_to_basic_type asserting only
+//     the eleven letters Z C F D B S I J L [ V produce a NON-default
+//     (i.e. non-12 OR the legitimately-12 'L') — restated as the converse:
+//     every byte that is NOT one of those eleven yields exactly the
+//     default-12 fallback.  This is the "table-driven exhaustiveness lock":
+//     adding a stray case label to the switch is a CI failure.
+//   * Method descriptor with NO parentheses at all is rejected by the
+//     reference parser (parse_method_descriptor) with ok=false — the call
+//     site's rfind(')')+1 fallback path is then verified to degrade to
+//     T_VOID(14) through the guarded ladder.
+//   * The lone "()V" empty-arg/void ctor walks cleanly: 0 args, 0 slots,
+//     return T_VOID(14); and ctor-build of an empty pack ROUND-TRIPS through
+//     parse_method_descriptor.
+//   * jvm_primitive_byte_width <-> sig_char_to_basic_type CONSISTENCY per
+//     type closure: width!=0 IFF BasicType is in {Z,B,C,S,I,F,J,D} (i.e.
+//     BasicType ints 4..11 EXCEPT L=12).  Driven over the FULL 0..255 byte
+//     range so the closure is total, not just over the 11 known letters.
+//
+// All assertions HARD — deterministic by source tables.
+// =====================================================================
+namespace wave25
+{
+    inline auto run() -> void
+    {
+        // ---- Per-letter joint cross-table lock: B C D F I J S Z V ---------
+        // Every valid JVMS field-descriptor letter pinned with BOTH its
+        // BasicType int AND its byte-width in the SAME row, so the two
+        // helpers cannot drift independently.  V is the deliberate
+        // BasicType-valid / width-zero outlier (return-only descriptor).
+        // Values from vmhook.hpp:16219-16230 and :16253-16263.
+        {
+            struct joint_row { char c; int bt; std::size_t w; const char* tag; };
+            const joint_row rows[]{
+                { 'B', 8,  1, "wave25_letter_B_bt8_w1"  },
+                { 'C', 5,  2, "wave25_letter_C_bt5_w2"  },
+                { 'D', 7,  8, "wave25_letter_D_bt7_w8"  },
+                { 'F', 6,  4, "wave25_letter_F_bt6_w4"  },
+                { 'I', 10, 4, "wave25_letter_I_bt10_w4" },
+                { 'J', 11, 8, "wave25_letter_J_bt11_w8" },
+                { 'S', 9,  2, "wave25_letter_S_bt9_w2"  },
+                { 'Z', 4,  1, "wave25_letter_Z_bt4_w1"  },
+                { 'V', 14, 0, "wave25_letter_V_bt14_w0_returnonly" },
+            };
+            for (const joint_row& r : rows)
+            {
+                const char one[1]{ r.c };
+                const bool both_match{
+                       vmhook::detail::sig_char_to_basic_type(r.c) == r.bt
+                    && vmhook::detail::jvm_primitive_byte_width(
+                           std::string_view{ one, 1 }) == r.w };
+                check(r.tag, both_match);
+            }
+        }
+
+        // ---- 0x00..0xFF EXHAUSTIVENESS LOCK on sig_char_to_basic_type -----
+        // Build the set of recognised bytes {Z,C,F,D,B,S,I,J,L,[,V} and
+        // iterate the full byte domain: every other byte must yield default
+        // 12; the eleven recognised bytes must yield their tabled int.  Any
+        // stray switch label in the library trips this.
+        {
+            auto is_known = [](int b) -> bool
+            {
+                return b == 'Z' || b == 'C' || b == 'F' || b == 'D'
+                    || b == 'B' || b == 'S' || b == 'I' || b == 'J'
+                    || b == 'L' || b == '[' || b == 'V';
+            };
+            auto known_value = [](int b) -> int
+            {
+                switch (b)
+                {
+                case 'Z': return 4;  case 'C': return 5;  case 'F': return 6;
+                case 'D': return 7;  case 'B': return 8;  case 'S': return 9;
+                case 'I': return 10; case 'J': return 11; case 'L': return 12;
+                case '[': return 13; case 'V': return 14; default:  return -1;
+                }
+            };
+            int  recognised_count{ 0 };
+            int  unrecognised_count{ 0 };
+            bool unrecognised_all_default12{ true };
+            bool recognised_all_match{ true };
+            for (int b{ 0 }; b <= 0xFF; ++b)
+            {
+                const int got{
+                    vmhook::detail::sig_char_to_basic_type(static_cast<char>(b)) };
+                if (is_known(b))
+                {
+                    ++recognised_count;
+                    if (got != known_value(b)) { recognised_all_match = false; }
+                }
+                else
+                {
+                    ++unrecognised_count;
+                    if (got != 12) { unrecognised_all_default12 = false; }
+                }
+            }
+            check("wave25_exhaustiveness_exactly_11_recognised_bytes",
+                  recognised_count == 11);
+            check("wave25_exhaustiveness_245_unrecognised_bytes",
+                  unrecognised_count == 245);
+            check("wave25_exhaustiveness_recognised_all_match_table",
+                  recognised_all_match);
+            check("wave25_exhaustiveness_unrecognised_all_default_12",
+                  unrecognised_all_default12);
+        }
+
+        // ---- Method descriptor with NO parentheses rejected ---------------
+        // parse_method_descriptor requires sig[0]=='(' (line ~226) AND a
+        // closing ')' before EOS.  A bare "I", a bare "V", and a parenless
+        // pseudo-signature "IDV" must ALL return ok=false.  The guarded
+        // call-site ladder then handles such a string as a return-only view:
+        // rfind(')') is npos so it falls to the 'V' branch -> T_VOID(14),
+        // i.e. it does NOT use sig_char_to_basic_type on the first byte.
+        {
+            const method_descriptor_parse p_bare_I{ parse_method_descriptor("I") };
+            const method_descriptor_parse p_bare_V{ parse_method_descriptor("V") };
+            const method_descriptor_parse p_no_paren{ parse_method_descriptor("IDV") };
+            const method_descriptor_parse p_empty{ parse_method_descriptor("") };
+            check("wave25_no_paren_bare_I_rejected", !p_bare_I.ok);
+            check("wave25_no_paren_bare_V_rejected", !p_bare_V.ok);
+            check("wave25_no_paren_IDV_rejected",    !p_no_paren.ok);
+            check("wave25_no_paren_empty_rejected",  !p_empty.ok);
+            // Call-site degrades parenless to T_VOID via the npos branch.
+            check("wave25_no_paren_callsite_degrades_to_void",
+                  call_site_result_type("I")   == 14
+                  && call_site_result_type("V") == 14
+                  && call_site_result_type("IDV") == 14
+                  && call_site_result_type("")  == 14);
+        }
+
+        // ---- Lone "()V" empty-arg ctor minimal full walk ------------------
+        // 0 args, 0 slots, T_VOID return; ctor-build of an empty pack equals
+        // "()V" and round-trips back through parse_method_descriptor.
+        {
+            const method_descriptor_parse m{ parse_method_descriptor("()V") };
+            check("wave25_lone_void_ctor_walks_clean",
+                  m.ok && m.arg_count == 0 && m.arg_slots == 0
+                  && m.return_basic == 14 && m.return_dims == 0);
+            const std::string built{ ctor_signature_of<>() };
+            check("wave25_lone_void_ctor_build_equals_paren_paren_V",
+                  built == "()V");
+            const method_descriptor_parse round{ parse_method_descriptor(built) };
+            check("wave25_lone_void_ctor_round_trip_ok",
+                  round.ok && round.arg_count == 0 && round.return_basic == 14);
+            // And the call-site ladder agrees: "()V" -> T_VOID(14).
+            check("wave25_lone_void_ctor_callsite_is_void_14",
+                  call_site_result_type("()V") == 14);
+        }
+
+        // ---- FULL closure: width!=0 IFF BasicType in {4..11}\{L=12} -------
+        // Iterate the FULL 0..255 byte domain (not just the 11 known
+        // letters): for every byte the joint condition
+        //     width != 0  <==>  BasicType in {4,5,6,7,8,9,10,11}
+        // must hold.  This is the per-type cross-table closure restated as
+        // a totality property — adding any new primitive letter to ONE
+        // helper without the OTHER breaks this in CI.
+        {
+            bool closure_ok{ true };
+            int  primitive_byte_count{ 0 };
+            for (int b{ 0 }; b <= 0xFF; ++b)
+            {
+                const char one[1]{ static_cast<char>(b) };
+                const int  bt{ vmhook::detail::sig_char_to_basic_type(
+                    static_cast<char>(b)) };
+                const std::size_t w{ vmhook::detail::jvm_primitive_byte_width(
+                    std::string_view{ one, 1 }) };
+                const bool bt_is_primitive{ bt >= 4 && bt <= 11 && bt != 12 };
+                const bool width_nonzero{ w != 0 };
+                if (bt_is_primitive != width_nonzero) { closure_ok = false; }
+                if (width_nonzero) { ++primitive_byte_count; }
+            }
+            check("wave25_full_byte_domain_width_iff_basictype_primitive",
+                  closure_ok);
+            // Exactly the 8 primitive letters Z B C S I J F D have width!=0.
+            check("wave25_exactly_8_bytes_have_nonzero_width",
+                  primitive_byte_count == 8);
+        }
+    }
+} // namespace wave25
+
 int main()
 {
     // ---- detail::sig_char_to_basic_type: HotSpot BasicType ints --------------
@@ -4082,6 +4272,7 @@ int main()
     wave21::run();
     wave23::run();
     wave24::run();
+    wave25::run();
 
     return failures == 0 ? 0 : 1;
 }

@@ -1546,5 +1546,236 @@ int main()
               vmhook::jni::signature_for_arg<char16_t>() == vmhook::detail::jni_signature_for_arg<char16_t>());
     }
 
+    // =====================================================================
+    // SECTION I — WAVE-25 LEDGER CLOSURES (additive, no-JVM safe).
+    // Closes five small gaps the wave-25 ledger flagged on the make_unique
+    // surface, each a compile-time / no-JVM-runtime pin of a contract that was
+    // implicit in earlier sections but never asserted on its own line.
+    //
+    // The five contracts pinned here:
+    //   (I1) VARIADIC ctor forwarding through a heterogeneous N-arg pack
+    //        (int, std::string, double, oop_t).  oop_t is void*, so it routes
+    //        through the object-handle arm of append_jni_arg (the "L...;"
+    //        descriptor letter does NOT apply for a bare void*: a void* is NOT
+    //        an object_base-derived wrapper, so this pack would actually be
+    //        ill-formed at the descriptor builder — see the gap-note below).
+    //        We therefore pin the forwarding via the construct()-detection
+    //        predicate (which is plain C++ overload resolution and does NOT
+    //        flow through jni_signature_for_arg) AND the no-JVM safe-default
+    //        contract on the legal pack (int, std::string, double).
+    //   (I2) MOVE-ONLY-arg perfect-forwarding into T(std::unique_ptr<int>&&,
+    //        oop_t).  std::unique_ptr<int> is move-only (no copy ctor) and is
+    //        NOT a unique_ptr<object_base-derived> (is_unique_object_ptr is
+    //        false), so it is REJECTED at the make_unique descriptor builder
+    //        (correct behaviour — only object-wrapper unique_ptrs are valid
+    //        Java <init> args).  The forwarding contract is therefore pinned
+    //        at the construct()-detection layer instead: a wrapper exposing
+    //        construct(std::unique_ptr<int>&&, vmhook::oop_t) is satisfied
+    //        ONLY for an rvalue-forwarded unique_ptr<int> (no copy possible),
+    //        which is the exact perfect-forwarding proof the ledger asks for.
+    //   (I3) The zero-arg and N-arg safe-default contracts are IDENTICAL:
+    //        both return a null unique_ptr<W> with no exception when there is
+    //        no JVM.  Cold-state contract uniformity over arity.
+    //   (I4) NOEXCEPT pin: make_unique<T>() is NOT marked noexcept (it
+    //        propagates std::bad_alloc from make_unique inside, and JNI calls
+    //        themselves are not noexcept).  Lock that fact so a hidden
+    //        regression that flips noexcept-ness (silently changing the
+    //        exception contract for callers) is caught here at compile time.
+    //   (I5) DELETER-IDENTITY pin: decltype(p)::deleter_type is EXACTLY
+    //        std::default_delete<T> for every wrapper variant — the factory
+    //        hands out a CANONICAL std::unique_ptr<W>, never a custom-deleter
+    //        variant that would silently change destruction semantics.
+    // =====================================================================
+    {
+        // ----- (I4) NOEXCEPT pin --------------------------------------------
+        // Pin the ACTUAL noexcept-ness of every make_unique form: the function
+        // is NOT marked noexcept (the JNI / TLAB paths can throw bad_alloc and
+        // the construct() branch can propagate user exceptions).  Locking the
+        // FALSE noexcept value is what the ledger wants — a future change that
+        // accidentally marks make_unique noexcept would silently swallow the
+        // exception escape route and break callers' RAII expectations.
+        static_assert(!noexcept(vmhook::make_unique<plain_wrapper>()),
+                      "make_unique<W>() is NOT noexcept (can propagate bad_alloc)");
+        static_assert(!noexcept(vmhook::make_unique<plain_wrapper>(7)),
+                      "make_unique<W>(arg) is NOT noexcept");
+        static_assert(!noexcept(vmhook::make_unique<ctor_wrapper>(1, std::string{ "y" })),
+                      "make_unique<W>(many...) is NOT noexcept");
+        static_assert(!noexcept(vmhook::make_unique<noarg_ctor_wrapper>()),
+                      "make_unique<W>() with construct() detected is NOT noexcept");
+        check("I4_make_unique_not_noexcept_compile_time", true);
+
+        // ----- (I5) DELETER-IDENTITY pin ------------------------------------
+        // The returned owning pointer uses std::default_delete<W> — the
+        // canonical deleter type — for every wrapper variant.  Asserting on a
+        // LIVE returned object (`auto p = make_unique<...>()`) is the exact
+        // form the ledger calls out: decltype(p)::deleter_type ==
+        // std::default_delete<W>.  Compile-time only; no JVM needed.
+        auto p_plain = vmhook::make_unique<plain_wrapper>();
+        static_assert(std::is_same_v<decltype(p_plain)::deleter_type,
+                                     std::default_delete<plain_wrapper>>,
+                      "deleter_type must be std::default_delete<plain_wrapper>");
+        auto p_ctor = vmhook::make_unique<ctor_wrapper>(1, std::string{ "y" });
+        static_assert(std::is_same_v<decltype(p_ctor)::deleter_type,
+                                     std::default_delete<ctor_wrapper>>,
+                      "deleter_type must be std::default_delete<ctor_wrapper>");
+        auto p_ijd = vmhook::make_unique<ijd_ctor_wrapper>(1, std::int64_t{ 2 }, 3.0);
+        static_assert(std::is_same_v<decltype(p_ijd)::deleter_type,
+                                     std::default_delete<ijd_ctor_wrapper>>);
+        auto p_bool = vmhook::make_unique<bool_ctor_wrapper>(true);
+        static_assert(std::is_same_v<decltype(p_bool)::deleter_type,
+                                     std::default_delete<bool_ctor_wrapper>>);
+        // Negative: the deleter is NOT some custom function-pointer or
+        // pointer-to-member type (a regression that swapped the deleter would
+        // not silently pass).
+        static_assert(!std::is_same_v<decltype(p_plain)::deleter_type,
+                                      void(*)(plain_wrapper*)>,
+                      "deleter must not be a custom function-pointer deleter");
+        check("I5_deleter_is_default_delete_compile_time", true);
+        // Runtime sanity: the live owning pointers are all null (no JVM).
+        check("I5_live_owning_pointers_null_no_jvm",
+              !p_plain && !p_ctor && !p_ijd && !p_bool);
+
+        // ----- (I1) VARIADIC ctor forwarding ---------------------------------
+        // The ledger asks for (int, std::string, double, oop_t).  oop_t is
+        // void*, which is NOT one of the JNI-acceptable arg shapes
+        // (jni_signature_for_arg static_asserts on unknown types), so the
+        // descriptor-layer call make_unique<W>(int, string, double, oop_t) is
+        // intentionally ill-formed.  But the construct()-detection PREDICATE
+        // is plain overload resolution and accepts oop_t happily — it is the
+        // perfect-forwarding observable the ledger wants pinned.
+        //
+        // Pin the variadic forwarding two ways:
+        //   (a) A local wrapper whose construct(int, std::string, double,
+        //       oop_t) overload exists: the requires-probe is satisfied for
+        //       the exact heterogeneous pack across every value-category
+        //       spelling, AND arity-checked (3/5 args do NOT match).
+        //   (b) The no-JVM safe-default contract on the LEGAL JNI pack (int,
+        //       std::string, double) — the legal prefix of the same shape —
+        //       returns null and does not throw.
+        struct quad_ctor_wrapper : public vmhook::object<quad_ctor_wrapper>
+        {
+            explicit quad_ctor_wrapper(vmhook::oop_t oop) noexcept
+                : vmhook::object<quad_ctor_wrapper>{ oop } {}
+            auto construct(int, std::string, double, vmhook::oop_t) -> void {}
+        };
+        // (a) probe across categories — the EXACT perfect-forwarding pin.
+        static_assert(has_matching_construct<quad_ctor_wrapper,
+                          int, std::string, double, vmhook::oop_t>);
+        static_assert(has_matching_construct<quad_ctor_wrapper,
+                          int&, std::string&, double&, vmhook::oop_t&>);
+        static_assert(has_matching_construct<quad_ctor_wrapper,
+                          const int&, const std::string&, const double&, const vmhook::oop_t&>);
+        static_assert(has_matching_construct<quad_ctor_wrapper,
+                          int&&, std::string&&, double&&, vmhook::oop_t&&>);
+        // Arity-checked.
+        static_assert(!has_matching_construct<quad_ctor_wrapper,
+                          int, std::string, double>);
+        static_assert(!has_matching_construct<quad_ctor_wrapper,
+                          int, std::string, double, vmhook::oop_t, int>);
+        // Descriptor invariance for the legal 3-arg JNI prefix (the part of
+        // the pack make_unique would actually assemble a "(...)V" for).
+        check("I1_legal_prefix_descriptor",
+              init_descriptor<int, std::string, double>()
+                  == "(ILjava/lang/String;D)V");
+        check("I1_legal_prefix_descriptor_category_invariant",
+              init_descriptor<int&, const std::string&, double&&>()
+                  == "(ILjava/lang/String;D)V");
+        // (b) no-JVM safe-default on the legal prefix.
+        check("I1_variadic_legal_prefix_safe_default",
+              make_unique_is_null_and_safe<plain_wrapper>(
+                  7, std::string{ "v" }, 3.5));
+        // ...and on a construct()-detected wrapper with the matching 3-arg
+        // overload (ijd_ctor_wrapper: construct(int, int64, double)) — proves
+        // the construct() branch instantiates for the heterogeneous pack
+        // without throwing or hitting non-null.
+        check("I1_variadic_construct_detected_safe_default",
+              make_unique_is_null_and_safe<ijd_ctor_wrapper>(
+                  7, std::int64_t{ 9 }, 3.5));
+        check("I1_variadic_construct_detected_xrvalue_pack_safe_default",
+              make_unique_is_null_and_safe<ijd_ctor_wrapper>(
+                  std::int32_t{ 1 }, std::int64_t{ 2 }, 3.0));
+        check("I1_quad_ctor_pin", true);
+
+        // ----- (I2) MOVE-ONLY-arg perfect-forwarding -------------------------
+        // std::unique_ptr<int> is the canonical move-only sink.  Pin that the
+        // requires-probe of a construct(std::unique_ptr<int>&&, oop_t)
+        // overload is satisfied ONLY by an rvalue-forwarded unique_ptr<int>
+        // (no copy is possible — std::unique_ptr's copy ctor is deleted), and
+        // is rejected by any lvalue / const-lvalue spelling at compile time.
+        // This is the EXACT perfect-forwarding contract for a move-only ctor
+        // arg the ledger asks for, observed at the layer where forwarding is
+        // actually witnessed by make_unique (the if-constexpr probe).
+        struct moveonly_ctor_wrapper : public vmhook::object<moveonly_ctor_wrapper>
+        {
+            explicit moveonly_ctor_wrapper(vmhook::oop_t oop) noexcept
+                : vmhook::object<moveonly_ctor_wrapper>{ oop } {}
+            auto construct(std::unique_ptr<int>&&, vmhook::oop_t) -> void {}
+        };
+        // Pure rvalue forms bind to unique_ptr<int>&&; lvalue / const-lvalue
+        // forms cannot bind to a non-const rvalue reference at all.
+        static_assert(has_matching_construct<moveonly_ctor_wrapper,
+                          std::unique_ptr<int>, vmhook::oop_t>);
+        static_assert(has_matching_construct<moveonly_ctor_wrapper,
+                          std::unique_ptr<int>&&, vmhook::oop_t>);
+        static_assert(!has_matching_construct<moveonly_ctor_wrapper,
+                          std::unique_ptr<int>&, vmhook::oop_t>);
+        static_assert(!has_matching_construct<moveonly_ctor_wrapper,
+                          const std::unique_ptr<int>&, vmhook::oop_t>);
+        // The oop_t arg's category does NOT change the result (the
+        // rvalue-vs-lvalue rejection comes purely from the unique_ptr<int>
+        // arg) — pin that orthogonality too.
+        static_assert(has_matching_construct<moveonly_ctor_wrapper,
+                          std::unique_ptr<int>, vmhook::oop_t&>);
+        static_assert(!has_matching_construct<moveonly_ctor_wrapper,
+                          std::unique_ptr<int>&, vmhook::oop_t&&>);
+        // std::unique_ptr<int> is NOT recognised as a unique_object_ptr
+        // (its T is `int`, not object_base-derived) — pin that classification
+        // so the JNI descriptor builder correctly REJECTS it as a Java <init>
+        // arg shape (the "only wrappers" gate).
+        static_assert(!vmhook::detail::is_unique_object_ptr<
+                          std::unique_ptr<int>>::value,
+                      "unique_ptr<int> must NOT be classified as an object wrapper");
+        // ...whereas a unique_ptr over a wrapper IS — the contrast point.
+        static_assert(vmhook::detail::is_unique_object_ptr<
+                          std::unique_ptr<plain_wrapper>>::value);
+        check("I2_moveonly_arg_perfect_forwarding_pin", true);
+
+        // ----- (I3) zero-arg / N-arg IDENTICAL safe-default contract --------
+        // Both forms return a null unique_ptr<W> with no exception thrown.
+        // Pin that the OBSERVABLE safe-default state is identical across
+        // arity: (a) both are null, (b) neither throws, (c) the operator==
+        // against nullptr is the SAME between forms, and (d) the comparison
+        // between the two returned owning pointers is well-defined (both
+        // null -> equal).
+        std::unique_ptr<plain_wrapper> z0{ vmhook::make_unique<plain_wrapper>() };
+        std::unique_ptr<plain_wrapper> z1{ vmhook::make_unique<plain_wrapper>(1) };
+        std::unique_ptr<plain_wrapper> z3{ vmhook::make_unique<plain_wrapper>(
+            1, std::string{ "s" }, 3.5) };
+        std::unique_ptr<plain_wrapper> zN{ vmhook::make_unique<plain_wrapper>(
+            true, std::int8_t{ 1 }, std::int16_t{ 2 }, std::uint16_t{ 3 },
+            4, std::int64_t{ 5 }, 6.0f, 7.0, std::string{ "x" }) };
+        check("I3_zero_arg_null_default", z0 == nullptr);
+        check("I3_one_arg_null_default",  z1 == nullptr);
+        check("I3_three_arg_null_default", z3 == nullptr);
+        check("I3_nine_arg_null_default", zN == nullptr);
+        // Cross-arity identity: all four are .get() == nullptr, all four are
+        // mutually equal (both null pointers compare equal).
+        check("I3_all_arities_get_null",
+              z0.get() == nullptr && z1.get() == nullptr
+                  && z3.get() == nullptr && zN.get() == nullptr);
+        check("I3_zero_vs_N_owning_pointers_equal",
+              z0.get() == zN.get() && z1.get() == z3.get()
+                  && z0.get() == z3.get());
+        // Bool-conversion contract is uniform across arity (all false).
+        check("I3_bool_conversion_uniform",
+              !z0 && !z1 && !z3 && !zN);
+        // The RETURN TYPE is identical across arity (re-affirm at the live
+        // call site, complementing Section A's static_assert via decltype).
+        static_assert(std::is_same_v<decltype(z0), decltype(z1)>);
+        static_assert(std::is_same_v<decltype(z0), decltype(z3)>);
+        static_assert(std::is_same_v<decltype(z0), decltype(zN)>);
+        check("I3_return_type_uniform_across_arity_compile_time", true);
+    }
+
     return failures == 0 ? 0 : 1;
 }

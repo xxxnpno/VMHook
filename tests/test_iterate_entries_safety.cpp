@@ -52,6 +52,7 @@
 #include <cstring>
 #include <array>
 #include <type_traits>
+#include <memory>
 
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
@@ -3382,6 +3383,247 @@ static auto test_w6_is_valid_pointer_residue_lattice() -> void
               && is_readable_pointer(as_ptr(base8 + 2u)) == false);
 }
 
+// ---------------------------------------------------------------------------
+// 56. Cold-state for_each_loaded_class / for_each_instance: bounded iteration
+//     with no JVM loaded.
+//
+// LEDGER (wave-25, no-JVM gap):
+//   * for_each_loaded_class() walks gHotSpotVMStructs-derived ClassLoaderData
+//     graph; with no JVM, the inner graph construction raises (caught by the
+//     function's try/catch) so the visitor is invoked ZERO times AND no
+//     exception escapes the call.  Result == "0 iterations, no throw".
+//   * for_each_instance<T>(visit) requires register_class<T>() AND a populated
+//     heap-VMStructs cache; with no JVM both preconditions fail and the function
+//     returns 0 via the early-return ladder, no visitor call, no throw.  We
+//     exercise BOTH branches: (a) type NOT registered -> early-return 0;
+//     (b) type IS registered -> find_class() returns nullptr -> early-return 0.
+//   * Cap CONSTANT pinning: the only externally-exposed iteration cap constant
+//     is vmhook::k_max_safe_container_elems (1<<24).  The internal walk caps
+//     (1<<20 for hash bucket chains, 1<<24 for descend) are LOCAL constexpr in
+//     the helpers and not addressable from outside the header; we pin
+//     k_max_safe_container_elems with a static_assert here AND assert by INFO-
+//     gated runtime probe that the documented value matches the spec (cap >=
+//     largest plausible container size, far above any honest JVM container).
+//   * Fabricated iterate_struct_entries with field_name==nullptr (the
+//     "synthetic null-field skip") is already pinned in test_null_arg_guards()
+//     section 5, but we re-pin it here in a fresh combo against types the
+//     walker would also short-circuit on (synthetic / never-occurring names),
+//     proving the guard fires for the same {nullptr field} signal regardless
+//     of the type slot contents -- a "fabricated array oop" surrogate.
+//
+// EVERY assertion below is HARD: no JVM here is deterministic for every
+// platform/JDK in the matrix (we never get past the early-return), so there is
+// no platform-variant case to gate.
+// ---------------------------------------------------------------------------
+namespace coll_iter_safety_w25 {
+    struct counting_visitor_loaded {
+        int* counter;
+        auto operator()(const std::string&, vmhook::hotspot::klass*) const -> void
+        {
+            ++*counter;
+        }
+    };
+    // A never-registered, never-instantiated type used purely as the T in
+    // for_each_instance<T> to drive the "type not registered" early-return.
+    struct never_registered_marker : public vmhook::object_base {
+        explicit never_registered_marker(void* p) : vmhook::object_base{ p } {}
+    };
+    // A second marker derived from object_base, used to register and drive
+    // the "registered but find_class returns null" branch with no JVM.
+    struct registered_but_absent_marker : public vmhook::object_base {
+        explicit registered_but_absent_marker(void* p) : vmhook::object_base{ p } {}
+    };
+} // namespace coll_iter_safety_w25
+
+static auto test_w25_for_each_loaded_class_no_jvm_zero_iterations() -> void
+{
+    int calls{ 0 };
+    bool threw{ false };
+    try
+    {
+        vmhook::for_each_loaded_class(
+            coll_iter_safety_w25::counting_visitor_loaded{ &calls });
+    }
+    catch (...)
+    {
+        threw = true;
+    }
+    // Zero iterations: with no JVM the graph construction (or the first
+    // VMStructs lookup it does internally) fails, the function's own try/catch
+    // swallows it, and the visitor is never invoked.
+    check("w25_for_each_loaded_class_no_jvm_zero_visits", calls == 0);
+    // No exception escapes the public API surface (the inner try/catch is the
+    // contract -- a regression that removed it would propagate here).
+    check("w25_for_each_loaded_class_no_jvm_no_throw", threw == false);
+
+    // Repeat hammering: the bound is stable across many cold-state calls (a
+    // regression that lazily-initialized state and then crashed on second use
+    // would surface here).
+    bool repeated_stable{ true };
+    for (int i{ 0 }; i < 32; ++i)
+    {
+        int c{ 0 };
+        try
+        {
+            vmhook::for_each_loaded_class(
+                coll_iter_safety_w25::counting_visitor_loaded{ &c });
+        }
+        catch (...)
+        {
+            repeated_stable = false;
+        }
+        if (c != 0) { repeated_stable = false; }
+    }
+    check("w25_for_each_loaded_class_no_jvm_repeated_stable", repeated_stable);
+}
+
+static auto test_w25_for_each_instance_no_jvm_zero_returns() -> void
+{
+    using coll_iter_safety_w25::never_registered_marker;
+    using coll_iter_safety_w25::registered_but_absent_marker;
+
+    // Branch (a): T not registered -> early-return 0, visitor never invoked.
+    int calls_a{ 0 };
+    auto visit_a = [&calls_a](std::unique_ptr<never_registered_marker>) { ++calls_a; };
+    bool threw_a{ false };
+    std::size_t got_a{ 0 };
+    try
+    {
+        got_a = vmhook::for_each_instance<never_registered_marker>(visit_a);
+    }
+    catch (...) { threw_a = true; }
+    check("w25_for_each_instance_unregistered_returns_zero", got_a == 0u);
+    check("w25_for_each_instance_unregistered_no_visit", calls_a == 0);
+    check("w25_for_each_instance_unregistered_no_throw", threw_a == false);
+
+    // Branch (b): T IS registered, but no JVM -> find_class returns null ->
+    // early-return 0.  register_class is noexcept and merely populates a map,
+    // so it succeeds even with no JVM.
+    vmhook::register_class<registered_but_absent_marker>(
+        "vmhook/test/W25NeverLoadedClass");
+    int calls_b{ 0 };
+    auto visit_b = [&calls_b](std::unique_ptr<registered_but_absent_marker>) { ++calls_b; };
+    bool threw_b{ false };
+    std::size_t got_b{ 0 };
+    try
+    {
+        got_b = vmhook::for_each_instance<registered_but_absent_marker>(visit_b);
+    }
+    catch (...) { threw_b = true; }
+    check("w25_for_each_instance_registered_absent_returns_zero", got_b == 0u);
+    check("w25_for_each_instance_registered_absent_no_visit", calls_b == 0);
+    check("w25_for_each_instance_registered_absent_no_throw", threw_b == false);
+
+    // max_visits parameter MUST be respected even on the cold path: a cap of 0
+    // is the most aggressive bound and still produces a clean 0 return.
+    std::size_t got_cap0{ 999 };
+    bool threw_cap0{ false };
+    try
+    {
+        got_cap0 = vmhook::for_each_instance<registered_but_absent_marker>(
+            visit_b, /*max_visits=*/0u);
+    }
+    catch (...) { threw_cap0 = true; }
+    check("w25_for_each_instance_max_visits_zero_returns_zero", got_cap0 == 0u);
+    check("w25_for_each_instance_max_visits_zero_no_throw", threw_cap0 == false);
+
+    // And the documented "no limit" default (size_t max) still returns 0 with
+    // no JVM -- the early-return ladder runs BEFORE the cap is consulted.
+    std::size_t got_nolimit{ 999 };
+    try
+    {
+        got_nolimit = vmhook::for_each_instance<registered_but_absent_marker>(
+            visit_b, std::numeric_limits<std::size_t>::max());
+    }
+    catch (...) {}
+    check("w25_for_each_instance_nolimit_default_returns_zero", got_nolimit == 0u);
+}
+
+static auto test_w25_iteration_cap_constants_pin() -> void
+{
+    // The ONE externally-exposed iteration cap: k_max_safe_container_elems.
+    // Pin its value AND its relationship to a signed-int32 loop bound (the
+    // documented saturating target the clamp returns).
+    static_assert(vmhook::k_max_safe_container_elems == (1ull << 24),
+                  "k_max_safe_container_elems must be exactly 1<<24");
+    static_assert(vmhook::k_max_safe_container_elems == 16777216ull,
+                  "k_max_safe_container_elems must be 16,777,216 elements");
+    static_assert(vmhook::k_max_safe_container_elems
+                      <= static_cast<std::size_t>(
+                          (std::numeric_limits<std::int32_t>::max)()),
+                  "cap must fit signed int32 for the clamp cast");
+    // Pin the cap's relationship to the documented bucket-chain cap (1<<20):
+    // 1<<24 is exactly 16x larger -- the descend cap must dominate the hash
+    // bucket cap, so an honest hash table walk cannot starve a descent walk.
+    static_assert(vmhook::k_max_safe_container_elems
+                      == static_cast<std::size_t>(1u << 20) * 16ull,
+                  "descend cap (1<<24) must be 16x the bucket cap (1<<20)");
+    check("w25_cap_descend_dominates_bucket_static_assert_held",
+          vmhook::k_max_safe_container_elems
+              == static_cast<std::size_t>(1u << 20) * 16ull);
+
+    // Internal-only caps 1<<20 and 1<<24 are NOT exposed as named symbols.
+    // INFO-gate the runtime probe: their numeric value is 1048576 and
+    // 16777216 respectively, and the descend cap equals the exposed
+    // k_max_safe_container_elems.  Any change to these numbers in the
+    // header that broke a walker's termination would surface in the JVM
+    // integration modules; this pin is purely the value contract.
+    constexpr std::size_t bucket_cap{ 1ull << 20 };
+    constexpr std::size_t descend_cap{ 1ull << 24 };
+    check("w25_bucket_cap_value_1M",  bucket_cap  == 1048576ull);
+    check("w25_descend_cap_value_16M", descend_cap == 16777216ull);
+    check("w25_descend_cap_eq_exposed_max",
+          descend_cap == vmhook::k_max_safe_container_elems);
+    std::printf("[INFO] w25 internal caps: bucket=1<<20=%zu descend=1<<24=%zu\n",
+                bucket_cap, descend_cap);
+
+    // Cross-tie: the clamp saturates EXACTLY to the descend cap for any input
+    // above it (a single boundary cross to seal the value).
+    check("w25_clamp_saturates_to_descend_cap_value",
+          static_cast<std::size_t>(
+              vmhook::clamp_safe_container_count(
+                  (std::numeric_limits<std::int32_t>::max)()))
+              == descend_cap);
+}
+
+static auto test_w25_fabricated_null_field_skip_surrogate() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+
+    // The "fabricated array oop" surrogate for the field_name==nullptr skip
+    // path: pass nullptr in the field slot against a variety of type slots
+    // (real, synthetic, empty, even nullptr itself) and prove the guard fires
+    // uniformly without ever dereferencing the type-slot bytes.  This pins
+    // that the null-field skip is type-slot-INVARIANT -- a regression that
+    // moved the null-field check below a strcmp of the type slot would crash
+    // on the nullptr type combo.
+    const char* const type_slots[]{
+        nullptr, "",  "Symbol", "Method", "FabricatedArrayOop",
+        "[Ljava/lang/Object;",                 // JNI-style array name
+        "X", "OopDesc", "ZZZ_NoSuchType",
+    };
+    bool all_null{ true };
+    int combos{ 0 };
+    for (const char* const t : type_slots)
+    {
+        ++combos;
+        if (iterate_struct_entries(t, nullptr) != nullptr) { all_null = false; }
+    }
+    check("w25_fabricated_null_field_skip_uniform_for_all_type_slots", all_null);
+    check("w25_fabricated_null_field_skip_combo_count", combos == 9);
+
+    // Cold-state determinism: hammer the (X, nullptr) and (nullptr, nullptr)
+    // shapes many times.  A regression that mutated cache state on the
+    // null-field path would surface as a non-null result somewhere.
+    bool det_ok{ true };
+    for (int i{ 0 }; i < 256; ++i)
+    {
+        if (iterate_struct_entries("FabricatedArrayOop", nullptr) != nullptr) { det_ok = false; }
+        if (iterate_struct_entries(nullptr,              nullptr) != nullptr) { det_ok = false; }
+    }
+    check("w25_fabricated_null_field_skip_deterministic", det_ok);
+}
+
 int main()
 {
     test_getters_cache_no_jvm();
@@ -3439,6 +3681,10 @@ int main()
     test_w6_resolved_offset_plus_base_value_gate();
     test_w6_untag_full_high_bit_sweep();
     test_w6_is_valid_pointer_residue_lattice();
+    test_w25_for_each_loaded_class_no_jvm_zero_iterations();
+    test_w25_for_each_instance_no_jvm_zero_returns();
+    test_w25_iteration_cap_constants_pin();
+    test_w25_fabricated_null_field_skip_surrogate();
 
     return failures == 0 ? 0 : 1;
 }
