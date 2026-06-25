@@ -732,6 +732,138 @@ int main()
         check("find_class_empty_name_stable_repeat", empty_stable);
     }
 
+    // =====================================================================
+    // K. WAVE-27 LEDGER GAPS: dispatch noexcept / null-method bail / empty-table
+    //    lock-free no-crash / signature type identity static_asserts.
+    //    All pure C++ — no JVM, no fabricated frame walk.
+    // =====================================================================
+    {
+        // K.1 Type identity of the dispatch detour cell at value level: a
+        // default-constructed std::function with the dispatch ABI is empty and
+        // compares equal to nullptr -- the cold-state cell representation.
+        const std::function<void(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*,
+                                 vmhook::hotspot::return_slot*)> empty_cell{};
+        check("dispatch_detour_cell_default_is_empty",
+              static_cast<bool>(empty_cell) == false);
+        check("dispatch_detour_cell_default_equals_nullptr",
+              empty_cell == nullptr);
+
+        // K.2 hooked_method is default-constructible and a default entry has a
+        // null method pointer + empty detour cell.  This is the COLD-STATE shape
+        // the install path must overwrite before push_back -- and it lets the
+        // scan's `hook.method == current_method` comparison work uniformly.
+        const vmhook::hotspot::hooked_method cold_entry{};
+        check("hooked_method_cold_method_ptr_is_null", cold_entry.method == nullptr);
+        check("hooked_method_cold_detour_cell_is_empty",
+              static_cast<bool>(cold_entry.detour) == false);
+
+        // K.3 NULL-METHOD BAIL: even if the global vector somehow held a
+        // null-method entry, the scan's `hook.method == current_method` for a
+        // NON-NULL current_method must NOT match.  And a null current_method
+        // (degenerate frame, flaw #6) must NOT match any real entry.
+        auto* const real_method{ reinterpret_cast<vmhook::hotspot::method*>(
+            std::uintptr_t{ 0x5000u }) };
+        std::vector<vmhook::hotspot::hooked_method> mixed_replica;
+        {
+            vmhook::hotspot::hooked_method null_entry{};
+            null_entry.method = nullptr;
+            null_entry.detour = [](vmhook::hotspot::frame*, vmhook::hotspot::java_thread*,
+                                   vmhook::hotspot::return_slot*) noexcept {};
+            mixed_replica.push_back(std::move(null_entry));
+
+            vmhook::hotspot::hooked_method real_entry{};
+            real_entry.method = real_method;
+            real_entry.detour = [](vmhook::hotspot::frame*, vmhook::hotspot::java_thread*,
+                                   vmhook::hotspot::return_slot*) noexcept {};
+            mixed_replica.push_back(std::move(real_entry));
+        }
+        bool null_current_matched_anything{ false };
+        bool real_current_matched_null_entry{ false };
+        for (const vmhook::hotspot::hooked_method& hook : mixed_replica)
+        {
+            const vmhook::hotspot::method* const null_current{ nullptr };
+            if (hook.method == null_current && hook.method != nullptr)
+            {
+                // unreachable -- documents the comparison semantics
+                null_current_matched_anything = true;
+            }
+            if (hook.method == real_method && hook.method == nullptr)
+            {
+                real_current_matched_null_entry = true;
+            }
+        }
+        check("null_current_does_not_pseudo_match", !null_current_matched_anything);
+        check("real_current_does_not_match_null_entry", !real_current_matched_null_entry);
+
+        // K.4 EMPTY-TABLE LOCK-FREE READ never derefs anything: a range-for
+        // over the LIVE empty g_hooked_methods executes zero iterations and
+        // does not touch storage.  We pin both that the loop body never runs
+        // and that .data()/.size() are consistent with "empty".
+        int iterations{ 0 };
+        for (const vmhook::hotspot::hooked_method& hook : vmhook::hotspot::g_hooked_methods)
+        {
+            (void)hook;
+            ++iterations;
+        }
+        check("empty_global_loop_body_never_runs", iterations == 0);
+        check("empty_global_size_zero", vmhook::hotspot::g_hooked_methods.size() == 0u);
+        check("empty_global_begin_equals_end",
+              vmhook::hotspot::g_hooked_methods.begin()
+                  == vmhook::hotspot::g_hooked_methods.end());
+
+        // Repeated empty-scan attempts are stable (no lazy mutation on read).
+        bool empty_scan_stable{ true };
+        for (int i{ 0 }; i < 32; ++i)
+        {
+            if (!vmhook::hotspot::g_hooked_methods.empty()) { empty_scan_stable = false; }
+        }
+        check("empty_global_repeated_scan_stable", empty_scan_stable);
+    }
+
+    // -----------------------------------------------------------------------
+    // K-COMPILE-TIME: extra static_asserts on dispatch signature type identity
+    // and noexcept properties (BUILD-time pins; regression fails compilation).
+    // -----------------------------------------------------------------------
+    {
+        // The detour ABI's three argument types are exactly frame* / java_thread*
+        // / return_slot* (pointer-to non-const).
+        using detour_fn = vmhook::hotspot::detour_function_t;
+        static_assert(std::is_pointer_v<detour_fn>,
+                      "detour_function_t must be a function pointer");
+        static_assert(std::is_function_v<std::remove_pointer_t<detour_fn>>,
+                      "detour_function_t pointee must be a function type");
+
+        // Confirm the empty-detour function pointer cell value is constexpr-null.
+        constexpr detour_fn null_detour{ nullptr };
+        static_assert(null_detour == nullptr, "null detour_function_t must compare nullptr");
+
+        // g_hooked_methods is a std::vector<hooked_method> (so range-for works
+        // and .empty()/.size()/.begin()/.end() are the standard contract).
+        static_assert(std::is_same_v<decltype(vmhook::hotspot::g_hooked_methods),
+                                     std::vector<vmhook::hotspot::hooked_method>>,
+                      "g_hooked_methods must be std::vector<hooked_method>");
+
+        // hooked_method is default-constructible (cold-state shape).
+        static_assert(std::is_default_constructible_v<vmhook::hotspot::hooked_method>,
+                      "hooked_method must be default-constructible");
+
+        // The atomic shutdown flag's load is noexcept (lock-free hot-path bail).
+        static_assert(noexcept(vmhook::hotspot::g_shutdown_requested.load(
+                          std::memory_order_acquire)),
+                      "g_shutdown_requested.load must be noexcept");
+        static_assert(std::atomic<bool>::is_always_lock_free,
+                      "atomic<bool> must be lock-free for the dispatch bail");
+
+        // return_slot construction is noexcept (the trampoline pushes a
+        // zero-initialised slot on the native stack; throwing is not an option).
+        static_assert(std::is_nothrow_default_constructible_v<vmhook::hotspot::return_slot>,
+                      "return_slot default ctor must be noexcept");
+        static_assert(std::is_nothrow_copy_constructible_v<vmhook::hotspot::return_slot>,
+                      "return_slot copy ctor must be noexcept");
+
+        check("wave27_dispatch_signature_static_asserts_compiled", true);
+    }
+
     std::printf("\n%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

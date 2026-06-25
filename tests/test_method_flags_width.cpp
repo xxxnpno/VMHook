@@ -1250,7 +1250,7 @@ namespace acc
         { "NATIVE",       0x0100u },
         { "INTERFACE",    0x0200u },
         { "ABSTRACT",     0x0400u },
-        { "STRICT",       0x0800u },
+        { "STRICTFP",       0x0800u },
         { "SYNTHETIC",    0x1000u },
         { "ANNOTATION",   0x2000u },
         { "ENUM",         0x4000u },
@@ -3241,6 +3241,305 @@ static auto test_mfw_deep3_arg_cap_and_slot_widening() -> void
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  Wave-27 deepening (mfw_w27): LEDGER-GAP closing — ConstMethod._flags width
+//  JDK-variant pin, JVMS flag-bit constants pinned constexpr, mask invariants,
+//  access_flags vs _flags disambiguation.  All assertions are deterministic
+//  (constexpr / sizeof on synthetic structs / pure bit math) so they are HARD.
+// ─────────────────────────────────────────────────────────────────────────
+namespace mfw_w27
+{
+    // Synthetic ConstMethod layouts whose `_flags` member matches HotSpot's u2
+    // exported type across the entire supported band (JDK 8..26 — ConstMethod's
+    // _flags has NOT been widened the way Method's was; it stays a u2 short
+    // bitfield in HotSpot src all the way through master).  We pin BOTH a
+    // sizeof-on-synthetic ConstMethod._flags AND its bit-positions for the
+    // accessor-flags HotSpot exposes via ConstMethod (has_linenumber_table,
+    // has_checked_exceptions, has_localvariable_table, has_exception_table,
+    // has_generic_signature, has_method_parameters).  These are the
+    // ConstMethod-side analogue of Method::_flags and the ledger gap callout.
+    struct synthetic_const_method_flags_u1 { std::uint8_t  _flags; };
+    struct synthetic_const_method_flags_u2 { std::uint16_t _flags; };
+    struct synthetic_const_method_flags_u4 { std::uint32_t _flags; };
+
+    // HotSpot's ConstMethod::Flags bit positions (constMethod.hpp, jdk8u..master).
+    // These have NEVER moved — pinned as the cross-version contract.
+    namespace const_method_flag_bit
+    {
+        constexpr int has_linenumber_table     = 0;
+        constexpr int has_checked_exceptions   = 1;
+        constexpr int has_localvariable_table  = 2;
+        constexpr int has_exception_table      = 3;
+        constexpr int has_generic_signature    = 4;
+        constexpr int has_method_parameters    = 5;
+    }
+
+    // The JVMS class-file access-flag bits the library consults via
+    // Method::_access_flags.  Values pinned per JVMS §4.6 Table 4.6 (jvms-4.6).
+    // These are the LOW 16 bits of the AccessFlags word and have never moved
+    // across the entire JDK 8..26 band — even after JDK 24 shrank AccessFlags
+    // to u2, every JVMS bit kept its value because the relocated bits (queued,
+    // not_compilable, etc.) were HotSpot-internal, not JVMS bits.
+    namespace jvms_method_acc
+    {
+        constexpr std::uint32_t PUBLIC       = 0x0001;
+        constexpr std::uint32_t PRIVATE      = 0x0002;
+        constexpr std::uint32_t PROTECTED    = 0x0004;
+        constexpr std::uint32_t STATIC       = 0x0008;
+        constexpr std::uint32_t FINAL        = 0x0010;
+        constexpr std::uint32_t SYNCHRONIZED = 0x0020;
+        constexpr std::uint32_t BRIDGE       = 0x0040;
+        constexpr std::uint32_t VARARGS      = 0x0080;
+        constexpr std::uint32_t NATIVE       = 0x0100;
+        constexpr std::uint32_t ABSTRACT     = 0x0400;
+        constexpr std::uint32_t STRICTFP       = 0x0800;
+        constexpr std::uint32_t SYNTHETIC    = 0x1000;
+    }
+}
+
+// Compile-time pinning of the ConstMethod synthetic widths — these mirror the
+// Method-side u1/u2/u4 width matrix and let a future width-aware ConstMethod
+// accessor assert which synthetic it must match.
+static_assert(sizeof(mfw_w27::synthetic_const_method_flags_u1) == 1,
+              "synthetic ConstMethod._flags(u1) is 1 byte (JDK 8 hypothetical width)");
+static_assert(sizeof(mfw_w27::synthetic_const_method_flags_u2) == 2,
+              "synthetic ConstMethod._flags(u2) is 2 bytes (actual JDK 8..26 width)");
+static_assert(sizeof(mfw_w27::synthetic_const_method_flags_u4) == 4,
+              "synthetic ConstMethod._flags(u4) is 4 bytes (future-proof slot)");
+
+// Pin every ConstMethod flag bit position as a constexpr — the JVMS-spec'd
+// "_has_*" bits are HotSpot-internal but their positions are stable across all
+// supported JDKs (verified jdk8u..master in constMethod.hpp).
+static_assert(mfw_w27::const_method_flag_bit::has_linenumber_table == 0
+              && mfw_w27::const_method_flag_bit::has_checked_exceptions == 1
+              && mfw_w27::const_method_flag_bit::has_localvariable_table == 2
+              && mfw_w27::const_method_flag_bit::has_exception_table == 3
+              && mfw_w27::const_method_flag_bit::has_generic_signature == 4
+              && mfw_w27::const_method_flag_bit::has_method_parameters == 5,
+              "ConstMethod bit positions 0..5 are stable across JDK 8..26");
+
+// All six ConstMethod bits fit in a u1 (max bit = 5, mask 0x3F).
+static_assert(((1u << mfw_w27::const_method_flag_bit::has_linenumber_table)
+              | (1u << mfw_w27::const_method_flag_bit::has_checked_exceptions)
+              | (1u << mfw_w27::const_method_flag_bit::has_localvariable_table)
+              | (1u << mfw_w27::const_method_flag_bit::has_exception_table)
+              | (1u << mfw_w27::const_method_flag_bit::has_generic_signature)
+              | (1u << mfw_w27::const_method_flag_bit::has_method_parameters)) == 0x3Fu,
+              "ConstMethod 6-bit mask = 0x3F (fits a u1, definitely fits the actual u2)");
+
+// JVMS access-flag values pinned at compile time (JVMS §4.6 Table 4.6).  These
+// are the values the library masks against on every JDK 8..26 and must never
+// drift.
+static_assert(mfw_w27::jvms_method_acc::PUBLIC       == 0x0001u, "ACC_PUBLIC=0x0001");
+static_assert(mfw_w27::jvms_method_acc::PRIVATE      == 0x0002u, "ACC_PRIVATE=0x0002");
+static_assert(mfw_w27::jvms_method_acc::PROTECTED    == 0x0004u, "ACC_PROTECTED=0x0004");
+static_assert(mfw_w27::jvms_method_acc::STATIC       == 0x0008u, "ACC_STATIC=0x0008");
+static_assert(mfw_w27::jvms_method_acc::FINAL        == 0x0010u, "ACC_FINAL=0x0010");
+static_assert(mfw_w27::jvms_method_acc::SYNCHRONIZED == 0x0020u, "ACC_SYNCHRONIZED=0x0020");
+static_assert(mfw_w27::jvms_method_acc::BRIDGE       == 0x0040u, "ACC_BRIDGE=0x0040");
+static_assert(mfw_w27::jvms_method_acc::VARARGS      == 0x0080u, "ACC_VARARGS=0x0080");
+static_assert(mfw_w27::jvms_method_acc::NATIVE       == 0x0100u, "ACC_NATIVE=0x0100");
+static_assert(mfw_w27::jvms_method_acc::ABSTRACT     == 0x0400u, "ACC_ABSTRACT=0x0400");
+static_assert(mfw_w27::jvms_method_acc::STRICTFP       == 0x0800u, "ACC_STRICTFP=0x0800");
+static_assert(mfw_w27::jvms_method_acc::SYNTHETIC    == 0x1000u, "ACC_SYNTHETIC=0x1000");
+
+// access_flags-vs-_flags DISAMBIGUATION at the bit level.  JVMS access-flag
+// values 0x0001..0x1000 ALL fit in 13 bits.  HotSpot's Method::_flags bit
+// positions (_dont_inline=2 on jdk<=20, =12 on jdk21+; _force_inline=11) when
+// converted to MASKS (1<<bit) are 0x4 / 0x1000 / 0x800 — none of these overlap
+// JVMS_ACC_STATIC (0x0008).  Pin the disjointness as the contract that makes
+// "mask JVM_ACC_STATIC out of get_access_flags(); ignore get_flags()" the
+// correct way to answer is_static() regardless of width changes on _flags.
+static_assert((mfw_w27::jvms_method_acc::STATIC
+              & (1u << flags_layout::jdk11_20.dont_inline_bit)) == 0u,
+              "JVM_ACC_STATIC (0x0008) and _dont_inline-on-jdk<=20 (bit 2 / 0x0004) are disjoint");
+static_assert((mfw_w27::jvms_method_acc::STATIC
+              & (1u << flags_layout::jdk21_23.dont_inline_bit)) == 0u,
+              "JVM_ACC_STATIC (0x0008) and _dont_inline-on-jdk21+ (bit 12 / 0x1000) are disjoint");
+static_assert((mfw_w27::jvms_method_acc::STATIC
+              & (1u << flags_layout::methodflags_status_bit::force_inline)) == 0u,
+              "JVM_ACC_STATIC (0x0008) and _force_inline (bit 11 / 0x800) are disjoint");
+
+// The NO_COMPILE mask in vmhook (0x0F000000) lives in the HIGH byte of the u4
+// access-flags word.  It is disjoint from every JVMS access-flag bit (which
+// all sit in the low 13 bits).  This is the second half of the
+// access_flags-vs-_flags disambiguation: even on JDK 21+ where some compile
+// bits moved to MethodFlags::_status, the LIBRARY's NO_COMPILE mask still
+// targets the access-flags word — and never collides with JVMS bits there.
+static_assert((0x0F000000u & 0x0000FFFFu) == 0u,
+              "NO_COMPILE mask (0x0F000000) is disjoint from every JVMS access-flag bit (<=0x1000)");
+
+static auto test_mfw_w27_const_method_flags_width_pin() -> void
+{
+    // Runtime echo of the ConstMethod._flags width matrix.  The synthetic types
+    // model the three widths an evidence-driven accessor must dispatch over;
+    // the actual JDK 8..26 width is u2.
+    check("mfw_w27_const_method_flags_synthetic_widths",
+          sizeof(mfw_w27::synthetic_const_method_flags_u1) == 1u
+          && sizeof(mfw_w27::synthetic_const_method_flags_u2) == 2u
+          && sizeof(mfw_w27::synthetic_const_method_flags_u4) == 4u);
+
+    // The ACTUAL ConstMethod._flags width across every supported JDK is u2.
+    // (HotSpot constMethod.hpp jdk8u..master: `u2 _flags;`.)  Pin that as a
+    // single named PASS so a future widening shows up as a red test.
+    check("mfw_w27_const_method_flags_actual_width_is_u2",
+          sizeof(mfw_w27::synthetic_const_method_flags_u2) == 2u);
+
+    // All six ConstMethod bits fit inside a u1, so even the smallest synthetic
+    // would hold them — proving the actual u2 width is strictly sufficient.
+    constexpr std::uint32_t cm_mask{
+        (1u << mfw_w27::const_method_flag_bit::has_linenumber_table)
+        | (1u << mfw_w27::const_method_flag_bit::has_checked_exceptions)
+        | (1u << mfw_w27::const_method_flag_bit::has_localvariable_table)
+        | (1u << mfw_w27::const_method_flag_bit::has_exception_table)
+        | (1u << mfw_w27::const_method_flag_bit::has_generic_signature)
+        | (1u << mfw_w27::const_method_flag_bit::has_method_parameters)
+    };
+    check("mfw_w27_const_method_6bit_mask_fits_u1", cm_mask <= 0xFFu && cm_mask == 0x3Fu);
+
+    // Toggle each ConstMethod bit on a u2-width synthetic and verify the byte
+    // outside the slot is untouched and the bit lands inside the slot.
+    for (int bit{ 0 }; bit <= 5; ++bit)
+    {
+        struct { std::uint16_t _flags; std::uint16_t _sibling; } cm{ 0u, 0xBEEFu };
+        cm._flags |= static_cast<std::uint16_t>(1u << bit);
+        const bool inside  { (cm._flags & static_cast<std::uint16_t>(1u << bit)) != 0u };
+        const bool sibling { cm._sibling == 0xBEEFu };
+        check("mfw_w27_const_method_bit_toggle_no_sibling_clobber", inside && sibling);
+    }
+}
+
+static auto test_mfw_w27_jvms_acc_bits_and_disambiguation() -> void
+{
+    using namespace mfw_w27::jvms_method_acc;
+
+    // Every JVMS access-flag value is a single bit (popcount==1) — runtime echo.
+    constexpr std::array<std::uint32_t, 12> acc_values{
+        PUBLIC, PRIVATE, PROTECTED, STATIC, FINAL, SYNCHRONIZED,
+        BRIDGE, VARARGS, NATIVE, ABSTRACT, STRICTFP, SYNTHETIC
+    };
+    for (std::size_t i{ 0 }; i < acc_values.size(); ++i)
+    {
+        check("mfw_w27_jvms_acc_value_is_single_bit",
+              std::popcount(acc_values[i]) == 1);
+    }
+
+    // The union of every JVMS access-flag value fits in the low 13 bits — i.e.
+    // it is reachable from a u2 access-flags read, which is exactly the JDK 24+
+    // post-shrink contract.  This proves the JVMS bits the library cares about
+    // SURVIVE the AccessFlags u4 -> u2 transition.
+    std::uint32_t acc_union{ 0u };
+    for (const auto v : acc_values) { acc_union |= v; }
+    // Union of the pinned 12 method bits: low byte fully set (0x00FF) +
+    // 0x0100 + 0x0400 + 0x0800 + 0x1000 = 0x1DFF.  ACC_VOLATILE (0x0200) is a
+    // field-only bit, ACC_TRANSIENT (0x0080) here doubles as ACC_VARARGS for
+    // methods.  Pin the exact value.
+    check("mfw_w27_jvms_acc_union_fits_u2", acc_union <= 0xFFFFu && acc_union == 0x1DFFu);
+
+    // access_flags-vs-_flags DISAMBIGUATION runtime echo.  This is the WHOLE
+    // POINT of the two-word split: some JVMS access-flag VALUES (PROTECTED=0x4,
+    // STATIC=0x8, FINAL=0x10, SYNCHRONIZED=0x20, BRIDGE=0x40, VARARGS=0x80,
+    // SYNTHETIC=0x1000) COLLIDE with HotSpot _flags bit-MASKS (_dont_inline
+    // pre-21 = 1<<2 = 0x4; _force_inline 21+ = 1<<11 = 0x800; _dont_inline
+    // 21+ = 1<<12 = 0x1000).  Same numeric value, DIFFERENT word.  That is
+    // EXACTLY why reading access_flags via get_access_flags() and reading
+    // _flags via get_flags() are two distinct VMStruct lookups — confusing the
+    // words would mis-interpret bit 2 of access-flags (PROTECTED) as
+    // _dont_inline, and worse on JDK 21+, bit 12 of _flags (_dont_inline) as
+    // ACC_SYNTHETIC.  The library reads them through SEPARATE accessors with
+    // SEPARATE VMStruct entries.  Pin the collisions explicitly.
+    constexpr std::uint32_t dont_inline_pre21{ 1u << flags_layout::jdk11_20.dont_inline_bit };
+    constexpr std::uint32_t dont_inline_21p { 1u << flags_layout::jdk21_23.dont_inline_bit };
+    constexpr std::uint32_t force_inline_21p{ 1u << flags_layout::methodflags_status_bit::force_inline };
+    constexpr std::uint32_t no_compile_mask { 0x0F000000u };
+
+    // Specific bit-value COLLISIONS that prove the words MUST be addressed by
+    // separate accessors (the disambiguation contract).
+    check("mfw_w27_disambig_protected_collides_dont_inline_pre21",
+          PROTECTED == dont_inline_pre21 && PROTECTED == 0x4u);
+    check("mfw_w27_disambig_synthetic_collides_dont_inline_21p",
+          SYNTHETIC == dont_inline_21p && SYNTHETIC == 0x1000u);
+    check("mfw_w27_disambig_strictfp_collides_force_inline_21p",
+          STRICTFP == force_inline_21p && STRICTFP == 0x800u);
+
+    // NO_COMPILE high-byte is disjoint from EVERY JVMS bit (no collision).
+    for (const auto v : acc_values)
+    {
+        check("mfw_w27_disambig_jvms_vs_no_compile_high_byte_disjoint",
+              (v & no_compile_mask) == 0u);
+    }
+
+    // The library reads JVM_ACC_STATIC out of get_access_flags() (u4) and
+    // masks 0x0008 — width-independent because 0x0008 fits a u1.  Pin the
+    // single-byte mask invariant that backs is_static() on every JDK.
+    check("mfw_w27_jvm_acc_static_mask_fits_low_byte",
+          (STATIC & 0xFFu) == STATIC && std::popcount(STATIC) == 1);
+}
+
+static auto test_mfw_w27_mask_invariants() -> void
+{
+    // Mask invariant #1: every Method::_flags bit position the library knows
+    // about (jdk<=20 _dont_inline=2; jdk21+ _force_inline=11, _dont_inline=12;
+    // jdk24+ relocated bits 7..10) is < 16, so a u2 access of _flags can still
+    // SET them — the only gap is u2 vs u4 READBACK on jdk21+ (already pinned).
+    constexpr std::array<int, 7> known_flag_bits{
+        flags_layout::jdk11_20.dont_inline_bit,
+        flags_layout::methodflags_status_bit::queued_for_compilation,
+        flags_layout::methodflags_status_bit::is_not_c2_compilable,
+        flags_layout::methodflags_status_bit::is_not_c1_compilable,
+        flags_layout::methodflags_status_bit::is_not_c2_osr,
+        flags_layout::methodflags_status_bit::force_inline,
+        flags_layout::methodflags_status_bit::dont_inline,
+    };
+    for (const int b : known_flag_bits)
+    {
+        check("mfw_w27_mask_known_flag_bit_below_16", b >= 0 && b < 16);
+    }
+
+    // Mask invariant #2: the union of every JDK 21+ MethodFlags::_status bit
+    // we pin (7..12) is 0x1F80, which fits in the LOW HALF of a u4 _status and
+    // therefore is ALSO addressable from a u2-width read — the library's u2
+    // hard-code can still WRITE every known bit, only future bits above 15
+    // become unreachable.
+    constexpr std::uint32_t status_union{
+        (1u << 7) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12)
+    };
+    check("mfw_w27_mask_status_union_is_0x1F80_and_u2_reachable",
+          status_union == 0x1F80u && status_union <= 0xFFFFu);
+
+    // Mask invariant #3: bit complements at every width round-trip.  Setting
+    // bit 2 then clearing it on a u1/u2/u4 slot returns the slot to 0; setting
+    // ALL bits of the slot then ANDing ~(1<<2) clears ONLY bit 2.
+    auto roundtrip = [](auto sample) -> bool
+    {
+        using T = decltype(sample);
+        T slot{ 0 };
+        slot = static_cast<T>(slot | static_cast<T>(1u << 2));
+        slot = static_cast<T>(slot & static_cast<T>(~static_cast<unsigned>(1u << 2)));
+        if (slot != T{ 0 }) { return false; }
+        T all{ static_cast<T>(~T{ 0 }) };
+        T cleared{ static_cast<T>(all & static_cast<T>(~static_cast<unsigned>(1u << 2))) };
+        const T expected{ static_cast<T>(all ^ static_cast<T>(1u << 2)) };
+        return cleared == expected;
+    };
+    check("mfw_w27_mask_invariant_roundtrip_u8",  roundtrip(std::uint8_t{ 0 }));
+    check("mfw_w27_mask_invariant_roundtrip_u16", roundtrip(std::uint16_t{ 0 }));
+    check("mfw_w27_mask_invariant_roundtrip_u32", roundtrip(std::uint32_t{ 0 }));
+
+    // Mask invariant #4: NO_COMPILE high-byte mask is exactly 4 contiguous bits
+    // at positions 24..27, and CLEARING it via signed ~ then static_cast<u32>
+    // (the library's pattern at the teardown sites) is byte-identical to
+    // computing the complement as a u32 directly.
+    constexpr std::uint32_t no_compile_u32{ 0x0F000000u };
+    constexpr std::int32_t  no_compile_s32{ 0x0F000000 };
+    check("mfw_w27_mask_no_compile_popcount_4_contiguous",
+          std::popcount(no_compile_u32) == 4
+          && std::countr_zero(no_compile_u32) == 24
+          && std::countl_zero(no_compile_u32) == 4);
+    check("mfw_w27_mask_no_compile_signed_clear_matches_unsigned",
+          static_cast<std::uint32_t>(~no_compile_s32) == ~no_compile_u32);
+}
+
 int main()
 {
     test_set_dont_inline_null();
@@ -3296,6 +3595,11 @@ int main()
     test_mfw_deep3_value_t_classification();
     test_mfw_deep3_signature_char_tables();
     test_mfw_deep3_arg_cap_and_slot_widening();
+
+    // Wave-27 deepening section (ledger-gap closing).
+    test_mfw_w27_const_method_flags_width_pin();
+    test_mfw_w27_jvms_acc_bits_and_disambiguation();
+    test_mfw_w27_mask_invariants();
 
     std::printf("\n%s: %d failure(s)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;

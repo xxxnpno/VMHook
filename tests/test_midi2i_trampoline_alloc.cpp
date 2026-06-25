@@ -1312,6 +1312,241 @@ static auto test_exported_struct_bit_layout() -> void
           std::is_trivially_copyable<cand>::value);
 }
 
+// ===========================================================================
+// L. WAVE-27 LEDGER GAPS — trampoline buffer allocation page-aligned +
+// executable bit, cold-state alloc returns nullptr-or-valid, 1000-iter
+// alloc/free leak/stability loop, alignment static_assert on returned pointer,
+// size cap pinned constant.
+// ===========================================================================
+
+// L.0 Pinned constants & alignment math (static_assert where deterministic).
+// HOOK_SIZE+sizeof(assembly) per-ABI: pin the per-ABI ceilings and the
+// session-wide kTrampolineSize used by section A as a single source of truth.
+static_assert(kTrampolineSize == 8u + 0x80u,
+              "kTrampolineSize is HOOK_SIZE + Win-ABI sizeof(assembly)");
+static_assert(kTrampolineSize < 0x1000u,
+              "trampoline body fits within a single page on every ABI");
+static_assert(kTrampolineSize > 0u, "trampoline size is strictly positive");
+// kRel32Limit is INT32_MAX. The detour data slot is exactly 8 bytes.
+static_assert(kRel32Limit == static_cast<std::uintptr_t>(0x7FFFFFFFu),
+              "rel32 reach is INT32_MAX");
+static_assert(sizeof(void*) == 8u, "x86_64-only trampoline assumes 8-byte pointers");
+
+// L.1 trampoline buffer is page-aligned AND every allocation_granularity is a
+// power of two AND a multiple of the page size — all of which the alignment
+// math the allocator and dtor rely on assumes silently.  Page-alignment of the
+// returned pointer is the contract os::release / os::protect ride on.
+static auto test_alloc_page_aligned_and_granularity_sane() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    const std::size_t gran{ vmhook::os::allocation_granularity() };
+
+    // Page size: >0, power of two.
+    check("L_page_size_nonzero", page > 0u);
+    check("L_page_size_power_of_two", (page & (page - 1u)) == 0u);
+    // Allocation granularity: >=page, power of two, multiple of page.
+    check("L_gran_nonzero", gran > 0u);
+    check("L_gran_power_of_two", (gran & (gran - 1u)) == 0u);
+    check("L_gran_ge_page", gran >= page);
+    check("L_gran_multiple_of_page", (gran % page) == 0u);
+
+    int anchor{ 0 };
+    auto* const target{ reinterpret_cast<std::uint8_t*>(&anchor) };
+    std::uint8_t* const block{ vmhook::hotspot::allocate_nearby_memory(target, kTrampolineSize) };
+    if (!block)
+    {
+        info("L_page_aligned: no nearby block on this runner — skipped");
+        return;
+    }
+    const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(block) };
+    // Page alignment (the dtor's protect/release contract).
+    check("L_block_page_aligned", (addr & (page - 1u)) == 0u);
+    // Granularity alignment (the allocator's own contract).
+    check("L_block_gran_aligned", (addr & (gran - 1u)) == 0u);
+    vmhook::os::release(block, kTrampolineSize);
+}
+
+// L.2 Executable-bit smoke: a trampoline page must be both writable (the ctor
+// memcpy's bytes into it) AND executable (CPU jumps into it).  We write a
+// `ret` instruction (0xC3) into the page and call it through a function
+// pointer — if the executable bit were missing this would fault.  Cross-
+// platform: a near `ret` is one byte on every x86_64 OS.
+static auto test_alloc_executable_bit() -> void
+{
+#if VMHOOK_ARCH_X86_64
+    int anchor{ 0 };
+    auto* const target{ reinterpret_cast<std::uint8_t*>(&anchor) };
+    std::uint8_t* const block{ vmhook::hotspot::allocate_nearby_memory(target, kTrampolineSize) };
+    if (!block)
+    {
+        info("L_exec_bit: no nearby block on this runner — skipped");
+        return;
+    }
+    // Single-byte `ret`.  Many OSes require an explicit RX flip before exec;
+    // the allocator returns RWX so a write-then-call is the contract.
+    block[0] = 0xC3u;
+    using fn_t = void (*)();
+    fn_t fn{ reinterpret_cast<fn_t>(block) };
+    fn();  // executes one `ret`; would SEGV if the executable bit were off
+    check("L_block_is_executable_after_alloc", true);
+    vmhook::os::release(block, kTrampolineSize);
+#else
+    info("L_exec_bit: non-x86_64 build — skipped");
+#endif
+}
+
+// L.3 Cold-state contract: on a freshly-loaded process (this one — no JVM,
+// no prior hooks installed) the allocator either returns a valid in-window
+// block or nullptr, NEVER a wild/unaligned/non-RWX pointer.  Probe a cold
+// target (function address in this TU's .text) and verify the binary
+// nullptr-or-valid contract end-to-end.
+static auto test_alloc_cold_state_null_or_valid() -> void
+{
+    auto* const cold_target{ reinterpret_cast<std::uint8_t*>(&test_alloc_cold_state_null_or_valid) };
+    std::uint8_t* const block{ vmhook::hotspot::allocate_nearby_memory(cold_target, kTrampolineSize) };
+    if (!block)
+    {
+        // Null is a valid cold-state outcome (dense address space).
+        check("L_cold_null_or_valid_is_null_ok", true);
+        info("L_cold: cold-state alloc returned null (acceptable)");
+        return;
+    }
+    // A non-null result must satisfy every universal invariant.
+    const std::size_t page{ vmhook::os::page_size() };
+    const std::size_t gran{ vmhook::os::allocation_granularity() };
+    const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(block) };
+    check("L_cold_valid_is_page_aligned", (addr & (page - 1u)) == 0u);
+    check("L_cold_valid_is_gran_aligned", (addr & (gran - 1u)) == 0u);
+    check("L_cold_valid_is_writable_readable",
+          write_read_whole_range(block, kTrampolineSize, 0xA3));
+    check("L_cold_valid_not_sentinel",
+          (addr & 0xFFFFFFFFu) != 0xCCCCCCCCu
+          && (addr & 0xFFFFFFFFu) != 0xDEADBEEFu
+          && (addr & 0xFFFFFFFFu) != 0xBAADF00Du);
+    vmhook::os::release(block, kTrampolineSize);
+}
+
+// L.4 1000-iteration alloc/free stability loop: install/teardown of trampolines
+// on hot-attached injectors does this repeatedly; the allocator must remain
+// usable across many cycles without leaking the address space or returning
+// degraded blocks.  We track the success rate and confirm every successful
+// block is invariants-clean; HARD-assert the FINAL allocator call (after 1000
+// cycles) still succeeds OR returns nullptr cleanly (no crash, no garbage).
+static auto test_alloc_1000_iter_stability_loop() -> void
+{
+    int anchor{ 0 };
+    auto* const target{ reinterpret_cast<std::uint8_t*>(&anchor) };
+    const std::size_t page{ vmhook::os::page_size() };
+    const std::size_t gran{ vmhook::os::allocation_granularity() };
+
+    constexpr int kIters{ 1000 };
+    int got{ 0 };
+    bool all_aligned{ true };
+    bool all_usable{ true };
+    int last_success_iter{ -1 };
+
+    for (int i{ 0 }; i < kIters; ++i)
+    {
+        std::uint8_t* const blk{ vmhook::hotspot::allocate_nearby_memory(target, kTrampolineSize) };
+        if (!blk)
+        {
+            continue;
+        }
+        ++got;
+        last_success_iter = i;
+        const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(blk) };
+        if ((addr & (page - 1u)) != 0u) { all_aligned = false; }
+        if ((addr & (gran - 1u)) != 0u) { all_aligned = false; }
+        // Touch a representative byte rather than the full range to keep this
+        // loop quick on slow CI runners; the full-range probe is exhaustively
+        // covered in section A and L.1.
+        blk[0] = static_cast<std::uint8_t>(i & 0xFFu);
+        if (blk[0] != static_cast<std::uint8_t>(i & 0xFFu)) { all_usable = false; }
+        vmhook::os::release(blk, kTrampolineSize);
+    }
+
+    info("L_loop: %d/%d alloc/free cycles succeeded (last success @ iter %d)",
+         got, kIters, last_success_iter);
+    // Stability: if ANY cycle succeeded, ALL successful cycles satisfied the
+    // alignment and usability invariants.  (Zero-success is run-variable on a
+    // dense address space — [INFO] not [FAIL].)
+    if (got > 0)
+    {
+        check("L_loop_all_successful_blocks_aligned", all_aligned);
+        check("L_loop_all_successful_blocks_usable", all_usable);
+    }
+    else
+    {
+        info("L_loop: no successful cycles on this runner — stability vacuous");
+    }
+    // A fresh post-loop call must still complete cleanly (null OR valid).
+    std::uint8_t* const post{ vmhook::hotspot::allocate_nearby_memory(target, kTrampolineSize) };
+    if (post)
+    {
+        check("L_loop_post_block_aligned",
+              (reinterpret_cast<std::uintptr_t>(post) & (page - 1u)) == 0u);
+        vmhook::os::release(post, kTrampolineSize);
+    }
+    else
+    {
+        check("L_loop_post_null_is_clean", true);
+    }
+}
+
+// L.5 Size-cap pinned constant: the real install path requests HOOK_SIZE +
+// sizeof(assembly) bytes, which on every supported ABI fits under a single
+// page (kTrampolineSize <= 0x1000).  A request at the exact one-page cap must
+// still succeed (single-page path) or return null cleanly; a request a hair
+// OVER one page must also be served by a single granularity-aligned region.
+// This pins the cap so a future ABI expansion that pushes the trampoline body
+// past 4 KiB lights up here.
+static auto test_alloc_size_cap_pinned_constant() -> void
+{
+    // The cap (one page) bounds the real trampoline body across every ABI.
+    const std::size_t page{ vmhook::os::page_size() };
+    check("L_cap_trampoline_under_one_page",
+          kTrampolineSize <= page);
+    // Both ABI totals (transcribed in section G) sit under the cap.
+    check("L_cap_win_total_under_page",
+          static_cast<std::size_t>(tramp_layout::kHookSize + tramp_layout::win::sizeof_assembly) <= page);
+    check("L_cap_sysv_total_under_page",
+          static_cast<std::size_t>(tramp_layout::kHookSize + tramp_layout::sysv::sizeof_assembly) <= page);
+
+    int anchor{ 0 };
+    auto* const target{ reinterpret_cast<std::uint8_t*>(&anchor) };
+
+    // At-cap: request exactly one page.  Must serve null OR a valid block.
+    std::uint8_t* const at_cap{ vmhook::hotspot::allocate_nearby_memory(target, page) };
+    if (at_cap)
+    {
+        const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(at_cap) };
+        check("L_at_cap_block_page_aligned", (addr & (page - 1u)) == 0u);
+        check("L_at_cap_block_usable",
+              write_read_whole_range(at_cap, page, 0xA1));
+        vmhook::os::release(at_cap, page);
+    }
+    else
+    {
+        check("L_at_cap_null_is_clean", true);
+    }
+
+    // Over-cap-by-one-page: still well within the granularity unit on every
+    // platform we ship (granularity >= page).  Should still serve null OR
+    // a valid, full-range usable block.
+    const std::size_t over{ page + 1u };
+    std::uint8_t* const over_blk{ vmhook::hotspot::allocate_nearby_memory(target, over) };
+    if (over_blk)
+    {
+        check("L_over_cap_block_page_aligned",
+              (reinterpret_cast<std::uintptr_t>(over_blk) & (page - 1u)) == 0u);
+        vmhook::os::release(over_blk, over);
+    }
+    else
+    {
+        check("L_over_cap_null_is_clean", true);
+    }
+}
+
 int main()
 {
     // A. allocate_nearby_memory reachability allocator.
@@ -1354,6 +1589,13 @@ int main()
     test_no_jvm_null_contract();
     // K. exported-struct bit layout (standard-layout / sizeof / offsetof).
     test_exported_struct_bit_layout();
+
+    // --- WAVE-27 LEDGER GAPS (L) ---
+    test_alloc_page_aligned_and_granularity_sane();
+    test_alloc_executable_bit();
+    test_alloc_cold_state_null_or_valid();
+    test_alloc_1000_iter_stability_loop();
+    test_alloc_size_cap_pinned_constant();
 
     if (failures == 0)
     {

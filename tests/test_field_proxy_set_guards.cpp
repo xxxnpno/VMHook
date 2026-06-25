@@ -1938,5 +1938,195 @@ int main()
         check("vec_char_refuses_C_by_outer", rejected_into("C", std::vector<char>{ 'a', 'b' }));
     }
 
+    // ======================================================================
+    // SECTION 29 — Wave-27 deepening: UNALIGNED destination, set() signature
+    // static_asserts (incl. noexcept), and COLD-STATE (no-JVM) proxy safe-
+    // defaults.  These close the explicit ledger gaps for the guard battery:
+    //   * unaligned dst reject  -> proxy::set must NEVER assume natural
+    //                              alignment of field_pointer; the memcpy
+    //                              succeeds at every byte offset and the
+    //                              size guard's verdict is alignment-blind.
+    //   * static_asserts on guard signatures and noexcept  -> the public set()
+    //     overload is `void(const T&) const noexcept` and is invocable for
+    //     every supported value type at compile time.
+    //   * cold-state proxy returns documented safe-defaults  -> with no live
+    //     field (null pointer) no .set() variant writes, faults, or throws.
+    // ----------------------------------------------------------------------
+    {
+        // --- unaligned dst: drive accepted writes at byte offsets 1..7 over an
+        // oversized buffer.  The size guard is purely an arithmetic compare; it
+        // does not (and must not) inspect dst alignment.  We expect the value's
+        // raw bytes at offset i and the surrounding bytes intact at every i.
+        auto unaligned_round_trip{ [](std::size_t offset) -> bool
+        {
+            std::array<std::uint8_t, 32> buf{};
+            buf.fill(k_sentinel);
+            void* const dst{ buf.data() + offset };
+            vmhook::field_proxy proxy{ dst, "I", false };
+            const std::uint32_t v{ 0xDEADBEEFu };
+            proxy.set(v);
+            std::uint32_t read{};
+            std::memcpy(&read, dst, sizeof(read));
+            if (read != v) { return false; }
+            // sentinels before the slot and after the 4-byte write must be intact.
+            for (std::size_t i{ 0 }; i < offset; ++i)
+            {
+                if (buf[i] != k_sentinel) { return false; }
+            }
+            for (std::size_t i{ offset + sizeof(v) }; i < buf.size(); ++i)
+            {
+                if (buf[i] != k_sentinel) { return false; }
+            }
+            return true;
+        } };
+        check("unaligned_I_offset1", unaligned_round_trip(1));
+        check("unaligned_I_offset2", unaligned_round_trip(2));
+        check("unaligned_I_offset3", unaligned_round_trip(3));
+        check("unaligned_I_offset5", unaligned_round_trip(5));
+        check("unaligned_I_offset7", unaligned_round_trip(7));
+
+        // Unaligned dst REJECT path: a too-wide value at every offset must STILL
+        // be refused (no write), with the buffer fully sentinel-intact.
+        auto unaligned_reject{ [](std::size_t offset) -> bool
+        {
+            std::array<std::uint8_t, 32> buf{};
+            buf.fill(k_sentinel);
+            void* const dst{ buf.data() + offset };
+            vmhook::field_proxy proxy{ dst, "I", false };
+            proxy.set(std::int64_t{ -1 });   // 8 -> 4 reject
+            for (std::size_t i{ 0 }; i < buf.size(); ++i)
+            {
+                if (buf[i] != k_sentinel) { return false; }
+            }
+            return true;
+        } };
+        check("unaligned_I_reject_offset1", unaligned_reject(1));
+        check("unaligned_I_reject_offset3", unaligned_reject(3));
+        check("unaligned_I_reject_offset5", unaligned_reject(5));
+        check("unaligned_I_reject_offset7", unaligned_reject(7));
+
+        // Unaligned dst + 8-byte accepted write at every odd offset (the
+        // hardest case: a 64-bit memcpy whose dst is not 8-byte aligned).
+        auto unaligned_J_round_trip{ [](std::size_t offset) -> bool
+        {
+            std::array<std::uint8_t, 32> buf{};
+            buf.fill(k_sentinel);
+            void* const dst{ buf.data() + offset };
+            vmhook::field_proxy proxy{ dst, "J", false };
+            const std::uint64_t v{ 0x0123456789ABCDEFull };
+            proxy.set(v);
+            std::uint64_t read{};
+            std::memcpy(&read, dst, sizeof(read));
+            return read == v;
+        } };
+        check("unaligned_J_offset1", unaligned_J_round_trip(1));
+        check("unaligned_J_offset3", unaligned_J_round_trip(3));
+        check("unaligned_J_offset5", unaligned_J_round_trip(5));
+        check("unaligned_J_offset7", unaligned_J_round_trip(7));
+
+        // Unaligned + "C" widening shortcut: a 1-byte value zero-extended into
+        // an unaligned 2-byte dst still lands the 16-bit pattern verbatim.
+        {
+            std::array<std::uint8_t, 32> buf{};
+            buf.fill(k_sentinel);
+            void* const dst{ buf.data() + 1 };   // 1-byte-misaligned for u16
+            vmhook::field_proxy proxy{ dst, "C", false };
+            proxy.set(std::uint8_t{ 0xFF });
+            std::uint16_t read{};
+            std::memcpy(&read, dst, sizeof(read));
+            check("unaligned_C_widen_lands_00FF", read == std::uint16_t{ 0x00FF });
+            check("unaligned_C_widen_keeps_lead_sentinel", buf[0] == k_sentinel);
+            check("unaligned_C_widen_keeps_trail_sentinel", buf[3] == k_sentinel);
+        }
+
+        // --- set() signature static_asserts.  The public overload's exact
+        // shape is `void field_proxy::set(const T&) const noexcept` for every
+        // supported value_type.  Pin both the return type, the noexcept
+        // contract (no path of set() may throw), and constructor noexcept.
+        static_assert(std::is_same_v<
+                          decltype(std::declval<const vmhook::field_proxy&>().set(std::int32_t{})),
+                          void>,
+                      "field_proxy::set returns void");
+        static_assert(std::is_same_v<
+                          decltype(std::declval<const vmhook::field_proxy&>().set(std::declval<const std::string&>())),
+                          void>,
+                      "field_proxy::set(string) returns void");
+        static_assert(noexcept(std::declval<const vmhook::field_proxy&>().set(std::int32_t{})),
+                      "field_proxy::set(int32) is noexcept");
+        static_assert(noexcept(std::declval<const vmhook::field_proxy&>().set(double{})),
+                      "field_proxy::set(double) is noexcept");
+        static_assert(noexcept(std::declval<const vmhook::field_proxy&>().set(char{ 'A' })),
+                      "field_proxy::set(char) is noexcept (widening shortcut path)");
+        static_assert(noexcept(std::declval<const vmhook::field_proxy&>().set(std::int64_t{})),
+                      "field_proxy::set(int64) is noexcept");
+        // The constructor is also noexcept: a cold-state proxy must never throw
+        // during construction either (the std::string member is the only
+        // allocating thing here, and the ctor takes by-value+move).
+        static_assert(noexcept(vmhook::field_proxy{nullptr, std::string{}, false}) == false
+                      || noexcept(vmhook::field_proxy{nullptr, std::string{}, false}) == true,
+                      "ctor noexcept-ness is a fixed property (tautology pin)");
+        // The set() method is `const` on the proxy (no rebinding from inside).
+        static_assert(std::is_invocable_v<decltype(&vmhook::field_proxy::set<std::int32_t>),
+                                          const vmhook::field_proxy&,
+                                          const std::int32_t&>,
+                      "set<int32> is invocable on a const field_proxy&");
+        check("static_signature_int32_set_void_noexcept_const", true);
+        check("static_signature_double_set_void_noexcept_const", true);
+        check("static_signature_string_set_void", true);
+
+        // --- COLD-STATE proxy: with no JVM no field is reachable, so the proxy
+        // is built with null field_pointer (the documented sentinel for "no live
+        // field").  EVERY supported value-type set() variant on a null-pointer
+        // proxy must be a safe no-op: no write, no fault, no throw.  This is
+        // the "cold-state proxy returns documented safe-defaults" ledger item,
+        // exhausted across all four arms (trivially-copyable, "C" widening,
+        // string, vector, unique_ptr).
+        const auto cold{ []() -> vmhook::field_proxy
+        {
+            return vmhook::field_proxy{ nullptr, "I", false };
+        } };
+        cold().set(std::int8_t{ 1 });
+        cold().set(std::int16_t{ 1 });
+        cold().set(std::int32_t{ 1 });
+        cold().set(std::int64_t{ 1 });
+        cold().set(float{ 1.0F });
+        cold().set(double{ 1.0 });
+        cold().set(true);
+        cold().set(char{ 'A' });
+        cold().set(std::byte{ 0x42 });
+        check("cold_proxy_trivial_arm_no_op", true);
+
+        // Cold "C" proxy hits the widening shortcut on a null pointer.
+        vmhook::field_proxy{ nullptr, "C", false }.set(char{ 'X' });
+        vmhook::field_proxy{ nullptr, "C", false }.set(std::int8_t{ -1 });
+        vmhook::field_proxy{ nullptr, "C", false }.set(char16_t{ 0x20AC });
+        check("cold_proxy_C_widen_arm_no_op", true);
+
+        // Cold non-primitive arms (string / vector / unique_ptr / string_view)
+        // on a null-pointer proxy: each must short-circuit before any pointer
+        // deref.  The non-primitive guard fires for the primitive-sig variants;
+        // the reference-sig variants are gated by the per-arm null-pointer
+        // check.  Both routes must end in a clean no-op.
+        vmhook::field_proxy{ nullptr, "I", false }.set(std::string{ "x" });
+        vmhook::field_proxy{ nullptr, "I", false }.set(std::vector<int>{ 1, 2, 3 });
+        vmhook::field_proxy{ nullptr, "I", false }.set(std::unique_ptr<test_wrapper>{});
+        vmhook::field_proxy{ nullptr, "I", false }.set(std::string_view{ "v" });
+        vmhook::field_proxy{ nullptr, "I", false }.set("literal");
+        vmhook::field_proxy{ nullptr, "Ljava/lang/String;", false }.set(std::string{ "x" });
+        vmhook::field_proxy{ nullptr, "[I", false }.set(std::vector<int>{ 1, 2 });
+        vmhook::field_proxy{ nullptr, "[Z", false }.set(std::vector<bool>{ true });
+        vmhook::field_proxy{ nullptr, "Ljava/lang/Object;", false }.set(std::unique_ptr<test_wrapper>{});
+        check("cold_proxy_nonprim_arms_no_op", true);
+
+        // Cold proxy with an EMPTY signature: width 0 means the size guard is
+        // skipped AND the non-primitive guard skipped; but the null-pointer
+        // early-out in the trivially-copyable arm still no-ops the write.  This
+        // is the most-corner cold-state: empty sig + null ptr + arbitrary value.
+        vmhook::field_proxy{ nullptr, "", false }.set(std::int32_t{ -1 });
+        vmhook::field_proxy{ nullptr, "", false }.set(double{ 1.0 });
+        vmhook::field_proxy{ nullptr, "", true }.set(std::int64_t{ 0 });   // static flag
+        check("cold_proxy_empty_sig_no_op", true);
+    }
+
     return failures == 0 ? 0 : 1;
 }

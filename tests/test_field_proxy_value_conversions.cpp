@@ -2441,5 +2441,205 @@ int main()
               static_cast<unsigned long long>(zero_unit) == 0ULL);
     }
 
+    // ---------------------------------------------------------------------
+    // 58. WAVE-27 LEDGER: explicit static_assert variant index map.  The 9
+    //     alternative ORDER is the load-bearing contract every test in this
+    //     file pins via `idx::k_*`.  Mirror that contract as static_asserts
+    //     directly on the variant type so a future reorder of value_t::data
+    //     hard-errors at compile time INSTEAD of silently re-pointing
+    //     idx::k_* (which would then quietly pass with the wrong meaning).
+    // ---------------------------------------------------------------------
+    {
+        using variant_t = decltype(std::declval<value_t&>().data);
+        static_assert(std::variant_size_v<variant_t> == 9,
+                      "value_t::data must hold exactly 9 alternatives");
+        static_assert(std::is_same_v<std::variant_alternative_t<0, variant_t>, bool>,
+                      "idx 0 = bool (Z)");
+        static_assert(std::is_same_v<std::variant_alternative_t<1, variant_t>, std::int8_t>,
+                      "idx 1 = int8_t (B)");
+        static_assert(std::is_same_v<std::variant_alternative_t<2, variant_t>, std::int16_t>,
+                      "idx 2 = int16_t (S)");
+        static_assert(std::is_same_v<std::variant_alternative_t<3, variant_t>, std::int32_t>,
+                      "idx 3 = int32_t (I)");
+        static_assert(std::is_same_v<std::variant_alternative_t<4, variant_t>, std::int64_t>,
+                      "idx 4 = int64_t (J)");
+        static_assert(std::is_same_v<std::variant_alternative_t<5, variant_t>, float>,
+                      "idx 5 = float (F)");
+        static_assert(std::is_same_v<std::variant_alternative_t<6, variant_t>, double>,
+                      "idx 6 = double (D)");
+        static_assert(std::is_same_v<std::variant_alternative_t<7, variant_t>, std::uint16_t>,
+                      "idx 7 = uint16_t (C)");
+        static_assert(std::is_same_v<std::variant_alternative_t<8, variant_t>, std::uint32_t>,
+                      "idx 8 = uint32_t (compressed OOP)");
+        check("variant_index_map_static_asserts_compiled", true);
+    }
+
+    // ---------------------------------------------------------------------
+    // 59. WAVE-27 LEDGER: holds_alternative<T> per-type sweep.  For each of
+    //     the 9 alternatives, constructing a value_t with that alternative
+    //     must make holds_alternative<T> true for exactly that T and false
+    //     for every other.  This is the runtime mirror of section 58.
+    // ---------------------------------------------------------------------
+    {
+        const value_t b{ bool{ true } };
+        check("holds_bool_for_bool", std::holds_alternative<bool>(b.data));
+        check("holds_not_i32_for_bool", !std::holds_alternative<std::int32_t>(b.data));
+        check("holds_not_u32_for_bool", !std::holds_alternative<std::uint32_t>(b.data));
+
+        const value_t i8{ std::int8_t{ -1 } };
+        check("holds_i8_for_i8", std::holds_alternative<std::int8_t>(i8.data));
+        check("holds_not_i16_for_i8", !std::holds_alternative<std::int16_t>(i8.data));
+
+        const value_t i16{ std::int16_t{ -1 } };
+        check("holds_i16_for_i16", std::holds_alternative<std::int16_t>(i16.data));
+        check("holds_not_i8_for_i16", !std::holds_alternative<std::int8_t>(i16.data));
+        check("holds_not_u16_for_i16", !std::holds_alternative<std::uint16_t>(i16.data));
+
+        const value_t i32{ std::int32_t{ 0 } };
+        check("holds_i32_for_i32", std::holds_alternative<std::int32_t>(i32.data));
+        check("holds_not_i64_for_i32", !std::holds_alternative<std::int64_t>(i32.data));
+        check("holds_not_u32_for_i32", !std::holds_alternative<std::uint32_t>(i32.data));
+
+        const value_t i64{ std::int64_t{ 0 } };
+        check("holds_i64_for_i64", std::holds_alternative<std::int64_t>(i64.data));
+        check("holds_not_i32_for_i64", !std::holds_alternative<std::int32_t>(i64.data));
+
+        const value_t f{ float{ 0.0f } };
+        check("holds_float_for_float", std::holds_alternative<float>(f.data));
+        check("holds_not_double_for_float", !std::holds_alternative<double>(f.data));
+
+        const value_t d{ double{ 0.0 } };
+        check("holds_double_for_double", std::holds_alternative<double>(d.data));
+        check("holds_not_float_for_double", !std::holds_alternative<float>(d.data));
+
+        const value_t u16{ std::uint16_t{ 0 } };
+        check("holds_u16_for_u16", std::holds_alternative<std::uint16_t>(u16.data));
+        check("holds_not_i16_for_u16", !std::holds_alternative<std::int16_t>(u16.data));
+
+        const value_t u32{ std::uint32_t{ 0 } };
+        check("holds_u32_for_u32", std::holds_alternative<std::uint32_t>(u32.data));
+        check("holds_not_i32_for_u32", !std::holds_alternative<std::int32_t>(u32.data));
+    }
+
+    // ---------------------------------------------------------------------
+    // 60. WAVE-27 LEDGER: std::get<WrongT> throws std::bad_variant_access.
+    //     Pin the variant's documented exception contract per alternative.
+    //     std::get<CorrectT> must succeed, std::get<OtherT> must throw.
+    // ---------------------------------------------------------------------
+    {
+        const value_t v{ std::int32_t{ 42 } };
+        bool got_correct{ false };
+        try { got_correct = (std::get<std::int32_t>(v.data) == 42); }
+        catch (const std::bad_variant_access&) { got_correct = false; }
+        check("get_correct_T_returns_value", got_correct);
+
+        bool threw_wrong{ false };
+        try { (void)std::get<std::int64_t>(v.data); }
+        catch (const std::bad_variant_access&) { threw_wrong = true; }
+        check("get_wrong_T_throws_bad_variant_access", threw_wrong);
+
+        bool threw_bool{ false };
+        try { (void)std::get<bool>(v.data); }
+        catch (const std::bad_variant_access&) { threw_bool = true; }
+        check("get_bool_on_i32_throws", threw_bool);
+
+        bool threw_u32{ false };
+        try { (void)std::get<std::uint32_t>(v.data); }
+        catch (const std::bad_variant_access&) { threw_u32 = true; }
+        check("get_u32_on_i32_throws", threw_u32);
+
+        // Float alt: get<double> throws (different alternative even though
+        // both are floating-point), get<float> returns the value.
+        const value_t fv{ float{ 1.5f } };
+        bool threw_double_on_float{ false };
+        try { (void)std::get<double>(fv.data); }
+        catch (const std::bad_variant_access&) { threw_double_on_float = true; }
+        check("get_double_on_float_throws", threw_double_on_float);
+
+        bool threw_float_on_double{ false };
+        const value_t dv{ double{ 1.5 } };
+        try { (void)std::get<float>(dv.data); }
+        catch (const std::bad_variant_access&) { threw_float_on_double = true; }
+        check("get_float_on_double_throws", threw_float_on_double);
+
+        // uint32 (OOP alt) vs int32: distinct alternatives despite same width.
+        const value_t oop{ std::uint32_t{ 0u } };
+        bool threw_i32_on_u32{ false };
+        try { (void)std::get<std::int32_t>(oop.data); }
+        catch (const std::bad_variant_access&) { threw_i32_on_u32 = true; }
+        check("get_i32_on_u32_throws", threw_i32_on_u32);
+    }
+
+    // ---------------------------------------------------------------------
+    // 61. WAVE-27 LEDGER: default-constructed value_t.  std::variant's
+    //     default ctor value-initialises the FIRST alternative.  For
+    //     value_t::data that is bool -> false.  signature is an empty
+    //     std::string.  Pin this so a future reorder of the variant (which
+    //     would break section 58 at compile time) is also pinned at runtime
+    //     via its default state.
+    // ---------------------------------------------------------------------
+    {
+        const value_t def{};
+        check("default_value_t_index_is_bool", def.data.index() == idx::k_bool);
+        check("default_value_t_bool_is_false", std::get<bool>(def.data) == false);
+        check("default_value_t_holds_bool", std::holds_alternative<bool>(def.data));
+        check("default_value_t_signature_empty", def.signature.empty());
+        // is_reference() asks holds_alternative<uint32_t>, so default is false.
+        check("default_value_t_is_reference_false", def.is_reference() == false);
+        // as_string() on a non-uint32 alternative returns "" by contract.
+        check("default_value_t_as_string_empty", def.as_string().empty());
+        // void* fallback on non-uint32 alternative is nullptr.
+        check("default_value_t_void_ptr_null", static_cast<void*>(def) == nullptr);
+        // Implicit bool conversion routes through static_cast<bool>(false).
+        check("default_value_t_bool_cast_false", static_cast<bool>(def) == false);
+        // Implicit int conversion routes through static_cast<int>(false) == 0.
+        check("default_value_t_int_cast_zero", static_cast<int>(def) == 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // 62. WAVE-27 LEDGER: round-trip every one of the 9 alternatives via
+    //     direct value_t{alt} construction (mirroring get()'s producer
+    //     contract) and std::get<T> readback.  Covers the boundary values
+    //     for each carrier in a single compact sweep — complementary to
+    //     section 1 which goes through read_back<>().
+    // ---------------------------------------------------------------------
+    {
+        const value_t vb{ bool{ true } };
+        check("rt_bool_true", std::get<bool>(vb.data) == true);
+        const value_t vbf{ bool{ false } };
+        check("rt_bool_false", std::get<bool>(vbf.data) == false);
+
+        const value_t vi8_min{ std::int8_t{ -128 } };
+        check("rt_i8_min", std::get<std::int8_t>(vi8_min.data) == std::int8_t{ -128 });
+        const value_t vi8_max{ std::int8_t{ 127 } };
+        check("rt_i8_max", std::get<std::int8_t>(vi8_max.data) == std::int8_t{ 127 });
+
+        const value_t vi16_min{ std::int16_t{ -32768 } };
+        check("rt_i16_min", std::get<std::int16_t>(vi16_min.data) == std::int16_t{ -32768 });
+        const value_t vi16_max{ std::int16_t{ 32767 } };
+        check("rt_i16_max", std::get<std::int16_t>(vi16_max.data) == std::int16_t{ 32767 });
+
+        const value_t vi32_min{ std::int32_t{ -2147483647 - 1 } };
+        check("rt_i32_min", std::get<std::int32_t>(vi32_min.data) == (-2147483647 - 1));
+        const value_t vi32_max{ std::int32_t{ 2147483647 } };
+        check("rt_i32_max", std::get<std::int32_t>(vi32_max.data) == 2147483647);
+
+        const value_t vi64_min{ std::int64_t{ -9223372036854775807LL - 1 } };
+        check("rt_i64_min", std::get<std::int64_t>(vi64_min.data)
+              == (std::int64_t{ -9223372036854775807LL - 1 }));
+        const value_t vi64_max{ std::int64_t{ 9223372036854775807LL } };
+        check("rt_i64_max", std::get<std::int64_t>(vi64_max.data) == 9223372036854775807LL);
+
+        const value_t vf{ float{ 3.5f } };
+        check("rt_float", std::get<float>(vf.data) == 3.5f);
+        const value_t vd{ double{ 3.5 } };
+        check("rt_double", std::get<double>(vd.data) == 3.5);
+
+        const value_t vu16_max{ std::uint16_t{ 0xFFFF } };
+        check("rt_u16_max", std::get<std::uint16_t>(vu16_max.data) == std::uint16_t{ 0xFFFF });
+        const value_t vu32_max{ std::uint32_t{ 0xFFFFFFFFu } };
+        check("rt_u32_max", std::get<std::uint32_t>(vu32_max.data) == 0xFFFFFFFFu);
+    }
+
     return failures == 0 ? 0 : 1;
 }

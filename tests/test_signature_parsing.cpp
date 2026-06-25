@@ -1276,6 +1276,172 @@ namespace wave25
     }
 } // namespace wave25
 
+// =====================================================================
+// WAVE-27 ADDITIVE DEEPENING (no-JVM, -Werror gcc/clang/msvc).
+// Round-4 ledger gaps:
+//   * full sweep of valid descriptor LETTERS (B/C/D/F/I/J/S/Z/V/L/[) -> BasicType
+//     in a SINGLE table closure — pin the 11-row table as one assertion;
+//   * signed-char vs unsigned-char compiler-flag invariance pin: build the same
+//     byte value through BOTH a signed-char path AND an unsigned-char path and
+//     verify sig_char_to_basic_type returns IDENTICAL ints over 0x00..0xFF;
+//   * descriptor with array depth > 255 (JVMS § 4.3.2 caps array dimensions
+//     at 255): walk a 300-'[' prefix through parse_one_field_descriptor and
+//     pin the REFERENCE walker's current behaviour ([INFO]-gated since the
+//     library has NO depth check — the helper only counts; the JVMS limit is
+//     a CLASS-FILE-validator concern, not a descriptor-lexer concern);
+//   * ()V vs (V)V malformed distinction explicit: the JVMS forbids V as a
+//     parameter, so "(V)V" is MALFORMED while "()V" is the void-no-args
+//     canonical form — pin parse_method_descriptor rejects (V)V and accepts
+//     ()V, and the guarded return-char ladder yields 14 (T_VOID) for both
+//     when treated as raw return-extraction inputs.
+// All HARD asserts except the >255-depth row, which is [INFO]-only because the
+// library deliberately does no depth enforcement.
+// =====================================================================
+namespace wave27
+{
+    inline auto run() -> void
+    {
+        // ---- Single-table sweep of the 11 valid descriptor letters ----------
+        // One closure asserts the entire BasicType table at once; any drift in
+        // ANY row fails this single check.  Values from vmhook.hpp:16219-16230.
+        {
+            struct row { char c; int bt; };
+            const row table[]{
+                { 'B', 8  }, { 'C', 5  }, { 'D', 7  }, { 'F', 6  },
+                { 'I', 10 }, { 'J', 11 }, { 'S', 9  }, { 'Z', 4  },
+                { 'V', 14 }, { 'L', 12 }, { '[', 13 },
+            };
+            bool all_rows_match{ true };
+            int  rows_checked{ 0 };
+            for (const row& r : table)
+            {
+                if (vmhook::detail::sig_char_to_basic_type(r.c) != r.bt)
+                {
+                    all_rows_match = false;
+                }
+                ++rows_checked;
+            }
+            check("wave27_all_11_valid_letters_match_basic_type_table",
+                  all_rows_match);
+            check("wave27_table_covers_exactly_11_rows",
+                  rows_checked == 11);
+        }
+
+        // ---- signed-char vs unsigned-char compiler-flag invariance ----------
+        // The helper takes a plain `char`.  On MSVC/MinGW `char` is signed by
+        // default but a -funsigned-char build (or platforms where char is
+        // unsigned) presents high bytes as positive.  Build each byte via BOTH
+        // a signed-char path (negative for >=0x80 on signed targets) AND an
+        // unsigned-char-then-cast path; assert sig_char_to_basic_type returns
+        // identical ints across the full 0..255 byte range.
+        {
+            bool invariant{ true };
+            for (int b{ 0 }; b <= 0xFF; ++b)
+            {
+                const unsigned char ub{ static_cast<unsigned char>(b) };
+                const signed char   sb{ static_cast<signed char>(b) };
+                const int via_unsigned{
+                    vmhook::detail::sig_char_to_basic_type(static_cast<char>(ub)) };
+                const int via_signed{
+                    vmhook::detail::sig_char_to_basic_type(static_cast<char>(sb)) };
+                if (via_unsigned != via_signed)
+                {
+                    invariant = false;
+                }
+            }
+            check("wave27_sig_char_signed_vs_unsigned_byte_path_invariant",
+                  invariant);
+            // And the cross-table invariance: NO byte value in 0..255 should
+            // map differently depending on the bit-pattern construction route.
+            // The 11 known rows route by value; the other 245 all default to 12.
+            int defaults_count{ 0 };
+            for (int b{ 0 }; b <= 0xFF; ++b)
+            {
+                if (vmhook::detail::sig_char_to_basic_type(static_cast<char>(b)) == 12)
+                {
+                    ++defaults_count;
+                }
+            }
+            // 'L' is in the known table BUT also returns 12 (T_OBJECT), so the
+            // count of bytes that map to 12 = 245 unknowns + 1 known-'L' = 246.
+            check("wave27_exactly_246_bytes_map_to_T_OBJECT_12",
+                  defaults_count == 246);
+        }
+
+        // ---- Array depth > 255 (JVMS § 4.3.2 cap) ---------------------------
+        // The JVMS caps array dimensions at 255 — but that is a class-file
+        // VERIFIER rule, not a descriptor-lexer rule.  The library's helpers
+        // do no depth check; the reference walker parse_one_field_descriptor
+        // counts '[' unconditionally.  Build a 300-'[' prefix then 'I' and
+        // pin CURRENT behaviour: ok=true, array_dims==300, basic_type==13
+        // (T_ARRAY), component_basic==10 (T_INT), consumed==301.  Reported
+        // as [INFO] because this is library-policy-not-defined territory; a
+        // future depth check would change ok to false and is a conscious
+        // decision a future maintainer makes against this pin.
+        {
+            std::string deep_array(300, '[');
+            deep_array += 'I';
+            const field_descriptor_parse f{
+                parse_one_field_descriptor(deep_array, 0) };
+            const bool current_behaviour_pin{
+                f.ok && f.array_dims == 300 && f.basic_type == 13
+                && f.component_basic == 10 && f.consumed == 301 };
+            std::printf("[INFO] wave27_array_depth_300_no_lexer_cap pinned=%d "
+                        "(ok=%d dims=%d basic=%d comp=%d consumed=%zu)\n",
+                        current_behaviour_pin ? 1 : 0,
+                        f.ok ? 1 : 0, f.array_dims, f.basic_type,
+                        f.component_basic, f.consumed);
+            // And a HARD lower bound: AT LEAST the descriptor with depth 255
+            // (the JVMS legal max) MUST parse cleanly — that is unambiguously
+            // a valid JVMS descriptor, so no future depth check can reject it.
+            std::string at_cap(255, '[');
+            at_cap += 'I';
+            const field_descriptor_parse fcap{
+                parse_one_field_descriptor(at_cap, 0) };
+            check("wave27_array_depth_255_is_valid_and_walks",
+                  fcap.ok && fcap.array_dims == 255 && fcap.basic_type == 13
+                  && fcap.component_basic == 10 && fcap.consumed == 256);
+        }
+
+        // ---- ()V vs (V)V malformed distinction ------------------------------
+        // "()V": canonical "no args, void return" — well-formed.
+        // "(V)V": V is NOT a legal PARAMETER descriptor (JVMS § 4.3.3 only
+        // allows V as a return descriptor), so this MUST be rejected by the
+        // method-descriptor walker.  Pin both.
+        {
+            const method_descriptor_parse m_empty{
+                parse_method_descriptor("()V") };
+            check("wave27_empty_args_void_return_well_formed",
+                  m_empty.ok && m_empty.arg_count == 0
+                  && m_empty.arg_slots == 0
+                  && m_empty.return_basic == 14);
+            const method_descriptor_parse m_v_arg{
+                parse_method_descriptor("(V)V") };
+            check("wave27_V_as_parameter_is_malformed",
+                  !m_v_arg.ok);
+            // Sanity: V is rejected by parse_one_field_descriptor as a leading
+            // byte too (the field grammar excludes V).
+            const field_descriptor_parse fv{
+                parse_one_field_descriptor("V", 0) };
+            check("wave27_V_is_not_a_valid_field_descriptor_leading_byte",
+                  !fv.ok);
+            // The RAW return-char extraction over both signatures: in "()V"
+            // the rfind(')') is at idx 1, sig[2]='V' -> 14.  In "(V)V" it is
+            // the SAME — rfind(')') at idx 2, sig[3]='V' -> 14.  So the
+            // return-char ladder cannot distinguish "()V" from "(V)V"; the
+            // malformedness is a PARAMETER-LIST property, detected only by a
+            // full walker.  Pin both ladders agree on the return value.
+            check("wave27_empty_void_and_V_arg_void_share_guarded_return",
+                  call_site_result_type("()V") == 14
+                  && call_site_result_type("(V)V") == 14);
+            // And the raw return classifier sees 'V' for both -> 14 each.
+            check("wave27_empty_void_and_V_arg_void_share_raw_return",
+                  return_basic_type_of("()V") == 14
+                  && return_basic_type_of("(V)V") == 14);
+        }
+    }
+} // namespace wave27
+
 int main()
 {
     // ---- detail::sig_char_to_basic_type: HotSpot BasicType ints --------------
@@ -4273,6 +4439,7 @@ int main()
     wave23::run();
     wave24::run();
     wave25::run();
+    wave27::run();
 
     return failures == 0 ? 0 : 1;
 }

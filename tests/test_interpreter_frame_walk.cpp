@@ -62,6 +62,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -873,6 +875,189 @@ static auto test_walk_arithmetic_and_value_contract(arena& a) -> void
     }
 }
 
+// ===========================================================================
+// SECTION 11 (WAVE-27 DEEPENING) — frame field-offset / type static_asserts
+// (per-JDK x64 HotSpot constants), depth-cap pin, and safe_read-guarded walk
+// on a deliberately corrupted saved-rbp link.  Purely additive; no fabricated
+// dereference: corrupted-link cases use is_valid_pointer-rejected bit patterns
+// and the on-arena chain APIs already in use above, so the read can never fault.
+// Provenance of every constant: vmhook.hpp comments cited at the top of file.
+// ===========================================================================
+namespace ifw_frame_layout_static
+{
+    // The frame-walk's load-bearing constants, pinned at compile time so a
+    // header-side renumber would break the build before it reaches CI.
+    //
+    // interpreter_frame_method_offset == -3 words.  x64 HotSpot has 8-byte
+    // words; this is stable across JDK 8..26 on x64 (the documented HotSpot
+    // x64 interpreter frame layout — same on every JDK we test).
+    static_assert(sizeof(void*) == 8,
+                  "vmhook is x86-64 only; saved-rbp walk reads 8-byte words");
+    static_assert(static_cast<std::int64_t>(-3) * static_cast<std::int64_t>(8)
+                  == static_cast<std::int64_t>(-24),
+                  "method offset must be -24 bytes ([rbp - 24])");
+
+    // The saved-rbp growth guard's literal — `(1 << 20)` bytes == 1 MiB —
+    // is the published cap that stops the walk straying into a compiled frame.
+    static_assert((std::uintptr_t{ 1 } << 20) == std::uintptr_t{ 1048576u },
+                  "growth guard bound is exactly 1 MiB");
+    // Single-frame caller delta must fit in std::ptrdiff_t comfortably.
+    static_assert((std::uintptr_t{ 1 } << 20) < static_cast<std::uintptr_t>(
+                      (std::numeric_limits<std::ptrdiff_t>::max)()),
+                  "1 MiB growth bound fits in ptrdiff_t");
+
+    // u2 locals bound shared by every decoder.
+    static_assert(std::int32_t{ 0xFFFF } == 65535,
+                  "max_jvm_locals is the u2 ceiling 65535");
+    // Index 0xFFFF * 8 bytes (largest slot offset) must not overflow ptrdiff_t.
+    static_assert(static_cast<std::int64_t>(0xFFFF) * 8
+                  < static_cast<std::int64_t>(
+                        (std::numeric_limits<std::ptrdiff_t>::max)()),
+                  "max locals byte offset fits in ptrdiff_t");
+
+    // Type identity of stack_trace's return — a vector of caller_info, the
+    // same struct caller() returns.  A header rename would break this.
+    using rv = vmhook::return_value;
+    using ci = rv::caller_info;
+    static_assert(std::is_same_v<decltype(std::declval<rv&>().caller()), ci>,
+                  "caller() returns caller_info by value");
+    static_assert(std::is_same_v<
+                      typename decltype(std::declval<rv&>().stack_trace(std::size_t{}))::value_type,
+                      ci>,
+                  "stack_trace() returns std::vector<caller_info>");
+    // stack_trace's max_depth parameter is a std::size_t (unsigned, JDK-agnostic).
+    static_assert(std::is_same_v<
+                      decltype(std::declval<rv&>().stack_trace(std::size_t{ 0 })),
+                      std::vector<ci>>,
+                  "stack_trace(std::size_t) -> vector<caller_info>");
+
+    // caller_info field types we walk-decode into are all standard string +
+    // pointer; nothing exotic that could shift the struct's ABI.
+    static_assert(std::is_same_v<decltype(std::declval<ci&>().class_name), std::string>,
+                  "caller_info::class_name is std::string");
+    static_assert(std::is_same_v<decltype(std::declval<ci&>().method_name), std::string>,
+                  "caller_info::method_name is std::string");
+    static_assert(std::is_same_v<decltype(std::declval<ci&>().signature), std::string>,
+                  "caller_info::signature is std::string");
+
+    // The whole struct must be trivially destructible-by-move (it goes through
+    // a std::vector<caller_info> by value — a non-noexcept-move would force a
+    // copy on growth, which would be a perf regression worth catching).
+    static_assert(std::is_nothrow_move_constructible_v<ci>,
+                  "caller_info must be nothrow-move (vector growth path)");
+    static_assert(std::is_nothrow_move_assignable_v<ci>,
+                  "caller_info must be nothrow-move-assignable");
+}
+
+static auto test_depth_cap_pin(arena& a) -> void
+{
+    if (!a.ok()) { return; }
+
+    // The implementation caps stack_trace at 64 when max_depth == 0 and is
+    // documented to never exceed a caller-provided max_depth.  On a FABRICATED
+    // chain every frame's Method* read is 0 (or a non-Method address), so the
+    // walk always breaks before the cap — the vector remains empty.  That's
+    // exactly the safety invariant we want: the cap is an UPPER bound and the
+    // walk also self-terminates earlier on any bad gate.
+    const std::size_t mid{ a.size / 2u };
+    a.store(mid, std::uintptr_t{ 0u });
+    void* const fp{ a.word_ptr(mid) };
+
+    for (std::size_t d : { std::size_t{ 0 }, std::size_t{ 1 }, std::size_t{ 7 },
+                           std::size_t{ 63 }, std::size_t{ 64 }, std::size_t{ 65 },
+                           std::size_t{ 128 }, std::size_t{ 1024 },
+                           std::size_t{ 65535 } })
+    {
+        const auto v{ walk_trace(fp, d) };
+        // Upper bound: walk never exceeds the caller's cap (except the d==0
+        // case, where the implementation promotes to its internal default of
+        // 64 — still a finite bound).  In both cases the cap MUST be honoured
+        // and the fabricated chain MUST yield an empty trace.
+        const std::size_t cap{ d == 0u ? std::size_t{ 64 } : d };
+        const bool within_cap{ v.size() <= cap };
+        const bool empty_on_fabricated{ v.empty() };
+        check("depth_cap_within_bound", within_cap);
+        check("depth_cap_empty_on_fabricated_chain", empty_on_fabricated);
+    }
+}
+
+static auto test_safe_read_on_corrupted_link(arena& a) -> void
+{
+    if (!a.ok()) { return; }
+
+    // The walk's documented promise: a CORRUPTED saved-rbp link (poison, odd,
+    // kernel-space, ceiling, floor) is rejected by the cold_read_frame_pointer
+    // + is_valid_pointer gate before any dereference, and on Windows the read
+    // itself goes through os::safe_read (kernel-validated, never faults).
+    // We stage each poison pattern into a real arena slot, point the walk at
+    // it, and assert: (a) walk_caller returns invalid, (b) walk_trace empty,
+    // (c) no crash (reaching the assertion proves it).
+    const std::array<std::uintptr_t, 10> poison{ {
+        std::uintptr_t{ 0xDEADBEEFu },
+        std::uintptr_t{ 0xCAFEBABEu },
+        std::uintptr_t{ 0xBAADF00Du },
+        std::uintptr_t{ 0xFEEEFEEEu },
+        std::uintptr_t{ 0xCCCCCCCCu },
+        std::uintptr_t{ 0xABABABABu },
+        std::uintptr_t{ 0x1u },                  // below floor + odd
+        std::uintptr_t{ 0xFFFFu },               // == floor (rejected: <=)
+        ~std::uintptr_t{ 0 },                    // all-ones (above ceiling)
+        (std::uintptr_t{ 1 } << 63),             // kernel-space
+    } };
+
+    const std::size_t mid{ a.size / 2u };
+    bool all_invalid{ true };
+    bool all_trace_empty{ true };
+    bool all_capped{ true };
+
+    for (const std::uintptr_t p : poison)
+    {
+        // Stage the corrupted link at the saved-rbp slot of a fabricated frame.
+        a.store(mid, p);
+        // Also corrupt the [rbp - 24] Method* slot with a non-Method value so
+        // even a hypothetical pre-link read can't decode anything meaningful.
+        a.store(mid - 24u, p);
+
+        void* const fp{ a.word_ptr(mid) };
+        if (walk_caller(fp).valid()) { all_invalid = false; }
+        const auto v8{ walk_trace(fp, 8) };
+        if (!v8.empty()) { all_trace_empty = false; }
+        if (v8.size() > 8u) { all_capped = false; }
+    }
+    check("safe_read_corrupted_link_caller_invalid", all_invalid);
+    check("safe_read_corrupted_link_trace_empty", all_trace_empty);
+    check("safe_read_corrupted_link_depth_capped", all_capped);
+}
+
+static auto test_walk_idempotent_and_reentrant(arena& a) -> void
+{
+    if (!a.ok()) { return; }
+
+    // Repeated calls on the SAME fabricated frame must return identical empty
+    // results — the walk has no hidden state that drifts between calls.
+    const std::size_t mid{ a.size / 2u };
+    a.store(mid, std::uintptr_t{ 0u });
+    void* const fp{ a.word_ptr(mid) };
+
+    const auto c1{ walk_caller(fp) };
+    const auto c2{ walk_caller(fp) };
+    const auto c3{ walk_caller(fp) };
+    check("walk_caller_idempotent_validity",
+          c1.valid() == c2.valid() && c2.valid() == c3.valid());
+    check("walk_caller_idempotent_invalid", !c1.valid());
+
+    const auto t1{ walk_trace(fp, 16) };
+    const auto t2{ walk_trace(fp, 16) };
+    check("walk_trace_idempotent_size", t1.size() == t2.size());
+    check("walk_trace_idempotent_empty", t1.empty() && t2.empty());
+
+    // Interleaved nullptr and arena calls must not perturb either result.
+    const auto cn{ walk_caller(nullptr) };
+    const auto cb{ walk_caller(fp) };
+    check("walk_interleave_null_then_arena_invalid",
+          !cn.valid() && !cb.valid());
+}
+
 int main()
 {
     std::printf("=== interpreter_frame_walk (no-JVM) ===\n");
@@ -896,6 +1081,9 @@ int main()
     test_frame_accessor_identity(a);
     test_caller_trace_agreement(a);
     test_walk_arithmetic_and_value_contract(a);
+    test_depth_cap_pin(a);
+    test_safe_read_on_corrupted_link(a);
+    test_walk_idempotent_and_reentrant(a);
 
     free_arena(a);
 

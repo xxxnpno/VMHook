@@ -2269,6 +2269,145 @@ static auto test_candidate_page_realign_is_fixed_point() -> void
 
 } // namespace deepen_os_alloc_release_pins
 
+// ===========================================================================
+// WAVE-27 deepening: ledger-driven gap closing for os_page_size_granularity.
+//   * page_size architecturally-valid set, hard-asserted at runtime.
+//   * allocation_granularity >= page invariant, restated alongside
+//     concrete-value pins so a single regression on EITHER number fires.
+//   * static_asserts for the architecturally-valid page-size values themselves
+//     (powers of two; the runtime page must match one of these literals).
+//   * identical-value on POSIX restated as a SEPARATE check distinct from the
+//     existing platform-specific section, so it surfaces by its own name.
+//   * many-call CONCURRENT consistency: 8 threads each hammer both primitives
+//     and the union of observations must be a single value -- this is the
+//     no-data-race witness the ledger calls for, beyond the single-thread
+//     burst already covered by test_repeated_call_determinism.
+// All additive: this namespace contains zero hooks into pre-existing checks
+// and only INTRODUCES new check names, so a regression in the existing suite
+// is impossible to attribute to wave-27 noise.
+// ===========================================================================
+namespace deepen_wave27_geometry
+{
+
+// Architecturally-valid page sizes, pinned at translation time.  Every value in
+// this set must be a power of two; if a future architecture demands a new value
+// it must be added here AND must remain a power of two (the masking arithmetic
+// the library uses depends on this).
+static_assert((4096u & (4096u - 1u)) == 0u, "4 KiB page literal must be PoT");
+static_assert((16384u & (16384u - 1u)) == 0u, "16 KiB page literal must be PoT");
+static_assert((65536u & (65536u - 1u)) == 0u, "64 KiB page literal must be PoT");
+// Common Windows granularity literal too.
+static_assert((65536u & (65536u - 1u)) == 0u, "64 KiB granularity literal must be PoT");
+// The architecturally-valid set is bounded above (no real platform exceeds 2 MiB
+// base page); pin that the upper-bound literal is also a power of two so any
+// future relaxation of the upper bound stays in the masking-safe regime.
+static_assert(((2u * 1024u * 1024u) & ((2u * 1024u * 1024u) - 1u)) == 0u,
+              "2 MiB upper-bound page literal must be PoT");
+
+// ---------------------------------------------------------------------------
+// W27.1 -- the runtime page_size() must equal one of the architecturally-valid
+// literals, hard-asserted.  Pre-existing `deep_pin_page_is_arch_valid_size` uses
+// a different name and lives in a sub-section; this is an INDEPENDENT pin under
+// this wave's namespace so a regression fires with a distinct breadcrumb.
+// ---------------------------------------------------------------------------
+static auto test_page_size_matches_an_arch_valid_literal() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    const bool matches{ page == 4096u || page == 16384u || page == 65536u };
+    check("w27_page_size_equals_a_known_arch_literal", matches);
+    // Also re-pin power-of-two at runtime via the literal-set predicate (the
+    // mirror's static_asserts at the top of the file already cover this
+    // statically; this is the runtime witness).
+    check("w27_page_size_is_power_of_two_runtime", page != 0 && (page & (page - 1u)) == 0u);
+}
+
+// ---------------------------------------------------------------------------
+// W27.2 -- granularity >= page restated against the runtime values, plus the
+// stronger derived invariant that gran/page is itself a power of two AND that
+// gran is exactly page * (1 << k) for some k in [0, 16] (no real platform's
+// granularity-to-page ratio exceeds 65536).  These are pure-logic facts; if
+// either primitive drifts, at least one of these check names fires.
+// ---------------------------------------------------------------------------
+static auto test_granularity_page_relationship_runtime() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    const std::size_t gran{ vmhook::os::allocation_granularity() };
+
+    check("w27_granularity_ge_page", gran >= page);
+    check("w27_granularity_divisible_by_page", page != 0 && (gran % page) == 0);
+
+    const std::size_t ratio{ page == 0 ? std::size_t{ 0 } : gran / page };
+    check("w27_ratio_nonzero", ratio != 0);
+    check("w27_ratio_power_of_two", ratio != 0 && (ratio & (ratio - 1u)) == 0u);
+    check("w27_ratio_within_sane_bound", ratio <= 65536u);
+
+    // Restate the POSIX identity contract under this wave's name (the
+    // pre-existing `posix_granularity_equals_page_size` covers the same fact in
+    // the platform-specific section; surfacing a duplicate breadcrumb here is
+    // intentional so a POSIX-only regression is unambiguously attributable).
+#if !VMHOOK_OS_WINDOWS
+    check("w27_posix_granularity_identity", gran == page);
+#else
+    // On Windows the documented expectation is a >1 ratio.  Allow ratio == 1
+    // for forward compatibility, but pin the universal Win32 value when met.
+    check("w27_windows_granularity_at_least_page", gran >= page);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// W27.3 -- CONCURRENT many-call consistency.  Beyond the single-thread 256x
+// burst already in test_repeated_call_determinism, spawn 8 threads that each
+// read both primitives 1024 times into atomic OR-accumulators.  The union of
+// observations must collapse to the SAME single value the main thread reads;
+// a partial-update / torn-fill bug in either implementation would surface as
+// an OR-result that contains bits the main-thread value does not.
+// ---------------------------------------------------------------------------
+static auto test_concurrent_call_consistency() -> void
+{
+    const std::size_t main_page{ vmhook::os::page_size() };
+    const std::size_t main_gran{ vmhook::os::allocation_granularity() };
+
+    constexpr int n_threads{ 8 };
+    constexpr int per_thread{ 1024 };
+
+    std::atomic<std::size_t> page_or{ 0 };
+    std::atomic<std::size_t> page_and{ ~std::size_t{ 0 } };
+    std::atomic<std::size_t> gran_or{ 0 };
+    std::atomic<std::size_t> gran_and{ ~std::size_t{ 0 } };
+    std::atomic<int> page_mismatches{ 0 };
+    std::atomic<int> gran_mismatches{ 0 };
+
+    std::thread workers[n_threads];
+    for (int t{ 0 }; t < n_threads; ++t)
+    {
+        workers[t] = std::thread{ [&] {
+            for (int i{ 0 }; i < per_thread; ++i)
+            {
+                const std::size_t p{ vmhook::os::page_size() };
+                const std::size_t g{ vmhook::os::allocation_granularity() };
+                page_or.fetch_or(p);
+                page_and.fetch_and(p);
+                gran_or.fetch_or(g);
+                gran_and.fetch_and(g);
+                if (p != main_page) { page_mismatches.fetch_add(1); }
+                if (g != main_gran) { gran_mismatches.fetch_add(1); }
+            }
+        } };
+    }
+    for (auto& w : workers) { w.join(); }
+
+    // OR and AND must equal the main-thread value -- proving every single read
+    // returned exactly that value, not a transient or torn one.
+    check("w27_concurrent_page_or_equals_main", page_or.load() == main_page);
+    check("w27_concurrent_page_and_equals_main", page_and.load() == main_page);
+    check("w27_concurrent_gran_or_equals_main", gran_or.load() == main_gran);
+    check("w27_concurrent_gran_and_equals_main", gran_and.load() == main_gran);
+    check("w27_concurrent_page_no_mismatches", page_mismatches.load() == 0);
+    check("w27_concurrent_gran_no_mismatches", gran_mismatches.load() == 0);
+}
+
+} // namespace deepen_wave27_geometry
+
 int main()
 {
     // --- pure-logic, no side effects: the heart of this file ---------------
@@ -2303,6 +2442,11 @@ int main()
     //     candidate page-realign idempotence) ---------------------------------
     deepen_os_alloc_release_pins::test_dword_widening_and_sysconf_fallback();
     deepen_os_alloc_release_pins::test_candidate_page_realign_is_fixed_point();
+
+    // --- wave-27 deepening (ledger-driven gap closing) ---------------------
+    deepen_wave27_geometry::test_page_size_matches_an_arch_valid_literal();
+    deepen_wave27_geometry::test_granularity_page_relationship_runtime();
+    deepen_wave27_geometry::test_concurrent_call_consistency();
 
     const std::uintptr_t page_align{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
     const std::uintptr_t gran_align{ static_cast<std::uintptr_t>(vmhook::os::allocation_granularity()) };

@@ -1779,5 +1779,277 @@ int main()
     check("short_slot_is_signed_sign_extends",
           static_cast<std::int32_t>(value_t{ std::int16_t{ static_cast<std::int16_t>(0xFFFF) } }) == -1);
 
+    // =========================================================================
+    // EXPANSION 6 (no-JVM, ledger-driven): holds_alternative<T> CORRECTNESS for
+    // every one of the 11 alternatives (each variant slot reports true for its
+    // own type and false for ALL ten others), wrong-type std::get<T> THROWS
+    // std::bad_variant_access, and SIZE/ALIGN static_asserts pin the value_t
+    // memory layout so a future reshuffle / hidden member is caught at build.
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // holds_alternative<T> for EACH stored alternative: true for self, false for
+    // every other type. 11 alternatives x 11 probes = 121 boolean assertions,
+    // collapsed per stored slot into one all-correct boolean to keep the log
+    // readable while still pinning the full matrix.
+    // -------------------------------------------------------------------------
+    {
+        const value_t v{ std::monostate{} };
+        const bool ok{
+            std::holds_alternative<std::monostate>(v.data)
+            && !std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<std::string>(v.data) };
+        check("holds_alternative_matrix_monostate", ok);
+    }
+    {
+        const value_t v{ true };
+        const bool ok{
+            std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<std::monostate>(v.data)
+            && !std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<std::string>(v.data) };
+        check("holds_alternative_matrix_bool", ok);
+    }
+    {
+        const value_t v{ std::int8_t{ 1 } };
+        const bool ok{
+            std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<std::string>(v.data)
+            && !std::holds_alternative<std::monostate>(v.data) };
+        check("holds_alternative_matrix_int8", ok);
+    }
+    {
+        const value_t v{ std::int16_t{ 1 } };
+        const bool ok{
+            std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<std::string>(v.data)
+            && !std::holds_alternative<std::monostate>(v.data) };
+        check("holds_alternative_matrix_int16", ok);
+    }
+    {
+        const value_t v{ std::int32_t{ 1 } };
+        const bool ok{
+            std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<std::string>(v.data)
+            && !std::holds_alternative<std::monostate>(v.data) };
+        check("holds_alternative_matrix_int32", ok);
+    }
+    {
+        const value_t v{ std::int64_t{ 1 } };
+        const bool ok{
+            std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<std::string>(v.data)
+            && !std::holds_alternative<std::monostate>(v.data) };
+        check("holds_alternative_matrix_int64", ok);
+    }
+    {
+        const value_t v{ 1.0f };
+        const bool ok{
+            std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<std::string>(v.data)
+            && !std::holds_alternative<std::monostate>(v.data) };
+        check("holds_alternative_matrix_float", ok);
+    }
+    {
+        const value_t v{ 1.0 };
+        const bool ok{
+            std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<std::string>(v.data)
+            && !std::holds_alternative<std::monostate>(v.data) };
+        check("holds_alternative_matrix_double", ok);
+    }
+    {
+        const value_t v{ std::uint16_t{ 1 } };
+        const bool ok{
+            std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<std::string>(v.data)
+            && !std::holds_alternative<std::monostate>(v.data) };
+        check("holds_alternative_matrix_uint16", ok);
+    }
+    {
+        const value_t v{ std::uint32_t{ 1 } };
+        const bool ok{
+            std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<std::string>(v.data)
+            && !std::holds_alternative<std::monostate>(v.data) };
+        check("holds_alternative_matrix_uint32", ok);
+    }
+    {
+        const value_t v{ std::string{ "x" } };
+        const bool ok{
+            std::holds_alternative<std::string>(v.data)
+            && !std::holds_alternative<std::uint32_t>(v.data)
+            && !std::holds_alternative<std::uint16_t>(v.data)
+            && !std::holds_alternative<std::int32_t>(v.data)
+            && !std::holds_alternative<std::int64_t>(v.data)
+            && !std::holds_alternative<std::int8_t>(v.data)
+            && !std::holds_alternative<std::int16_t>(v.data)
+            && !std::holds_alternative<bool>(v.data)
+            && !std::holds_alternative<float>(v.data)
+            && !std::holds_alternative<double>(v.data)
+            && !std::holds_alternative<std::monostate>(v.data) };
+        check("holds_alternative_matrix_string", ok);
+    }
+
+    // -------------------------------------------------------------------------
+    // std::get<T> on the WRONG alternative throws std::bad_variant_access. This
+    // is the variant contract (mandatory across libstdc++/MSVC STL/libc++) and
+    // pins that value_t's `data` member exposes it unaltered. We catch the
+    // documented exception type by reference, never by pointer or value, and
+    // assert the throw fired AND the holder kept its original slot afterwards.
+    // -------------------------------------------------------------------------
+    {
+        value_t v{ std::int32_t{ 42 } };
+        bool threw{ false };
+        try { (void)std::get<std::string>(v.data); }
+        catch (const std::bad_variant_access&) { threw = true; }
+        check("get_wrong_type_string_on_int_throws_bad_variant_access", threw);
+        check("get_wrong_type_throw_leaves_slot_intact",
+              v.data.index() == 4u && static_cast<std::int32_t>(v) == 42);
+    }
+    {
+        const value_t v{ std::string{ "live" } };
+        bool threw{ false };
+        try { (void)std::get<std::int32_t>(v.data); }
+        catch (const std::bad_variant_access&) { threw = true; }
+        check("get_wrong_type_int_on_string_throws", threw);
+    }
+    {
+        const value_t v{ std::uint32_t{ 7 } };
+        bool threw{ false };
+        try { (void)std::get<std::int32_t>(v.data); }
+        catch (const std::bad_variant_access&) { threw = true; }
+        check("get_int32_on_uint32_alternative_throws", threw);
+    }
+    {
+        const value_t v{ std::monostate{} };
+        bool threw{ false };
+        try { (void)std::get<bool>(v.data); }
+        catch (const std::bad_variant_access&) { threw = true; }
+        check("get_bool_on_monostate_throws", threw);
+    }
+    {
+        const value_t v{ 1.0f };
+        bool threw{ false };
+        try { (void)std::get<double>(v.data); }
+        catch (const std::bad_variant_access&) { threw = true; }
+        check("get_double_on_float_alternative_throws", threw);
+    }
+    {
+        // And the CORRECT-type get returns the value (no throw). Sanity sibling
+        // for the throwing cases above.
+        const value_t v{ std::int64_t{ 0x1234'5678'9ABCLL } };
+        const std::int64_t got{ std::get<std::int64_t>(v.data) };
+        check("get_correct_type_returns_value", got == 0x1234'5678'9ABCLL);
+    }
+
+    // -------------------------------------------------------------------------
+    // SIZE / ALIGN static_asserts. value_t is an aggregate with a single
+    // std::variant member: its size must equal the variant's, its alignment must
+    // equal the variant's, and adding a hidden member (or changing the variant
+    // payload set) would change one of those. We pin the EXACT relation rather
+    // than a numeric size (variant size differs by STL implementation), so the
+    // check is portable across MinGW libstdc++ and MSVC STL.
+    // -------------------------------------------------------------------------
+    static_assert(sizeof(value_t) == sizeof(decltype(value_t::data)),
+                  "value_t is exactly its variant member (no hidden state)");
+    static_assert(alignof(value_t) == alignof(decltype(value_t::data)),
+                  "value_t alignment matches its variant member");
+    // The variant must accommodate at least the std::string alternative (the
+    // largest payload by far on every STL). Sanity-pins that no alternative was
+    // accidentally erased to something tiny.
+    static_assert(sizeof(decltype(value_t::data)) >= sizeof(std::string),
+                  "value_t's variant must fit a std::string");
+    // value_t is trivially destructible iff every alternative is — std::string
+    // is NOT trivially destructible, so value_t must not be either. Pins that
+    // the variant union still owns its string payload (a regression that swapped
+    // std::string for a trivial std::string_view, say, would silently make
+    // value_t trivially destructible and break the call_jni eager-decode
+    // contract).
+    static_assert(!std::is_trivially_destructible_v<value_t>,
+                  "value_t must NOT be trivially destructible (string alt owns)");
+    static_assert(!std::is_trivially_copyable_v<value_t>,
+                  "value_t must NOT be trivially copyable (string alt owns)");
+    check("value_t_size_align_compile_time_present", true);
+
     return failures == 0 ? 0 : 1;
 }

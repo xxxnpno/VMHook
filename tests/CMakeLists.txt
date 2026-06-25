@@ -83,6 +83,7 @@ vmhook_add_test(field_proxy_value_conversions SOURCES test_field_proxy_value_con
 vmhook_add_test(field_proxy_set_guards         SOURCES test_field_proxy_set_guards.cpp)
 vmhook_add_test(method_proxy_value_t           SOURCES test_method_proxy_value_t.cpp)
 vmhook_add_test(method_flags_width             SOURCES test_method_flags_width.cpp)
+vmhook_add_test(method_entry_points            SOURCES test_method_entry_points.cpp)
 vmhook_add_test(jni_arg_packing                SOURCES test_jni_arg_packing.cpp)
 vmhook_add_test(signature_parsing              SOURCES test_signature_parsing.cpp)
 vmhook_add_test(decode_oop_and_pointers        SOURCES test_decode_oop_and_pointers.cpp)
