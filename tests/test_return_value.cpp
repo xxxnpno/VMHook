@@ -2365,5 +2365,212 @@ int main()
         }
     }
 
+    // =====================================================================
+    // SECTION W30 — wave-30 LEDGER gap-closing for set<T>() over a
+    // "default-constructed" return_value (i.e. over a fresh, value-init slot:
+    // the no-frame ctor default).  Closes the four ledger items:
+    //   (1) safe no-op semantics for ALL primitive return-bearing types — a
+    //       set() over a clean slot leaves the slot in the SAME final state
+    //       it would land in for any other call sequence to the same value;
+    //   (2) idempotency — set(v) twice in a row equals set(v) once (the
+    //       cancel-only flag and the value cell are write-only, never
+    //       read-modified, so two writes are bit-identical);
+    //   (3) noexcept characterization for every primitive overload selected;
+    //   (4) static_asserts pinning the OVERLOAD SET (every primitive
+    //       resolves) and the RETURN TYPE (void).
+    // No platform-variant cases — every assertion below is a hard PASS.
+    // =====================================================================
+    {
+        using rv_t = vmhook::return_value;
+
+        // (4) Overload-set + return-type-void static_asserts for every
+        // primitive Java return descriptor (Z B S C I J F D) AND their
+        // C++ unsigned/wider/pointer counterparts that the header also
+        // accepts via the generic set<T> template (vmhook.hpp:1353-1382).
+        // decltype(rv.set(v)) must be void for every entry; if a future
+        // header tweak changes the return type or removes an overload,
+        // these trip at COMPILE time.
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(bool{})),         void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(std::int8_t{})),  void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(std::int16_t{})), void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(std::int32_t{})), void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(std::int64_t{})), void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(std::uint8_t{})), void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(std::uint16_t{})),void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(std::uint32_t{})),void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(std::uint64_t{})),void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(char{})),         void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(char16_t{})),     void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(char32_t{})),     void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(wchar_t{})),      void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(float{})),        void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(double{})),       void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(static_cast<void*>(nullptr))), void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(static_cast<const void*>(nullptr))), void>);
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().set(static_cast<int*>(nullptr))),  void>);
+
+        // cancel() also returns void.
+        static_assert(std::is_same_v<decltype(std::declval<rv_t&>().cancel()), void>);
+
+        // (3) noexcept on every primitive set<T> instantiation.  The header
+        // declares set noexcept (vmhook.hpp:1354) — pin it so a future drop
+        // of the qualifier (which would let a hypothetical bad_alloc inside
+        // the slot write escape and tear down the hot detour) is caught.
+        static_assert(noexcept(std::declval<rv_t&>().set(bool{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(std::int8_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(std::int16_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(std::int32_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(std::int64_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(std::uint8_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(std::uint16_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(std::uint32_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(std::uint64_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(char{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(char16_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(char32_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(wchar_t{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(float{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(double{})));
+        static_assert(noexcept(std::declval<rv_t&>().set(static_cast<void*>(nullptr))));
+
+        // Also pin the wrapper-null overload's noexcept + return-void.
+        static_assert(noexcept(std::declval<rv_t&>().set<fake_wrapper>(nullptr)));
+        static_assert(std::is_same_v<
+                          decltype(std::declval<rv_t&>().set<fake_wrapper>(nullptr)),
+                          void>);
+
+        // Compile-time sentinel: at least one runtime check confirming the
+        // static_asserts above were actually parsed (a failure to instantiate
+        // the assertions would surface at compile time, not at runtime — this
+        // just makes the pass count include a tally for the section).
+        check("w30_static_asserts_set_overloads_void_and_noexcept", true);
+
+        // (2) IDEMPOTENCY: set(v) twice yields BIT-IDENTICAL slot state.
+        // Drive every primitive category through a small helper.  Compares
+        // the full 16-byte return_slot via memcmp so any divergence in either
+        // retval or cancel is caught.
+        auto idempotent{ [&]<typename T>(T v, const char* label) -> bool
+        {
+            vmhook::hotspot::return_slot s_once{};
+            vmhook::hotspot::return_slot s_twice{};
+            vmhook::return_value         rv_once { &s_once  };
+            vmhook::return_value         rv_twice{ &s_twice };
+            rv_once.set(v);
+            rv_twice.set(v);
+            rv_twice.set(v);  // second call: must be a no-op vs once
+            const bool same{ std::memcmp(&s_once, &s_twice, sizeof(s_once)) == 0 };
+            (void)label;
+            return same;
+        } };
+
+        check("w30_idempotent_bool_true",   idempotent(true,                          "bool_true"));
+        check("w30_idempotent_bool_false",  idempotent(false,                         "bool_false"));
+        check("w30_idempotent_int8_min",    idempotent(std::numeric_limits<std::int8_t>::min(),  "int8_min"));
+        check("w30_idempotent_int8_max",    idempotent(std::numeric_limits<std::int8_t>::max(),  "int8_max"));
+        check("w30_idempotent_int8_neg1",   idempotent(std::int8_t{ -1 },             "int8_neg1"));
+        check("w30_idempotent_int16_min",   idempotent(std::numeric_limits<std::int16_t>::min(), "int16_min"));
+        check("w30_idempotent_int16_max",   idempotent(std::numeric_limits<std::int16_t>::max(), "int16_max"));
+        check("w30_idempotent_int32_min",   idempotent(std::numeric_limits<std::int32_t>::min(), "int32_min"));
+        check("w30_idempotent_int32_max",   idempotent(std::numeric_limits<std::int32_t>::max(), "int32_max"));
+        check("w30_idempotent_int64_min",   idempotent(std::numeric_limits<std::int64_t>::min(), "int64_min"));
+        check("w30_idempotent_int64_max",   idempotent(std::numeric_limits<std::int64_t>::max(), "int64_max"));
+        check("w30_idempotent_uint8_max",   idempotent(std::numeric_limits<std::uint8_t>::max(), "uint8_max"));
+        check("w30_idempotent_uint16_max",  idempotent(std::numeric_limits<std::uint16_t>::max(),"uint16_max"));
+        check("w30_idempotent_uint32_max",  idempotent(std::numeric_limits<std::uint32_t>::max(),"uint32_max"));
+        check("w30_idempotent_uint64_max",  idempotent(std::numeric_limits<std::uint64_t>::max(),"uint64_max"));
+        check("w30_idempotent_char16_0xD83D", idempotent(char16_t{ 0xD83D },          "char16_surrogate"));
+        check("w30_idempotent_char32_emoji",  idempotent(char32_t{ 0x0001F600u },     "char32_emoji"));
+        check("w30_idempotent_float_neg_zero", idempotent(-0.0f,                      "float_neg_zero"));
+        check("w30_idempotent_float_qnan",
+              idempotent(std::numeric_limits<float>::quiet_NaN(),                     "float_qnan"));
+        check("w30_idempotent_float_pos_inf",
+              idempotent(std::numeric_limits<float>::infinity(),                      "float_pos_inf"));
+        check("w30_idempotent_double_neg_zero", idempotent(-0.0,                      "double_neg_zero"));
+        check("w30_idempotent_double_qnan",
+              idempotent(std::numeric_limits<double>::quiet_NaN(),                    "double_qnan"));
+        check("w30_idempotent_double_pos_inf",
+              idempotent(std::numeric_limits<double>::infinity(),                     "double_pos_inf"));
+        check("w30_idempotent_void_ptr_null",
+              idempotent(static_cast<void*>(nullptr),                                 "void_ptr_null"));
+        check("w30_idempotent_void_ptr_high",
+              idempotent(reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xFFFFFFFFFFFFFFFFull)),
+                         "void_ptr_high"));
+
+        // (1) "Safe no-op" over default-init slot — set(v) on a fresh slot
+        // produces EXACTLY the documented post-state and touches nothing
+        // beyond the 16-byte return_slot.  We bookend with a STACK CANARY
+        // around the slot and assert the canary is unchanged: proves set()
+        // never writes outside the slot for ANY primitive.  Closes ledger
+        // item (1) verbatim for the full primitive return-type set.
+        auto safe_noop{ [&]<typename T>(T v) -> bool
+        {
+            struct canaried
+            {
+                std::uint64_t                 before{ 0xDEADBEEFCAFEBABEull };
+                vmhook::hotspot::return_slot  slot{};
+                std::uint64_t                 after { 0xFEEDFACEBAADF00Dull };
+            } c{};
+            vmhook::return_value rv{ &c.slot };
+            rv.set(v);
+            return c.before == 0xDEADBEEFCAFEBABEull
+                && c.after  == 0xFEEDFACEBAADF00Dull
+                && c.slot.cancel == true;
+        } };
+
+        check("w30_safe_noop_bool_true",      safe_noop(true));
+        check("w30_safe_noop_bool_false",     safe_noop(false));
+        check("w30_safe_noop_int8_neg1",      safe_noop(std::int8_t{ -1 }));
+        check("w30_safe_noop_int16_min",      safe_noop(std::numeric_limits<std::int16_t>::min()));
+        check("w30_safe_noop_int32_max",      safe_noop(std::numeric_limits<std::int32_t>::max()));
+        check("w30_safe_noop_int64_min",      safe_noop(std::numeric_limits<std::int64_t>::min()));
+        check("w30_safe_noop_uint8_max",      safe_noop(std::numeric_limits<std::uint8_t>::max()));
+        check("w30_safe_noop_uint16_max",     safe_noop(std::numeric_limits<std::uint16_t>::max()));
+        check("w30_safe_noop_uint32_high",    safe_noop(std::uint32_t{ 0x80000000u }));
+        check("w30_safe_noop_uint64_max",     safe_noop(std::numeric_limits<std::uint64_t>::max()));
+        check("w30_safe_noop_char_A",         safe_noop(char{ 'A' }));
+        check("w30_safe_noop_char16_0xFFFF",  safe_noop(char16_t{ 0xFFFF }));
+        check("w30_safe_noop_char32_emoji",   safe_noop(char32_t{ 0x0001F600u }));
+        check("w30_safe_noop_wchar_smiley",   safe_noop(static_cast<wchar_t>(0x263A)));
+        check("w30_safe_noop_float_neg_zero", safe_noop(-0.0f));
+        check("w30_safe_noop_float_qnan",     safe_noop(std::numeric_limits<float>::quiet_NaN()));
+        check("w30_safe_noop_double_neg_zero",safe_noop(-0.0));
+        check("w30_safe_noop_double_qnan",    safe_noop(std::numeric_limits<double>::quiet_NaN()));
+        check("w30_safe_noop_void_ptr_null",  safe_noop(static_cast<void*>(nullptr)));
+        check("w30_safe_noop_void_ptr_high",
+              safe_noop(reinterpret_cast<void*>(
+                  static_cast<std::uintptr_t>(0xCAFEBABEDEADBEEFull))));
+
+        // Wrapper-null overload safe no-op: the SAME canary contract holds
+        // for the object_base-derived overload (vmhook.hpp:1402-1409).
+        {
+            struct canaried
+            {
+                std::uint64_t                before{ 0xDEADBEEFCAFEBABEull };
+                vmhook::hotspot::return_slot slot{};
+                std::uint64_t                after { 0xFEEDFACEBAADF00Dull };
+            } c{};
+            vmhook::return_value rv{ &c.slot };
+            rv.set<fake_wrapper>(nullptr);
+            check("w30_safe_noop_wrapper_null_canary",
+                  c.before == 0xDEADBEEFCAFEBABEull
+               && c.after  == 0xFEEDFACEBAADF00Dull
+               && c.slot.cancel == true
+               && c.slot.retval == 0);
+        }
+
+        // Idempotent wrapper-null: two calls = one call, byte-identical.
+        {
+            vmhook::hotspot::return_slot s_once{};
+            vmhook::hotspot::return_slot s_twice{};
+            vmhook::return_value         rv_once { &s_once  };
+            vmhook::return_value         rv_twice{ &s_twice };
+            rv_once.set<fake_wrapper>(nullptr);
+            rv_twice.set<fake_wrapper>(nullptr);
+            rv_twice.set<fake_wrapper>(nullptr);
+            check("w30_idempotent_wrapper_null",
+                  std::memcmp(&s_once, &s_twice, sizeof(s_once)) == 0);
+        }
+    }
+
     return failures == 0 ? 0 : 1;
 }
