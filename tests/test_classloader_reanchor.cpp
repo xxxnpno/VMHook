@@ -1349,10 +1349,13 @@ int main()
                           decltype(&vmhook::detail::inherit_host_context_classloader_for_current_thread),
                           inherit_fn_t>,
                       "inherit_* must be void() noexcept");
-        // The host-klass atomic is lock-free on every supported platform
-        // (a non-lock-free atomic<klass*> would be a regression worth knowing).
+        // Use is_always_lock_free (constexpr) instead of is_lock_free() —
+        // the runtime call requires linking libatomic on Linux clang for
+        // certain compilers/configs (undefined __atomic_is_lock_free).
+        // For a pointer-sized atomic on every supported platform, the
+        // constexpr property is the stronger pin anyway.
         info("host_classloader_klass_atomic_is_lock_free",
-             vmhook::detail::host_classloader_klass.is_lock_free());
+             std::atomic<vmhook::hotspot::klass*>::is_always_lock_free);
         check("section14_static_assert_identity_compiled", true);
     }
 

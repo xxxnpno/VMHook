@@ -85,14 +85,14 @@ namespace entry_layout
     // are the only strings the accessor layer ever passes to
     // iterate_struct_entries.  Pinned so a future rename in the library
     // surfaces here too.
-    constexpr const char* fld_i2i_entry              = "_i2i_entry";
-    constexpr const char* fld_from_interpreted       = "_from_interpreted_entry";
-    constexpr const char* fld_from_compiled_pre21    = "_from_compiled_code_entry_point";
-    constexpr const char* fld_from_compiled_post21   = "_from_compiled_entry";
-    constexpr const char* fld_code                   = "_code";
-    constexpr const char* fld_adapter                = "_adapter";
-    constexpr const char* fld_ahe_c2i_entry          = "_c2i_entry";
-    constexpr const char* fld_ahe_i2c_entry          = "_i2c_entry";
+    [[maybe_unused]] constexpr const char* fld_i2i_entry              = "_i2i_entry";
+    [[maybe_unused]] constexpr const char* fld_from_interpreted       = "_from_interpreted_entry";
+    [[maybe_unused]] constexpr const char* fld_from_compiled_pre21    = "_from_compiled_code_entry_point";
+    [[maybe_unused]] constexpr const char* fld_from_compiled_post21   = "_from_compiled_entry";
+    [[maybe_unused]] constexpr const char* fld_code                   = "_code";
+    [[maybe_unused]] constexpr const char* fld_adapter                = "_adapter";
+    [[maybe_unused]] constexpr const char* fld_ahe_c2i_entry          = "_c2i_entry";
+    [[maybe_unused]] constexpr const char* fld_ahe_i2c_entry          = "_i2c_entry";
 
     // detect_adapter_offset_from_method's known-fields skip-set: any Method
     // field whose offset appears here is excluded from the brute byte-scan
