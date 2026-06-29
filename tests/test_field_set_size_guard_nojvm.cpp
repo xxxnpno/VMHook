@@ -128,13 +128,17 @@ int main()
     // with the static_asserts above this proves the guard is on a no-throw
     // contract over every relevant input.
     // ----------------------------------------------------------------------
-    check("noexcept_oracle_on_I", noexcept(jvm_primitive_byte_width("I")));
-    check("noexcept_oracle_on_J", noexcept(jvm_primitive_byte_width("J")));
-    check("noexcept_oracle_on_empty", noexcept(jvm_primitive_byte_width("")));
-    check("noexcept_oracle_on_unknown", noexcept(jvm_primitive_byte_width("XXX")));
+    // Use the length-explicit string_view ctor (noexcept on every stdlib per
+    // [string.view.cons]/8) so the noexcept observation isolates the function
+    // under test from string_view(const char*) — macOS / Android libc++ does
+    // not mark the implicit-ctor overload noexcept (libstdc++ + MSVC-stl do).
+    check("noexcept_oracle_on_I", noexcept(jvm_primitive_byte_width(std::string_view{ "I", 1 })));
+    check("noexcept_oracle_on_J", noexcept(jvm_primitive_byte_width(std::string_view{ "J", 1 })));
+    check("noexcept_oracle_on_empty", noexcept(jvm_primitive_byte_width(std::string_view{ "", 0 })));
+    check("noexcept_oracle_on_unknown", noexcept(jvm_primitive_byte_width(std::string_view{ "XXX", 3 })));
     check("noexcept_oracle_on_ref_sig",
-          noexcept(jvm_primitive_byte_width("Ljava/lang/String;")));
-    check("noexcept_oracle_on_array_sig", noexcept(jvm_primitive_byte_width("[I")));
+          noexcept(jvm_primitive_byte_width(std::string_view{ "Ljava/lang/String;", 18 })));
+    check("noexcept_oracle_on_array_sig", noexcept(jvm_primitive_byte_width(std::string_view{ "[I", 2 })));
 
     // ----------------------------------------------------------------------
     // SECTION B — cold-state guard on a NULL parent (null field_pointer).
