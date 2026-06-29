@@ -2451,8 +2451,16 @@ int main()
         // retval or cancel is caught.
         auto idempotent{ [&]<typename T>(T v, const char* label) -> bool
         {
+            // memset both slots to 0 before set(): return_slot has a bool
+            // followed by an int64_t, so it carries 7 bytes of padding the
+            // standard leaves indeterminate even after `{}` value-init on
+            // MSVC.  Without the memset, the full-struct memcmp below would
+            // sometimes compare padding-junk vs padding-junk and report a
+            // spurious diff that has nothing to do with set()'s idempotency.
             vmhook::hotspot::return_slot s_once{};
             vmhook::hotspot::return_slot s_twice{};
+            std::memset(static_cast<void*>(&s_once),  0, sizeof(s_once));
+            std::memset(static_cast<void*>(&s_twice), 0, sizeof(s_twice));
             vmhook::return_value         rv_once { &s_once  };
             vmhook::return_value         rv_twice{ &s_twice };
             rv_once.set(v);
@@ -2562,6 +2570,8 @@ int main()
         {
             vmhook::hotspot::return_slot s_once{};
             vmhook::hotspot::return_slot s_twice{};
+            std::memset(static_cast<void*>(&s_once),  0, sizeof(s_once));   // see W30 padding note
+            std::memset(static_cast<void*>(&s_twice), 0, sizeof(s_twice));
             vmhook::return_value         rv_once { &s_once  };
             vmhook::return_value         rv_twice{ &s_twice };
             rv_once.set<fake_wrapper>(nullptr);
@@ -2662,6 +2672,8 @@ int main()
 
             vmhook::hotspot::return_slot s_from_empty{};
             vmhook::hotspot::return_slot s_from_null{};
+            std::memset(static_cast<void*>(&s_from_empty), 0, sizeof(s_from_empty));   // see W30 padding note
+            std::memset(static_cast<void*>(&s_from_null),  0, sizeof(s_from_null));
             vmhook::return_value rv_e{ &s_from_empty };
             vmhook::return_value rv_n{ &s_from_null  };
 
@@ -2735,6 +2747,8 @@ int main()
         {
             vmhook::hotspot::return_slot s_once{};
             vmhook::hotspot::return_slot s_many{};
+            std::memset(static_cast<void*>(&s_once), 0, sizeof(s_once));   // see W30 padding note
+            std::memset(static_cast<void*>(&s_many), 0, sizeof(s_many));
             vmhook::return_value         rv_once{ &s_once };
             vmhook::return_value         rv_many{ &s_many };
             rv_once.set<W>(nullptr);

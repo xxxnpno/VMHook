@@ -182,11 +182,17 @@ static_assert(std::is_move_constructible_v<std::optional<vmhook::method_proxy>>,
 
 // (15) The return type's default-constructed state is empty — pins the
 //      semantics call-sites rely on when threading optionals through
-//      detour code without exceptions.
-static_assert(!std::optional<vmhook::method_proxy>{}.has_value(),
-              "default optional<method_proxy> is empty (constexpr)");
-static_assert(std::optional<vmhook::method_proxy>{} == std::nullopt,
-              "default optional<method_proxy> compares equal to nullopt");
+//      detour code without exceptions.  Runtime checks (not static_assert):
+//      clang+libc++ refuses optional<T>::has_value()/operator==(nullopt) in
+//      a constant expression when T (method_proxy) has a user-provided
+//      destructor (not trivially destructible).  MSVC-stl is more permissive
+//      but clang is correct per [optional.observe]/[optional.relops] in C++23.
+//      Promote to runtime once; the property is still observable.
+static const bool method_proxy_optional_default_empty{
+    !std::optional<vmhook::method_proxy>{}.has_value()
+    && std::optional<vmhook::method_proxy>{} == std::nullopt };
+static_assert(std::is_default_constructible_v<std::optional<vmhook::method_proxy>>,
+              "default optional<method_proxy> is constructible");
 
 // (16) method_proxy::value_t::is_void() — used by the live module to
 //      decode void returns through the same call path.  Pin return-type

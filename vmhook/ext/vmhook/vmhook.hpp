@@ -913,17 +913,49 @@ namespace vmhook
 
             inline thread_local probe_state* active_state{ nullptr };
 
-            inline auto handler(int /*sig*/, siginfo_t* /*info*/, void* /*ctx*/) -> void
+            // Previously-installed handlers (HotSpot's SIGSEGV/SIGBUS) captured
+            // by install_once and CHAINED on non-probe faults so JVM-internal
+            // implicit-null-checks, safepoint polls, and stack-bang->SOE keep
+            // working.  Without this the original code reset SIG_DFL on the
+            // first stray non-probe fault, aborting the whole process instead
+            // of letting HotSpot synthesize an NPE / poll a safepoint.
+            inline struct sigaction previous_segv{};
+            inline struct sigaction previous_bus{};
+
+            inline auto chain_to_previous(int sig, siginfo_t* info, void* ctx) -> void
+            {
+                const struct sigaction& prev{ (sig == SIGBUS) ? previous_bus : previous_segv };
+                if ((prev.sa_flags & SA_SIGINFO) && prev.sa_sigaction)
+                {
+                    prev.sa_sigaction(sig, info, ctx);
+                    return;
+                }
+                if (prev.sa_handler && prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN)
+                {
+                    prev.sa_handler(sig);
+                    return;
+                }
+                // No previous user handler — reinstall SIG_DFL and let the
+                // faulting instruction re-execute, which aborts the process
+                // with the original signal (same as the pre-fix behaviour
+                // when nothing else was installed).
+                struct sigaction sa{};
+                sa.sa_handler = SIG_DFL;
+                ::sigaction(sig, &sa, nullptr);
+            }
+
+            inline auto handler(int sig, siginfo_t* info, void* ctx) -> void
             {
                 if (active_state)
                 {
                     active_state->fault = true;
                     ::siglongjmp(active_state->env, 1);
                 }
-                // Not in a probe; let the default handler take over.
-                struct sigaction sa{};
-                sa.sa_handler = SIG_DFL;
-                ::sigaction(SIGSEGV, &sa, nullptr);
+                // Not in a probe: a legitimate JVM fault (HotSpot implicit
+                // null-check / safepoint poll / stack-bang).  Chain to the
+                // handler that was installed BEFORE vmhook instead of
+                // resetting to SIG_DFL and aborting the process.
+                chain_to_previous(sig, info, ctx);
             }
 
             inline auto install_once() noexcept -> bool
@@ -934,8 +966,9 @@ namespace vmhook
                     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
                     sa.sa_sigaction = &handler;
                     ::sigemptyset(&sa.sa_mask);
-                    return ::sigaction(SIGSEGV, &sa, nullptr) == 0
-                        && ::sigaction(SIGBUS,  &sa, nullptr) == 0;
+                    const bool ok_segv{ ::sigaction(SIGSEGV, &sa, &previous_segv) == 0 };
+                    const bool ok_bus { ::sigaction(SIGBUS,  &sa, &previous_bus ) == 0 };
+                    return ok_segv && ok_bus;
                 }() };
                 return installed;
             }
@@ -4418,9 +4451,23 @@ namespace vmhook
                     return nullptr;
                 }
 
+                // Chain-pointer untag helper: untag_pointer's GC mask
+                // (0x00007FFFFFFFFFFF) preserves bit 0, which CDS sets on
+                // shared HashtableEntry::_next to mark the entry as shared.
+                // Leaving bit 0 set produces an odd pointer the next
+                // is_valid_pointer rejects, truncating the bucket chain at
+                // the first CDS-archived class on JDK8 + CDS-enabled JDKs
+                // (find_class / for_each_loaded_class then silently omit
+                // every class chained after a shared entry).  Mask it off.
+                auto untag_chain = [](const void* const raw) noexcept -> const void*
+                {
+                    return reinterpret_cast<const void*>(
+                        reinterpret_cast<std::uintptr_t>(vmhook::hotspot::untag_pointer(raw)) & ~std::uintptr_t{ 1 });
+                };
+
                 for (std::int32_t bucket_index{ 0 }; bucket_index < table_size; ++bucket_index)
                 {
-                    const std::uint8_t* dict_entry{ reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_pointer(vmhook::hotspot::safe_read_pointer(buckets + bucket_index * 8))) };
+                    const std::uint8_t* dict_entry{ reinterpret_cast<const std::uint8_t*>(untag_chain(vmhook::hotspot::safe_read_pointer(buckets + bucket_index * 8))) };
 
                     while (vmhook::hotspot::is_valid_pointer(dict_entry))
                     {
@@ -4440,7 +4487,7 @@ namespace vmhook
                             }
                         }
 
-                        dict_entry = reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_pointer(vmhook::hotspot::safe_read_pointer(dict_entry)));
+                        dict_entry = reinterpret_cast<const std::uint8_t*>(untag_chain(vmhook::hotspot::safe_read_pointer(dict_entry)));
                     }
                 }
 
@@ -4468,9 +4515,16 @@ namespace vmhook
                     return;
                 }
 
+                // Same CDS-shared-marker mask as find_klass — see the note there.
+                auto untag_chain = [](const void* const raw) noexcept -> const void*
+                {
+                    return reinterpret_cast<const void*>(
+                        reinterpret_cast<std::uintptr_t>(vmhook::hotspot::untag_pointer(raw)) & ~std::uintptr_t{ 1 });
+                };
+
                 for (std::int32_t bucket_index{ 0 }; bucket_index < table_size; ++bucket_index)
                 {
-                    const std::uint8_t* dict_entry{ reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_pointer(vmhook::hotspot::safe_read_pointer(buckets + bucket_index * 8))) };
+                    const std::uint8_t* dict_entry{ reinterpret_cast<const std::uint8_t*>(untag_chain(vmhook::hotspot::safe_read_pointer(buckets + bucket_index * 8))) };
 
                     std::int32_t chain_visited{ 0 };
                     while (vmhook::hotspot::is_valid_pointer(dict_entry) && chain_visited < 1048576)
@@ -4489,7 +4543,7 @@ namespace vmhook
                             }
                         }
 
-                        dict_entry = reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_pointer(vmhook::hotspot::safe_read_pointer(dict_entry)));
+                        dict_entry = reinterpret_cast<const std::uint8_t*>(untag_chain(vmhook::hotspot::safe_read_pointer(dict_entry)));
                     }
                 }
             }
@@ -4912,7 +4966,20 @@ namespace vmhook
                     return 0;
                 }
 
-                void* const os_thread{ *reinterpret_cast<void* const*>(reinterpret_cast<const std::uint8_t*>(this) + osthread_entry->offset) };
+                // Fault-safe pointer load: VMStruct-offset reads on a stored /
+                // SMR-snapshotted JavaThread can land on an unmapped page after
+                // the SMR list is freed/relocated.  A raw `*this->_osthread`
+                // would fault uncontained on the no-SEH legs (mingw/clang-cl)
+                // and on the detached POSIX watchdog.  Cross-platform safe_read
+                // — metadata, not a frame walk; no stk_ POSIX regression.
+                void* os_thread{ nullptr };
+                if (!vmhook::os::safe_read(
+                        &os_thread,
+                        reinterpret_cast<const std::uint8_t*>(this) + osthread_entry->offset,
+                        sizeof(os_thread)))
+                {
+                    return 0;
+                }
                 if (!os_thread || !vmhook::hotspot::is_valid_pointer(os_thread))
                 {
                     return 0;
@@ -4921,9 +4988,16 @@ namespace vmhook
                 // HotSpot exports OSThread::_thread_id with a platform-specific underlying
                 // type (32-bit DWORD on Windows, pid_t on Linux). Read the raw 32-bit slot
                 // and zero-extend so callers always see a uniformly-typed value.
-                return static_cast<vmhook::os::thread_id_t>(
-                    *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(os_thread) + thread_id_entry->offset));
+                // Same safe_read discipline as the _osthread load above.
+                std::uint32_t thread_id_raw{ 0 };
+                if (!vmhook::os::safe_read(
+                        &thread_id_raw,
+                        reinterpret_cast<const std::uint8_t*>(os_thread) + thread_id_entry->offset,
+                        sizeof(thread_id_raw)))
+                {
+                    return 0;
+                }
+                return static_cast<vmhook::os::thread_id_t>(thread_id_raw);
             }
 
             /*
@@ -5582,6 +5656,29 @@ namespace vmhook
             const std::uint64_t decoded_address{ reinterpret_cast<std::uint64_t>(decoded) };
             if (decoded_address < narrow_oop_base)
             {
+                // Sub-base pointer: there is no valid compressed-OOP encoding
+                // for it.  The function returns 0 (the null narrow-OOP) — the
+                // caller will store null into the slot.  Log it so the silent
+                // null-store doesn't masquerade as a legitimate null write
+                // (the original bug: a foreign / stale pointer encoded as
+                // "store null" nulled a live Java reference with no trace).
+                VMHOOK_LOG("{} encode_oop_pointer: pointer 0x{:016X} is below the narrow-OOP "
+                           "base 0x{:016X} — encoding null; the caller will overwrite the "
+                           "target slot with the null reference.",
+                           vmhook::warning_tag, decoded_address, narrow_oop_base);
+                return 0;
+            }
+
+            // Upper-bound check: an address beyond what (uint32 << shift) can
+            // represent silently truncates to a valid-looking-but-wrong narrow
+            // OOP.  Reject the same way the sub-base case does, with a log.
+            const std::uint64_t encodable_span{ static_cast<std::uint64_t>(0xFFFFFFFFull) << narrow_oop_shift };
+            if (decoded_address - narrow_oop_base > encodable_span)
+            {
+                VMHOOK_LOG("{} encode_oop_pointer: pointer 0x{:016X} is beyond the encodable "
+                           "narrow-OOP range (base 0x{:016X}, shift {}) — encoding null instead "
+                           "of a truncated bogus value.",
+                           vmhook::warning_tag, decoded_address, narrow_oop_base, narrow_oop_shift);
                 return 0;
             }
 
@@ -5631,7 +5728,71 @@ namespace vmhook
             const std::uint64_t base{ *reinterpret_cast<const std::uint64_t*>(base_entry->address) };
             const std::uint32_t shift{ *reinterpret_cast<const std::uint32_t*>(shift_entry->address) };
 
-            return vmhook::hotspot::narrow_decode(base, shift, compressed);
+            void* const decoded{ vmhook::hotspot::narrow_decode(base, shift, compressed) };
+
+            // Klass pointers in HotSpot are 8-byte aligned (Metaspace allocates
+            // Klass on 8-byte boundaries; the low 3 bits of a canonical Klass*
+            // are always 0).  A torn / garbage narrow-klass word can decode to
+            // a non-aligned pointer that still passes is_valid_pointer's
+            // heuristic — guard at the primitive so a bogus low-bit-set value
+            // never reaches get_name / field / method resolution.  Cheap mask;
+            // no JDK-version sensitivity.
+            if (reinterpret_cast<std::uintptr_t>(decoded) & 0x7u)
+            {
+                return nullptr;
+            }
+            return decoded;
+        }
+
+        /*
+            @brief Reads the runtime Klass* out of an object-header BUFFER (already
+                   copied / known mapped).  Picks the slot via VMStructs so it works
+                   under BOTH -XX:+UseCompressedClassPointers (default, 32-bit narrow
+                   slot at _metadata._compressed_klass) AND -XX:-UseCompressedClassPointers
+                   (full 64-bit Klass* at _metadata._klass).
+            @param header  Pointer to the start of an object header in caller-owned
+                           memory (e.g. a memcpy'd safe_read buffer, or — on a path
+                           where the caller has already gated mapping — the live oop).
+                           Caller is responsible for the load being safe.
+            @return  The decoded Klass*, or nullptr if neither VMStruct is exported
+                     and the legacy +8 fallback decodes to nothing.
+            @details
+            Mirrors the writer make_java_object (~vmhook.hpp:14554).  Centralising
+            here removes the four copy-paste hardcoded `+8 / uint32 / decode` sites
+            (klass_from_object_header, klass_from_oop, for_each_instance scanner,
+            jni_make_unique diagnostic) that previously decoded garbage on the
+            uncompressed-class-pointer config.
+            Exception safety: noexcept — pure pointer arithmetic + decode_klass_pointer.
+        */
+        inline static auto read_klass_from_header_buffer(const void* const header) noexcept
+            -> vmhook::hotspot::klass*
+        {
+            static const vmhook::hotspot::vm_struct_entry_t* const compressed_klass_entry{
+                vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._compressed_klass") };
+            static const vmhook::hotspot::vm_struct_entry_t* const klass_entry{
+                vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._klass") };
+
+            if (compressed_klass_entry)
+            {
+                const std::size_t offset{ static_cast<std::size_t>(compressed_klass_entry->offset) };
+                const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
+                    reinterpret_cast<const std::uint8_t*>(header) + offset) };
+                return reinterpret_cast<vmhook::hotspot::klass*>(
+                    vmhook::hotspot::decode_klass_pointer(narrow));
+            }
+            if (klass_entry)
+            {
+                const std::size_t offset{ static_cast<std::size_t>(klass_entry->offset) };
+                return *reinterpret_cast<vmhook::hotspot::klass* const*>(
+                    reinterpret_cast<const std::uint8_t*>(header) + offset);
+            }
+            // Legacy fallback: neither VMStruct exported.  Old hardcoded +8 / u32 /
+            // decode behaviour — byte-for-byte the pre-fix code so this is at worst
+            // not-a-regression on very old / patched HotSpots.
+            const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
+                reinterpret_cast<const std::uint8_t*>(header) + 8) };
+            return reinterpret_cast<vmhook::hotspot::klass*>(
+                vmhook::hotspot::decode_klass_pointer(narrow));
         }
 
         /*
@@ -7175,8 +7336,25 @@ namespace vmhook
             If you need to install/remove hooks WHILE detours are firing,
             either pre-reserve the vector to a known cap or copy the iteration
             snapshot inside common_detour - see commit log for the analysis.
+
+            HARD CAP: the vector is RESERVED at static-init time below so the
+            backing buffer is allocated once, before any thread can fire a
+            detour, and never reallocates as long as size() stays <= the cap.
+            Install (under g_hooked_methods_mutex) refuses to push_back past
+            the cap — the silent reallocation that would otherwise race the
+            lock-free common_detour iteration is the use-after-free root cause.
+            1024 leaves a generous headroom over the largest real hook set
+            observed (~150) without ballooning the static footprint.
         */
-        inline std::vector<vmhook::hotspot::hooked_method> g_hooked_methods{};
+        inline constexpr std::size_t k_max_hooked_methods{ 1024 };
+        inline std::vector<vmhook::hotspot::hooked_method> g_hooked_methods{
+            []() noexcept -> std::vector<vmhook::hotspot::hooked_method>
+            {
+                std::vector<vmhook::hotspot::hooked_method> v;
+                v.reserve(k_max_hooked_methods);
+                return v;
+            }()
+        };
         inline std::mutex g_hooked_methods_mutex{};
 
         /*
@@ -7219,12 +7397,24 @@ namespace vmhook
             -> bool
         {
 #if defined(_MSC_VER) && !defined(__clang__)
+            // SEH filter: blacklist EXCEPTION_STACK_OVERFLOW (0xC00000FD).
+            // Swallowing that without resetting the thread guard page leaves
+            // the next deep call to fault again with the guard gone (UB).
+            // EXCEPTION_EXECUTE_HANDLER for everything else — that retains the
+            // original wide net that catches the four real shapes seen in the
+            // wild: (1) hardware AV / IN_PAGE_ERROR from a stale-OOP or unmapped
+            // deref inside the user detour, (2) C++ throws raised through the
+            // MSVC C++-EH SEH code 0xE06D7363, (3) integer/FP traps from
+            // genuine detour bugs (logged as 'skipped detour' — better than a
+            // crash), (4) std::bad_function_call from an unbound std::function.
             __try
             {
                 detour_fn(frame_pointer, thread, slot);
                 return true;
             }
-            __except (EXCEPTION_EXECUTE_HANDLER)
+            __except (GetExceptionCode() == EXCEPTION_STACK_OVERFLOW
+                      ? EXCEPTION_CONTINUE_SEARCH
+                      : EXCEPTION_EXECUTE_HANDLER)
             {
                 return false;
             }
@@ -7923,10 +8113,20 @@ namespace vmhook
             {
                 return false;
             }
-            // _i2c_entry lives at offset 0 of AdapterHandlerEntry across every
-            // JDK we support (the field is the first non-inherited member).
+            // _i2c_entry offset: resolve from VMStructs (it IS exported, like
+            // _c2i_entry).  On JDKs that don't export it, fall back to offset 0
+            // — the first non-inherited member position across every JDK 8-26
+            // layout we've measured.  This avoids silently degrading the entire
+            // JDK 9+ deopt feature when a future HotSpot reorders the AHE
+            // (the hardcoded-0 read would still SUCCEED on a wrong slot and
+            // cache a bogus _adapter offset process-wide).
+            static const vmhook::hotspot::vm_struct_entry_t* const i2c_field{
+                vmhook::hotspot::iterate_struct_entries("AdapterHandlerEntry", "_i2c_entry") };
+            const std::size_t i2c_offset{ i2c_field
+                ? static_cast<std::size_t>(i2c_field->offset)
+                : std::size_t{ 0 } };
             void* i2c{};
-            std::memcpy(&i2c, candidate, sizeof(i2c));
+            std::memcpy(&i2c, reinterpret_cast<const std::uint8_t*>(candidate) + i2c_offset, sizeof(i2c));
             if (!i2c || !vmhook::hotspot::is_readable_pointer(i2c))
             {
                 return false;
@@ -7992,11 +8192,22 @@ namespace vmhook
             // Build the skip set of well-known Method field offsets so the
             // scan doesn't dereference _constMethod / _code / etc. as if
             // they were adapter pointers.
-            std::array<std::size_t, 8> skip_offsets{};
+            // Capacity headroom: 6 fields are added today, 16 leaves room for
+            // future JDK aliases / additional well-known Method fields without
+            // forcing a re-resize.  add_skip used to silently no-op once the
+            // array filled, which would let the scan pick a real-field slot
+            // and cache a wrong _adapter offset process-wide — log it instead.
+            std::array<std::size_t, 16> skip_offsets{};
             std::size_t skip_count{ 0 };
             auto add_skip = [&](const char* const field_name) noexcept
                 {
-                    if (skip_count >= skip_offsets.size()) return;
+                    if (skip_count >= skip_offsets.size())
+                    {
+                        VMHOOK_LOG("{} detect_adapter_offset_from_method: skip_offsets is full "
+                                   "({} entries) — '{}' skipped; bump the array capacity.",
+                                   vmhook::warning_tag, skip_offsets.size(), field_name);
+                        return;
+                    }
                     if (const auto* const entry{ vmhook::hotspot::iterate_struct_entries("Method", field_name) })
                     {
                         skip_offsets[skip_count++] = static_cast<std::size_t>(entry->offset);
@@ -8863,19 +9074,16 @@ namespace vmhook
                 continue;
             }
 
-            // Walk the chunk at 8-byte stride; every potential
-            // object header has its mark word at +0 and a narrow
-            // klass pointer at +8.
-            for (std::size_t off{ 0 }; off + 12 <= to_read && visits < max_visits; off += stride)
+            // Walk the chunk at 8-byte stride; every potential object header has
+            // its klass slot at the VMStructs-resolved offset (4-byte narrow on
+            // -XX:+UseCompressedClassPointers, 8-byte full on -XX:- ).
+            // read_klass_from_header_buffer abstracts both layouts; previously a
+            // hardcoded +8/uint32/decode decoded garbage on the uncompressed config.
+            for (std::size_t off{ 0 }; off + 16 <= to_read && visits < max_visits; off += stride)
             {
-                const std::uint32_t narrow{
-                    *reinterpret_cast<const std::uint32_t*>(buffer + off + 8) };
-                if (narrow == 0)
-                {
-                    continue;
-                }
-                void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow) };
-                if (decoded != static_cast<void*>(target_klass))
+                vmhook::hotspot::klass* const decoded{
+                    vmhook::hotspot::read_klass_from_header_buffer(buffer + off) };
+                if (!decoded || decoded != target_klass)
                 {
                     continue;
                 }
@@ -8953,7 +9161,17 @@ namespace vmhook
         // cast_for_variant and does not consult this map.)
         // The factory returns a raw pointer; consumers immediately wrap it in
         // a unique_ptr at the call site.  See type_factory_function_t for why.
-        vmhook::g_type_factory_map.emplace(std::string{ class_name }, +[](void* instance)
+        //
+        // insert_or_assign (not emplace): the type map updates last-writer-wins
+        // via insert_or_assign above, so re-registering / rebinding a Java
+        // class name to a NEW C++ wrapper type B (after a prior register of A)
+        // updates the type map but, with emplace, LEFT the factory pointing at
+        // A's `new A{instance}`.  extract_frame_arg then resolved typeid(B) ->
+        // "X" -> factory_A, built an A, and static_cast<B*>'d it — cross-type
+        // UB and wrong destructor on teardown.  Aligning both maps to
+        // insert_or_assign keeps the two views consistent so a rebind is
+        // either fully accepted or fully rejected as a unit.
+        vmhook::g_type_factory_map.insert_or_assign(std::string{ class_name }, +[](void* instance)
             -> object_base*
             {
                 return new wrapper_type{ instance };
@@ -8991,6 +9209,23 @@ namespace vmhook
                 if (!target_klass)
                 {
                     return result;
+                }
+                // Klass-kind gate: _methods is an InstanceKlass-only field.
+                // find_class can resolve an ArrayKlass ("[I", "[Ljava/lang/String;",
+                // "[[J") whose layout does NOT have _methods at the cached
+                // InstanceKlass offset — reading it returns garbage that the
+                // per-element is_valid_pointer mostly filters but still spends
+                // cycles iterating.  Cheap exclusion: array klass names start
+                // with '['.  No JDK-version sensitivity (the JVM descriptor
+                // grammar is fixed); falls through gracefully if get_name fails.
+                if (const vmhook::hotspot::symbol* const klass_name{ target_klass->get_name() };
+                    klass_name && vmhook::hotspot::is_valid_pointer(klass_name))
+                {
+                    const std::string name_str{ klass_name->to_string() };
+                    if (!name_str.empty() && name_str.front() == '[')
+                    {
+                        return result;
+                    }
                 }
                 const std::int32_t method_count{ target_klass->get_methods_count() };
                 vmhook::hotspot::method** const methods_array{ target_klass->get_methods_ptr() };
@@ -10483,7 +10718,39 @@ namespace vmhook
             hm_entry.expected_class_name = type_map_entry->second;
             hm_entry.expected_method_name = std::string{ method_name };
             hm_entry.expected_signature = found_method->get_signature();
-            vmhook::hotspot::g_hooked_methods.push_back(std::move(hm_entry));
+            // Prefer reusing a tombstoned slot (hook_handle::stop sets
+            // method=nullptr in-place rather than vector::erase, so a stop+install
+            // sequence doesn't permanently consume cap).  Overwrites the std::function
+            // detour cell in-place — safe because the lock-free reader filters on
+            // `hook.method == current_method` and a tombstone has method=nullptr,
+            // so it cannot dispatch the half-constructed cell during the assign.
+            // Falls through to push_back when no tombstone is available.
+            bool reused_slot{ false };
+            for (vmhook::hotspot::hooked_method& slot : vmhook::hotspot::g_hooked_methods)
+            {
+                if (slot.method == nullptr)
+                {
+                    slot = std::move(hm_entry);
+                    reused_slot = true;
+                    break;
+                }
+            }
+            if (!reused_slot)
+            {
+                // Refuse to grow past the static-init reserved cap: a push_back
+                // that would reallocate races the lock-free common_detour scan
+                // and produces a use-after-free on the hook.detour cell.
+                if (vmhook::hotspot::g_hooked_methods.size()
+                    >= vmhook::hotspot::g_hooked_methods.capacity())
+                {
+                    VMHOOK_LOG("{} hook<T>: refusing to install — g_hooked_methods is at the "
+                               "static-init capacity cap ({}).  Pushing past it would reallocate "
+                               "and race the lock-free common_detour scan.  Bump k_max_hooked_methods.",
+                               vmhook::error_tag, vmhook::hotspot::g_hooked_methods.capacity());
+                    return false;
+                }
+                vmhook::hotspot::g_hooked_methods.push_back(std::move(hm_entry));
+            }
 
             // -- Install (or reuse) the i2i stub patch ---------------------------
             bool i2i_already_patched{ false };
@@ -11397,7 +11664,18 @@ namespace vmhook
             // pointer hands the JVM a dangling code-cache address and
             // every subsequent dispatch to the method AVs in 0x10??????.
 
-            hooks.erase(entry_it);
+            // Tombstone-in-place (NOT vector::erase): the lock-free
+            // common_detour scan iterates this vector WITHOUT the install
+            // mutex (the detour hot path), so `erase` shifting every later
+            // element's std::function detour cell would race a sibling
+            // scan — a torn hook.method read or a half-moved std::function
+            // invocation, i.e. UAF.  Setting method=nullptr is a single
+            // pointer-sized store (effectively atomic on x86_64) the reader
+            // already filters via `hook.method == current_method` (a real
+            // dispatch always has current_method != nullptr).  The slot is
+            // reused by the next install (see hook<T>'s tombstone scan), so
+            // cap consumption stays bounded across install/stop churn.
+            entry_it->method = nullptr;
         }
         catch (const std::exception& ex)
         {
@@ -13525,14 +13803,21 @@ namespace vmhook
             // host code (Lunar's Adventure chat handler, Forge's GuiNewChat
             // wrapper) crash on "wrong" methods being dispatched.
             {
+                // Header-klass via read_klass_from_header_buffer so the
+                // diagnostic works under -XX:-UseCompressedClassPointers too
+                // (the legacy hardcoded +8/uint32 path decoded garbage on
+                // uncompressed-class-pointer configs).  narrow_klass is kept
+                // for the log line, sourced from the +8 slot as a best-effort
+                // diagnostic — meaningless under uncompressed but the call
+                // sites only log it, never dispatch on it.
+                vmhook::hotspot::klass* const decoded_klass{
+                    vmhook::hotspot::read_klass_from_header_buffer(oop) };
                 const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
                     reinterpret_cast<const std::uint8_t*>(oop) + 8) };
-                void* const decoded_klass{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
                 std::string returned_name{ "<unresolved>" };
                 if (decoded_klass && vmhook::hotspot::is_valid_pointer(decoded_klass))
                 {
-                    auto* const k{ reinterpret_cast<vmhook::hotspot::klass*>(decoded_klass) };
-                    if (auto* const sym{ k->get_name() }; sym && vmhook::hotspot::is_valid_pointer(sym))
+                    if (auto* const sym{ decoded_klass->get_name() }; sym && vmhook::hotspot::is_valid_pointer(sym))
                     {
                         returned_name = sym->to_string();
                     }
@@ -15872,7 +16157,30 @@ namespace vmhook
                     return;
                 }
 
-                std::memcpy(this->field_pointer, &value, value_size);
+                // GC-safety: mirror the get() path's mirror_klass re-resolve
+                // before writing.  field_pointer was computed as
+                // mirror_oop + offset at proxy-creation time; a relocating GC
+                // (G1) may have moved the mirror since, so the cached address
+                // can be stale / unmapped on the static path.  Route through
+                // os::safe_write so even a cold/relocated mirror page degrades
+                // to a silent no-op instead of faulting the no-SEH legs.
+                // Instance and 3-arg-ctor proxies have mirror_klass == nullptr
+                // -> write_pointer == field_pointer, byte-identical fast path.
+                void* write_pointer{ this->field_pointer };
+                if (this->mirror_klass)
+                {
+                    void* const live_mirror{ this->mirror_klass->get_java_mirror() };
+                    if (!live_mirror || !vmhook::hotspot::is_valid_pointer(live_mirror))
+                    {
+                        return;
+                    }
+                    write_pointer = reinterpret_cast<std::uint8_t*>(live_mirror) + this->field_offset;
+                }
+                if (!write_pointer)
+                {
+                    return;
+                }
+                (void)vmhook::os::safe_write(write_pointer, &value, value_size);
             }
             else
             {
@@ -17419,8 +17727,14 @@ namespace vmhook
             case 'C': return value_t{ static_cast<std::uint16_t>(result_holder) };
             case 'F':
             {
+                // Read the IEEE-754 bit pattern via an UNSIGNED 32-bit copy.
+                // A signed std::int32_t intermediate is implementation-defined
+                // for the negative-quiet-NaN bit patterns (top bit set) — MSVC,
+                // gcc and clang happen to bit-preserve the cast today, but the
+                // standard does not require it.  Going through uint32_t pins
+                // the round-trip portably for every NaN / signed-zero / inf.
                 float f{};
-                const std::int32_t bits{ static_cast<std::int32_t>(result_holder) };
+                const std::uint32_t bits{ static_cast<std::uint32_t>(result_holder) };
                 std::memcpy(&f, &bits, sizeof(f));
                 return value_t{ f };
             }
@@ -17601,31 +17915,76 @@ namespace vmhook
                 return nullptr;
             }
 
-            // Cold read: the narrow-klass slot in the object header (oop + 8).  A
-            // detour can reach here with a stale / GC-relocated oop that passes
-            // is_valid_pointer's range/alignment HEURISTIC yet sits on an unmapped
-            // page; a raw `*(oop + 8)` then FAULTS, and on the no-SEH toolchains
-            // (MinGW / clang-on-windows) that hardware AV is uncontained and tears
-            // the JVM down.  Windows-gate the header read through os::safe_read
-            // (ReadProcessMemory — never faults), yielding a zeroed narrow klass
-            // (-> nullptr below) on a bad page.  POSIX keeps the raw read: a stray
-            // AV there is contained by the JVM's own signal handling and gating
-            // reads regressed other oop walks (see frame::get_method); for a
-            // normally-mapped oop the bytes are identical.  Verbatim twin of the
-            // klass_from_oop free function.
-#if defined(_WIN32)
-            std::uint32_t narrow_klass{ 0 };
-            if (!vmhook::os::safe_read(&narrow_klass,
-                                       reinterpret_cast<const std::uint8_t*>(oop) + 8,
-                                       sizeof(narrow_klass)))
+            // Resolve the klass slot offset + width via VMStructs the same
+            // way make_java_object does on the WRITE side (vmhook.hpp ~14554).
+            // With -XX:-UseCompressedClassPointers the slot holds a FULL 64-bit
+            // Klass* at _metadata._klass; with compressed (the default) it holds
+            // a 32-bit narrow klass at _metadata._compressed_klass.  Hardcoding
+            // +8 + 32-bit-read decoded garbage on the uncompressed config.
+            static const vmhook::hotspot::vm_struct_entry_t* const compressed_klass_entry{
+                vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._compressed_klass") };
+            static const vmhook::hotspot::vm_struct_entry_t* const klass_entry{
+                vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._klass") };
+
+            // Cold read: the klass slot may sit on an unmapped page on a stale
+            // / GC-relocated oop that passed the is_valid_pointer heuristic.
+            // Windows-gate the header read through os::safe_read (kernel-
+            // validated, never faults).  POSIX keeps the raw read: a stray AV
+            // is contained by the JVM's own signal handling and gating POSIX
+            // reads regressed other oop walks (see frame::get_method).  For a
+            // normally-mapped oop the bytes are identical.
+            void* decoded{ nullptr };
+            if (compressed_klass_entry)
             {
-                return nullptr;
-            }
+                const std::size_t offset{ static_cast<std::size_t>(compressed_klass_entry->offset) };
+#if defined(_WIN32)
+                std::uint32_t narrow_klass{ 0 };
+                if (!vmhook::os::safe_read(&narrow_klass,
+                                           reinterpret_cast<const std::uint8_t*>(oop) + offset,
+                                           sizeof(narrow_klass)))
+                {
+                    return nullptr;
+                }
 #else
-            const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
-                reinterpret_cast<const std::uint8_t*>(oop) + 8) };
+                const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
+                    reinterpret_cast<const std::uint8_t*>(oop) + offset) };
 #endif
-            void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
+                decoded = vmhook::hotspot::decode_klass_pointer(narrow_klass);
+            }
+            else if (klass_entry)
+            {
+                const std::size_t offset{ static_cast<std::size_t>(klass_entry->offset) };
+#if defined(_WIN32)
+                if (!vmhook::os::safe_read(&decoded,
+                                           reinterpret_cast<const std::uint8_t*>(oop) + offset,
+                                           sizeof(decoded)))
+                {
+                    return nullptr;
+                }
+#else
+                decoded = *reinterpret_cast<vmhook::hotspot::klass* const*>(
+                    reinterpret_cast<const std::uint8_t*>(oop) + offset);
+#endif
+            }
+            else
+            {
+                // Neither VMStruct exported (very old / patched HotSpot): fall
+                // back to the legacy +8 / 32-bit / decode path so this is at
+                // worst byte-for-byte the old behaviour, not a regression.
+#if defined(_WIN32)
+                std::uint32_t narrow_klass{ 0 };
+                if (!vmhook::os::safe_read(&narrow_klass,
+                                           reinterpret_cast<const std::uint8_t*>(oop) + 8,
+                                           sizeof(narrow_klass)))
+                {
+                    return nullptr;
+                }
+#else
+                const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
+                    reinterpret_cast<const std::uint8_t*>(oop) + 8) };
+#endif
+                decoded = vmhook::hotspot::decode_klass_pointer(narrow_klass);
+            }
             if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
             {
                 return nullptr;
@@ -19149,31 +19508,74 @@ namespace vmhook
         {
             return nullptr;
         }
-        // Cold read: the narrow-klass slot in the object header (oop + 8).  A
-        // detour can reach here with a stale / GC-relocated oop (e.g. a wrapper
-        // held across a System.gc(), or a collection/map element on a relocated
-        // page) that passes is_valid_pointer's range/alignment HEURISTIC yet
-        // sits on an unmapped page; a raw `*(oop + 8)` then FAULTS, and on the
-        // no-SEH toolchains (MinGW / clang-on-windows) that hardware AV is
-        // uncontained and tears the JVM down.  Windows-gate the header read
-        // through os::safe_read (ReadProcessMemory — never faults), yielding a
-        // zeroed narrow klass (-> nullptr below) on a bad page.  POSIX keeps the
-        // raw read: a stray AV there is contained by the JVM's own signal
-        // handling and gating reads regressed other oop walks (see
-        // frame::get_method); for a normally-mapped oop the bytes are identical.
-#if defined(_WIN32)
-        std::uint32_t narrow{ 0 };
-        if (!vmhook::os::safe_read(&narrow,
-                                   reinterpret_cast<const std::uint8_t*>(oop) + 8,
-                                   sizeof(narrow)))
+        // Resolve klass slot offset+width via VMStructs — mirrors the writer
+        // make_java_object (vmhook.hpp ~14554) so reads symmetric with writes:
+        // _compressed_klass = 32-bit narrow at the exported offset (default
+        // config), _klass = full 64-bit at the exported offset (with
+        // -XX:-UseCompressedClassPointers).  Hardcoded +8 + uint32 used to
+        // decode garbage on the uncompressed config.
+        static const vmhook::hotspot::vm_struct_entry_t* const compressed_klass_entry{
+            vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._compressed_klass") };
+        static const vmhook::hotspot::vm_struct_entry_t* const klass_entry{
+            vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._klass") };
+
+        // Cold read: header slot may sit on an unmapped page (stale / GC-
+        // relocated oop that passed is_valid_pointer's heuristic).  Windows-
+        // gate through os::safe_read (kernel-validated, never faults).  POSIX
+        // keeps the raw read: a stray AV there is contained by the JVM's own
+        // signal handling and gating POSIX reads regressed other oop walks
+        // (see frame::get_method); for a mapped oop the bytes are identical.
+        void* decoded{ nullptr };
+        if (compressed_klass_entry)
         {
-            return nullptr;
-        }
+            const std::size_t offset{ static_cast<std::size_t>(compressed_klass_entry->offset) };
+#if defined(_WIN32)
+            std::uint32_t narrow{ 0 };
+            if (!vmhook::os::safe_read(&narrow,
+                                       reinterpret_cast<const std::uint8_t*>(oop) + offset,
+                                       sizeof(narrow)))
+            {
+                return nullptr;
+            }
 #else
-        const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
-            reinterpret_cast<const std::uint8_t*>(oop) + 8) };
+            const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
+                reinterpret_cast<const std::uint8_t*>(oop) + offset) };
 #endif
-        void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow) };
+            decoded = vmhook::hotspot::decode_klass_pointer(narrow);
+        }
+        else if (klass_entry)
+        {
+            const std::size_t offset{ static_cast<std::size_t>(klass_entry->offset) };
+#if defined(_WIN32)
+            if (!vmhook::os::safe_read(&decoded,
+                                       reinterpret_cast<const std::uint8_t*>(oop) + offset,
+                                       sizeof(decoded)))
+            {
+                return nullptr;
+            }
+#else
+            decoded = *reinterpret_cast<vmhook::hotspot::klass* const*>(
+                reinterpret_cast<const std::uint8_t*>(oop) + offset);
+#endif
+        }
+        else
+        {
+            // Legacy fallback: neither VMStruct exported.  Byte-for-byte the
+            // old +8 / uint32 / decode path.
+#if defined(_WIN32)
+            std::uint32_t narrow{ 0 };
+            if (!vmhook::os::safe_read(&narrow,
+                                       reinterpret_cast<const std::uint8_t*>(oop) + 8,
+                                       sizeof(narrow)))
+            {
+                return nullptr;
+            }
+#else
+            const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
+                reinterpret_cast<const std::uint8_t*>(oop) + 8) };
+#endif
+            decoded = vmhook::hotspot::decode_klass_pointer(narrow);
+        }
         if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
         {
             return nullptr;

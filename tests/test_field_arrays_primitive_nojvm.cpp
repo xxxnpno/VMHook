@@ -67,7 +67,7 @@ auto convert_default_vector(std::string_view sig) -> std::vector<T>
 {
     vmhook::field_proxy proxy{ nullptr, std::string{ sig }, /*is_static=*/false };
     const auto value{ proxy.get() };
-    return static_cast<std::vector<T>>(value);
+    return value.operator std::vector<T>();
 }
 
 static_assert(std::is_same_v<decltype(convert_default_vector<bool>("[Z")),
@@ -183,7 +183,7 @@ static auto cold_vec(std::string_view sig, bool is_static) -> std::vector<T>
 {
     vmhook::field_proxy proxy{ nullptr, std::string{ sig }, is_static };
     const auto value{ proxy.get() };
-    return static_cast<std::vector<T>>(value);
+    return value.operator std::vector<T>();
 }
 
 static auto section_cold_vec_all_descriptors() -> void
@@ -261,7 +261,8 @@ static auto assert_null_parent_safe(std::string_view sig, const char* tag) -> vo
           proxy.raw_address() == nullptr);
     check((std::string{ tag } + ": signature() round-trips").c_str(),
           proxy.signature() == sig);
-    const std::vector<T> v{ static_cast<std::vector<T>>(proxy.get()) };
+    const auto value{ proxy.get() };
+    const std::vector<T> v{ value.operator std::vector<T>() };
     check((std::string{ tag } + ": vector is empty").c_str(), v.empty());
     check((std::string{ tag } + ": vector has size 0").c_str(), v.size() == 0);
     // capacity 0 — no speculative reserve on the cold path.  This is the
@@ -365,7 +366,11 @@ static auto section_idempotent_cold_reads() -> void
             // Different vector<T> per descriptor — exercise the int8/int16/
             // int32/int64/float/double element_type branches at least once.
             // We only care about emptiness here; the sigs sequence is fixed.
-            const std::vector<std::int32_t> coerced{ static_cast<std::vector<std::int32_t>>(v) };
+            // Call the operator explicitly: MSVC /permissive- sees
+            // `static_cast<std::vector<int>>(v)` as ambiguous against vector's
+            // size_t / initializer_list / allocator ctors, even though the
+            // conversion operator is the only viable candidate on MinGW.
+            const std::vector<std::int32_t> coerced{ v.operator std::vector<std::int32_t>() };
             if (!coerced.empty()) { all_empty = false; break; }
         }
     }

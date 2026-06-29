@@ -3268,7 +3268,26 @@ namespace
 
 static auto run_test_suite() -> void
 {
-    std::this_thread::sleep_for(std::chrono::seconds{ 2 });
+    // JVM readiness gate: a fixed 2s sleep was the only check, so on a slow
+    // or heavily-loaded CI runner the example_class::get_instance() below
+    // returned null and the whole suite reported "Example.instance=false"
+    // and bailed.  Replace with a bounded poll on the live vmhook/Example
+    // class: succeed as soon as find_class resolves it (the Main fixture is
+    // loaded right before instance assignment), cap at 30s so a truly
+    // failed-to-load JVM still terminates instead of hanging the runner.
+    // The 50ms tick keeps wall-time near-original on a healthy JVM (~0-100ms
+    // vs. the old hard 2000ms) and is cheap (one find_class hashtable hit).
+    constexpr auto poll_step{ std::chrono::milliseconds{ 50 } };
+    constexpr auto poll_cap { std::chrono::seconds{ 30 } };
+    const auto deadline{ std::chrono::steady_clock::now() + poll_cap };
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        if (vmhook::find_class("vmhook/Example"))
+        {
+            break;
+        }
+        std::this_thread::sleep_for(poll_step);
+    }
 
     test_log.open("test_results.txt", std::ios::out | std::ios::trunc);
 
@@ -3418,11 +3437,19 @@ namespace
 {
     inline auto launch_worker_once() -> void
     {
-        static std::once_flag launched{};
-        std::call_once(launched, []
+        // Resettable launch flag (instead of std::once_flag): a process-lifetime
+        // once_flag means a FreeLibrary+LoadLibrary cycle never re-spawns the
+        // worker, which silently defeats vmhook::shutdown_hooks()'s now-reversible
+        // teardown+re-init contract (the mod-loader unload/reload pattern).  An
+        // atomic bool is reset by an explicit teardown if/when needed; today no
+        // caller resets it, so semantics are byte-identical to call_once on the
+        // single-load case but the path is no longer one-shot by construction.
+        static std::atomic<bool> launched{ false };
+        bool expected{ false };
+        if (launched.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
         {
             std::thread{ run_test_suite }.detach();
-        });
+        }
     }
 }
 

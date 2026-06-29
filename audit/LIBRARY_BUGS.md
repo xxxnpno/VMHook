@@ -1,8 +1,30 @@
 # vmhook library bugs — master fix-list (agent-def wave, 2026-06-06)
 
+> **STALE WARNING (2026-06-29):** Most of the HIGH list below has been LANDED
+> across multiple fix campaigns. Verify each item against current source before
+> acting — line numbers are systematically out-of-date and many items reference
+> patterns that no longer match the code shape. The authoritative open-bugs
+> list is `audit/AUDIT_FINDINGS.md` Wave-3 (also partly stale post 2026-06-29 —
+> see `[[library_fix_session_20260629]]` for current state).
+>
+> Items VERIFIED LANDED as of 2026-06-29: array_element_helpers ptrdiff_t
+> widening, array_length cap via clamp_safe_container_count, method_flags_width
+> width-correct via resolve_method_flags_slot, const_method_bounds FIX-B field
+> path via resolve_constant_pool_symbol, hook_common_detour_dispatch
+> frame::get_method os::safe_read hardening, method_proxy::call args
+> static_assert, AHE validate uses VMStructs _i2c_entry, encode_oop_pointer
+> bounds logs, decode_klass alignment, sigaction handler chain,
+> g_hooked_methods static-init reserve + tombstone-on-stop, register_class
+> factory map insert_or_assign, klass_from_* uncompressed-klass-pointer path
+> via VMStructs, dictionary CDS bit-0 strip, field_proxy::set static
+> mirror_klass re-resolve + safe_write, seh_invoke_detour STACK_OVERFLOW
+> blacklist, /EHa MSVC, collect_klass_methods array-klass gate,
+> example.cpp run_test_suite JVM-readiness poll, launch_worker_once
+> reversible, set_prim_array element-width guard.
+
 216 agent-reported findings across 40 feature specialists; fix in the serial header pass (high first). Each is also in the owning .claude/agents/<feature>-specialist.md "Flaws I found". Earlier Wave-1/2/3 bugs (make_java_object, JDK8 dictionary, register_class factory UB, FIX E, collection to_vector mis-routing) are in audit/PERFECTION_PROGRAM.md.
 
-Counts: high=32 medium=87 low=97
+Counts: high=32 medium=87 low=97 (snapshot; current open count is lower — see stale warning above).
 
 ## HIGH severity
 

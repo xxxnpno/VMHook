@@ -5,6 +5,20 @@ project(vmhook
     DESCRIPTION "Single-header HotSpot JVM hooking library"
     LANGUAGES CXX)
 
+# ── MSVC EH model: drop CMake's default /EHsc so we can pick /EHa per-target ──
+# CMake injects /EHsc into CMAKE_CXX_FLAGS for every MSVC build.  vmhook's
+# seh_invoke_detour needs ASYNC exception unwinding (/EHa) so a hardware
+# 0xC0000005 raised inside a detour properly unwinds the intervening C++
+# frames before the outer __except catches it.  Leaving /EHsc in place
+# and adding /EHa per-target produces D9025 "overriding /EHsc with /EHa",
+# which /WX turns into a hard error.  Scrub the default here so the
+# per-target /EHa we set in vmhook_apply_warnings is the single, coherent
+# EH model for the whole build.
+if(MSVC)
+    string(REGEX REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REGEX REPLACE "/EHs"  "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
 # ── Detect target platform ───────────────────────────────────────────────────
 # The library compiles on Windows / Linux / macOS / iOS / Android.  Runtime
 # functionality (HotSpot interpreter hooking) needs a HotSpot JVM in-process,
@@ -130,6 +144,16 @@ function(vmhook_apply_warnings target)
             /W4 /permissive- /Zc:__cplusplus /utf-8
             /wd4505     # unreferenced static function (header carries multiple by design)
             /wd4101)    # unreferenced local (release builds compile out VMHOOK_LOG)
+        # /EHa: async (SEH + C++) exception unwinding.  Load-bearing for
+        # seh_invoke_detour: a hardware AV (0xC0000005) raised inside a
+        # detour's extract_frame_arg has C++ frames between the fault site
+        # and the outer __except; the default /EHsc only guarantees sync
+        # C++ unwinding, so destructors and partial state on those frames
+        # may not unwind cleanly, and the __except catch can be skipped.
+        # /EHa restores the documented crash-safety contract on MSVC.
+        # The top-of-file scrub removes CMake's default /EHsc from
+        # CMAKE_CXX_FLAGS, so /EHa is the sole EH model — no D9025.
+        target_compile_options(${target} PRIVATE /EHa)
         if(VMHOOK_WARNINGS_AS_ERRORS AND NOT _no_werror)
             target_compile_options(${target} PRIVATE /WX)
         endif()

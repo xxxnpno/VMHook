@@ -14,6 +14,22 @@ Several Wave-1/Wave-2 items reappear in Wave 3 with corrected current line numbe
 
 ## Executive summary
 
+> **POST-2026-06-29 STATUS — Wave-3 HIGH (9 items):**
+> - #1 register_class factory-map asymmetry — **DONE** (insert_or_assign on both maps)
+> - #2 hook_handle::stop erase race — **DONE** (tombstone in place + install reuse)
+> - #3 call_jni stale cache cross-overload — **DONE** (cached_keyed_signature re-key gate)
+> - #4 for_each_thread raw struct derefs — **DONE** (get_os_thread_id safe_read; Path 2 + find_any_java_thread already safe_read in master)
+> - #5 uncompressed-class-pointer klass-read — **DONE** (`read_klass_from_header_buffer` helper; klass_from_object_header + klass_from_oop + for_each_instance scanner + jni_make_unique diagnostic all routed)
+> - #6 set_prim_array stride — **DONE** (element-width guard already in master at the read-path mirror)
+> - #7 static primitive set stale field_pointer — **DONE** (mirror_klass re-resolve + safe_write in the trivially-copyable arm)
+> - #8 JDK8/CDS dictionary truncation — **DONE** (untag_chain `& ~uintptr_t{1}` strip in find_klass + for_each_klass)
+> - #9 injector GetExitCodeThread — **DONE** (K32EnumProcessModulesEx authoritative check) + launch_worker_once reversible
+>
+> All 9 HIGH addressed. Wave-3 medium/low list NOT updated inline below; verify
+> against current source before acting (many items silently fixed in intervening
+> sessions). The Rework D legacy-test-lane retirement remains the dominant
+> structural cleanup. Session details: `[[library_fix_session_20260629]]`.
+
 **Wave-3 (current, source-verified): 70 findings across 16 subsystems.**
 
 By severity: **high = 9**, medium = 22, low = 39.
