@@ -110,7 +110,11 @@ static_assert(std::is_same_v<
 // The width oracle is constexpr-noexcept and consults a string_view; both
 // the oracle and its signature byte are pinned compile-time-evaluated, so a
 // future change to runtime-dispatch / throwing-style is caught here.
-static_assert(noexcept(vmhook::detail::jvm_primitive_byte_width("I")),
+// Use the length-explicit string_view ctor (noexcept on every stdlib per
+// [string.view.cons]/8) so the noexcept observation isolates the function
+// from the implicit string_view(const char*) ctor (Android NDK libc++ does
+// not mark that overload noexcept; libstdc++ and MSVC-stl do).
+static_assert(noexcept(vmhook::detail::jvm_primitive_byte_width(std::string_view{ "I", 1 })),
     "jvm_primitive_byte_width must be noexcept");
 
 int main()

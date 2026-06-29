@@ -84,11 +84,13 @@ static_assert(
         decltype(vmhook::detail::jvm_primitive_byte_width(std::string_view{ "I" })),
         std::size_t>,
     "jvm_primitive_byte_width must return std::size_t");
+// Length-explicit string_view ctor — see test_field_primitives_set_nojvm.cpp
+// note; Android NDK libc++ doesn't mark string_view(const char*) noexcept.
 static_assert(
-    noexcept(vmhook::detail::jvm_primitive_byte_width(std::string_view{ "I" })),
+    noexcept(vmhook::detail::jvm_primitive_byte_width(std::string_view{ "I", 1 })),
     "jvm_primitive_byte_width must be noexcept (cold guard is on the hot path)");
 static_assert(
-    noexcept(vmhook::detail::jvm_primitive_byte_width(std::string_view{ "" })),
+    noexcept(vmhook::detail::jvm_primitive_byte_width(std::string_view{ "", 0 })),
     "jvm_primitive_byte_width must be noexcept on the empty-signature path too");
 
 // The oracle is callable on a literal const-char* via the implicit
