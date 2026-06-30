@@ -112,16 +112,19 @@ static_assert(std::is_same_v<decltype(vmhook::hotspot::return_slot::cancel), boo
 static_assert(std::is_same_v<decltype(vmhook::hotspot::return_slot::retval), std::int64_t>,
               "return_slot::retval must be int64_t (the 64-bit return cell)");
 
-// The detour ABI the trampoline bakes in (vmhook.hpp:6020): a void(*) taking
-// (frame*, java_thread*, return_slot*).  Pin the function-pointer type shape.
+// The detour ABI the trampoline bakes in: an int64_t(*) taking
+// (frame*, java_thread*, return_slot*).  Retval is passed through RAX
+// (the C++ ABI return-value register) so the trampoline no longer wraps
+// it through rbx.  Pin the function-pointer type shape.
 static_assert(
     std::is_same_v<vmhook::hotspot::detour_function_t,
-                   void (*)(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*,
-                            vmhook::hotspot::return_slot*)>,
-    "detour_function_t must be void(*)(frame*, java_thread*, return_slot*)");
+                   std::int64_t (*)(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*,
+                                    vmhook::hotspot::return_slot*)>,
+    "detour_function_t must be int64_t(*)(frame*, java_thread*, return_slot*)");
 
-// hooked_method.detour is a std::function with the SAME 3-arg signature -- the
-// cell common_detour invokes through seh_invoke_detour.
+// hooked_method.detour is a std::function with void return -- it writes
+// result through the return_slot* parameter.  common_detour bridges the
+// int64_t ABI to the void-returning std::function internally.
 static_assert(
     std::is_same_v<decltype(vmhook::hotspot::hooked_method::detour),
                    std::function<void(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*,

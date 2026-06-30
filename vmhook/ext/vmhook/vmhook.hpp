@@ -6782,15 +6782,17 @@ namespace vmhook
                 (void)target;
                 (void)detour;
                 return;
-#else
+#else  // VMHOOK_RUNTIME_HOOKING_AVAILABLE
                 static constexpr std::int32_t HOOK_SIZE{ 8 };
                 static constexpr std::int32_t JMP_SIZE{ 5 };
+                static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
+
+#if defined(_WIN32)
                 // Offset within the assembly of the resume-stub's `jmp rel32` instruction.
                 static constexpr std::int32_t JMP_TO_RESUME_OFFSET{ 95 };
                 static constexpr std::int32_t JMP_TO_RESUME_SIZE{ 5 };
                 // Offset of the 8-byte detour function pointer data slot.
                 static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 100 };
-                static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
                 // Design overview
                 // ---------------
@@ -6881,7 +6883,7 @@ namespace vmhook
                     // --- data slot: detour function pointer (offset 100) ---
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
                 };
-#else
+#else  // !_WIN32
                 // ------------------------------------------------------------
                 // System V AMD64 calling convention trampoline.
                 // Args: rdi, rsi, rdx, rcx, r8, r9.  No shadow space.
@@ -6982,7 +6984,7 @@ namespace vmhook
                     // data slot (offset 0x79..0x80):
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
                 };
-#endif
+#endif  // _WIN32
 
                 const std::size_t total_size{ static_cast<std::size_t>(HOOK_SIZE) + sizeof(assembly) };
                 this->allocated = vmhook::hotspot::allocate_nearby_memory(target, total_size);
@@ -7000,11 +7002,6 @@ namespace vmhook
                     VMHOOK_LOG("{} midi2i_hook::midi2i_hook {}", vmhook::error_tag, exception.what());
                     return;
                 }
-
-                // Patch the resume-stub's jmp to point at target+HOOK_SIZE.
-                const std::int32_t jmp_to_resume_delta{ static_cast<std::int32_t>(
-                    target + HOOK_SIZE - (this->allocated + HOOK_SIZE + JMP_TO_RESUME_OFFSET + JMP_TO_RESUME_SIZE)) };
-                *reinterpret_cast<std::int32_t*>(assembly + JMP_TO_RESUME_OFFSET + 1) = jmp_to_resume_delta;
 
                 // Where to resume after the detour returns "don't cancel".
                 // Default: `target + HOOK_SIZE` (continue past the patched window
@@ -7026,9 +7023,16 @@ namespace vmhook
                         : target + HOOK_SIZE
                 };
 
+                // Patch the resume-stub's jmp to point at effective_resume.
+#if defined(_WIN32)
+                const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(
+                    effective_resume - (this->allocated + HOOK_SIZE + JMP_TO_RESUME_OFFSET + JMP_TO_RESUME_SIZE)) };
+                *reinterpret_cast<std::int32_t*>(assembly + JMP_TO_RESUME_OFFSET + 1) = resume_jmp_delta;
+#else
                 const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(
                     effective_resume - (this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE)) };
                 *reinterpret_cast<std::int32_t*>(assembly + RESUME_JMP_OFFSET + 1) = resume_jmp_delta;
+#endif
 
                 *reinterpret_cast<vmhook::hotspot::detour_function_t*>(assembly + DETOUR_ADDRESS_OFFSET) = detour;
 
@@ -7487,7 +7491,7 @@ namespace vmhook
             // before iterating the about-to-be-cleared vector.
             if (vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire))
             {
-                return;
+                return int64_t{0};
             }
 
             try
