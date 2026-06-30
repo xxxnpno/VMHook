@@ -7029,6 +7029,12 @@ namespace vmhook
                     effective_resume - (this->allocated + HOOK_SIZE + JMP_TO_RESUME_OFFSET + JMP_TO_RESUME_SIZE)) };
                 *reinterpret_cast<std::int32_t*>(assembly + JMP_TO_RESUME_OFFSET + 1) = resume_jmp_delta;
 #else
+                // Patch the conditional je at JE_OFFSET to jump to the resume
+                // path (RESUME_OFFSET) when the cancel flag is 0.
+                const std::int32_t je_delta{ static_cast<std::int32_t>(
+                    RESUME_OFFSET - (JE_OFFSET + JE_SIZE)) };
+                *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 1) = je_delta;
+
                 const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(
                     effective_resume - (this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE)) };
                 *reinterpret_cast<std::int32_t*>(assembly + RESUME_JMP_OFFSET + 1) = resume_jmp_delta;
