@@ -7347,14 +7347,16 @@ namespace vmhook
             observed (~150) without ballooning the static footprint.
         */
         inline constexpr std::size_t k_max_hooked_methods{ 1024 };
-        inline std::vector<vmhook::hotspot::hooked_method> g_hooked_methods{
-            []() noexcept -> std::vector<vmhook::hotspot::hooked_method>
-            {
-                std::vector<vmhook::hotspot::hooked_method> v;
-                v.reserve(k_max_hooked_methods);
-                return v;
-            }()
-        };
+        // Default-initialized empty.  install_one_hook reserves to
+        // k_max_hooked_methods under g_hooked_methods_mutex on first call,
+        // BEFORE the trampoline is patched in — so no detour can fire while
+        // capacity is still 0, and once capacity is set push_back never
+        // reallocates as long as size <= cap.  The original static-init
+        // reserve via inline-lambda triggered a 0.00 s static-init segfault
+        // on macOS-clang in CI (test_method_entry_points), and lazy reserve
+        // under the install lock preserves the use-after-free fix while
+        // avoiding the static-init footgun.
+        inline std::vector<vmhook::hotspot::hooked_method> g_hooked_methods{};
         inline std::mutex g_hooked_methods_mutex{};
 
         /*
@@ -10718,6 +10720,14 @@ namespace vmhook
             hm_entry.expected_class_name = type_map_entry->second;
             hm_entry.expected_method_name = std::string{ method_name };
             hm_entry.expected_signature = found_method->get_signature();
+            // Lazy reserve on first install under the install lock — before any
+            // detour can fire (no patched trampoline yet).  Once capacity is set
+            // the lock-free common_detour reader sees a stable backing buffer.
+            if (vmhook::hotspot::g_hooked_methods.capacity() == 0)
+            {
+                vmhook::hotspot::g_hooked_methods.reserve(vmhook::hotspot::k_max_hooked_methods);
+            }
+
             // Prefer reusing a tombstoned slot (hook_handle::stop sets
             // method=nullptr in-place rather than vector::erase, so a stop+install
             // sequence doesn't permanently consume cap).  Overwrites the std::function
