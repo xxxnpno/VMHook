@@ -56,7 +56,7 @@ namespace
 {
     constexpr auto always_true_pred =
         [](const std::string&, vmhook::hotspot::method*) noexcept { return true; };
-    constexpr auto always_false_pred =
+    [[maybe_unused]] constexpr auto always_false_pred =
         [](const std::string&, vmhook::hotspot::method*) noexcept { return false; };
 }
 
