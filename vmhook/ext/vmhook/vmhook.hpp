@@ -17926,18 +17926,18 @@ namespace vmhook
             static const vmhook::hotspot::vm_struct_entry_t* const klass_entry{
                 vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._klass") };
 
-            // Cold read: the klass slot may sit on an unmapped page on a stale
-            // / GC-relocated oop that passed the is_valid_pointer heuristic.
-            // Windows-gate the header read through os::safe_read (kernel-
-            // validated, never faults).  POSIX keeps the raw read: a stray AV
-            // is contained by the JVM's own signal handling and gating POSIX
-            // reads regressed other oop walks (see frame::get_method).  For a
-            // normally-mapped oop the bytes are identical.
+            // Cold read: header slot may sit on an unmapped page (stale /
+            // GC-relocated oop, or a fabricated test sentinel that passes
+            // the is_valid_pointer range heuristic).  Cross-platform
+            // os::safe_read: this is metadata (NOT a frame walk), so the
+            // stk_ POSIX-frame-walk regression that gated frame::get_method
+            // to Windows-only does not apply.  Without the POSIX gate, a
+            // no-JVM test process (no HotSpot SIGSEGV handler) crashes on
+            // a garbage oop.  For a mapped oop the bytes are identical.
             void* decoded{ nullptr };
             if (compressed_klass_entry)
             {
                 const std::size_t offset{ static_cast<std::size_t>(compressed_klass_entry->offset) };
-#if defined(_WIN32)
                 std::uint32_t narrow_klass{ 0 };
                 if (!vmhook::os::safe_read(&narrow_klass,
                                            reinterpret_cast<const std::uint8_t*>(oop) + offset,
@@ -17945,33 +17945,20 @@ namespace vmhook
                 {
                     return nullptr;
                 }
-#else
-                const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
-                    reinterpret_cast<const std::uint8_t*>(oop) + offset) };
-#endif
                 decoded = vmhook::hotspot::decode_klass_pointer(narrow_klass);
             }
             else if (klass_entry)
             {
                 const std::size_t offset{ static_cast<std::size_t>(klass_entry->offset) };
-#if defined(_WIN32)
                 if (!vmhook::os::safe_read(&decoded,
                                            reinterpret_cast<const std::uint8_t*>(oop) + offset,
                                            sizeof(decoded)))
                 {
                     return nullptr;
                 }
-#else
-                decoded = *reinterpret_cast<vmhook::hotspot::klass* const*>(
-                    reinterpret_cast<const std::uint8_t*>(oop) + offset);
-#endif
             }
             else
             {
-                // Neither VMStruct exported (very old / patched HotSpot): fall
-                // back to the legacy +8 / 32-bit / decode path so this is at
-                // worst byte-for-byte the old behaviour, not a regression.
-#if defined(_WIN32)
                 std::uint32_t narrow_klass{ 0 };
                 if (!vmhook::os::safe_read(&narrow_klass,
                                            reinterpret_cast<const std::uint8_t*>(oop) + 8,
@@ -17979,10 +17966,6 @@ namespace vmhook
                 {
                     return nullptr;
                 }
-#else
-                const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
-                    reinterpret_cast<const std::uint8_t*>(oop) + 8) };
-#endif
                 decoded = vmhook::hotspot::decode_klass_pointer(narrow_klass);
             }
             if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
@@ -19520,16 +19503,17 @@ namespace vmhook
             vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._klass") };
 
         // Cold read: header slot may sit on an unmapped page (stale / GC-
-        // relocated oop that passed is_valid_pointer's heuristic).  Windows-
-        // gate through os::safe_read (kernel-validated, never faults).  POSIX
-        // keeps the raw read: a stray AV there is contained by the JVM's own
-        // signal handling and gating POSIX reads regressed other oop walks
-        // (see frame::get_method); for a mapped oop the bytes are identical.
+        // relocated oop, or a fabricated test sentinel that passes the
+        // is_valid_pointer range heuristic).  Cross-platform os::safe_read:
+        // metadata read (NOT a frame walk), so the stk_ POSIX-frame-walk
+        // regression that gated frame::get_method to Windows-only does not
+        // apply here.  Without the POSIX gate, a no-JVM test process (no
+        // HotSpot SIGSEGV handler to catch the AV) crashes on a garbage oop.
+        // For a mapped oop the bytes are identical to the prior raw load.
         void* decoded{ nullptr };
         if (compressed_klass_entry)
         {
             const std::size_t offset{ static_cast<std::size_t>(compressed_klass_entry->offset) };
-#if defined(_WIN32)
             std::uint32_t narrow{ 0 };
             if (!vmhook::os::safe_read(&narrow,
                                        reinterpret_cast<const std::uint8_t*>(oop) + offset,
@@ -19537,32 +19521,21 @@ namespace vmhook
             {
                 return nullptr;
             }
-#else
-            const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
-                reinterpret_cast<const std::uint8_t*>(oop) + offset) };
-#endif
             decoded = vmhook::hotspot::decode_klass_pointer(narrow);
         }
         else if (klass_entry)
         {
             const std::size_t offset{ static_cast<std::size_t>(klass_entry->offset) };
-#if defined(_WIN32)
             if (!vmhook::os::safe_read(&decoded,
                                        reinterpret_cast<const std::uint8_t*>(oop) + offset,
                                        sizeof(decoded)))
             {
                 return nullptr;
             }
-#else
-            decoded = *reinterpret_cast<vmhook::hotspot::klass* const*>(
-                reinterpret_cast<const std::uint8_t*>(oop) + offset);
-#endif
         }
         else
         {
-            // Legacy fallback: neither VMStruct exported.  Byte-for-byte the
-            // old +8 / uint32 / decode path.
-#if defined(_WIN32)
+            // Legacy fallback: neither VMStruct exported.
             std::uint32_t narrow{ 0 };
             if (!vmhook::os::safe_read(&narrow,
                                        reinterpret_cast<const std::uint8_t*>(oop) + 8,
@@ -19570,10 +19543,6 @@ namespace vmhook
             {
                 return nullptr;
             }
-#else
-            const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
-                reinterpret_cast<const std::uint8_t*>(oop) + 8) };
-#endif
             decoded = vmhook::hotspot::decode_klass_pointer(narrow);
         }
         if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))

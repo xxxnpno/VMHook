@@ -188,7 +188,7 @@ static_assert(std::is_move_constructible_v<std::optional<vmhook::method_proxy>>,
 //      destructor (not trivially destructible).  MSVC-stl is more permissive
 //      but clang is correct per [optional.observe]/[optional.relops] in C++23.
 //      Promote to runtime once; the property is still observable.
-static const bool method_proxy_optional_default_empty{
+[[maybe_unused]] static const bool method_proxy_optional_default_empty{
     !std::optional<vmhook::method_proxy>{}.has_value()
     && std::optional<vmhook::method_proxy>{} == std::nullopt };
 static_assert(std::is_default_constructible_v<std::optional<vmhook::method_proxy>>,
