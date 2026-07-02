@@ -10746,17 +10746,36 @@ namespace vmhook
 
             // Prefer reusing a tombstoned slot (hook_handle::stop sets
             // method=nullptr in-place rather than vector::erase, so a stop+install
-            // sequence doesn't permanently consume cap).  Overwrites the std::function
-            // detour cell in-place — safe because the lock-free reader filters on
-            // `hook.method == current_method` and a tombstone has method=nullptr,
-            // so it cannot dispatch the half-constructed cell during the assign.
-            // Falls through to push_back when no tombstone is available.
+            // sequence doesn't permanently consume cap).  Falls through to push_back
+            // when no tombstone is available.
+            //
+            // PUBLICATION ORDER matters — the lock-free common_detour reader filters
+            // on `hook.method == current_method`, so once we write a non-null
+            // slot.method the reader can (and will) dispatch slot.detour on any core
+            // that observes it.  If we did a whole-struct move-assign, the compiler-
+            // generated implementation follows member declaration order (method
+            // first, then detour, then …) — a reader on another core can see the
+            // new method BEFORE the detour cell has been assigned and dispatch a
+            // torn/half-constructed std::function.  So assign every field EXCEPT
+            // method first, insert a release fence, and only then publish method:
+            // any reader that sees the new method is now guaranteed to see a fully
+            // constructed detour.
             bool reused_slot{ false };
             for (vmhook::hotspot::hooked_method& slot : vmhook::hotspot::g_hooked_methods)
             {
                 if (slot.method == nullptr)
                 {
-                    slot = std::move(hm_entry);
+                    slot.detour                        = std::move(hm_entry.detour);
+                    slot.original_code                 = hm_entry.original_code;
+                    slot.original_from_interpreted_entry = hm_entry.original_from_interpreted_entry;
+                    slot.original_from_compiled_entry  = hm_entry.original_from_compiled_entry;
+                    slot.was_compiled                  = hm_entry.was_compiled;
+                    slot.expected_class_name           = std::move(hm_entry.expected_class_name);
+                    slot.expected_method_name          = std::move(hm_entry.expected_method_name);
+                    slot.expected_signature            = std::move(hm_entry.expected_signature);
+                    slot.drift_logged                  = false;
+                    std::atomic_thread_fence(std::memory_order_release);
+                    slot.method                        = hm_entry.method;
                     reused_slot = true;
                     break;
                 }
