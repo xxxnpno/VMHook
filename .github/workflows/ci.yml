@@ -257,16 +257,18 @@ jobs:
           # in the GC-survival tests still runs, so GC coverage is preserved
           # (unlike -XX:+UseEpsilonGC, which no-ops System.gc).  -Xmx/-Xmn are
           # universal across JDK 8..26 (no experimental unlock needed).
-          # Bumped 2g/1g -> 4g/3g: as the JVM test suite grew (deepening batches),
-          # the borderline cells (clang·java25, msvc·java11) began stalling
+          # Bumped 2g/1g -> 4g/3g -> 8g/6g: as the JVM test suite grew (deepening
+          # batches), the borderline cells (clang·java25, msvc·java11) began stalling
           # frequently — and after the HashTreeMap rebuild-once fix the stall merely
           # RELOCATED (collection_hash_tree_map -> collection_list), confirming it is
-          # a general GC-during-walk window, not one module.  A 3g young gen (well
-          # within the 16 GB runners) absorbs far more transient allocation before
-          # any minor GC fires, widening the margin for the whole growing suite.
+          # a general GC-during-walk window, not one module.  Post dc73048 batch
+          # + trampoline fix the java 11+ cells stall at ~11k tests (java 8 at
+          # 24.7k passes cleanly with 4g/3g), so a 6g young gen (still well within
+          # the 16 GB runners) absorbs the additional transient allocation the
+          # newer G1GC layouts churn through relative to Java 8's ParallelGC.
           $java = Start-Process `
             -FilePath "java" `
-            -ArgumentList "-Xmx4g", "-Xmn3g", "-cp", "out", "vmhook.Main" `
+            -ArgumentList "-Xmx8g", "-Xmn6g", "-cp", "out", "vmhook.Main" `
             -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput "java_stdout.txt" `
             -RedirectStandardError  "java_stderr.txt"
