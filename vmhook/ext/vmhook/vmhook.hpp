@@ -7136,7 +7136,26 @@ namespace vmhook
                     vmhook::os::flush_instruction_cache(this->target, 5);
                 }
 
-                vmhook::os::release(this->allocated, this->allocated_size);
+                // Trampoline graveyard: intentionally LEAK the executable stub page.
+                //
+                // We just restored the original 5 bytes at `target`, so no new call
+                // will enter this trampoline.  But Java worker threads that were
+                // ALREADY mid-execution inside this stub (or inside common_detour
+                // called through it) still hold a return address pointing into
+                // `this->allocated`.  shutdown_hooks() joins the watchdog thread but
+                // does NOT safepoint-sync Java threads, and drive()/settle loops are
+                // not a barrier.  Releasing the page here would UAF that return
+                // address; on no-SEH toolchains (MinGW / clang-cl / MSVC without
+                // seh_invoke) the `ret` into a freed page kills the JVM outright —
+                // the Java-11+ msvc/clang crash cluster remaining from ab79f91 and
+                // characterised by the shutdown_hooks specialist audit.
+                //
+                // Cost: ~one page per lifetime hook install; even 10k installs is
+                // well under 2 MB — acceptable for an instrumentation library.
+                // Correctness: the target is fully unhooked (bytes restored above),
+                // so this is a bounded, one-shot leak, not a growing one.
+                //
+                // (void)vmhook::os::release(this->allocated, this->allocated_size);
             }
 
             inline auto has_error() const noexcept -> bool
