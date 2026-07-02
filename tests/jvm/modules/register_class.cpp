@@ -657,12 +657,12 @@ namespace
         }
 
         // =====================================================================
-        //  7. FACTORY ASYMMETRY (BUG PIN).  Register collide_a to a shared name,
-        //     then collide_b to the SAME name.  type_to_class_map (insert_or_assign)
-        //     now maps collide_b -> name, but g_type_factory_map (emplace) STILL
-        //     holds collide_a's factory.  We assert the factory pointer is IDENTICAL
-        //     before and after the second register (proving emplace did not
-        //     overwrite).
+        //  7. FACTORY LAST-WINS.  Register collide_a to a shared name, then
+        //     collide_b to the SAME name.  Both maps use insert_or_assign, so
+        //     collide_b's factory now owns the slot (last-writer-wins).  This
+        //     was previously a BUG PIN when g_type_factory_map used emplace
+        //     (first-wins) — fixed in the lib to insert_or_assign so the two
+        //     views stay lockstep-consistent on rebind.
         //
         //     We use java/lang/Object as the shared name: no module PINS its factory
         //     IDENTITY, and -- critically -- no module CONSUMES its factory (the two
@@ -700,26 +700,19 @@ namespace
             ctx.check("collide_a_maps_to_shared", a_name == shared);
             ctx.check("collide_b_maps_to_shared_too", b_name == shared);
 
-            // THE BUG: the factory slot did NOT change when collide_b registered.
-            // g_type_factory_map.emplace is a no-op on an existing key, so the
-            // factory still builds whatever type owned the slot first (`pre` if a
-            // prior module bound java/lang/Object, else collide_a).
-            ctx.check("collide_factory_unchanged_after_second_register",
-                      after_b == after_a);
-            // Whichever owned it first still owns it: if java/lang/Object was unbound
-            // before, after_a==collide_a's factory and stays so; if it was bound, the
-            // pre-existing factory survived collide_a too.
-            ctx.check("collide_factory_owner_is_first_registrant",
-                      (pre == nullptr) ? (after_b == after_a)
-                                       : (after_b == pre));
-            ctx.record("[INFO] register_class factory/type-map asymmetry: "
-                       "type_to_class_map.insert_or_assign is last-wins, but "
-                       "g_type_factory_map.emplace is first-wins. Two distinct "
-                       "wrapper types sharing one class name end up with the SECOND "
-                       "type mapped but the FIRST type's factory -- a "
-                       "unique_ptr<Second> hook arg would be built as `new First` and "
-                       "static_cast to Second* (extract_frame_arg): UB. Pinned, not "
-                       "routed through a live oop.");
+            // FIXED: the factory slot IS overwritten when collide_b registers,
+            // now that g_type_factory_map uses insert_or_assign (last-wins).
+            // after_b differs from after_a (unless collide_b's factory happens
+            // to alias, which the lambda-per-instantiation address rules out).
+            ctx.check("collide_factory_changed_after_second_register",
+                      after_b != after_a);
+            // Last registrant owns the slot regardless of the pre-existing binding.
+            ctx.check("collide_factory_owner_is_last_registrant",
+                      after_b != pre || pre == nullptr);
+            ctx.record("[INFO] register_class factory/type-map now last-wins on "
+                       "both maps (type_to_class_map + g_type_factory_map use "
+                       "insert_or_assign), keeping the two views consistent on "
+                       "rebind. Historic first-wins-vs-last-wins asymmetry fixed.");
         }
 
         // =====================================================================
