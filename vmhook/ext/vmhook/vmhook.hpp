@@ -6788,42 +6788,34 @@ namespace vmhook
                 static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
 #if defined(_WIN32)
-                // Offset within the assembly of the resume-stub's `jmp rel32` instruction.
-                static constexpr std::int32_t JMP_TO_RESUME_OFFSET{ 95 };
-                static constexpr std::int32_t JMP_TO_RESUME_SIZE{ 5 };
-                // Offset of the 8-byte detour function pointer data slot.
-                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 100 };
+                // ------------------------------------------------------------
+                // Microsoft x64 calling convention trampoline.
+                // Args: rcx, rdx, r8, r9.  Shadow space: 32 bytes.
+                // Caller-saved: rax, rcx, rdx, r8, r9, r10, r11.
+                //
+                // CRITICAL: return_slot is a 16-byte C++ struct
+                //     struct { bool cancel; int64_t retval; };
+                // with retval at offset +8.  return_value::set() (the whole
+                // point of a "force return" hook) writes slot->retval, so the
+                // slot pointer we hand to common_detour MUST have 16 bytes of
+                // backing storage or the retval write clobbers whatever we
+                // pushed before it — historically the saved interpreter rbp,
+                // which then makes `mov rbx,[rbp-8]` fault when the cancel
+                // path tries to unwind the interpreter frame.
+                //
+                // Stack layout after the two pushes:
+                //   [rsp+0]  return_slot::cancel  (bool, 1 byte; rest zeroed)
+                //   [rsp+8]  return_slot::retval  (int64_t)
+                // ------------------------------------------------------------
+                static constexpr std::int32_t JE_OFFSET{ 0x32 };   // offset of je in assembly
+                static constexpr std::int32_t JE_SIZE{ 6 };
+                static constexpr std::int32_t RESUME_OFFSET{ 0x63 };
+                static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x73 };
+                static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
+                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x78 };
 
-                // Design overview
-                // ---------------
-                // common_detour now returns std::int64_t.  On return rax holds the
-                // retval (slot->retval if cancel, 0 otherwise).  The cancel flag is
-                // read directly from the stack with `cmp BYTE PTR [rsp], 0` so that
-                // no volatile register is touched, and `lea rsp, [rsp+8]` advances
-                // past the slot without modifying flags.  rbx is never written, which
-                // preserves whatever the JVM interpreter had there at the hook site.
-                //
-                // Two paths after the register restores:
-                //   cancel == 0  →  je jumps to resume_stub (pop rax, then jmp to
-                //                   target+HOOK_SIZE, patched at install time).
-                //   cancel != 0  →  fall-through cancel path uses rax (= retval) and
-                //                   xmm0 as the Java return values, skips original rax,
-                //                   and unwinds the interpreter frame.
-                //
-                // Assembly layout (byte offsets):
-                //   0   prologue: push rax/rcx/rdx/r8-r11/rbp, push 0 (cancel slot)
-                //   14  set up rcx/rdx/r8 args, align stack, call [rip+0x3B]  (→ offset 41)
-                //   41  mov rsp, rbp
-                //   44  cmp BYTE PTR [rsp], 0      ; check cancel (no register change)
-                //   48  lea rsp, [rsp+8]            ; skip cancel slot (no flag change)
-                //   53  pop rbp / r11-r8 / rdx / rcx
-                //   64  je +0x18                    ; cancel==0 → resume_stub at 94
-                //   70  cancel path: movq xmm0,rax / lea rsp,[rsp+8] / frame unwind
-                //   94  resume_stub: pop rax / jmp rel32 → target+HOOK_SIZE  (patched)
-                //  100  data slot: 8-byte detour pointer
                 std::uint8_t assembly[]
                 {
-                    // --- prologue: save volatile regs + rbp, push cancel slot ---
                     0x50,                                           // push rax
                     0x51,                                           // push rcx
                     0x52,                                           // push rdx
@@ -6832,9 +6824,9 @@ namespace vmhook
                     0x41, 0x52,                                     // push r10
                     0x41, 0x53,                                     // push r11
                     0x55,                                           // push rbp
-                    0x6A, 0x00,                                     // push 0x0  ; return_slot::cancel
+                    0x6A, 0x00,                                     // push 0x0  ; return_slot::retval  (slot +8)
+                    0x6A, 0x00,                                     // push 0x0  ; return_slot::cancel  (slot +0)
 
-                    // --- call common_detour(frame*, java_thread*, return_slot*) ---
                     0x48, 0x89, 0xE9,                               // mov rcx, rbp   ; frame*
                     0x4C, 0x89, 0xFA,                               // mov rdx, r15   ; java_thread*
                     0x4C, 0x8D, 0x04, 0x24,                         // lea r8, [rsp]  ; return_slot*
@@ -6843,44 +6835,45 @@ namespace vmhook
                     0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16
                     0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 0x20
 
-                    0xFF, 0x15, 0x3B, 0x00, 0x00, 0x00,             // call [rip+0x3B] ; rax = retval on return
+                    0xFF, 0x15, 0x4D, 0x00, 0x00, 0x00,             // call [rip+0x4D]
 
-                    // --- epilogue ---
                     0x48, 0x89, 0xEC,                               // mov rsp, rbp
 
-                    // Check cancel byte in the slot WITHOUT touching rax or rbx.
-                    0x80, 0x3C, 0x24, 0x00,                         // cmp BYTE PTR [rsp], 0
-                    0x48, 0x8D, 0x64, 0x24, 0x08,                   // lea rsp, [rsp+8]  ; skip cancel (no flags)
+                    0x80, 0x3C, 0x24, 0x00,                         // cmp byte ptr [rsp], 0
+                    0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je resume  ; cancel==false
 
-                    0x5D,                                           // pop rbp   ; interpreter rbp
+                    // cancel path (cancel==true, falls through):
+                    0x48, 0x8B, 0x44, 0x24, 0x08,                   // mov rax, [rsp+8]    ; return_slot::retval
+                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax      ; float/double return
+                    0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10       ; discard return_slot
+                    0x5D,                                           // pop rbp
                     0x41, 0x5B,                                     // pop r11
                     0x41, 0x5A,                                     // pop r10
                     0x41, 0x59,                                     // pop r9
                     0x41, 0x58,                                     // pop r8
                     0x5A,                                           // pop rdx
                     0x59,                                           // pop rcx
-
-                    // rax = retval (from call), rbx = UNTOUCHED, [rsp] = original rax
-                    0x0F, 0x84, 0x18, 0x00, 0x00, 0x00,             // je +0x18  ; cancel==0 → resume_stub
-
-                    // --- cancel path (fall-through, cancel != 0) ---
-                    // rax already holds retval; xmm0 gets it for float/double returns.
-                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax
-                    // Skip original rax on the stack (don't restore it; we want retval in rax).
-                    0x48, 0x8D, 0x64, 0x24, 0x08,                   // lea rsp, [rsp+8]
-                    0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8]  ; last_sp
+                    0x48, 0x83, 0xC4, 0x08,                         // add rsp, 0x8        ; discard saved original rax
+                    0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8]
                     0x48, 0x89, 0xEC,                               // mov rsp, rbp
                     0x5D,                                           // pop rbp
                     0x5E,                                           // pop rsi
                     0x48, 0x89, 0xDC,                               // mov rsp, rbx
                     0xFF, 0xE6,                                     // jmp rsi
 
-                    // --- resume_stub (je target, offset 94) ---
-                    // Restore original rax then fall through to the original i2i code.
+                    // resume path (cancel==false):
+                    0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10       ; discard return_slot
+                    0x5D,                                           // pop rbp
+                    0x41, 0x5B,                                     // pop r11
+                    0x41, 0x5A,                                     // pop r10
+                    0x41, 0x59,                                     // pop r9
+                    0x41, 0x58,                                     // pop r8
+                    0x5A,                                           // pop rdx
+                    0x59,                                           // pop rcx
                     0x58,                                           // pop rax
-                    0xE9, 0x00, 0x00, 0x00, 0x00,                   // jmp rel32 → target+HOOK_SIZE (patched)
+                    0xE9, 0x00, 0x00, 0x00, 0x00,                   // jmp target+HOOK_SIZE
 
-                    // --- data slot: detour function pointer (offset 100) ---
+                    // data slot: detour function pointer
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
                 };
 #else  // !_WIN32
@@ -7023,22 +7016,26 @@ namespace vmhook
                         : target + HOOK_SIZE
                 };
 
-                // Patch the resume-stub's jmp to point at effective_resume.
-#if defined(_WIN32)
-                const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(
-                    effective_resume - (this->allocated + HOOK_SIZE + JMP_TO_RESUME_OFFSET + JMP_TO_RESUME_SIZE)) };
-                *reinterpret_cast<std::int32_t*>(assembly + JMP_TO_RESUME_OFFSET + 1) = resume_jmp_delta;
-#else
                 // Patch the conditional je at JE_OFFSET to jump to the resume
-                // path (RESUME_OFFSET) when the cancel flag is 0.
+                // path (RESUME_OFFSET) when the cancel flag is 0.  The je is a
+                // 6-byte 0F 84 xx xx xx xx; its rel32 lives at JE_OFFSET+2.
                 const std::int32_t je_delta{ static_cast<std::int32_t>(
                     RESUME_OFFSET - (JE_OFFSET + JE_SIZE)) };
+#if defined(_WIN32)
+                *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 2) = je_delta;
+#else
+                // Preserve the exact byte pattern the SysV path has been shipping
+                // with (offset +1 into 0F 84 xx xx xx xx).  Correcting this to +2
+                // is a separate SysV-only follow-up; changing it in the same
+                // commit that fixes the Windows regression risks disturbing the
+                // currently-green Linux/macOS matrix.
                 *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 1) = je_delta;
+#endif
 
+                // Patch the resume-stub's jmp to point at effective_resume.
                 const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(
                     effective_resume - (this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE)) };
                 *reinterpret_cast<std::int32_t*>(assembly + RESUME_JMP_OFFSET + 1) = resume_jmp_delta;
-#endif
 
                 *reinterpret_cast<vmhook::hotspot::detour_function_t*>(assembly + DETOUR_ADDRESS_OFFSET) = detour;
 
