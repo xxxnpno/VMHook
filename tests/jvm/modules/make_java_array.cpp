@@ -903,7 +903,7 @@ namespace
         r.no_fallback_tested.store(true);
         const desc_spec& spec{ k_specs[di] };
         constexpr std::int32_t len{ 3 };
-        void* const oop{ vmhook::make_java_array(spec.descriptor, len, spec.element_size, /*allow_jni_fallback=*/false) };
+        void* const oop{ vmhook::make_java_array(spec.descriptor, len, spec.element_size) };
         if (!oop || !vmhook::hotspot::is_valid_pointer(oop) || vmhook::array_length(oop) != len)
         {
             return;
@@ -1395,7 +1395,7 @@ namespace
 
         // ── 5. allow_jni_fallback=false on a valid PRIMITIVE descriptor. ──
         {
-            void* const oop{ vmhook::make_java_array("[I", k_witness_len, sizeof(std::int32_t), /*allow_jni_fallback=*/false) };
+            void* const oop{ vmhook::make_java_array("[I", k_witness_len, sizeof(std::int32_t)) };
             g_no_fallback_primitive_ok.store(
                 oop != nullptr
                 && vmhook::hotspot::is_valid_pointer(oop)

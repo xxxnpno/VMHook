@@ -10434,22 +10434,20 @@ namespace vmhook
             // and mangle astral scalars (it decodes modified UTF-8).  make_java_string
             // is the GC-aware fallback and already encodes via the same UTF-16 path,
             // so both routes agree byte-for-byte.
-            void* const string_handle{ vmhook::detail::jni_new_string_utf16_local(value) };
-            void* const string_oop{ string_handle
-                ? vmhook::detail::jni_decode_object(string_handle)
-                : vmhook::make_java_string(value) };
+            // Pure-VM: build the String oop directly via make_java_string (TLAB
+            // allocation + UTF-16 value/coder field encode).  No JNI NewString,
+            // no local reference, so no DeleteLocalRef bookkeeping.  The oop goes
+            // into an interpreter local slot (a GC root) via store_oop.
+            void* const string_oop{ vmhook::make_java_string(value) };
             if (!string_oop)
             {
-                vmhook::detail::jni_delete_local_ref(string_handle);
-                VMHOOK_LOG("{} return_value::set_arg(index={}): both JNI NewStringUTF and "
-                           "make_java_string fallback failed - cannot inject a Java String.",
+                VMHOOK_LOG("{} return_value::set_arg(index={}): make_java_string "
+                           "failed - cannot inject a Java String.",
                            vmhook::error_tag, index);
                 return false;
             }
 
-            const bool stored{ store_oop(string_oop) };
-            vmhook::detail::jni_delete_local_ref(string_handle);
-            return stored;
+            return store_oop(string_oop);
         }
         else if constexpr (std::is_same_v<clean_value_type, const char*> || std::is_same_v<clean_value_type, char*>)
         {
@@ -10457,22 +10455,17 @@ namespace vmhook
             // standard-UTF-8 astral bytes, so use the length-counted UTF-16 encoder
             // (NewString) rather than NewStringUTF to avoid modified-UTF-8 mangling.
             const std::string_view text{ value ? std::string_view{ value } : std::string_view{} };
-            void* const string_handle{ vmhook::detail::jni_new_string_utf16_local(text) };
-            void* const string_oop{ string_handle
-                ? vmhook::detail::jni_decode_object(string_handle)
-                : vmhook::make_java_string(text) };
+            // Pure-VM: build the String oop directly (no JNI NewString/local ref).
+            void* const string_oop{ vmhook::make_java_string(text) };
             if (!string_oop)
             {
-                vmhook::detail::jni_delete_local_ref(string_handle);
-                VMHOOK_LOG("{} return_value::set_arg(index={}): both JNI NewStringUTF and "
-                           "make_java_string fallback failed for const char* arg.",
+                VMHOOK_LOG("{} return_value::set_arg(index={}): make_java_string "
+                           "failed for const char* arg.",
                            vmhook::error_tag, index);
                 return false;
             }
 
-            const bool stored{ store_oop(string_oop) };
-            vmhook::detail::jni_delete_local_ref(string_handle);
-            return stored;
+            return store_oop(string_oop);
         }
         else if constexpr (std::is_trivially_copyable_v<clean_value_type> && sizeof(clean_value_type) <= sizeof(void*))
         {
@@ -14750,7 +14743,7 @@ namespace vmhook
                                   supply their own rooted fallback instead.
         @return  Pointer to the raw array OOP with header and length initialised, or nullptr on failure.
     */
-    inline auto make_java_array(const std::string_view class_name, const std::int32_t length, const std::size_t element_size, const bool allow_jni_fallback = true) noexcept
+    inline auto make_java_array(const std::string_view class_name, const std::int32_t length, const std::size_t element_size, [[maybe_unused]] const bool retained_for_abi = true) noexcept
         -> void*
     {
         if (length < 0)
@@ -14806,23 +14799,9 @@ namespace vmhook
         void* const array_oop{ vmhook::make_java_object(array_klass, array_header_size + static_cast<std::size_t>(length) * element_size) };
         if (!array_oop)
         {
-            // ADDITIVE GC-aware fallback (fast path above is untouched): the TLAB
-            // primitive returned null, which happens when the buffer is exhausted
-            // and the allocation needs a GC.  For PRIMITIVE arrays, retry through
-            // the JVM's GC-aware JNI New<Type>Array slow path, which allocates a
-            // fully-formed array (header/klass/_length stamped by the JVM, GC run
-            // first if needed).  This only runs on the already-failing path, so it
-            // cannot regress any config where the TLAB path currently succeeds.
-            if (allow_jni_fallback)
-            {
-                if (void* const jni_array_oop{ vmhook::detail::jni_new_primitive_array(class_name, length) })
-                {
-                    // The JVM already wrote the _length slot; the oop is in the same
-                    // raw decoded form the TLAB path returns.  Hand it straight back.
-                    return jni_array_oop;
-                }
-            }
-
+            // Pure-VM: no GC-aware JNI New<Type>Array fallback.  A null here means
+            // the TLAB allocation could not be satisfied (buffer exhausted / a GC
+            // would be required); report it rather than dispatching a JNI slow path.
             VMHOOK_LOG("{} vmhook::make_java_array('{}'): make_java_object failed for {} elements "
                        "({} bytes total).",
                        vmhook::error_tag, class_name, length,
@@ -14886,14 +14865,6 @@ namespace vmhook
         const std::vector<std::uint16_t> units{ vmhook::detail::utf8_to_utf16(value) };
         const std::int32_t char_count{ static_cast<std::int32_t>(units.size()) };
 
-        // Largest decoded length the hand-built TLAB fast path constructs.  This
-        // mirrors the ceiling read_java_string can read back (its fixed 8192-byte
-        // body buffer == 4096 chars * 2), so the TLAB product stays round-trippable
-        // by read_java_string.  Inputs LONGER than this are NOT truncated: they fall
-        // through to the GC-aware JNIEnv::NewString fallback below, which builds the
-        // full String inside the JVM at any length (so the result equals the whole
-        // input).  This is the fix for the silent >4096 truncation (robustness #9).
-        constexpr std::int32_t k_tlab_string_max_units{ 4096 };
 
         // A compact (JDK 9+) String may use the LATIN1 coder only when every
         // code unit fits in one byte; otherwise it must use the UTF16 coder.
@@ -14926,7 +14897,7 @@ namespace vmhook
 
             if (compact_string && all_latin1)
             {
-                void* const value_array{ vmhook::make_java_array("[B", char_count, sizeof(std::uint8_t), false) };
+                void* const value_array{ vmhook::make_java_array("[B", char_count, sizeof(std::uint8_t)) };
                 if (!value_array)
                 {
                     VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the byte[] backing "
@@ -14948,7 +14919,7 @@ namespace vmhook
                 // UTF16 coder: byte[] holding 2 bytes per code unit, native-endian
                 // (HotSpot StringUTF16 stores chars in platform byte order; on the
                 // x64 CI that is little-endian, matching the units' in-memory bytes).
-                void* const value_array{ vmhook::make_java_array("[B", char_count * 2, sizeof(std::uint8_t), false) };
+                void* const value_array{ vmhook::make_java_array("[B", char_count * 2, sizeof(std::uint8_t)) };
                 if (!value_array)
                 {
                     VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the byte[] backing "
@@ -14964,7 +14935,7 @@ namespace vmhook
             }
             else
             {
-                void* const value_array{ vmhook::make_java_array("[C", char_count, sizeof(std::uint16_t), false) };
+                void* const value_array{ vmhook::make_java_array("[C", char_count, sizeof(std::uint16_t)) };
                 if (!value_array)
                 {
                     VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the char[] backing "
@@ -15007,43 +14978,21 @@ namespace vmhook
         // GC-aware JNIEnv::NewString fallback below, which builds the full String in
         // the JVM.  The ONLY difference for an over-cap input is which path makes it
         // — it is built completely either way, never truncated.
-        if (char_count <= k_tlab_string_max_units)
+        // Pure-VM: build via the TLAB path at ANY length (no JNI NewString
+        // fallback).  The former k_tlab_string_max_units cap only existed to
+        // route longer inputs to the GC-aware JNI slow path; build_via_tlab()
+        // constructs the complete String for the full input regardless of size.
+        if (void* const tlab_string_oop{ build_via_tlab() })
         {
-            if (void* const tlab_string_oop{ build_via_tlab() })
-            {
-                return tlab_string_oop;
-            }
+            return tlab_string_oop;
         }
 
-        // GC-aware fallback.  Reached on two paths, both ADDITIVE to the unchanged
-        // fast path above:
-        //   (1) the TLAB path was attempted (char_count <= cap) but returned null
-        //       because the String instance or its backing array could not be
-        //       allocated without a GC; or
-        //   (2) char_count > cap, so we intentionally bypassed the TLAB path to
-        //       build the over-cap String in full here rather than truncating it.
-        // Either way, rebuild the entire String — instance AND backing array, rooted
-        // internally by the JVM for the whole operation — via the GC-aware
-        // JNIEnv::NewString slow path, using the SAME code units we just computed
-        // (content-exact for every code point, including astral surrogate pairs, at
-        // any length).  No unrooted intermediate oop is exposed, so this is GC-safe;
-        // and for case (1) it only runs on the already-failing path, so it cannot
-        // regress any config where the TLAB path currently succeeds.
-        if (void* const jni_string_oop{ vmhook::detail::jni_new_string_utf16(units) })
-        {
-            // Bind the reason to a named lvalue (not a ternary prvalue) before
-            // logging: std::make_format_args takes its arguments by lvalue
-            // reference, so an inline temporary would not bind on the stricter
-            // standard libraries.
-            const char* const fallback_reason{ char_count > k_tlab_string_max_units
-                                                   ? "input exceeds the TLAB fast-path cap"
-                                                   : "TLAB encode path failed" };
-            VMHOOK_LOG("{} vmhook::make_java_string(): built java.lang.String via the "
-                       "GC-aware JNIEnv::NewString fallback ({} code units; {}).",
-                       vmhook::info_tag, char_count, fallback_reason);
-            return jni_string_oop;
-        }
-
+        // Pure-VM: no GC-aware JNIEnv::NewString fallback.  If build_via_tlab()
+        // above could not allocate (heap/TLAB exhausted, GC required), report null
+        // rather than dispatching a JNI slow path.
+        VMHOOK_LOG("{} vmhook::make_java_string(): TLAB build failed ({} code units); "
+                   "no JNI fallback (pure-VM build).",
+                   vmhook::info_tag, char_count);
         return nullptr;
     }
 
