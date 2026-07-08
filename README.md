@@ -40,10 +40,10 @@ what CI actually exercises for each target.
 | OS / Arch                | Compiler                  | Header builds | OS layer | Hook trampoline | Real-JVM tests |
 |--------------------------|---------------------------|:-------------:|:--------:|:---------------:|:--------------:|
 | Windows x86_64           | MSVC 19.36+               | yes           | yes      | yes (Win64 ABI) | yes            |
-| Windows x86_64           | clang / clang-cl 16+      | yes           | yes      | yes (Win64 ABI) | yes            |
-| Windows x86_64           | MinGW-w64 GCC 13+         | yes           | yes      | yes (Win64 ABI) | yes            |
-| Linux x86_64             | GCC 13+                   | yes           | yes      | yes (SysV ABI)  | yes            |
-| Linux x86_64             | Clang 16+                 | yes           | yes      | yes (SysV ABI)  | yes            |
+| Windows x86_64           | clang / clang-cl 20+      | yes           | yes      | yes (Win64 ABI) | yes            |
+| Windows x86_64           | MinGW-w64 GCC 14+         | yes           | yes      | yes (Win64 ABI) | yes            |
+| Linux x86_64             | GCC 14+                   | yes           | yes      | yes (SysV ABI)  | yes            |
+| Linux x86_64             | Clang 18+                 | yes           | yes      | yes (SysV ABI)  | yes            |
 | macOS x86_64             | Apple Clang               | yes           | yes      | yes (SysV ABI)  | best-effort    |
 | macOS arm64              | Apple Clang               | yes           | yes      | no (arm64)      | best-effort    |
 | Android (ARM64 / x86_64) | NDK clang                 | yes           | yes      | x86_64 only     | n/a (no HotSpot) |
