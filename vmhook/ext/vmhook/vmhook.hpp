@@ -19995,9 +19995,9 @@ namespace vmhook
         hook detour parameter.
 
         Usage:
-            // Java: public List<A> listOfAs;
-            auto vec = get_field("listOfAs")->get().to_vector<a_class>();
-            // vec is std::vector<std::unique_ptr<a_class>>
+            // Java: public List<Widget> items;
+            auto vec = get_field("items")->get().to_vector<widget>();
+            // vec is std::vector<std::unique_ptr<widget>>
     */
     class list : public vmhook::collection
     {
@@ -20017,8 +20017,8 @@ namespace vmhook
         already takes the right path.
 
         Usage:
-            // Java: public Set<A> setOfAs;
-            auto vec = get_field("setOfAs")->get().to_vector<a_class>();
+            // Java: public Set<Widget> items;
+            auto vec = get_field("items")->get().to_vector<widget>();
     */
     class set : public vmhook::collection
     {
@@ -20038,8 +20038,8 @@ namespace vmhook
         to bind to.
 
         Usage:
-            // Java: public LinkedList<A> chainOfAs;
-            auto vec = get_field("chainOfAs")->get().to_vector<a_class>();
+            // Java: public LinkedList<Widget> chain;
+            auto vec = get_field("chain")->get().to_vector<widget>();
     */
     class linked_list : public vmhook::list
     {

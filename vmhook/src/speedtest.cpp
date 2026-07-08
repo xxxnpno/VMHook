@@ -5,7 +5,7 @@
 // unit and reuses the JNIEnv* that vmhook::hotspot::current_jni_env
 // stores after attach_current_native_thread().
 //
-// The bench calls vmhook/Example.staticReturnMe(int) in a tight loop
+// The bench calls vmhook/fixtures/MethodStatic.sEchoInt(int) in a tight loop
 // through three paths:
 //   1. vmhook method_proxy::call() (the everyday API)
 //   2. pure JNI CallStaticIntMethodA via jni.h
@@ -63,7 +63,7 @@ extern "C" auto run_vmhook_vs_jni_speedtest() -> void
     if (vmhook::type_to_class_map.find(std::type_index{ typeid(example_wrapper) })
         == vmhook::type_to_class_map.end())
     {
-        if (!vmhook::register_class<example_wrapper>("vmhook/Example"))
+        if (!vmhook::register_class<example_wrapper>("vmhook/fixtures/MethodStatic"))
         {
             std::fprintf(stdout, "[BENCH] vmhook: register_class failed\n");
             std::fflush(stdout);
@@ -72,24 +72,23 @@ extern "C" auto run_vmhook_vs_jni_speedtest() -> void
     }
 
     example_wrapper empty{ nullptr };
-    auto method_opt{ empty.get_method("staticReturnMe") };
+    auto method_opt{ empty.get_method("sEchoInt") };
     if (!method_opt.has_value())
     {
-        std::fprintf(stdout, "[BENCH] vmhook: get_method('staticReturnMe') failed\n");
+        std::fprintf(stdout, "[BENCH] vmhook: get_method('sEchoInt') failed\n");
         std::fflush(stdout);
         return;
     }
 
     // Quick sanity probe: call once and make sure the value comes
-    // back correctly before timing the loop.  staticReturnMe(40)
-    // returns 40 + 2 = 42.
+    // back correctly before timing the loop.  sEchoInt(40) returns 40.
     {
         const auto sanity{ method_opt->call(static_cast<std::int32_t>(40)) };
         const auto* const p{ std::get_if<std::int32_t>(&sanity.data) };
-        if (!p || *p != 42)
+        if (!p || *p != 40)
         {
             std::fprintf(stdout,
-                         "[BENCH] vmhook sanity check failed (variant index %zu, expected int32=42); "
+                         "[BENCH] vmhook sanity check failed (variant index %zu, expected int32=40); "
                          "skipping speedtest\n",
                          sanity.data.index());
             std::fflush(stdout);
@@ -123,15 +122,15 @@ extern "C" auto run_vmhook_vs_jni_speedtest() -> void
     const auto t_vmhook_end{ clock::now() };
 
     // -------- pure JNI side --------
-    jclass cls{ env->FindClass("vmhook/Example") };
+    jclass cls{ env->FindClass("vmhook/fixtures/MethodStatic") };
     if (!cls)
     {
         env->ExceptionClear();
-        std::fprintf(stdout, "[BENCH] JNI: FindClass('vmhook/Example') failed\n");
+        std::fprintf(stdout, "[BENCH] JNI: FindClass('vmhook/fixtures/MethodStatic') failed\n");
         std::fflush(stdout);
         return;
     }
-    jmethodID mid{ env->GetStaticMethodID(cls, "staticReturnMe", "(I)I") };
+    jmethodID mid{ env->GetStaticMethodID(cls, "sEchoInt", "(I)I") };
     if (!mid)
     {
         env->ExceptionClear();
@@ -160,7 +159,7 @@ extern "C" auto run_vmhook_vs_jni_speedtest() -> void
     const long long jni_ns{    std::chrono::duration_cast<ns>(t_jni_end    - t_jni_begin   ).count() };
 
     std::fprintf(stdout,
-                 "[BENCH] iterations: %zu (staticReturnMe(int) -> int)\n",
+                 "[BENCH] iterations: %zu (sEchoInt(int) -> int)\n",
                  iterations);
     std::fprintf(stdout,
                  "[BENCH] vmhook : total %lld ns, per-call %.0f ns, acc=%lld\n",
