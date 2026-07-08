@@ -2070,7 +2070,8 @@ namespace vmhook
             Filters out null pointers, low sentinel values used by HotSpot to mark
             the end of linked lists, kernel-space addresses above the user ceiling,
             AND well-known debug-poison patterns (0xDEADBEEF, 0xCAFEBABE,
-            0xCCCCCCCC, 0xCDCDCDCD, 0xBAADF00D, 0xFEEEFEEE).  The previous
+            0xCCCCCCCC, 0xCDCDCDCD, 0xBAADF00D, 0xFEEEFEEE, 0xABABABAB,
+            0xFDFDFDFD, 0xDDDDDDDD).  The previous
             implementation only checked the address range, so those patterns
             (which fall inside user-space) sneaked through and crashed on
             dereference - the very thing the function exists to prevent.
@@ -13455,9 +13456,9 @@ namespace vmhook
             this collapses them to one copy so they can never diverge again.
 
             Compile-time dispatch over std::decay_t<arg_type>:
-              - std::string / string_view              -> jni_new_string_utf + .l slot
+              - std::string / string_view              -> jni_new_string_utf16_local + .l slot
               - const char* / char*                    -> null arg -> Java null (.l = nullptr,
-                                                          no release); non-null -> jni_new_string_utf
+                                                          no release); non-null -> jni_new_string_utf16_local
                                                           (a non-null empty "" still becomes a real
                                                           empty Java String) + .l slot
               - unique_ptr<T extends object_base>       -> writes raw OOP handle into `storage`; .l = &storage
@@ -13602,9 +13603,9 @@ namespace vmhook
             The heap (vector) path.  Delegates the per-type conversion to the shared
             detail::convert_jni_arg core, then boxes the results onto the caller's
             std::vectors:
-              - std::string / string_view              -> jni_new_string_utf + .l slot
+              - std::string / string_view              -> jni_new_string_utf16_local + .l slot
               - const char* / char*                    -> null -> Java null; non-null (incl "")
-                                                          -> jni_new_string_utf + .l slot
+                                                          -> jni_new_string_utf16_local + .l slot
               - unique_ptr<T extends object_base>       -> stores raw OOP in object_handles; .l slot
               - object_base derived by value            -> stores raw OOP in object_handles; .l slot
               - bool                                    -> .z slot
@@ -13654,10 +13655,10 @@ namespace vmhook
             if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
                 object_handles.push_back(local_storage);
-                // Defensive empty()-guard preserved verbatim from the original
-                // (we just pushed, so empty() is always false here, but keep the
-                // belt-and-braces null in case the push were ever elided).
-                value.l = object_handles.empty() ? nullptr : &object_handles.back();
+                // We just pushed and the vector was reserved up front, so
+                // &back() is stable and never dangles — mirror the object_base
+                // arm below (the old empty()?nullptr ternary was provably dead).
+                value.l = &object_handles.back();
             }
             else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
             {
@@ -21743,7 +21744,7 @@ namespace vmhook
             detail::dr_slots[slot].address  = nullptr;
             detail::dr_slots[slot].callback = nullptr;
             detail::dr_slots[slot].dr7_bits = 0;
-            // Balance the dr_arm_one() in watch_static_field below.  When
+            // Balance the dr_arm_one() in watch_static_field above.  When
             // the last live watch_handle goes away the VEH is uninstalled
             // by the dr_armed_count 1 -> 0 transition.
             detail::dr_unarm_one();
