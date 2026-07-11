@@ -23,6 +23,7 @@
 #include "app.hpp"
 #include "descriptor.hpp"
 #include "icons.hpp"
+#include "widgets.hpp"
 
 #pragma comment(lib, "d3d11.lib")
 
@@ -191,6 +192,7 @@ namespace
         c[ImGuiCol_TableRowBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
         c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.00f, 1.00f, 1.00f, 0.022f);
         c[ImGuiCol_TextSelectedBg]       = ImVec4(accent.x, accent.y, accent.z, 0.35f);
+        c[ImGuiCol_TextLink]             = accentHi;  // the extends / field-type jump links
         c[ImGuiCol_NavHighlight]         = accent;
     }
 
@@ -214,6 +216,7 @@ namespace
                 0xF002, 0xF002,  // magnifying-glass
                 0xF00D, 0xF00D,  // xmark
                 0xF059, 0xF059,  // circle-question
+                0xF065, 0xF066,  // expand / compress
                 0xF068, 0xF068,  // minus
                 0xF1E6, 0xF1E6,  // plug
                 0xF7B6, 0xF7B6,  // mug-hot
@@ -240,9 +243,12 @@ namespace
     bool         g_full_names{ false };
     bool         g_show_inherited{ false };  // details: include super-chain members
     bool         g_focus_search{ false };
-    int          g_kind_filter{ 0 };  // 0=all; else index into k_kind_names
+    int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
+    int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
     std::wstring g_dll_path{};
     std::vector<int> g_filtered;  // rebuilt each frame from the search box
+    // Global member-search results: (class index, member index) pairs.
+    std::vector<std::pair<int,int>> g_member_results;
 
     // Back/forward navigation history (paired with the clickable `extends` jump
     // and class-list clicks) so browsing the class graph feels like a browser.
@@ -418,10 +424,11 @@ namespace
         }
     }
 
-    void export_class(const viewer::ClassInfo& c)
+    bool export_class(const viewer::ClassInfo& c)
     {
         std::string path{ exe_dir() + "vmhook_export.txt" };
         std::ofstream out{ path, std::ios::trunc };
+        if (!out) return false;  // directory not writable, etc.
         out << class_decl(c) << " " << c.internal_name;
         if (!c.super_name.empty() && c.super_name != "java/lang/Object")
             out << " extends " << c.super_name;
@@ -429,6 +436,7 @@ namespace
         for (const auto& m : c.methods) out << "  " << m.name << "  " << m.descriptor << "\n";
         out << "\nFIELDS (" << c.fields.size() << ")\n";
         for (const auto& f : c.fields) out << "  " << (f.is_static ? "static " : "") << f.name << "  " << f.descriptor << "\n";
+        return static_cast<bool>(out);
     }
 }
 
@@ -517,14 +525,21 @@ namespace
             ImGui::SetTooltip("Inject vmhook and enumerate every class, method and field");
 
         row_divider();
-        status_pill(app.status.load());
-        if (app.status.load() == viewer::Status::Receiving)
+        const viewer::Status st{ app.status.load() };
+        status_pill(st);
+        if (st == viewer::Status::Injecting || st == viewer::Status::Receiving)
         {
-            ImGui::SameLine(0.0f, em(0.5f));
-            const char spin[]{ '|', '/', '-', '\\' };
+            ImGui::SameLine(0.0f, em(0.6f));
+            const float r{ ImGui::GetFrameHeight() * 0.32f };
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetFrameHeight() * 0.5f - r) - ImGui::GetStyle().FramePadding.y);
+            ui::Spinner("##spin", r, (std::max)(r * 0.35f, 2.0f), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ImGui::SameLine(0.0f, em(0.45f));
             ImGui::AlignTextToFramePadding();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.6f, 0.95f, 1));
-            ImGui::Text("%c %llu classes...", spin[(int)(ImGui::GetTime() * 8) & 3], (unsigned long long)app.classes_streamed.load());
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.74f, 1.0f, 1.0f));
+            if (st == viewer::Status::Receiving)
+                ImGui::Text("%llu classes...", (unsigned long long)app.classes_streamed.load());
+            else
+                ImGui::TextUnformatted("injecting...");
             ImGui::PopStyleColor();
         }
 
@@ -533,9 +548,9 @@ namespace
         // Square buttons (width = row height) sized/spaced in font-relative units.
         const float bw{ ImGui::GetFrameHeight() };
         const float gap{ em(0.35f) };
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - (bw * 3.0f + gap * 2.0f));
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - (bw * 4.0f + gap * 3.0f));
         // Ghost (transparent) window controls that only tint on hover — subtle
-        // chrome rather than three loud primary buttons.
+        // chrome rather than loud primary buttons.
         ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.10f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1.0f, 1.0f, 1.0f, 0.16f));
@@ -545,6 +560,13 @@ namespace
         ImGui::SameLine(0.0f, gap);
         if (ImGui::Button(ICON_FA_MINUS "##min", ImVec2(bw, bw)) && g_hwnd) ShowWindow(g_hwnd, SW_MINIMIZE);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimize");
+        ImGui::SameLine(0.0f, gap);
+        const bool maximized{ g_hwnd && IsZoomed(g_hwnd) };
+        char maxlbl[24];
+        std::snprintf(maxlbl, sizeof(maxlbl), "%s##maxrestore", maximized ? ICON_FA_COMPRESS : ICON_FA_EXPAND);
+        if (ImGui::Button(maxlbl, ImVec2(bw, bw)) && g_hwnd)
+            ShowWindow(g_hwnd, maximized ? SW_RESTORE : SW_MAXIMIZE);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(maximized ? "Restore" : "Maximize");
         ImGui::PopStyleColor(3);
         ImGui::SameLine(0.0f, gap);
         ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -581,17 +603,45 @@ namespace
         }
     }
 
+    // Details-pane methods/fields tables are drawn by draw_details; declared here
+    // so a member-search click can pre-focus the right filter.
+    void draw_member_results(viewer::App& app, bool fields);
+
     void draw_class_list(viewer::App& app)
     {
-        // search box (Ctrl+F focuses it), with a magnifier icon
+        // ── search row: magnifier + input + clear button ────────────────────
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(ICON_FA_SEARCH);
         ImGui::SameLine(0.0f, em(0.4f));
         if (g_focus_search) { ImGui::SetKeyboardFocusHere(); g_focus_search = false; }
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputTextWithHint("##search", "Search classes  (Ctrl+F)", g_search, sizeof(g_search));
+        const bool has_query{ g_search[0] != '\0' };
+        ImGui::SetNextItemWidth(has_query ? -em(1.9f) : -1.0f);
+        const char* hint{ g_search_scope == 1 ? "Search methods across all classes" : g_search_scope == 2 ? "Search fields across all classes" : "Search classes  (Ctrl+F)" };
+        ImGui::InputTextWithHint("##search", hint, g_search, sizeof(g_search));
+        if (has_query)
+        {
+            ImGui::SameLine(0.0f, em(0.3f));
+            if (ImGui::Button(ICON_FA_XMARK "##clear", ImVec2(em(1.6f), 0.0f))) g_search[0] = '\0';
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear (Esc)");
+        }
 
         std::lock_guard<std::mutex> lock{ app.data_mutex };
+
+        // ── scope selector — search Classes / Methods / Fields ──────────────
+        ImGui::AlignTextToFramePadding();
+        ImGui::SetNextItemWidth(em(7.5f));
+        push_combo_style();
+        ImGui::Combo("##scope", &g_search_scope, "Classes\0Methods\0Fields\0");
+        pop_combo_style();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Search across every class's methods or fields");
+        ImGui::SameLine(0.0f, em(0.7f));
+
+        if (g_search_scope != 0)
+        {
+            draw_member_results(app, g_search_scope == 2);
+            return;
+        }
+
         // Match either slash- or dot-qualified queries ("java.lang" == "java/lang").
         std::string needle{ g_search };
         for (char& ch : needle) if (ch == '.') ch = '/';
@@ -691,6 +741,94 @@ namespace
         }
     }
 
+    // Global search across every class's methods or fields.  Called by
+    // draw_class_list with app.data_mutex ALREADY HELD (must not re-lock).
+    void draw_member_results(viewer::App& app, bool fields)
+    {
+        const std::string needle{ g_search };  // raw: member names have no . or /
+        g_member_results.clear();
+        if (!needle.empty())
+        {
+            for (int ci = 0; ci < (int)app.classes.size(); ++ci)
+            {
+                const viewer::ClassInfo& c{ app.classes[(std::size_t)ci] };
+                const int n{ fields ? (int)c.fields.size() : (int)c.methods.size() };
+                for (int mi = 0; mi < n; ++mi)
+                {
+                    const std::string& nm{ fields ? c.fields[(std::size_t)mi].name : c.methods[(std::size_t)mi].name };
+                    if (icontains(nm, needle)) g_member_results.emplace_back(ci, mi);
+                }
+            }
+        }
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%zu %s", g_member_results.size(), fields ? "fields" : "methods");
+
+        if (needle.empty())
+        {
+            ImGui::Dummy(ImVec2(0.0f, em(1.5f)));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.55f, 1.0f));
+            const std::string hint{ std::string("Type above to search ") + (fields ? "fields" : "methods") + " across every loaded class." };
+            const float w{ ImGui::CalcTextSize(hint.c_str()).x };
+            ImGui::SetCursorPosX((std::max)((ImGui::GetContentRegionAvail().x - w) * 0.5f, 0.0f));
+            ImGui::TextUnformatted(hint.c_str());
+            ImGui::PopStyleColor();
+            return;
+        }
+
+        if (ImGui::BeginTable("members", 3,
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
+        {
+            ImGui::TableSetupColumn(fields ? "Field" : "Method", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn(fields ? "Type" : "Signature", ImGuiTableColumnFlags_WidthStretch, 1.1f);
+            ImGui::TableSetupColumn("Class", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableHeadersRow();
+
+            ImGuiListClipper clip;
+            clip.Begin((int)g_member_results.size());
+            while (clip.Step())
+            {
+                for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r)
+                {
+                    const auto [ci, mi] = g_member_results[(std::size_t)r];
+                    const viewer::ClassInfo& c{ app.classes[(std::size_t)ci] };
+                    std::string dotted{ c.internal_name };
+                    for (char& ch : dotted) if (ch == '/') ch = '.';
+
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::PushID(r);
+                    if (fields)
+                    {
+                        const viewer::FieldInfo& f{ c.fields[(std::size_t)mi] };
+                        ImGui::PushStyleColor(ImGuiCol_Text, vis_color(f.access));
+                        const bool clicked{ ImGui::Selectable(f.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) };
+                        ImGui::PopStyleColor();
+                        if (clicked) { navigate_to(ci); std::snprintf(g_field_filter, sizeof(g_field_filter), "%s", g_search); }
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextUnformatted((g_pretty ? viewer::pretty_field(f.descriptor, g_full_names) : f.descriptor).c_str());
+                    }
+                    else
+                    {
+                        const viewer::MethodInfo& m{ c.methods[(std::size_t)mi] };
+                        ImGui::PushStyleColor(ImGuiCol_Text, vis_color(m.access));
+                        const bool clicked{ ImGui::Selectable(m.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) };
+                        ImGui::PopStyleColor();
+                        if (clicked) { navigate_to(ci); std::snprintf(g_method_filter, sizeof(g_method_filter), "%s", g_search); }
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextUnformatted((g_pretty ? viewer::pretty_method(m.descriptor, g_full_names) : m.descriptor).c_str());
+                    }
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextDisabled("%s", dotted.c_str());
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", dotted.c_str());
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndTable();
+        }
+    }
+
     void draw_details(viewer::App& app)
     {
         std::lock_guard<std::mutex> lock{ app.data_mutex };
@@ -767,7 +905,13 @@ namespace
             }
         }
         ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(20.0f), ImGui::GetCursorPosX() + em(0.5f)));
-        if (ImGui::SmallButton("Copy name")) ImGui::SetClipboardText(c.internal_name.c_str());
+        // These run while draw_details holds data_mutex, so status_message
+        // (also guarded by it) can be written directly for lightweight feedback.
+        if (ImGui::SmallButton("Copy name"))
+        {
+            ImGui::SetClipboardText(c.internal_name.c_str());
+            app.status_message = "Copied class name to clipboard.";
+        }
         ImGui::SameLine();
         if (ImGui::SmallButton("Copy all"))
         {
@@ -779,11 +923,14 @@ namespace
                 all += "  " + viewer::access_modifiers(m.access, true) + " " + m.name + viewer::pretty_method(m.descriptor) + "\n";
             all += "}\n";
             ImGui::SetClipboardText(all.c_str());
+            app.status_message = "Copied class listing to clipboard.";
         }
         ImGui::SameLine();
-        if (ImGui::SmallButton("Export .txt")) export_class(c);
+        if (ImGui::SmallButton("Export .txt"))
+            app.status_message = export_class(c) ? "Exported to vmhook_export.txt (next to the viewer)."
+                                                 : "Export failed — is the viewer's folder writable?";
         ImGui::Spacing();
-        ImGui::Checkbox("Show inherited members", &g_show_inherited);
+        ui::Toggle("Show inherited members", &g_show_inherited);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include methods & fields from superclasses (shown dimmed)");
         ImGui::Separator();
 
@@ -824,8 +971,11 @@ namespace
         // Methods
         ImGui::BeginChild("methods", ImVec2(half, 0), ImGuiChildFlags_Borders);
         ImGui::Text("Methods (%zu)", meths.size());
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(ICON_FA_SEARCH);
+        ImGui::SameLine(0.0f, em(0.4f));
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputTextWithHint("##mf", "filter methods", g_method_filter, sizeof(g_method_filter));
+        ImGui::InputTextWithHint("##mf", "Filter methods", g_method_filter, sizeof(g_method_filter));
         {
             const std::string mf{ g_method_filter };
             static std::vector<int> mrows;
@@ -874,8 +1024,11 @@ namespace
         // Fields
         ImGui::BeginChild("fields", ImVec2(0, 0), ImGuiChildFlags_Borders);
         ImGui::Text("Fields (%zu)", flds.size());
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(ICON_FA_SEARCH);
+        ImGui::SameLine(0.0f, em(0.4f));
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputTextWithHint("##ff", "filter fields", g_field_filter, sizeof(g_field_filter));
+        ImGui::InputTextWithHint("##ff", "Filter fields", g_field_filter, sizeof(g_field_filter));
         {
             const std::string ff{ g_field_filter };
             static std::vector<int> frows;
@@ -1009,17 +1162,41 @@ namespace
             ImGui::AlignTextToFramePadding();
             ImGui::Text("%zu classes  \xC2\xB7  %zu methods  \xC2\xB7  %zu fields", nclasses, nmethods, nfields);
             ImGui::SameLine(0.0f, em(0.8f));
+
+            // Status message — coloured by severity and ellipsized so a long error
+            // can never run under / push the toggles off the right edge.
+            const auto ellipsize{ [](const std::string& s, float max_w) -> std::string
+            {
+                if (ImGui::CalcTextSize(s.c_str()).x <= max_w) return s;
+                std::string out{ s };
+                while (!out.empty() && ImGui::CalcTextSize((out + "...").c_str()).x > max_w) out.pop_back();
+                return out + "...";
+            } };
+            const float toggles_w{ em(23.0f) };
+            const float msg_max{ (std::max)(ImGui::GetContentRegionMax().x - toggles_w - ImGui::GetCursorPosX() - em(0.8f), em(3.0f)) };
             {
                 std::lock_guard<std::mutex> lock{ app.data_mutex };
+                const viewer::Status st{ app.status.load() };
+                const ImVec4 mcol{ st == viewer::Status::Error ? ImVec4(0.95f, 0.46f, 0.46f, 1.0f)
+                                 : st == viewer::Status::Done  ? ImVec4(0.55f, 0.78f, 0.60f, 1.0f)
+                                 : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled) };
+                const std::string shown{ ellipsize(app.status_message, msg_max) };
                 ImGui::AlignTextToFramePadding();
-                ImGui::TextDisabled("%s", app.status_message.c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text, mcol);
+                ImGui::TextUnformatted(shown.c_str());
+                ImGui::PopStyleColor();
+                if (shown.size() != app.status_message.size() && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", app.status_message.c_str());
             }
-            ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(22.0f), ImGui::GetCursorPosX() + em(0.5f)));
-            ImGui::Checkbox("Pretty signatures", &g_pretty);
-            ImGui::SameLine(0.0f, em(0.8f));
+
+            ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - toggles_w, ImGui::GetCursorPosX() + em(0.5f)));
+            ui::Toggle("Pretty signatures", &g_pretty);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show human-readable signatures/types instead of raw JVM descriptors");
+            ImGui::SameLine(0.0f, em(0.9f));
             ImGui::BeginDisabled(!g_pretty);
-            ImGui::Checkbox("Full names", &g_full_names);
+            ui::Toggle("Full names", &g_full_names);
             ImGui::EndDisabled();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show fully-qualified type names (java.lang.String) instead of simple ones (String)");
         }
 
         ImGui::End();
