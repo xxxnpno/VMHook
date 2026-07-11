@@ -180,6 +180,7 @@ namespace
     float        g_left_width{ 420.0f };
     bool         g_pretty{ true };
     bool         g_full_names{ false };
+    bool         g_show_inherited{ false };  // details: include super-chain members
     bool         g_focus_search{ false };
     int          g_kind_filter{ 0 };  // 0=all; else index into k_kind_names
     std::wstring g_dll_path{};
@@ -527,21 +528,56 @@ namespace
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Export .txt")) export_class(c);
+        ImGui::Spacing();
+        ImGui::Checkbox("Show inherited members", &g_show_inherited);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include methods & fields from superclasses (shown dimmed)");
         ImGui::Separator();
+
+        // Member source chain: this class, plus (optionally) its superclasses.
+        // The hop cap is a cycle/corruption guard — real Java hierarchies are shallow.
+        std::vector<const viewer::ClassInfo*> chain{ &c };
+        if (g_show_inherited)
+        {
+            const viewer::ClassInfo* cur{ &c };
+            for (int hops = 0; hops < 200; ++hops)
+            {
+                if (cur->super_name.empty() || cur->super_name == "java/lang/Object") break;
+                const auto it{ app.name_to_index.find(cur->super_name) };
+                if (it == app.name_to_index.end()) break;
+                cur = &app.classes[(std::size_t)it->second];
+                if (cur == &c) break;  // defensive: never loop back to the start
+                chain.push_back(cur);
+            }
+        }
+        struct MRow { const viewer::MethodInfo* m; const viewer::ClassInfo* owner; };
+        struct FRow { const viewer::FieldInfo*  f; const viewer::ClassInfo* owner; };
+        std::vector<MRow> meths; std::vector<FRow> flds;
+        for (const viewer::ClassInfo* kc : chain)
+        {
+            for (const auto& m : kc->methods) meths.push_back({ &m, kc });
+            for (const auto& f : kc->fields)  flds.push_back({ &f, kc });
+        }
+        const auto owner_tooltip{ [&](const viewer::ClassInfo* owner)
+        {
+            if (owner == &c || !ImGui::IsItemHovered()) return;
+            std::string od{ owner->internal_name };
+            for (char& ch : od) if (ch == '/') ch = '.';
+            ImGui::SetTooltip("inherited from %s", od.c_str());
+        } };
 
         const float half{ ImGui::GetContentRegionAvail().x * 0.5f - 4.0f };
 
         // Methods
         ImGui::BeginChild("methods", ImVec2(half, 0), ImGuiChildFlags_Borders);
-        ImGui::Text("Methods (%zu)", c.methods.size());
+        ImGui::Text("Methods (%zu)", meths.size());
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##mf", "filter methods", g_method_filter, sizeof(g_method_filter));
         {
             const std::string mf{ g_method_filter };
             static std::vector<int> mrows;
             mrows.clear();
-            for (int i = 0; i < (int)c.methods.size(); ++i)
-                if (icontains(c.methods[(std::size_t)i].name, mf) || icontains(c.methods[(std::size_t)i].descriptor, mf))
+            for (int i = 0; i < (int)meths.size(); ++i)
+                if (icontains(meths[(std::size_t)i].m->name, mf) || icontains(meths[(std::size_t)i].m->descriptor, mf))
                     mrows.push_back(i);
             if (ImGui::BeginTable("mt", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
             {
@@ -554,10 +590,15 @@ namespace
                 while (clip.Step())
                     for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r)
                     {
-                        const viewer::MethodInfo& m{ c.methods[(std::size_t)mrows[(std::size_t)r]] };
+                        const MRow& row{ meths[(std::size_t)mrows[(std::size_t)r]] };
+                        const viewer::MethodInfo& m{ *row.m };
+                        const bool inh{ row.owner != &c };
                         ImGui::TableNextRow(); ImGui::TableNextColumn();
                         ImGui::PushID(r);
+                        if (inh) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
                         ImGui::TextUnformatted(m.name.c_str());
+                        if (inh) ImGui::PopStyleColor();
+                        owner_tooltip(row.owner);
                         copy_menu("m", m.name, m.descriptor);
                         ImGui::TableNextColumn();
                         ImGui::PushStyleColor(ImGuiCol_Text, vis_color(m.access));
@@ -578,15 +619,15 @@ namespace
 
         // Fields
         ImGui::BeginChild("fields", ImVec2(0, 0), ImGuiChildFlags_Borders);
-        ImGui::Text("Fields (%zu)", c.fields.size());
+        ImGui::Text("Fields (%zu)", flds.size());
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##ff", "filter fields", g_field_filter, sizeof(g_field_filter));
         {
             const std::string ff{ g_field_filter };
             static std::vector<int> frows;
             frows.clear();
-            for (int i = 0; i < (int)c.fields.size(); ++i)
-                if (icontains(c.fields[(std::size_t)i].name, ff) || icontains(c.fields[(std::size_t)i].descriptor, ff))
+            for (int i = 0; i < (int)flds.size(); ++i)
+                if (icontains(flds[(std::size_t)i].f->name, ff) || icontains(flds[(std::size_t)i].f->descriptor, ff))
                     frows.push_back(i);
             if (ImGui::BeginTable("ft", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
             {
@@ -599,10 +640,15 @@ namespace
                 while (clip.Step())
                     for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r)
                     {
-                        const viewer::FieldInfo& f{ c.fields[(std::size_t)frows[(std::size_t)r]] };
+                        const FRow& row{ flds[(std::size_t)frows[(std::size_t)r]] };
+                        const viewer::FieldInfo& f{ *row.f };
+                        const bool inh{ row.owner != &c };
                         ImGui::TableNextRow(); ImGui::TableNextColumn();
                         ImGui::PushID(r);
+                        if (inh) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
                         ImGui::TextUnformatted(f.name.c_str());
+                        if (inh) ImGui::PopStyleColor();
+                        owner_tooltip(row.owner);
                         copy_menu("f", f.name, f.descriptor);
                         ImGui::TableNextColumn();
                         ImGui::PushStyleColor(ImGuiCol_Text, vis_color(f.access));
