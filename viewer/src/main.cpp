@@ -1039,6 +1039,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     }
 
     WNDCLASSEXW wc{ sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandleW(nullptr), nullptr, LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW)), nullptr, nullptr, L"vmhook_viewer", nullptr };
+    // App icon (resource id 1 from assets/vmhook.rc) for the taskbar / alt-tab.
+    wc.hIcon   = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
+    wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
     // Borderless (no native title bar) — a custom in-app toolbar provides the
     // minimize/close controls.  WS_MAXIMIZEBOX + WM_GETMINMAXINFO make it fill

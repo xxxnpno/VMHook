@@ -56,7 +56,7 @@ target_include_directories(imgui PUBLIC "${IMGUI_DIR}" "${IMGUI_DIR}/backends")
 target_compile_features(imgui PRIVATE cxx_std_17)
 
 # ── viewer GUI exe ────────────────────────────────────────────────────────────
-add_executable(vmhook_viewer WIN32 src/main.cpp)
+add_executable(vmhook_viewer WIN32 src/main.cpp assets/vmhook.rc)
 target_include_directories(vmhook_viewer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(vmhook_viewer PRIVATE cxx_std_23)
 target_link_libraries(vmhook_viewer PRIVATE imgui d3d11 dxgi dwmapi)

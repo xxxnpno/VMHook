@@ -1,0 +1,3 @@
+// Application icon for vmhook_viewer (taskbar / alt-tab / window).
+// The lowest-numbered ICON resource is what Explorer shows for the exe.
+1 ICON "vmhook.ico"
