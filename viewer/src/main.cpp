@@ -380,6 +380,16 @@ namespace
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f,0.82f,1.0f,1));
         ImGui::TextUnformatted(dotted.c_str());
         ImGui::PopStyleColor();
+        // kind badge inferred from the superclass (no extra data needed)
+        const char* kind{ c.super_name == "java/lang/Enum" ? "enum"
+                          : (c.internal_name.find('$') != std::string::npos ? "nested" : nullptr) };
+        if (kind)
+        {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.78f, 0.95f, 1.0f));
+            ImGui::Text("[%s]", kind);
+            ImGui::PopStyleColor();
+        }
         if (!c.super_name.empty() && c.super_name != "java/lang/Object")
         {
             ImGui::SameLine(); ImGui::TextDisabled("extends"); ImGui::SameLine();
@@ -506,8 +516,12 @@ namespace
 
     void render_ui(viewer::App& app)
     {
-        // Ctrl+F focuses the class search.
+        // Ctrl+F focuses the class search; Esc clears all filters.
         if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyPressed(ImGuiKey_F, false)) g_focus_search = true;
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+        {
+            g_search[0] = 0; g_method_filter[0] = 0; g_field_filter[0] = 0;
+        }
 
         // Auto-refresh the JVM list every 2s so new/closed JVMs appear without a
         // manual Refresh (selection is preserved by pid).
