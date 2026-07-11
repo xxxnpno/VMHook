@@ -698,8 +698,10 @@ namespace
                 ImGui::EndTable();
             }
             ImGui::Separator();
-            ImGui::TextDisabled("Tip: click a field's type or 'extends' to jump to that class.");
+            ImGui::TextDisabled("Tip: click any field or method type (or 'extends') to jump to that class.");
             ImGui::TextDisabled("Tip: use the Methods/Fields scope to search members across all classes.");
+            ImGui::TextDisabled("Tip: 'Live instances' scans the heap for live objects of a class and shows");
+            ImGui::TextDisabled("      their field values — sortable, filterable, live; click a row for full detail.");
             ImGui::TextDisabled("Tip: right-click a class/method/field row to copy its name.");
             ImGui::EndPopup();
         }
