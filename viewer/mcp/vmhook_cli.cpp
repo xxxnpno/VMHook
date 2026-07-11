@@ -5,9 +5,11 @@
 //   vmhook_cli enumerate <pid>          -> inject + read; cache; {pid,classes,methods,fields}
 //   vmhook_cli classes  <pid> [substr]  -> [class internal names] (from cache)
 //   vmhook_cli class    <pid> <name>    -> {name, methods:[...], fields:[...]} (from cache)
+//   vmhook_cli instances <pid> <class> [cap] -> {pid,class,instances:[{address,fields:{...}}]} (live heap)
 //
-// `enumerate` caches the raw stream to %TEMP%\vmhook_mcp_<pid>.txt so the other
-// queries are cheap and don't re-inject.  All output is JSON on stdout.
+// `enumerate` caches the raw stream to %TEMP%\vmhook_mcp_<pid>.txt so the class/
+// classes queries are cheap and don't re-inject.  `instances` reads the live heap
+// (no cache).  All output is JSON on stdout.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
