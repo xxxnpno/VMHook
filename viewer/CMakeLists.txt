@@ -72,3 +72,9 @@ add_executable(vmhook_cli_probe test/cli_probe.cpp)
 target_include_directories(vmhook_cli_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(vmhook_cli_probe PRIVATE cxx_std_23)
 add_dependencies(vmhook_cli_probe vmhook_payload)
+
+# ── vmhook_cli — JSON front-end used by the MCP server ───────────────────────
+add_executable(vmhook_cli mcp/vmhook_cli.cpp)
+target_include_directories(vmhook_cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_features(vmhook_cli PRIVATE cxx_std_23)
+add_dependencies(vmhook_cli vmhook_payload)

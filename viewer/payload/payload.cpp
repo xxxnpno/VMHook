@@ -66,37 +66,8 @@ namespace
         }
     };
 
-    auto connect_pipe() -> HANDLE
+    void stream_to(HANDLE pipe)
     {
-        // The viewer creates the pipe server before injecting, but injection and
-        // process warm-up race, so retry for a few seconds.
-        for (int attempt{ 0 }; attempt < 150; ++attempt)
-        {
-            HANDLE handle{ CreateFileW(k_pipe_name, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr) };
-            if (handle != INVALID_HANDLE_VALUE)
-            {
-                return handle;
-            }
-            if (GetLastError() == ERROR_PIPE_BUSY)
-            {
-                WaitNamedPipeW(k_pipe_name, 2000);
-            }
-            else
-            {
-                Sleep(100);
-            }
-        }
-        return INVALID_HANDLE_VALUE;
-    }
-
-    void enumerate_and_stream()
-    {
-        HANDLE pipe{ connect_pipe() };
-        if (pipe == INVALID_HANDLE_VALUE)
-        {
-            return;
-        }
-
         pipe_writer writer{ pipe };
         std::uint64_t class_count{ 0 };
 
@@ -147,9 +118,36 @@ namespace
         writer.put(std::to_string(class_count));
         writer.put("\n");
         writer.flush();
-
         FlushFileBuffers(pipe);
-        CloseHandle(pipe);
+    }
+
+    // Serve every attach: the payload stays loaded and, each time a viewer/CLI
+    // creates the pipe server, connects to it and re-streams the current class
+    // surface.  This makes RE-ATTACH robust — a second attach just re-uses this
+    // already-running server (LoadLibrary of an already-loaded DLL never re-runs
+    // DllMain, so relying on re-injection to re-enumerate would hang).  Low
+    // overhead: it sleeps between connect attempts and blocks in the OS while a
+    // client is reading.  The payload only READS VM metadata (no hooks).
+    void serve_forever()
+    {
+        for (;;)
+        {
+            HANDLE pipe{ CreateFileW(k_pipe_name, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr) };
+            if (pipe == INVALID_HANDLE_VALUE)
+            {
+                if (GetLastError() == ERROR_PIPE_BUSY)
+                {
+                    WaitNamedPipeW(k_pipe_name, 2000);
+                }
+                else
+                {
+                    Sleep(250);  // no server up right now; wait for the next attach
+                }
+                continue;
+            }
+            stream_to(pipe);
+            CloseHandle(pipe);
+        }
     }
 }
 
@@ -158,15 +156,8 @@ extern "C" BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(module);
-        // Walk off the loader lock on a detached worker, then UNLOAD ourselves so
-        // a subsequent attach re-runs the enumeration (LoadLibrary of an already-
-        // loaded DLL would otherwise skip DLL_PROCESS_ATTACH).  Safe: the payload
-        // only READS VM metadata — it installs no hooks/detours to leave dangling.
-        std::thread([module]
-        {
-            enumerate_and_stream();
-            FreeLibraryAndExitThread(module, 0);  // never returns
-        }).detach();
+        // One detached server thread handles this attach and every future one.
+        std::thread(serve_forever).detach();
     }
     return TRUE;
 }
