@@ -22,6 +22,7 @@
 
 #include "app.hpp"
 #include "descriptor.hpp"
+#include "icons.hpp"
 
 #pragma comment(lib, "d3d11.lib")
 
@@ -32,6 +33,7 @@ namespace
     ID3D11DeviceContext*    g_context{ nullptr };
     IDXGISwapChain*         g_swap_chain{ nullptr };
     ID3D11RenderTargetView* g_rtv{ nullptr };
+    HWND                    g_hwnd{ nullptr };  // for the custom min/close controls
 
     void create_rtv()
     {
@@ -108,6 +110,23 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
     case WM_SIZE:
         if (g_device && w != SIZE_MINIMIZED) { cleanup_rtv(); g_swap_chain->ResizeBuffers(0, LOWORD(l), HIWORD(l), DXGI_FORMAT_UNKNOWN, 0); create_rtv(); }
         return 0;
+    case WM_GETMINMAXINFO:
+    {
+        // Borderless (WS_POPUP) window: constrain "maximize" to the monitor work
+        // area so it fills the screen without covering the taskbar.
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+        {
+            auto* const mmi{ reinterpret_cast<MINMAXINFO*>(l) };
+            mmi->ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left;
+            mmi->ptMaxPosition.y = mi.rcWork.top  - mi.rcMonitor.top;
+            mmi->ptMaxSize.x     = mi.rcWork.right  - mi.rcWork.left;
+            mmi->ptMaxSize.y     = mi.rcWork.bottom - mi.rcWork.top;
+            mmi->ptMinTrackSize.x = 900;
+            mmi->ptMinTrackSize.y = 600;
+        }
+        return 0;
+    }
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, msg, w, l);
@@ -167,6 +186,28 @@ namespace
         if (io.Fonts->Fonts.empty())
         {
             io.Fonts->AddFontDefault();
+        }
+
+        // Merge Font Awesome icons into the base font (shared baseline), if the
+        // bundled font is present next to the exe.  Only the glyphs actually used
+        // are rasterized (tight codepoint ranges) to keep the atlas small.
+        const std::string icon_ttf{ exe_dir() + "fa-solid-900.ttf" };
+        if (std::ifstream{ icon_ttf, std::ios::binary }.good())
+        {
+            static const ImWchar icon_ranges[]{
+                0xF002, 0xF002,  // magnifying-glass
+                0xF00D, 0xF00D,  // xmark
+                0xF059, 0xF059,  // circle-question
+                0xF068, 0xF068,  // minus
+                0xF1E6, 0xF1E6,  // plug
+                0xF7B6, 0xF7B6,  // mug-hot
+                0 };
+            ImFontConfig cfg{};
+            cfg.MergeMode        = true;
+            cfg.PixelSnapH       = true;
+            cfg.GlyphMinAdvanceX = 16.0f;      // keep icons a consistent width
+            cfg.GlyphOffset      = ImVec2(0.0f, 2.0f);  // sit on the text baseline
+            io.Fonts->AddFontFromFileTTF(icon_ttf.c_str(), 15.0f, &cfg, icon_ranges);
         }
     }
 }
@@ -375,10 +416,10 @@ namespace
         ImGui::TextDisabled("viewer");
         ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
 
-        // JVM combo
-        ImGui::TextUnformatted("JVM");
+        // JVM combo (list auto-refreshes every 2s; no manual Refresh button)
+        ImGui::TextUnformatted(ICON_FA_MUG_HOT "  JVM");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(560.0f);
+        ImGui::SetNextItemWidth(600.0f);
         std::string preview{ "Select a running JVM..." };
         if (app.selected_jvm >= 0 && app.selected_jvm < (int)app.jvms.size())
         {
@@ -396,13 +437,11 @@ namespace
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        ImGui::BeginDisabled(app.busy());
-        if (ImGui::Button("Refresh")) app.refresh_jvms();
-        ImGui::EndDisabled();
-        ImGui::SameLine();
         ImGui::BeginDisabled(app.busy() || app.selected_jvm < 0);
-        if (ImGui::Button("Attach & Enumerate")) { app.attach_selected(g_dll_path); g_selected_class = -1; g_nav_back.clear(); g_nav_fwd.clear(); }
+        if (ImGui::Button(ICON_FA_PLUG "  Attach")) { app.attach_selected(g_dll_path); g_selected_class = -1; g_nav_back.clear(); g_nav_fwd.clear(); }
         ImGui::EndDisabled();
+        if (ImGui::IsItemHovered() && !ImGui::IsItemActive())
+            ImGui::SetTooltip("Inject vmhook and enumerate every class, method and field");
 
         ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
         status_pill(app.status.load());
@@ -415,11 +454,22 @@ namespace
             ImGui::PopStyleColor();
         }
 
-        // Right-aligned "?" opens the keyboard-shortcuts cheatsheet (also F1).
-        ImGui::SameLine(ImGui::GetWindowWidth() - 40.0f);
-        if (ImGui::Button("?")) ImGui::OpenPopup("shortcuts");
+        // Right-aligned window controls: help (?), minimize, close — the app is
+        // borderless (no native title bar), so these replace the caption buttons.
+        const float bw{ 30.0f };
+        ImGui::SameLine(ImGui::GetWindowWidth() - bw * 3.0f - 20.0f);
+        if (ImGui::Button(ICON_FA_CIRCLE_Q "##help", ImVec2(bw, 0))) ImGui::OpenPopup("shortcuts");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyboard shortcuts (F1)");
         if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) ImGui::OpenPopup("shortcuts");
+        ImGui::SameLine(0.0f, 5.0f);
+        if (ImGui::Button(ICON_FA_MINUS "##min", ImVec2(bw, 0)) && g_hwnd) ShowWindow(g_hwnd, SW_MINIMIZE);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimize");
+        ImGui::SameLine(0.0f, 5.0f);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.86f, 0.26f, 0.26f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.70f, 0.17f, 0.17f, 1.0f));
+        if (ImGui::Button(ICON_FA_XMARK "##close", ImVec2(bw, 0)) && g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        ImGui::PopStyleColor(2);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close");
         if (ImGui::BeginPopup("shortcuts"))
         {
             ImGui::SeparatorText("Keyboard shortcuts");
@@ -450,7 +500,10 @@ namespace
 
     void draw_class_list(viewer::App& app)
     {
-        // search box (Ctrl+F focuses it)
+        // search box (Ctrl+F focuses it), with a magnifier icon
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(ICON_FA_SEARCH);
+        ImGui::SameLine(0.0f, 6.0f);
         if (g_focus_search) { ImGui::SetKeyboardFocusHere(); g_focus_search = false; }
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##search", "Search classes  (Ctrl+F)", g_search, sizeof(g_search));
@@ -559,7 +612,7 @@ namespace
             ImGui::Dummy(ImVec2(0, 40));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f,0.5f,0.55f,1));
             const char* hint{ app.classes.empty()
-                ? "Pick a JVM above and click \"Attach & Enumerate\" to load its classes."
+                ? "Pick a JVM above and click \"Attach\" to load its classes."
                 : "Select a class on the left to see its methods and fields." };
             const float w{ ImGui::CalcTextSize(hint).x };
             ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - w) * 0.5f);
@@ -884,7 +937,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 {
     WNDCLASSEXW wc{ sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandleW(nullptr), nullptr, LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW)), nullptr, nullptr, L"vmhook_viewer", nullptr };
     RegisterClassExW(&wc);
-    HWND hwnd{ CreateWindowW(wc.lpszClassName, L"vmhook viewer", WS_OVERLAPPEDWINDOW, 80, 80, 1400, 880, nullptr, nullptr, wc.hInstance, nullptr) };
+    // Borderless (no native title bar) — a custom in-app toolbar provides the
+    // minimize/close controls.  WS_MAXIMIZEBOX + WM_GETMINMAXINFO make it fill
+    // the monitor work area (respecting the taskbar); WS_MINIMIZEBOX/WS_SYSMENU
+    // keep taskbar minimize/restore working.
+    HWND hwnd{ CreateWindowW(wc.lpszClassName, L"vmhook viewer",
+                             WS_POPUP | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_CLIPCHILDREN,
+                             80, 80, 1400, 880, nullptr, nullptr, wc.hInstance, nullptr) };
+    g_hwnd = hwnd;
 
     if (!create_device(hwnd)) { cleanup_device(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
     ShowWindow(hwnd, SW_SHOWMAXIMIZED);

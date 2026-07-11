@@ -1,0 +1,10 @@
+Font Awesome 6 Free — icon font asset bundled with the vmhook viewer.
+
+Only the FONT file (fa-solid-900.ttf) is bundled here. Font Awesome Free's fonts
+are licensed under the SIL Open Font License 1.1:
+    https://fontawesome.com/license/free  (Fonts: SIL OFL 1.1)
+    https://scripts.sil.org/OFL
+
+Copyright (c) Fonticons, Inc.  "Font Awesome Free" is a trademark of Fonticons,
+Inc.  No modifications were made to the font file; it is redistributed verbatim
+solely to render UI glyphs in the viewer.

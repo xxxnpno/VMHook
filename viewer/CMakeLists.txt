@@ -67,6 +67,14 @@ endif()
 # Build the payload alongside the viewer.
 add_dependencies(vmhook_viewer vmhook_payload)
 
+# Bundle the Font Awesome icon font next to the exe so the viewer can merge it
+# into its font atlas at startup (graceful no-op if the file is missing).
+add_custom_command(TARGET vmhook_viewer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/fa-solid-900.ttf"
+        "$<TARGET_FILE_DIR:vmhook_viewer>/fa-solid-900.ttf"
+    VERBATIM)
+
 # ── headless end-to-end probe (test) ─────────────────────────────────────────
 add_executable(vmhook_cli_probe test/cli_probe.cpp)
 target_include_directories(vmhook_cli_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
