@@ -91,6 +91,17 @@ namespace
 
                 writer.put("C\t");
                 writer.put(name);
+                writer.put("\t");
+                // Superclass internal name (empty for java/lang/Object / interfaces).
+                if (vmhook::hotspot::klass* const super_klass{ klass->get_super() };
+                    super_klass && vmhook::hotspot::is_valid_pointer(super_klass))
+                {
+                    if (const vmhook::hotspot::symbol* const super_name{ super_klass->get_name() };
+                        super_name && vmhook::hotspot::is_valid_pointer(super_name))
+                    {
+                        writer.put(super_name->to_string());
+                    }
+                }
                 writer.put("\n");
 
                 // Declared methods: (name, descriptor, access flags).  Array

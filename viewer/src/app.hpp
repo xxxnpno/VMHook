@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace viewer
@@ -45,6 +46,7 @@ namespace viewer
         std::string             internal_name;  // "net/minecraft/client/Minecraft"
         std::string             package;        // "net/minecraft/client"
         std::string             simple_name;    // "Minecraft"
+        std::string             super_name;     // superclass internal name ("" for Object/interfaces)
         std::vector<MethodInfo> methods;
         std::vector<FieldInfo>  fields;
     };
@@ -275,8 +277,9 @@ namespace viewer
         std::vector<JvmProcess> jvms;
         int                     selected_jvm{ -1 };
 
-        std::mutex              data_mutex;   // guards `classes`
-        std::vector<ClassInfo>  classes;      // published result
+        std::mutex              data_mutex;      // guards `classes` + `name_to_index`
+        std::vector<ClassInfo>  classes;         // published result
+        std::unordered_map<std::string, int> name_to_index;  // internal name -> index (for jump-to-class)
 
         std::atomic<Status>       status{ Status::Idle };
         std::atomic<std::uint64_t> classes_streamed{ 0 };
@@ -445,6 +448,10 @@ namespace viewer
             {
                 std::lock_guard<std::mutex> lock{ data_mutex };
                 classes = std::move(parsed);
+                name_to_index.clear();
+                name_to_index.reserve(classes.size());
+                for (int i = 0; i < (int)classes.size(); ++i)
+                    name_to_index.emplace(classes[(std::size_t)i].internal_name, i);
                 classes_streamed.store(classes.size());
                 status_message = "Loaded " + std::to_string(classes.size()) + " classes.";
             }
@@ -494,6 +501,7 @@ namespace viewer
                 {
                     ClassInfo ci{};
                     ci.internal_name = std::string{ parts[0] };
+                    if (parts.size() >= 2) ci.super_name = std::string{ parts[1] };
                     out.push_back(std::move(ci));
                 }
                 break;

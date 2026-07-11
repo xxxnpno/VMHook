@@ -380,6 +380,21 @@ namespace
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f,0.82f,1.0f,1));
         ImGui::TextUnformatted(dotted.c_str());
         ImGui::PopStyleColor();
+        if (!c.super_name.empty() && c.super_name != "java/lang/Object")
+        {
+            ImGui::SameLine(); ImGui::TextDisabled("extends"); ImGui::SameLine();
+            std::string sd{ c.super_name };
+            for (char& ch : sd) if (ch == '/') ch = '.';
+            const auto it{ app.name_to_index.find(c.super_name) };
+            if (it != app.name_to_index.end())
+            {
+                if (ImGui::TextLink(sd.c_str())) { g_selected_class = it->second; g_method_filter[0] = 0; g_field_filter[0] = 0; }
+            }
+            else
+            {
+                ImGui::TextDisabled("%s", sd.c_str());
+            }
+        }
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 250.0f);
         if (ImGui::SmallButton("Copy name")) ImGui::SetClipboardText(c.internal_name.c_str());
         ImGui::SameLine();
