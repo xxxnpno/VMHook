@@ -506,6 +506,7 @@ namespace
             preview = std::to_string(p.pid) + " — " + (p.command_line.empty() ? p.image_name : p.command_line);
         }
         push_combo_style();
+        ImGui::BeginDisabled(app.busy());  // don't swap JVM mid-attach
         if (ImGui::BeginCombo("##jvm", preview.c_str()))
         {
             for (int i = 0; i < (int)app.jvms.size(); ++i)
@@ -516,6 +517,7 @@ namespace
             }
             ImGui::EndCombo();
         }
+        ImGui::EndDisabled();
         pop_combo_style();
         ImGui::SameLine(0.0f, em(0.5f));
         ImGui::BeginDisabled(app.busy() || app.selected_jvm < 0);
@@ -599,6 +601,8 @@ namespace
             }
             ImGui::Separator();
             ImGui::TextDisabled("Tip: click a field's type or 'extends' to jump to that class.");
+            ImGui::TextDisabled("Tip: use the Methods/Fields scope to search members across all classes.");
+            ImGui::TextDisabled("Tip: right-click a class/method/field row to copy its name.");
             ImGui::EndPopup();
         }
     }
@@ -722,13 +726,19 @@ namespace
                     }
                     copy_menu("cls", c.internal_name);
                     ImGui::TableSetColumnIndex(1);
-                    ImGui::PushStyleColor(ImGuiCol_Text, class_kind(c).color);
+                    // On the selected (blue) row, use plain text so the kind colour
+                    // doesn't lose contrast against the highlight — the details
+                    // pane restates the kind badge anyway.
+                    const bool sel{ g_selected_class == idx };
+                    ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : class_kind(c).color);
                     ImGui::TextUnformatted(c.simple_name.c_str());
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered() && (c.access || !c.super_name.empty()))
                         ImGui::SetTooltip("%s", class_kind(c).label);
                     ImGui::TableSetColumnIndex(2);
                     ImGui::TextDisabled("%zu/%zu", c.methods.size(), c.fields.size());
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%zu methods / %zu fields", c.methods.size(), c.fields.size());
                     ImGui::PopID();
                     if (row == scroll_row && g_scroll_to_selected)
                     {
