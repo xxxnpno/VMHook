@@ -5324,11 +5324,6 @@ namespace vmhook
         {
             if (vmhook::hotspot::current_java_thread && vmhook::hotspot::is_valid_pointer(vmhook::hotspot::current_java_thread))
             {
-                if (!vmhook::hotspot::current_jni_env)
-                {
-                    vmhook::hotspot::attach_current_native_thread();
-                }
-
                 return true;
             }
 
@@ -5341,26 +5336,14 @@ namespace vmhook
                 return true;
             }
 
-            if (!vmhook::hotspot::attach_current_native_thread())
-            {
-                VMHOOK_LOG("{} ensure_current_java_thread(): AttachCurrentThread failed for OS thread {}", vmhook::error_tag, current_os_thread_id);
-                return false;
-            }
-
-            for (std::int32_t attempt{ 0 }; attempt < 64; ++attempt)
-            {
-                if (vmhook::hotspot::java_thread* const attached_thread{ vmhook::hotspot::find_java_thread_by_os_thread_id(current_os_thread_id) })
-                {
-                    vmhook::hotspot::current_java_thread = attached_thread;
-                    vmhook::hotspot::last_java_thread.store(attached_thread, std::memory_order_relaxed);
-                    VMHOOK_LOG("{} ensure_current_java_thread(): attached JavaThread 0x{:016X} for OS thread {}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(attached_thread), current_os_thread_id);
-                    return true;
-                }
-
-                std::this_thread::yield();
-            }
-
-            VMHOOK_LOG("{} ensure_current_java_thread(): attached thread was not found in HotSpot thread list for OS thread {}", vmhook::error_tag, current_os_thread_id);
+            // Pure-VM: no JNI AttachCurrentThread.  Inside a detour / hooked method
+            // the calling thread is ALWAYS a HotSpot JavaThread and is adopted above.
+            // A native thread that HotSpot has never seen cannot be attached without a
+            // VM call, so report false here; operations that only need SOME JavaThread
+            // (TLAB allocation walks the whole thread list) do not depend on this.
+            VMHOOK_LOG("{} ensure_current_java_thread(): OS thread {} is not a HotSpot JavaThread "
+                       "and pure-VM cannot attach it (no JNI).",
+                       vmhook::info_tag, current_os_thread_id);
             return false;
         }
 
@@ -14213,84 +14196,18 @@ namespace vmhook
     inline auto find_class_via_oop(void* const anchor_oop, const std::string_view class_name) noexcept
         -> vmhook::hotspot::klass*
     {
-        if (!anchor_oop || !vmhook::hotspot::ensure_current_java_thread())
+        // Pure-VM: the former JNI path called
+        // anchor.getClass().getClassLoader().loadClass(name), which both
+        // disambiguated the loader AND triggered class loading.  Without JNI,
+        // validate the anchor and return the class via the global
+        // ClassLoaderDataGraph walk, which finds it across every loader once it is
+        // LOADED.  Loader-specific selection among multiple loaded copies, and
+        // loadClass-triggered class loading, are not available pure-VM.
+        if (!anchor_oop || !vmhook::hotspot::is_valid_pointer(anchor_oop))
         {
             return nullptr;
         }
-
-        void* storage{};
-        void* const anchor_handle{ vmhook::detail::jni_oop_handle(anchor_oop, storage) };
-        void* const anchor_class_handle{ vmhook::detail::jni_get_object_class(anchor_handle) };
-        if (!anchor_class_handle)
-        {
-            vmhook::detail::jni_exception_clear();
-            return nullptr;
-        }
-
-        void* const class_class{ vmhook::detail::jni_get_object_class(anchor_class_handle) };
-        if (!class_class)
-        {
-            vmhook::detail::jni_exception_clear();
-            vmhook::detail::jni_delete_local_ref(anchor_class_handle);
-            return nullptr;
-        }
-
-        void* const get_loader_id{ vmhook::detail::jni_get_method_id(
-            class_class, "getClassLoader", "()Ljava/lang/ClassLoader;") };
-        vmhook::detail::jni_delete_local_ref(class_class);
-        if (!get_loader_id)
-        {
-            vmhook::detail::jni_delete_local_ref(anchor_class_handle);
-            return nullptr;
-        }
-
-        void* const classloader{ vmhook::detail::jni_call_object_method(
-            anchor_class_handle, get_loader_id, nullptr) };
-        vmhook::detail::jni_delete_local_ref(anchor_class_handle);
-        vmhook::detail::jni_exception_clear();
-        if (!classloader)
-        {
-            return nullptr;
-        }
-
-        void* const cl_class{ vmhook::detail::jni_get_object_class(classloader) };
-        if (!cl_class)
-        {
-            vmhook::detail::jni_delete_local_ref(classloader);
-            return nullptr;
-        }
-        void* const load_class_id{ vmhook::detail::jni_get_method_id(
-            cl_class, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;") };
-        vmhook::detail::jni_delete_local_ref(cl_class);
-        if (!load_class_id)
-        {
-            vmhook::detail::jni_delete_local_ref(classloader);
-            return nullptr;
-        }
-
-        std::string dotted_name{ class_name };
-        std::replace(dotted_name.begin(), dotted_name.end(), '/', '.');
-        void* const name_string{ vmhook::detail::jni_new_string_utf(dotted_name) };
-        if (!name_string)
-        {
-            vmhook::detail::jni_delete_local_ref(classloader);
-            return nullptr;
-        }
-
-        vmhook::detail::jni_value args[1]{};
-        args[0].l = name_string;
-        void* const class_mirror{ vmhook::detail::jni_call_object_method(classloader, load_class_id, args) };
-        vmhook::detail::jni_delete_local_ref(name_string);
-        vmhook::detail::jni_delete_local_ref(classloader);
-        vmhook::detail::jni_exception_clear();
-        if (!class_mirror)
-        {
-            return nullptr;
-        }
-
-        vmhook::hotspot::klass* const result{ vmhook::detail::jni_klass_from_class_mirror(class_mirror) };
-        vmhook::detail::jni_delete_local_ref(class_mirror);
-        return result;
+        return vmhook::find_class(class_name);
     }
 
     /*
@@ -14694,14 +14611,10 @@ namespace vmhook
     inline auto make_java_object(vmhook::hotspot::klass* const klass, const std::size_t requested_size) noexcept
         -> void*
     {
-        if (!vmhook::hotspot::ensure_current_java_thread())
-        {
-            VMHOOK_LOG("{} vmhook::make_java_object(): ensure_current_java_thread() failed - "
-                       "cannot allocate without an attached JavaThread.",
-                       vmhook::error_tag);
-            return nullptr;
-        }
-
+        // Pure-VM: no attach gate.  Allocation uses find_allocation_thread() (the
+        // current JavaThread if there is one) and otherwise walks the live thread
+        // list for a usable TLAB, so it does not require THIS OS thread to be an
+        // attached JavaThread.
         if (!klass || requested_size == 0)
         {
             VMHOOK_LOG("{} vmhook::make_java_object(): invalid arguments (klass={}, "
@@ -16484,17 +16397,14 @@ namespace vmhook
             // decode to surrogate pairs — NewStringUTF would truncate / mangle
             // both.  The returned handle is a JNI local ref that keeps the new
             // String rooted across the store below (GC-safety of the value).
-            void* const string_handle{ vmhook::detail::jni_new_string_utf16_local(value) };
-            void* const string_oop{ string_handle
-                ? vmhook::detail::jni_decode_object(string_handle)
-                : vmhook::make_java_string(value) };
+            // Pure-VM: build the String oop directly via make_java_string (TLAB +
+            // UTF-16 value/coder encode).  No JNI NewString, no local reference.
+            void* const string_oop{ vmhook::make_java_string(value) };
             if (!string_oop)
             {
-                vmhook::detail::jni_delete_local_ref(string_handle);
                 VMHOOK_LOG("{} field_proxy::set: failed to build a java.lang.String for a "
-                           "String-field write (sig='{}') at {:p} ({} field) - both the JNI "
-                           "NewString path and the make_java_string fallback returned null; "
-                           "the field is left unchanged.",
+                           "String-field write (sig='{}') at {:p} ({} field) - make_java_string "
+                           "returned null; the field is left unchanged.",
                            vmhook::error_tag, this->signature_text, this->field_pointer,
                            this->static_field ? "static" : "instance");
                 return false;
@@ -16513,7 +16423,6 @@ namespace vmhook
                            vmhook::error_tag, this->signature_text, this->field_pointer,
                            this->static_field ? "static" : "instance");
             }
-            vmhook::detail::jni_delete_local_ref(string_handle);
             return stored;
         }
 
