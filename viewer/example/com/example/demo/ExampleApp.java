@@ -8,10 +8,12 @@ import java.util.Map;
 /**
  * A long-running example JVM to test the vmhook viewer against.
  *
- * It deliberately exposes a rich surface — static and instance fields of many
- * types, methods with varied signatures, a nested class, an interface and an
- * enum — so that after you attach the viewer you can find
- * {@code com/example/demo/ExampleApp} and see its members populated.
+ * It deliberately exposes a rich surface for the viewer + CLI + MCP: static AND
+ * instance fields of every primitive descriptor (Z/C/B/S/I/J/F/D) plus String,
+ * arrays and object refs; a {@code Worker} subclass (for inherited-field and
+ * live-instance testing); a nested class, an interface and an enum; and a pool
+ * of 40 live {@code Worker} instances mutated every second so the live-heap
+ * inspector (and `vmhook_cli instances` / `statics`) has changing state to show.
  *
  * Build + run:
  *   javac -d out com/example/demo/*.java
