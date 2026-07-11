@@ -255,6 +255,7 @@ namespace
     char         g_instance_filter[128]{};   // substring filter over the instance rows
     bool         g_open_instance_detail{ false };  // request the per-instance detail popup
     std::string  g_detail_addr;              // address of the instance the popup shows
+    bool         g_copy_instance_table{ false };   // request a TSV copy of the instance table
     bool         g_focus_search{ false };
     int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
     int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
@@ -1195,11 +1196,14 @@ namespace
             const float r{ ImGui::GetFrameHeight() * 0.28f };
             ui::Spinner("##iscan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
         }
-        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(11.5f), ImGui::GetCursorPosX() + em(1.0f)));
+        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(16.5f), ImGui::GetCursorPosX() + em(1.0f)));
         ui::Toggle("Live", &g_instances_live);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Re-scan the heap ~every 1.5s so field values update live");
         ImGui::SameLine(0.0f, em(0.7f));
         if (ImGui::SmallButton("Refresh")) g_instances_refresh_now = true;
+        ImGui::SameLine(0.0f, em(0.4f));
+        if (ImGui::SmallButton("Copy table")) g_copy_instance_table = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the filtered + sorted rows to the clipboard as TSV");
 
         // Columns = the fields actually streamed for these instances (declared
         // then inherited, in payload order): (name, owner) where a non-empty
@@ -1340,6 +1344,26 @@ namespace
                     ImGui::PopID();
                 }
             ImGui::EndTable();
+        }
+
+        // Copy the filtered + sorted table to the clipboard as TSV (view holds
+        // the current display order after the sort above).
+        if (g_copy_instance_table)
+        {
+            g_copy_instance_table = false;
+            std::string tsv{ "#\tAddress" };
+            for (const auto& c : cols) { tsv += '\t'; tsv += c.first; }
+            tsv += '\n';
+            for (const int rr : view)
+            {
+                const viewer::InstanceInfo& in{ app.instances[(std::size_t)rr] };
+                tsv += std::to_string(rr);
+                tsv += '\t';
+                tsv += in.address;
+                for (const viewer::InstField& f : in.fields) { tsv += '\t'; tsv += f.value; }
+                tsv += '\n';
+            }
+            ImGui::SetClipboardText(tsv.c_str());
         }
 
         // Per-instance detail popup (click a row): a vertical Field/Value/From
