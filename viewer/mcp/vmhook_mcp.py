@@ -149,6 +149,8 @@ def handle(msg: dict):
             text = call_tool(name, args)
         except KeyError as ke:
             text = json.dumps({"error": f"missing argument: {ke}"})
+        except Exception as exc:  # never let one bad tool call kill the server
+            text = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
         return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": text}]}}
 
     if mid is not None:
@@ -165,7 +167,12 @@ def main() -> None:
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        resp = handle(msg)
+        try:
+            resp = handle(msg)
+        except Exception as exc:  # a malformed request must not kill the loop
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            resp = ({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": str(exc)}}
+                    if mid is not None else None)
         if resp is not None:
             sys.stdout.write(json.dumps(resp) + "\n")
             sys.stdout.flush()
