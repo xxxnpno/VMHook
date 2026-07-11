@@ -924,6 +924,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
         g_context->ClearRenderTargetView(g_rtv, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_swap_chain->Present(1, 0);
+
+        // Reflect the loaded class count in the window title (only on change).
+        {
+            static std::string last_title;
+            const unsigned long long n{ app.classes_streamed.load() };
+            std::string title{ n ? "vmhook viewer  —  " + std::to_string(n) + " classes" : "vmhook viewer" };
+            if (title != last_title) { last_title = title; SetWindowTextA(hwnd, title.c_str()); }
+        }
     }
 
     save_settings();  // remember preferences for next launch
