@@ -1602,7 +1602,7 @@ namespace
         if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyPressed(ImGuiKey_F, false)) g_focus_search = true;
         if (ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
         {
-            g_search[0] = 0; g_method_filter[0] = 0; g_field_filter[0] = 0;
+            g_search[0] = 0; g_method_filter[0] = 0; g_field_filter[0] = 0; g_instance_filter[0] = 0;
         }
         // Alt+Left / Alt+Right walk the class navigation history (browser-style).
         if (ImGui::IsKeyDown(ImGuiKey_LeftAlt) || ImGui::IsKeyDown(ImGuiKey_RightAlt))
