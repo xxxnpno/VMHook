@@ -47,6 +47,7 @@ namespace viewer
         std::string             package;        // "net/minecraft/client"
         std::string             simple_name;    // "Minecraft"
         std::string             super_name;     // superclass internal name ("" for Object/interfaces)
+        std::uint16_t           access{ 0 };    // class-file access flags (ACC_INTERFACE/ENUM/ABSTRACT/...)
         std::vector<MethodInfo> methods;
         std::vector<FieldInfo>  fields;
     };
@@ -502,6 +503,8 @@ namespace viewer
                     ClassInfo ci{};
                     ci.internal_name = std::string{ parts[0] };
                     if (parts.size() >= 2) ci.super_name = std::string{ parts[1] };
+                    if (parts.size() >= 3)
+                        ci.access = (std::uint16_t)std::strtoul(std::string{ parts[2] }.c_str(), nullptr, 10);
                     out.push_back(std::move(ci));
                 }
                 break;

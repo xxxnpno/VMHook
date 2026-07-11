@@ -135,6 +135,8 @@ namespace
                     viewer::ClassInfo c;
                     c.internal_name.assign(parts[0]);
                     if (parts.size() >= 2) c.super_name.assign(parts[1]);
+                    if (parts.size() >= 3)
+                        c.access = (std::uint16_t)std::strtoul(std::string{ parts[2] }.c_str(), nullptr, 10);
                     const std::size_t s{ c.internal_name.find_last_of('/') };
                     c.package     = (s == std::string::npos) ? "" : c.internal_name.substr(0, s);
                     c.simple_name = (s == std::string::npos) ? c.internal_name : c.internal_name.substr(s + 1);
@@ -250,8 +252,16 @@ int main(int argc, char** argv)
         for (const auto& c : classes)
         {
             if (c.internal_name != name) continue;
-            std::printf("{\"name\":\"%s\",\"super\":\"%s\",\"methods\":[",
-                json_escape(c.internal_name).c_str(), json_escape(c.super_name).c_str());
+            const char* kind{
+                (c.access & 0x2000u) ? "annotation" :
+                (c.access & 0x0200u) ? "interface"  :
+                (c.access & 0x4000u) ? "enum"       :
+                (c.super_name == "java/lang/Record") ? "record" :
+                (c.access == 0u && c.super_name == "java/lang/Enum") ? "enum" :
+                (c.access & 0x0400u) ? "abstract" : "class" };
+            std::printf("{\"name\":\"%s\",\"super\":\"%s\",\"kind\":\"%s\",\"access\":%u,\"methods\":[",
+                json_escape(c.internal_name).c_str(), json_escape(c.super_name).c_str(),
+                kind, (unsigned)c.access);
             for (std::size_t i = 0; i < c.methods.size(); ++i)
                 std::printf("%s{\"name\":\"%s\",\"descriptor\":\"%s\",\"signature\":\"%s\",\"modifiers\":\"%s\",\"access\":%u}",
                     i ? "," : "", json_escape(c.methods[i].name).c_str(),

@@ -3780,6 +3780,43 @@ namespace vmhook
             }
 
             /*
+                @brief Returns this class's class-file access flags (public/final/
+                       interface/abstract/enum/annotation/...).
+                @details
+                Reads Klass::_access_flags, whose low 16 bits mirror the class-file
+                access_flags word.  The bits of interest to callers are the standard
+                JVM class modifiers: PUBLIC 0x0001, FINAL 0x0010, INTERFACE 0x0200,
+                ABSTRACT 0x0400, SYNTHETIC 0x1000, ANNOTATION 0x2000, ENUM 0x4000.
+
+                _access_flags is a HotSpot AccessFlags: u4 on JDK 8..~24 and narrowed
+                to u2 on the very latest builds, but every class modifier lives in the
+                low halfword regardless, so a little-endian 4-byte memcpy captures them
+                on all widths (the surplus high bytes are truncated by the u16 return).
+                std::memcpy avoids any strict-aliasing UB.
+
+                Complexity: O(1) after the VMStruct offset is cached on first call.
+                Exception safety: noexcept — returns 0 on any failure.
+
+                @return The class's low-16 access flags, or 0 if unavailable.
+            */
+            auto get_class_access_flags() const noexcept
+                -> std::uint16_t
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{
+                    vmhook::hotspot::iterate_struct_entries("Klass", "_access_flags") };
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return 0u;
+                }
+
+                std::uint32_t access_flags{ 0u };
+                std::memcpy(&access_flags,
+                            reinterpret_cast<const std::uint8_t*>(this) + entry->offset,
+                            sizeof(access_flags));
+                return static_cast<std::uint16_t>(access_flags & 0xFFFFu);
+            }
+
+            /*
                 @brief Returns the size in bytes of one instance of this class.
                 @details
                 Reads Klass._layout_helper, which encodes instance layout information.

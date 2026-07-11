@@ -7,11 +7,13 @@
 //
 // Wire protocol (UTF-8, '\n'-delimited, '\t'-separated; Java identifiers and JVM
 // descriptors never contain '\t' or '\n', so the framing is unambiguous):
-//   C <TAB> internal/Class/Name
-//   M <TAB> methodName <TAB> (descriptor)ret
-//   F <TAB> fieldName  <TAB> descriptor <TAB> {0|1 static}
+//   C <TAB> internal/Class/Name <TAB> super/Internal/Name <TAB> <classAccessFlags>
+//   M <TAB> methodName <TAB> (descriptor)ret <TAB> <methodAccessFlags>
+//   F <TAB> fieldName  <TAB> descriptor <TAB> <fieldAccessFlags>
 //   DONE <TAB> <classCount>
-// Methods/fields belong to the most recently emitted C record.
+// Methods/fields belong to the most recently emitted C record.  Access-flag
+// fields are decimal JVM class-file flag words (older readers ignore extra
+// trailing tab-separated fields, so appending the class flags stays compatible).
 
 #include <vmhook/vmhook.hpp>
 
@@ -102,6 +104,9 @@ namespace
                         writer.put(super_name->to_string());
                     }
                 }
+                writer.put("\t");
+                // Class-file access flags (interface/enum/abstract/... kind + vis).
+                writer.put(std::to_string(klass->get_class_access_flags()));
                 writer.put("\n");
 
                 // Declared methods: (name, descriptor, access flags).  Array

@@ -207,6 +207,40 @@ namespace
         return ImVec4(0.62f, 0.63f, 0.70f, 1.0f);                   // package-private
     }
 
+    // Primary class kind from the class-file access flags (+ super for records),
+    // with a distinct badge colour.  ANNOTATION implies INTERFACE, and ENUM
+    // implies FINAL, so the checks are ordered most-specific first.  Returns a
+    // stable label even when flags are 0 (older payloads) — falls back to super.
+    struct ClassKind { const char* label; ImVec4 color; };
+    ClassKind class_kind(const viewer::ClassInfo& c)
+    {
+        const std::uint16_t f{ c.access };
+        if (f & 0x2000u) return { "annotation", ImVec4(0.80f, 0.68f, 0.95f, 1.0f) };
+        if (f & 0x0200u) return { "interface",  ImVec4(0.52f, 0.82f, 0.92f, 1.0f) };
+        if (f & 0x4000u) return { "enum",       ImVec4(0.95f, 0.80f, 0.45f, 1.0f) };
+        if (c.super_name == "java/lang/Record") return { "record", ImVec4(0.60f, 0.86f, 0.66f, 1.0f) };
+        if (f & 0x0400u) return { "abstract",   ImVec4(0.82f, 0.66f, 0.60f, 1.0f) };
+        // Flags unavailable but super says enum → still label it.
+        if (f == 0u && c.super_name == "java/lang/Enum") return { "enum", ImVec4(0.95f, 0.80f, 0.45f, 1.0f) };
+        return { "class", ImVec4(0.62f, 0.72f, 0.85f, 1.0f) };
+    }
+
+    // The Java source keyword(s) that would declare this class, for export.
+    std::string class_decl(const viewer::ClassInfo& c)
+    {
+        const std::uint16_t f{ c.access };
+        if (f & 0x2000u) return "@interface";
+        if (f & 0x0200u) return "interface";
+        if (f & 0x4000u) return "enum";
+        if (c.super_name == "java/lang/Record") return "record";
+        if (f == 0u && c.super_name == "java/lang/Enum") return "enum";
+        std::string kw;
+        if (f & 0x0400u) kw += "abstract ";
+        else if (f & 0x0010u) kw += "final ";
+        kw += "class";
+        return kw;
+    }
+
     void copy_menu(const char* id, const std::string& primary, const std::string& secondary = {})
     {
         if (ImGui::BeginPopupContextItem(id))
@@ -223,7 +257,10 @@ namespace
     {
         std::string path{ exe_dir() + "vmhook_export.txt" };
         std::ofstream out{ path, std::ios::trunc };
-        out << "class " << c.internal_name << "\n\nMETHODS (" << c.methods.size() << ")\n";
+        out << class_decl(c) << " " << c.internal_name;
+        if (!c.super_name.empty() && c.super_name != "java/lang/Object")
+            out << " extends " << c.super_name;
+        out << "\n\nMETHODS (" << c.methods.size() << ")\n";
         for (const auto& m : c.methods) out << "  " << m.name << "  " << m.descriptor << "\n";
         out << "\nFIELDS (" << c.fields.size() << ")\n";
         for (const auto& f : c.fields) out << "  " << (f.is_static ? "static " : "") << f.name << "  " << f.descriptor << "\n";
@@ -346,7 +383,11 @@ namespace
                     }
                     copy_menu("cls", c.internal_name);
                     ImGui::TableSetColumnIndex(1);
+                    ImGui::PushStyleColor(ImGuiCol_Text, class_kind(c).color);
                     ImGui::TextUnformatted(c.simple_name.c_str());
+                    ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered() && (c.access || !c.super_name.empty()))
+                        ImGui::SetTooltip("%s", class_kind(c).label);
                     ImGui::TableSetColumnIndex(2);
                     ImGui::TextDisabled("%zu/%zu", c.methods.size(), c.fields.size());
                     ImGui::PopID();
@@ -380,14 +421,24 @@ namespace
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f,0.82f,1.0f,1));
         ImGui::TextUnformatted(dotted.c_str());
         ImGui::PopStyleColor();
-        // kind badge inferred from the superclass (no extra data needed)
-        const char* kind{ c.super_name == "java/lang/Enum" ? "enum"
-                          : (c.internal_name.find('$') != std::string::npos ? "nested" : nullptr) };
-        if (kind)
+        // kind badge from the class-file access flags (interface/enum/abstract/...)
+        const ClassKind kind{ class_kind(c) };
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, kind.color);
+        ImGui::Text("[%s]", kind.label);
+        ImGui::PopStyleColor();
+        if (c.access & 0x0010u && !(c.access & 0x4000u))  // final (enums are implicitly final)
         {
             ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.78f, 0.95f, 1.0f));
-            ImGui::Text("[%s]", kind);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
+            ImGui::TextUnformatted("[final]");
+            ImGui::PopStyleColor();
+        }
+        if (c.internal_name.find('$') != std::string::npos)
+        {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
+            ImGui::TextUnformatted("[nested]");
             ImGui::PopStyleColor();
         }
         if (!c.super_name.empty() && c.super_name != "java/lang/Object")
@@ -410,7 +461,7 @@ namespace
         ImGui::SameLine();
         if (ImGui::SmallButton("Copy all"))
         {
-            std::string all{ "class " + dotted + " {\n" };
+            std::string all{ class_decl(c) + " " + dotted + " {\n" };
             for (const auto& f : c.fields)
                 all += "  " + viewer::access_modifiers(f.access, false) + " " + viewer::pretty_field(f.descriptor) + " " + f.name + ";\n";
             all += "\n";
