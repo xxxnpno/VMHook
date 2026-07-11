@@ -93,24 +93,47 @@ namespace
                 writer.put(name);
                 writer.put("\n");
 
-                // Declared methods: (name, JVM descriptor).
-                for (const auto& [method_name, descriptor] : vmhook::detail::collect_klass_methods(klass))
+                // Declared methods: (name, descriptor, access flags).  Array
+                // klasses have no _methods array, so skip them ('[' names).
+                if (name.empty() || name.front() != '[')
                 {
-                    writer.put("M\t");
-                    writer.put(method_name);
-                    writer.put("\t");
-                    writer.put(descriptor);
-                    writer.put("\n");
+                    const std::int32_t method_count{ klass->get_methods_count() };
+                    vmhook::hotspot::method** const methods{ klass->get_methods_ptr() };
+                    if (methods && method_count > 0)
+                    {
+                        for (std::int32_t mi = 0; mi < method_count; ++mi)
+                        {
+                            vmhook::hotspot::method* const m{ methods[mi] };
+                            if (!m || !vmhook::hotspot::is_valid_pointer(m))
+                            {
+                                continue;
+                            }
+                            std::uint32_t flags{ 0 };
+                            if (std::uint32_t* const fp{ m->get_access_flags() })
+                            {
+                                vmhook::os::safe_read(&flags, fp, sizeof(flags));
+                            }
+                            writer.put("M\t");
+                            writer.put(m->get_name());
+                            writer.put("\t");
+                            writer.put(m->get_signature());
+                            writer.put("\t");
+                            writer.put(std::to_string(flags));
+                            writer.put("\n");
+                        }
+                    }
                 }
 
-                // Declared fields: (name, JVM descriptor, is_static).
-                for (const auto& [field_name, field_descriptor, is_static] : klass->collect_fields())
+                // Declared fields: (name, descriptor, access flags).
+                for (const auto& [field_name, field_descriptor, access_flags] : klass->collect_fields())
                 {
                     writer.put("F\t");
                     writer.put(field_name);
                     writer.put("\t");
                     writer.put(field_descriptor);
-                    writer.put(is_static ? "\t1\n" : "\t0\n");
+                    writer.put("\t");
+                    writer.put(std::to_string(access_flags));
+                    writer.put("\n");
                 }
             });
 

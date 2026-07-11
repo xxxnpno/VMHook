@@ -4210,16 +4210,16 @@ namespace vmhook
 
             /*
                 @brief Enumerates EVERY field this class declares directly (not
-                inherited), returning (name, JVM type descriptor, is_static) for
+                inherited), returning (name, JVM type descriptor, access_flags) for
                 each.  Same two storage formats as find_field(): the JDK 21+
                 _fieldinfo_stream (UNSIGNED5) and the JDK 8-20 _fields Array<u2>.
                 Pure metadata read (used by tooling like the vmhook viewer to list
                 a class's whole field surface); returns {} on any failure.
             */
             auto collect_fields() const noexcept
-                -> std::vector<std::tuple<std::string, std::string, bool>>
+                -> std::vector<std::tuple<std::string, std::string, std::uint16_t>>
             {
-                std::vector<std::tuple<std::string, std::string, bool>> result{};
+                std::vector<std::tuple<std::string, std::string, std::uint16_t>> result{};
                 try
                 {
                     static const vmhook::hotspot::vm_struct_entry_t* const fields_entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fields") };
@@ -4286,7 +4286,7 @@ namespace vmhook
                             }
                             const vmhook::hotspot::symbol* const signature_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, sig_index, cp_length) };
                             std::string signature{ vmhook::hotspot::is_valid_pointer(signature_symbol) ? signature_symbol->to_string() : std::string{} };
-                            result.emplace_back(name_symbol->to_string(), std::move(signature), (access_flags & 0x0008u) != 0u);
+                            result.emplace_back(name_symbol->to_string(), std::move(signature), static_cast<std::uint16_t>(access_flags));
                         }
                         return result;
                     }
@@ -4328,7 +4328,7 @@ namespace vmhook
                         const std::uint16_t sig_index{ data[field_slot_index * field_slots + 2] };
                         const vmhook::hotspot::symbol* const signature_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, sig_index, cp_length) };
                         std::string signature{ vmhook::hotspot::is_valid_pointer(signature_symbol) ? signature_symbol->to_string() : std::string{} };
-                        result.emplace_back(name_symbol->to_string(), std::move(signature), (access_flags & 0x0008u) != 0u);
+                        result.emplace_back(name_symbol->to_string(), std::move(signature), static_cast<std::uint16_t>(access_flags));
                     }
                 }
                 catch (const std::exception&)

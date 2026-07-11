@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -26,15 +27,17 @@ namespace viewer
 
     struct MethodInfo
     {
-        std::string name;
-        std::string descriptor;
+        std::string   name;
+        std::string   descriptor;
+        std::uint16_t access{ 0 };  // JVM access flags (ACC_PUBLIC, ACC_STATIC, ...)
     };
 
     struct FieldInfo
     {
-        std::string name;
-        std::string descriptor;
-        bool        is_static{ false };
+        std::string   name;
+        std::string   descriptor;
+        std::uint16_t access{ 0 };
+        bool          is_static{ false };
     };
 
     struct ClassInfo
@@ -294,12 +297,17 @@ namespace viewer
 
         void refresh_jvms()
         {
+            // Preserve the current selection across refreshes by pid (the list
+            // order/size can change as JVMs come and go).
+            const std::uint32_t previous{ (selected_jvm >= 0 && selected_jvm < (int)jvms.size())
+                                              ? jvms[(std::size_t)selected_jvm].pid : 0 };
             jvms = enumerate_jvms();
-            if (selected_jvm >= static_cast<int>(jvms.size()))
+            selected_jvm = -1;
+            for (int i = 0; i < (int)jvms.size(); ++i)
             {
-                selected_jvm = jvms.empty() ? -1 : 0;
+                if (jvms[(std::size_t)i].pid == previous) { selected_jvm = i; break; }
             }
-            else if (selected_jvm < 0 && !jvms.empty())
+            if (selected_jvm < 0 && !jvms.empty())
             {
                 selected_jvm = 0;
             }
@@ -492,14 +500,17 @@ namespace viewer
             case 'M':
                 if (parts.size() >= 2 && !out.empty())
                 {
-                    out.back().methods.push_back(MethodInfo{ std::string{ parts[0] }, std::string{ parts[1] } });
+                    const std::uint16_t acc{ parts.size() >= 3
+                        ? (std::uint16_t)std::strtoul(std::string{ parts[2] }.c_str(), nullptr, 10) : (std::uint16_t)0 };
+                    out.back().methods.push_back(MethodInfo{ std::string{ parts[0] }, std::string{ parts[1] }, acc });
                 }
                 break;
             case 'F':
                 if (parts.size() >= 3 && !out.empty())
                 {
+                    const std::uint16_t acc{ (std::uint16_t)std::strtoul(std::string{ parts[2] }.c_str(), nullptr, 10) };
                     out.back().fields.push_back(
-                        FieldInfo{ std::string{ parts[0] }, std::string{ parts[1] }, parts[2] == "1" });
+                        FieldInfo{ std::string{ parts[0] }, std::string{ parts[1] }, acc, (acc & 0x0008u) != 0 });
                 }
                 break;
             case 'D':

@@ -142,11 +142,18 @@ namespace
                 break;
             case 'M':
                 if (parts.size() >= 2 && !out.empty())
-                    out.back().methods.push_back({ std::string{ parts[0] }, std::string{ parts[1] } });
+                {
+                    const std::uint16_t acc{ parts.size() >= 3
+                        ? (std::uint16_t)std::strtoul(std::string{ parts[2] }.c_str(), nullptr, 10) : (std::uint16_t)0 };
+                    out.back().methods.push_back({ std::string{ parts[0] }, std::string{ parts[1] }, acc });
+                }
                 break;
             case 'F':
                 if (parts.size() >= 3 && !out.empty())
-                    out.back().fields.push_back({ std::string{ parts[0] }, std::string{ parts[1] }, parts[2] == "1" });
+                {
+                    const std::uint16_t acc{ (std::uint16_t)std::strtoul(std::string{ parts[2] }.c_str(), nullptr, 10) };
+                    out.back().fields.push_back({ std::string{ parts[0] }, std::string{ parts[1] }, acc, (acc & 0x0008u) != 0 });
+                }
                 break;
             default: break;
             }
@@ -244,16 +251,20 @@ int main(int argc, char** argv)
             if (c.internal_name != name) continue;
             std::printf("{\"name\":\"%s\",\"methods\":[", json_escape(c.internal_name).c_str());
             for (std::size_t i = 0; i < c.methods.size(); ++i)
-                std::printf("%s{\"name\":\"%s\",\"descriptor\":\"%s\",\"signature\":\"%s\"}",
+                std::printf("%s{\"name\":\"%s\",\"descriptor\":\"%s\",\"signature\":\"%s\",\"modifiers\":\"%s\",\"access\":%u}",
                     i ? "," : "", json_escape(c.methods[i].name).c_str(),
                     json_escape(c.methods[i].descriptor).c_str(),
-                    json_escape(viewer::pretty_method(c.methods[i].descriptor)).c_str());
+                    json_escape(viewer::pretty_method(c.methods[i].descriptor)).c_str(),
+                    json_escape(viewer::access_modifiers(c.methods[i].access, true)).c_str(),
+                    (unsigned)c.methods[i].access);
             std::printf("],\"fields\":[");
             for (std::size_t i = 0; i < c.fields.size(); ++i)
-                std::printf("%s{\"name\":\"%s\",\"descriptor\":\"%s\",\"type\":\"%s\",\"static\":%s}",
+                std::printf("%s{\"name\":\"%s\",\"descriptor\":\"%s\",\"type\":\"%s\",\"modifiers\":\"%s\",\"access\":%u,\"static\":%s}",
                     i ? "," : "", json_escape(c.fields[i].name).c_str(),
                     json_escape(c.fields[i].descriptor).c_str(),
                     json_escape(viewer::pretty_field(c.fields[i].descriptor)).c_str(),
+                    json_escape(viewer::access_modifiers(c.fields[i].access, false)).c_str(),
+                    (unsigned)c.fields[i].access,
                     c.fields[i].is_static ? "true" : "false");
             std::printf("]}\n");
             return 0;

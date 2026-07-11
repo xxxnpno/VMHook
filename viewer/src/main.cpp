@@ -199,6 +199,14 @@ namespace
         ImGui::PopStyleColor();
     }
 
+    ImVec4 vis_color(std::uint16_t f)
+    {
+        if (f & 0x0001u) return ImVec4(0.52f, 0.82f, 0.56f, 1.0f);  // public
+        if (f & 0x0002u) return ImVec4(0.90f, 0.52f, 0.52f, 1.0f);  // private
+        if (f & 0x0004u) return ImVec4(0.92f, 0.74f, 0.42f, 1.0f);  // protected
+        return ImVec4(0.62f, 0.63f, 0.70f, 1.0f);                   // package-private
+    }
+
     void copy_menu(const char* id, const std::string& primary, const std::string& secondary = {})
     {
         if (ImGui::BeginPopupContextItem(id))
@@ -379,9 +387,10 @@ namespace
         ImGui::Text("Methods (%zu)", c.methods.size());
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##mf", "filter methods", g_method_filter, sizeof(g_method_filter));
-        if (ImGui::BeginTable("mt", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
+        if (ImGui::BeginTable("mt", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
         {
-            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+            ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 118.0f);
             ImGui::TableSetupColumn(g_pretty ? "Signature" : "Descriptor", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();
@@ -393,6 +402,10 @@ namespace
                 ImGui::PushID(&m);
                 ImGui::TextUnformatted(m.name.c_str());
                 copy_menu("m", m.name, m.descriptor);
+                ImGui::TableNextColumn();
+                ImGui::PushStyleColor(ImGuiCol_Text, vis_color(m.access));
+                ImGui::TextUnformatted(viewer::access_modifiers(m.access, true).c_str());
+                ImGui::PopStyleColor();
                 ImGui::TableNextColumn();
                 const std::string sig{ g_pretty ? viewer::pretty_method(m.descriptor, g_full_names) : m.descriptor };
                 ImGui::TextUnformatted(sig.c_str());
@@ -412,9 +425,9 @@ namespace
         ImGui::InputTextWithHint("##ff", "filter fields", g_field_filter, sizeof(g_field_filter));
         if (ImGui::BeginTable("ft", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
         {
-            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+            ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 118.0f);
             ImGui::TableSetupColumn(g_pretty ? "Type" : "Descriptor", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Static", ImGuiTableColumnFlags_WidthFixed, 52.0f);
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();
             const std::string ff{ g_field_filter };
@@ -426,11 +439,13 @@ namespace
                 ImGui::TextUnformatted(f.name.c_str());
                 copy_menu("f", f.name, f.descriptor);
                 ImGui::TableNextColumn();
+                ImGui::PushStyleColor(ImGuiCol_Text, vis_color(f.access));
+                ImGui::TextUnformatted(viewer::access_modifiers(f.access, false).c_str());
+                ImGui::PopStyleColor();
+                ImGui::TableNextColumn();
                 const std::string ty{ g_pretty ? viewer::pretty_field(f.descriptor, g_full_names) : f.descriptor };
                 ImGui::TextUnformatted(ty.c_str());
                 if (g_pretty && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", f.descriptor.c_str());
-                ImGui::TableNextColumn();
-                if (f.is_static) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.72f,1,1)); ImGui::TextUnformatted("static"); ImGui::PopStyleColor(); }
                 ImGui::PopID();
             }
             ImGui::EndTable();

@@ -2,11 +2,36 @@
 // and "Ljava/lang/String;" into "String".  Pure string logic, no dependencies.
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
 namespace viewer
 {
+    // JVM access flags -> "public static final" etc.
+    inline auto access_modifiers(std::uint16_t f, bool method) -> std::string
+    {
+        std::string s;
+        if      (f & 0x0001u) s += "public ";
+        else if (f & 0x0002u) s += "private ";
+        else if (f & 0x0004u) s += "protected ";
+        if (f & 0x0008u) s += "static ";
+        if (f & 0x0010u) s += "final ";
+        if (method)
+        {
+            if (f & 0x0400u) s += "abstract ";
+            if (f & 0x0100u) s += "native ";
+            if (f & 0x0020u) s += "synchronized ";
+        }
+        else
+        {
+            if (f & 0x0040u) s += "volatile ";
+            if (f & 0x0080u) s += "transient ";
+        }
+        if (!s.empty()) s.pop_back();
+        return s;
+    }
+
     inline auto pretty_one_type(std::string_view d, std::size_t& i, bool full = false) -> std::string
     {
         int arrays{ 0 };
