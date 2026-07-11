@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -280,10 +281,22 @@ namespace
         }
     }
 
-    // Stream up to 200 live instances of `classname`, each with its declared
-    // instance (non-static) field values.
-    void stream_instances(HANDLE pipe, const std::string& classname)
+    // Stream up to `max` live instances of `arg` ("classname" or
+    // "classname\t<max>"), each with its declared instance (non-static) field
+    // values.  `max` is viewer-driven (the scan-cap control); default 200.
+    void stream_instances(HANDLE pipe, const std::string& arg)
     {
+        std::string classname{ arg };
+        std::size_t max_scan{ 200 };
+        if (const std::size_t tab{ arg.find('\t') }; tab != std::string::npos)
+        {
+            classname = arg.substr(0, tab);
+            if (const unsigned long long m{ std::strtoull(arg.c_str() + tab + 1, nullptr, 10) }; m > 0ull)
+            {
+                max_scan = static_cast<std::size_t>(m);
+            }
+        }
+
         pipe_writer writer{ pipe };
         vmhook::hotspot::klass* const k{ vmhook::find_class(classname) };
         if (!k || !vmhook::hotspot::is_valid_pointer(k))
@@ -323,7 +336,7 @@ namespace
                 writer.put("\n");
             }
             ++count;
-        }, 200);
+        }, max_scan);
 
         writer.put("DONE\t");
         writer.put(std::to_string(count));

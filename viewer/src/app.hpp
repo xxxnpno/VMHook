@@ -378,6 +378,7 @@ namespace viewer
         std::string               inst_message{};
         std::string               inst_class{};    // internal name being inspected
         std::vector<InstanceInfo> instances;
+        int                       inst_cap{ 1000 }; // max instances the payload scans
 
         App()
         {
@@ -544,7 +545,8 @@ namespace viewer
 
         void run_instances(const std::string& classname)
         {
-            write_request("INST\t" + classname);
+            const int cap{ inst_cap > 0 ? inst_cap : 1000 };
+            write_request("INST\t" + classname + "\t" + std::to_string(cap));
 
             HANDLE pipe{ CreateNamedPipeW(
                 k_pipe_name, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,

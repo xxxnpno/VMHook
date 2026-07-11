@@ -72,26 +72,35 @@ public class ExampleApp
 
     enum Color { RED, GREEN, BLUE }
 
+    // Keep many live instances alive (a real heap has more than one) so the
+    // viewer's instance inspector has rows to sort / filter — each mutates every tick.
+    static final List<ExampleApp> live = new ArrayList<>();
+
     // ── entry point (runs forever so it stays attachable) ────────────────────
     public static void main(String[] args) throws Exception
     {
-        ExampleApp app = new ExampleApp(1, "main");
-        Greeter    g   = who -> "Hello, " + who + "!";
+        Greeter g = who -> "Hello, " + who + "!";
         scores.put("player", 100);
+        for (int n = 0; n < 40; n++) live.add(new ExampleApp(n, "worker-" + n));
 
         System.out.println("[ExampleApp] JVM up — attach the vmhook viewer to this process.");
-        System.out.println(g.greet("vmhook") + " color=" + defaultColor + " inner=" + app.inner.doubleIt(21));
+        System.out.println(g.greet("vmhook") + " color=" + defaultColor
+                           + " instances=" + live.size());
 
         long i = 0;
         while (true)
         {
             ExampleApp.tick();
-            // Mutate the live instance's own fields so the viewer shows them change.
-            app.ticks  = (int) i;
-            app.label  = "main#" + i;
-            app.active = (i % 2 == 0);
+            // Mutate every live instance's own fields so the viewer shows them change.
+            for (int n = 0; n < live.size(); n++)
+            {
+                ExampleApp a = live.get(n);
+                a.ticks  = (int) (i + n);
+                a.label  = "worker-" + n + "#" + i;
+                a.active = ((i + n) % 2 == 0);
+                a.compute((int) i, ratio);
+            }
             history[(int) (i % history.length)] = i;
-            app.compute((int) i, ratio);
             Thread.sleep(1000);
             i++;
         }

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -251,6 +252,7 @@ namespace
     bool         g_instances_live{ true };   // auto-refresh the instances window
     bool         g_instances_refresh_now{ false };  // force an immediate re-scan
     std::string  g_instances_class;          // internal name shown in the window
+    char         g_instance_filter[128]{};   // substring filter over the instance rows
     bool         g_focus_search{ false };
     int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
     int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
@@ -1121,6 +1123,52 @@ namespace
     // Floating window listing the live heap instances of a class (one row per
     // instance: heap address + one column per declared instance field, cells =
     // field values).  Auto-refreshes while "Live" so values update in real time.
+    // Case-insensitive substring test (needle must already be lower-cased).
+    bool contains_ci(const std::string& hay, const std::string& lower_needle)
+    {
+        if (lower_needle.empty())            return true;
+        if (lower_needle.size() > hay.size()) return false;
+        std::string h;
+        h.reserve(hay.size());
+        for (char c : hay) h.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        return h.find(lower_needle) != std::string::npos;
+    }
+
+    // Compare two field-value strings numerically when BOTH parse as a full
+    // number (so ticks 9 < 10, not "10" < "9"), else lexicographically.
+    int cmp_num_or_str(const std::string& x, const std::string& y)
+    {
+        auto as_num = [](const std::string& s, double& out) -> bool
+        {
+            if (s.empty() || s == "null") return false;
+            char* end{ nullptr };
+            out = std::strtod(s.c_str(), &end);
+            return end != nullptr && *end == '\0';
+        };
+        double nx{}, ny{};
+        if (as_num(x, nx) && as_num(y, ny)) return nx < ny ? -1 : nx > ny ? 1 : 0;
+        const int c{ x.compare(y) };
+        return c < 0 ? -1 : c > 0 ? 1 : 0;
+    }
+
+    // Order two instances by table column `col` (0=#, 1=Address, 2+=field).
+    int cmp_instance(const viewer::InstanceInfo& A, const viewer::InstanceInfo& B,
+                     int col, int ia, int ib)
+    {
+        if (col <= 0) return ia < ib ? -1 : ia > ib ? 1 : 0;
+        if (col == 1)
+        {
+            const unsigned long long x{ std::strtoull(A.address.c_str(), nullptr, 16) };
+            const unsigned long long y{ std::strtoull(B.address.c_str(), nullptr, 16) };
+            return x < y ? -1 : x > y ? 1 : 0;
+        }
+        static const std::string empty{};
+        const int fi{ col - 2 };
+        const std::string& xs{ fi < (int)A.fields.size() ? A.fields[(std::size_t)fi].second : empty };
+        const std::string& ys{ fi < (int)B.fields.size() ? B.fields[(std::size_t)fi].second : empty };
+        return cmp_num_or_str(xs, ys);
+    }
+
     void draw_instances_window(viewer::App& app)
     {
         ImGui::SetNextWindowSize(ImVec2(em(58.0f), em(32.0f)), ImGuiCond_FirstUseEver);
@@ -1153,6 +1201,13 @@ namespace
 
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%s", app.inst_message.c_str());
+        if (app.inst_cap > 0 && (int)app.instances.size() >= app.inst_cap)
+        {
+            ImGui::SameLine(0.0f, em(0.6f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.75f, 0.35f, 1.0f));
+            ImGui::TextUnformatted("scan cap reached — raise it to see more");
+            ImGui::PopStyleColor();
+        }
 
         // Columns = the class's declared instance (non-static) fields.
         std::vector<const viewer::FieldInfo*> cols;
@@ -1163,6 +1218,41 @@ namespace
                 if (!f.is_static) cols.push_back(&f);
         }
 
+        // Row: substring filter (address or any value) + the heap-scan cap.
+        ImGui::SetNextItemWidth((std::max)(ImGui::GetContentRegionAvail().x - em(9.3f), em(6.0f)));
+        ImGui::InputTextWithHint("##ifilter", ICON_FA_SEARCH "  Filter instances",
+                                 g_instance_filter, sizeof(g_instance_filter));
+        ImGui::SameLine(0.0f, em(0.6f));
+        ImGui::SetNextItemWidth(em(8.5f));
+        int cap{ app.inst_cap };
+        if (ImGui::DragInt("##icap", &cap, 10.0f, 20, 200000, "cap %d"))
+        {
+            app.inst_cap = std::clamp(cap, 20, 200000);
+            g_instances_refresh_now = true;  // re-scan with the new cap
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Max instances to scan for on the heap (drag or double-click to edit)");
+
+        // Display order: filter first, then sort by the table's sort spec.
+        std::string needle{ g_instance_filter };
+        for (char& ch : needle) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        std::vector<int> view;
+        view.reserve(app.instances.size());
+        for (int i = 0; i < (int)app.instances.size(); ++i)
+        {
+            if (needle.empty()) { view.push_back(i); continue; }
+            const viewer::InstanceInfo& in{ app.instances[(std::size_t)i] };
+            bool hit{ contains_ci(in.address, needle) };
+            for (const auto& fv : in.fields) if (!hit && contains_ci(fv.second, needle)) hit = true;
+            if (hit) view.push_back(i);
+        }
+        if (!needle.empty())
+        {
+            ImGui::SameLine(0.0f, em(0.6f));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("%d / %d", (int)view.size(), (int)app.instances.size());
+        }
+
         ImGui::Separator();
         if (app.instances.empty())
         {
@@ -1171,20 +1261,38 @@ namespace
         }
         else if (ImGui::BeginTable("instances", 2 + (int)cols.size(),
                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                     ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable))
+                     ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable |
+                     ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti))
         {
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, em(2.6f));
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort, em(2.8f));
             ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, em(11.0f));
             for (const viewer::FieldInfo* f : cols)
                 ImGui::TableSetupColumn(f->name.c_str(), ImGuiTableColumnFlags_WidthFixed, em(11.0f));
             ImGui::TableSetupScrollFreeze(2, 1);
             ImGui::TableHeadersRow();
 
-            ImGuiListClipper clip;
-            clip.Begin((int)app.instances.size());
-            while (clip.Step())
-                for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r)
+            if (ImGuiTableSortSpecs* ss{ ImGui::TableGetSortSpecs() }; ss && ss->SpecsCount > 0)
+            {
+                std::stable_sort(view.begin(), view.end(), [&](int a, int b)
                 {
+                    for (int s = 0; s < ss->SpecsCount; ++s)
+                    {
+                        const ImGuiTableColumnSortSpecs& sp{ ss->Specs[s] };
+                        const int c{ cmp_instance(app.instances[(std::size_t)a], app.instances[(std::size_t)b],
+                                                  sp.ColumnIndex, a, b) };
+                        if (c != 0)
+                            return sp.SortDirection == ImGuiSortDirection_Ascending ? c < 0 : c > 0;
+                    }
+                    return a < b;
+                });
+            }
+
+            ImGuiListClipper clip;
+            clip.Begin((int)view.size());
+            while (clip.Step())
+                for (int vr = clip.DisplayStart; vr < clip.DisplayEnd; ++vr)
+                {
+                    const int r{ view[(std::size_t)vr] };
                     const viewer::InstanceInfo& inst{ app.instances[(std::size_t)r] };
                     ImGui::TableNextRow();
                     ImGui::PushID(r);
