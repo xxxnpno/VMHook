@@ -89,7 +89,12 @@ TOOLS = [
     },
     {
         "name": "get_class",
-        "description": "Get the declared methods and fields of one class (by internal '/'-separated name) from a JVM's cached enumeration. Each member includes the raw JVM descriptor and a pretty signature.",
+        "description": (
+            "Get one class (by internal '/'-separated name) from a JVM's cached enumeration: its "
+            "superclass, 'kind' (class/interface/enum/abstract/annotation/record), raw class access "
+            "flags, and every declared method and field. Each member has the raw JVM descriptor, a "
+            "pretty signature/type, human-readable modifiers, and the numeric access flags."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
