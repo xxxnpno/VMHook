@@ -31,6 +31,27 @@ Typical flow: `list_jvms` → pick a pid → `enumerate_jvm(pid)` → then
 **live heap** directly (not the cache), so it reflects the current object state
 on every call.
 
+### Example — live heap + statics
+
+The same commands the MCP tools shell out to (JSON on one line, wrapped here):
+
+```
+$ vmhook_cli list
+[{"pid":15352,"image":"java.exe","cmdline":"…com.example.demo.ExampleApp"}]
+
+$ vmhook_cli instances 15352 com/example/demo/ExampleApp$Worker 2
+{"pid":15352,"class":"…$Worker","instances":[
+  {"address":"0x60F44D7F8","fields":{"seq":"0","team":"\"team-0\"","id":"0",
+   "ticks":"325","active":"false","inner":"<com/example/demo/ExampleApp$Inner>"}}, … ]}
+
+$ vmhook_cli statics 15352 com/example/demo/ExampleApp
+{"pid":15352,"class":"…","statics":{"APP_NAME":"\"vmhook demo\"","ratio":"1.500000",
+  "tickCounter":"188","defaultColor":"<…$Color>","scores":"<java/util/HashMap>"}}
+```
+
+A `<internal/name>` value is an object reference; a `"…"` value is a String; the
+rest are primitives.
+
 ## Setup
 
 1. Build the viewer (which also builds `vmhook_cli.exe` + `vmhook_payload.dll`):
