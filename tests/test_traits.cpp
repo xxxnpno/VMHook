@@ -155,8 +155,8 @@ static_assert(std::is_same_v<vmhook::jni::value, vmhook::detail::jni_value>,
 // These are non-template, non-overloaded - take their address and check the type.
 // If the wrapper signature ever drifts from the underlying detail function, the
 // types won't match and this fires at compile time.
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::find_class), std::string_view>,
-              "vmhook::jni::find_class must accept string_view and return void* (jclass handle)");
+static_assert(std::is_invocable_r_v<void*, decltype(vmhook::find_class), std::string_view>,
+              "vmhook::find_class must accept string_view and return void* (jclass handle)");
 static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::decode_object), void*>,
               "vmhook::jni::decode_object must take a jobject and return the decoded oop");
 static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::new_string_utf), std::string_view>,
@@ -172,7 +172,7 @@ static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::get_object_clas
 // against the underlying detail::jni_signature_for_arg lives in
 // test_helpers.cpp where we can call it at runtime.  Here we just confirm the
 // wrapper exists and the return type matches.
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<int>()), std::string>,
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>,
               "signature_for_arg<T> must return std::string");
 
 // -----------------------------------------------------------------------------
@@ -777,10 +777,10 @@ static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::decode_object),
               "jni::decode_object(jobject) -> void*");
 static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::oop_handle), void*, void*&>,
               "jni::oop_handle(oop, storage&) -> void*");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::find_class), std::string_view>,
+static_assert(std::is_invocable_r_v<void*, decltype(vmhook::find_class), std::string_view>,
               "jni::find_class(name) -> void*");
 static_assert(std::is_invocable_r_v<vmhook::hotspot::klass*,
-                  decltype(vmhook::jni::find_class_with_context_loader), std::string_view>,
+                  decltype(vmhook::find_class), std::string_view>,
               "jni::find_class_with_context_loader(name) -> klass*");
 static_assert(std::is_invocable_r_v<void, decltype(vmhook::jni::exception_clear)>,
               "jni::exception_clear() -> void");
@@ -820,23 +820,23 @@ static_assert(std::is_invocable_r_v<std::string, decltype(vmhook::jni::get_strin
 // (the VALUE table is in test_helpers.cpp; here we pin the return type uniformly
 // across the whole accepted set — primitives, wide ints, string spellings, and a
 // registered-or-not wrapper, which all resolve to std::string at the type level).
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<bool>()),               std::string>, "sig<bool> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<std::int8_t>()),        std::string>, "sig<int8> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<std::uint8_t>()),       std::string>, "sig<uint8> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<std::int16_t>()),       std::string>, "sig<int16> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<std::uint16_t>()),      std::string>, "sig<uint16> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<std::int32_t>()),       std::string>, "sig<int32> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<std::int64_t>()),       std::string>, "sig<int64> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<std::uint64_t>()),      std::string>, "sig<uint64> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<float>()),              std::string>, "sig<float> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<double>()),             std::string>, "sig<double> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<std::string>()),        std::string>, "sig<string> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<std::string_view>()),   std::string>, "sig<string_view> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<const char*>()),        std::string>, "sig<const char*> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<char*>()),              std::string>, "sig<char*> -> string");
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<std::unique_ptr<zoo::wrapper_a>>()), std::string>, "sig<unique_ptr<wrapper>> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<bool>()),               std::string>, "sig<bool> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::int8_t>()),        std::string>, "sig<int8> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::uint8_t>()),       std::string>, "sig<uint8> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::int16_t>()),       std::string>, "sig<int16> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::uint16_t>()),      std::string>, "sig<uint16> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::int32_t>()),       std::string>, "sig<int32> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::int64_t>()),       std::string>, "sig<int64> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::uint64_t>()),      std::string>, "sig<uint64> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<float>()),              std::string>, "sig<float> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<double>()),             std::string>, "sig<double> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::string>()),        std::string>, "sig<string> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::string_view>()),   std::string>, "sig<string_view> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<const char*>()),        std::string>, "sig<const char*> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<char*>()),              std::string>, "sig<char*> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::unique_ptr<zoo::wrapper_a>>()), std::string>, "sig<unique_ptr<wrapper>> -> string");
 // And the public wrapper forwards to the detail implementation (same type).
-static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<int>()),
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<int>()),
                              decltype(vmhook::detail::jni_signature_for_arg<int>())>,
               "jni::signature_for_arg<T> return type matches detail::jni_signature_for_arg<T>");
 
@@ -1112,12 +1112,12 @@ int main()
     // signature_for_arg branches: these never touch the JVM (the wrapper branches
     // do; we avoid those here).  Matches the authoritative table in
     // test_helpers.cpp but proves the traits-target binary agrees.
-    check("signature_for_arg<bool> == Z",    vmhook::jni::signature_for_arg<bool>() == "Z");
-    check("signature_for_arg<int32_t> == I", vmhook::jni::signature_for_arg<std::int32_t>() == "I");
-    check("signature_for_arg<int64_t> == J", vmhook::jni::signature_for_arg<std::int64_t>() == "J");
-    check("signature_for_arg<double> == D",  vmhook::jni::signature_for_arg<double>() == "D");
+    check("signature_for_arg<bool> == Z",    vmhook::detail::jni_signature_for_arg<bool>() == "Z");
+    check("signature_for_arg<int32_t> == I", vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I");
+    check("signature_for_arg<int64_t> == J", vmhook::detail::jni_signature_for_arg<std::int64_t>() == "J");
+    check("signature_for_arg<double> == D",  vmhook::detail::jni_signature_for_arg<double>() == "D");
     check("signature_for_arg<string> == Ljava/lang/String;",
-          vmhook::jni::signature_for_arg<std::string>() == "Ljava/lang/String;");
+          vmhook::detail::jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
 
     // -------------------------------------------------------------------------
     // ADDITIVE runtime tally — unified_call_syntax no-JVM surface.

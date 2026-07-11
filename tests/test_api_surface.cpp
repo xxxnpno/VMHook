@@ -623,11 +623,11 @@ namespace matrix
 
     // jni::make_unique<T>(const string&, args...) — the JNI sibling factory.
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::make_unique<fx::plain_w>(std::declval<const std::string&>())),
+                      decltype(vmhook::make_unique<fx::plain_w>(std::declval<const std::string&>())),
                       std::unique_ptr<fx::plain_w>>,
                   "jni::make_unique<T>(const string&)");
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::make_unique<fx::ntd_w>(
+                      decltype(vmhook::make_unique<fx::ntd_w>(
                           std::declval<const std::string&>(), 1, 2.0, false)),
                       std::unique_ptr<fx::ntd_w>>,
                   "jni::make_unique<T>(const string&, args...) over a non-trivial-dtor wrapper");
@@ -1176,12 +1176,12 @@ namespace matrix
     // ===== GROUP 18 — jni:: forwarder ARGUMENT-CATEGORY MATRIX ===============
     // The extended file pins each jni:: forwarder's exact signature once; here
     // we widen the STRING-argument categories on the string-taking forwarders.
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::find_class), const char*>,
+    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::find_class), const char*>,
                   "jni::find_class(const char*)");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::find_class), std::string>,
+    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::find_class), std::string>,
                   "jni::find_class(std::string)");
     static_assert(std::is_invocable_r_v<klass*,
-                                        decltype(&vmhook::jni::find_class_with_context_loader),
+                                        decltype(&vmhook::find_class),
                                         std::string_view>,
                   "jni::find_class_with_context_loader(string_view)");
     static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::new_string_utf), const char*>,
@@ -1195,7 +1195,7 @@ namespace matrix
     // hook detour parameter or make_unique ctor arg could carry.
     template<typename T>
     inline constexpr bool sig_for_arg_string_v =
-        std::is_same_v<decltype(vmhook::jni::signature_for_arg<T>()), std::string>;
+        std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<T>()), std::string>;
     static_assert(sig_for_arg_string_v<bool>,            "signature_for_arg<bool>");
     static_assert(sig_for_arg_string_v<std::int8_t>,     "signature_for_arg<int8>");
     static_assert(sig_for_arg_string_v<std::int16_t>,    "signature_for_arg<int16>");
@@ -1573,13 +1573,13 @@ static auto run_extra_noop_checks() -> void
         try
         {
             // find_class over const char* / std::string / std::string_view / "".
-            const void* fc_cstr{ vmhook::jni::find_class("java/lang/String") };
-            const void* fc_str { vmhook::jni::find_class(std::string{ "java/util/List" }) };
-            const void* fc_sv  { vmhook::jni::find_class(std::string_view{ "java/lang/Object" }) };
-            const void* fc_empty{ vmhook::jni::find_class("") };
+            const void* fc_cstr{ vmhook::find_class("java/lang/String") };
+            const void* fc_str { vmhook::find_class(std::string{ "java/util/List" }) };
+            const void* fc_sv  { vmhook::find_class(std::string_view{ "java/lang/Object" }) };
+            const void* fc_empty{ vmhook::find_class("") };
             // find_class_with_context_loader -> Klass* (null with no JVM).
             const vmhook::hotspot::klass* fccl{
-                vmhook::jni::find_class_with_context_loader(std::string_view{ "java/lang/Thread" }) };
+                vmhook::find_class(std::string_view{ "java/lang/Thread" }) };
             // new_string_utf over const char* / std::string / "".
             const void* ns_cstr{ vmhook::jni::new_string_utf("hello") };
             const void* ns_str { vmhook::jni::new_string_utf(std::string{ "world" }) };
@@ -1636,18 +1636,18 @@ static auto run_extra_noop_checks() -> void
         bool sigs_ok{ false };
         try
         {
-            const std::string s_bool   { vmhook::jni::signature_for_arg<bool>() };
-            const std::string s_i8     { vmhook::jni::signature_for_arg<std::int8_t>() };
-            const std::string s_i16    { vmhook::jni::signature_for_arg<std::int16_t>() };
-            const std::string s_i32    { vmhook::jni::signature_for_arg<std::int32_t>() };
-            const std::string s_i64    { vmhook::jni::signature_for_arg<std::int64_t>() };
-            const std::string s_u16    { vmhook::jni::signature_for_arg<std::uint16_t>() };
-            const std::string s_char   { vmhook::jni::signature_for_arg<char16_t>() };
-            const std::string s_float  { vmhook::jni::signature_for_arg<float>() };
-            const std::string s_double { vmhook::jni::signature_for_arg<double>() };
-            const std::string s_str    { vmhook::jni::signature_for_arg<std::string>() };
-            const std::string s_cstr   { vmhook::jni::signature_for_arg<const char*>() };
-            const std::string s_sv     { vmhook::jni::signature_for_arg<std::string_view>() };
+            const std::string s_bool   { vmhook::detail::jni_signature_for_arg<bool>() };
+            const std::string s_i8     { vmhook::detail::jni_signature_for_arg<std::int8_t>() };
+            const std::string s_i16    { vmhook::detail::jni_signature_for_arg<std::int16_t>() };
+            const std::string s_i32    { vmhook::detail::jni_signature_for_arg<std::int32_t>() };
+            const std::string s_i64    { vmhook::detail::jni_signature_for_arg<std::int64_t>() };
+            const std::string s_u16    { vmhook::detail::jni_signature_for_arg<std::uint16_t>() };
+            const std::string s_char   { vmhook::detail::jni_signature_for_arg<char16_t>() };
+            const std::string s_float  { vmhook::detail::jni_signature_for_arg<float>() };
+            const std::string s_double { vmhook::detail::jni_signature_for_arg<double>() };
+            const std::string s_str    { vmhook::detail::jni_signature_for_arg<std::string>() };
+            const std::string s_cstr   { vmhook::detail::jni_signature_for_arg<const char*>() };
+            const std::string s_sv     { vmhook::detail::jni_signature_for_arg<std::string_view>() };
             sigs_ok =
                 (s_bool == "Z") && (s_i8 == "B") && (s_i16 == "S") && (s_i32 == "I")
                 && (s_i64 == "J") && (s_u16 == "C") && (s_char == "C")

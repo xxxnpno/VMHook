@@ -1534,16 +1534,16 @@ int main()
                   make_unique_is_null_and_safe<plain_wrapper>(true, c_arg, c16_arg, 7, ll_arg));
         }
 
-        // (f) vmhook::jni::signature_for_arg<T>() (the public forwarding twin)
+        // (f) vmhook::detail::jni_signature_for_arg<T>() (the public forwarding twin)
         // routes to the SAME jni_signature_for_arg, so it MUST agree letter-for-
         // letter on the native ladder — pin the equivalence so a future divergence
         // of the two entry points is caught here, no JVM needed.
         check("H_signature_for_arg_agrees_char",
-              vmhook::jni::signature_for_arg<char>() == vmhook::detail::jni_signature_for_arg<char>());
+              vmhook::detail::jni_signature_for_arg<char>() == vmhook::detail::jni_signature_for_arg<char>());
         check("H_signature_for_arg_agrees_long",
-              vmhook::jni::signature_for_arg<long>() == vmhook::detail::jni_signature_for_arg<long>());
+              vmhook::detail::jni_signature_for_arg<long>() == vmhook::detail::jni_signature_for_arg<long>());
         check("H_signature_for_arg_agrees_char16",
-              vmhook::jni::signature_for_arg<char16_t>() == vmhook::detail::jni_signature_for_arg<char16_t>());
+              vmhook::detail::jni_signature_for_arg<char16_t>() == vmhook::detail::jni_signature_for_arg<char16_t>());
     }
 
     // =====================================================================

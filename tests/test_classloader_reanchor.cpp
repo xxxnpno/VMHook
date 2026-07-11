@@ -175,7 +175,7 @@ namespace
     // ---- ADDITIVE deepening (section 13) no-throw probes ---------------------
     // The remaining no-JVM-observable entry points of the classloader_reanchor
     // feature beyond the four already covered above: the public JNI context-
-    // loader resolver (vmhook::jni::find_class_with_context_loader), the
+    // loader resolver (vmhook::find_class), the
     // HotSpot-internal find_class consumer that override/evict actually steer
     // (vmhook::find_class), and the detail:: host-classloader-inheritance
     // machinery (klass_to_class_loader_oop / capture_host_classloader_klass /
@@ -187,7 +187,7 @@ namespace
     // before the pointer is touched.
     auto ctx_loader_never_throws(std::string_view name) -> bool
     {
-        try { (void)vmhook::jni::find_class_with_context_loader(name); return true; }
+        try { (void)vmhook::find_class(name); return true; }
         catch (...) { return false; }
     }
     auto find_class_never_throws(std::string_view name) -> bool
@@ -963,7 +963,7 @@ int main()
     //     exercised above.  Three further entry points are part of this
     //     feature per the header (vmhook.hpp):
     //
-    //       * vmhook::jni::find_class_with_context_loader(name)  (~13620)
+    //       * vmhook::find_class(name)  (~13620)
     //           -> detail::jni_find_class_with_context_loader (~12173), which
     //           short-circuits to nullptr on !ensure_current_java_thread()
     //           (~12176).  Public, noexcept, klass*.
@@ -990,10 +990,10 @@ int main()
 
     // ---- 13a. Compile-time signature / return-type / noexcept contracts -----
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::find_class_with_context_loader(std::string_view{})),
+                      decltype(vmhook::find_class(std::string_view{})),
                       vmhook::hotspot::klass*>,
                   "find_class_with_context_loader must return vmhook::hotspot::klass*");
-    static_assert(noexcept(vmhook::jni::find_class_with_context_loader(std::string_view{})),
+    static_assert(noexcept(vmhook::find_class(std::string_view{})),
                   "find_class_with_context_loader must be noexcept");
     static_assert(std::is_same_v<
                       decltype(vmhook::find_class(std::string_view{})),
@@ -1035,15 +1035,15 @@ int main()
         for (const auto& n : names)
         {
             const std::string_view sv{ n.data(), n.size() };
-            if (vmhook::jni::find_class_with_context_loader(sv) != nullptr) { all_null = false; }
+            if (vmhook::find_class(sv) != nullptr) { all_null = false; }
             if (!ctx_loader_never_throws(sv))                              { none_threw = false; }
         }
         check("ctx_loader_all_names_null_no_jvm", all_null);
         check("ctx_loader_no_throw_all_shapes", none_threw);
         check("ctx_loader_empty_name_null",
-              vmhook::jni::find_class_with_context_loader("") == nullptr);
+              vmhook::find_class("") == nullptr);
         check("ctx_loader_default_string_view_null",
-              vmhook::jni::find_class_with_context_loader(std::string_view{}) == nullptr);
+              vmhook::find_class(std::string_view{}) == nullptr);
         check("ctx_loader_does_not_grow_cache", cache_size() == before);
     }
 
@@ -1169,7 +1169,7 @@ int main()
             {
                 for (int i{ 0 }; i < iterations; ++i)
                 {
-                    if (vmhook::jni::find_class_with_context_loader("java/lang/Object") != nullptr)
+                    if (vmhook::find_class("java/lang/Object") != nullptr)
                     {
                         ++resolved[static_cast<std::size_t>(t)];
                     }
@@ -1215,13 +1215,13 @@ int main()
         check("cold_ensure_current_java_thread_still_false",
               vmhook::hotspot::ensure_current_java_thread() == false);
         check("cold_ctx_loader_object_null",
-              vmhook::jni::find_class_with_context_loader("java/lang/Object") == nullptr);
+              vmhook::find_class("java/lang/Object") == nullptr);
         check("cold_ctx_loader_app_null",
-              vmhook::jni::find_class_with_context_loader("com/example/App") == nullptr);
+              vmhook::find_class("com/example/App") == nullptr);
         check("cold_ctx_loader_array_null",
-              vmhook::jni::find_class_with_context_loader("[Ljava/lang/Object;") == nullptr);
+              vmhook::find_class("[Ljava/lang/Object;") == nullptr);
         check("cold_ctx_loader_dotted_null",
-              vmhook::jni::find_class_with_context_loader("java.lang.Object") == nullptr);
+              vmhook::find_class("java.lang.Object") == nullptr);
         // Host latch must still be unpublished after these cold calls (the
         // resolver never reaches capture without a JVM).
         check("cold_host_latch_unpublished",
@@ -1248,7 +1248,7 @@ int main()
         bool none_threw{ true };
         for (const char* n : fallback_names)
         {
-            if (vmhook::jni::find_class_with_context_loader(n) != nullptr) { all_null = false; }
+            if (vmhook::find_class(n) != nullptr) { all_null = false; }
             if (!ctx_loader_never_throws(n))                               { none_threw = false; }
         }
         check("fallback_cascade_all_null_no_jvm", all_null);
@@ -1277,7 +1277,7 @@ int main()
         {
             for (const char* n : cycle)
             {
-                if (vmhook::jni::find_class_with_context_loader(n) != nullptr) { stable = false; }
+                if (vmhook::find_class(n) != nullptr) { stable = false; }
             }
         }
         check("loader_switch_repeat_stable_null", stable);
@@ -1300,7 +1300,7 @@ int main()
                 {
                     for (const char* n : cycle)
                     {
-                        if (vmhook::jni::find_class_with_context_loader(n) != nullptr)
+                        if (vmhook::find_class(n) != nullptr)
                         {
                             nonnull_hits.fetch_add(1, std::memory_order_relaxed);
                         }
@@ -1324,7 +1324,7 @@ int main()
     {
         using ctx_loader_fn_t = vmhook::hotspot::klass*(*)(std::string_view) noexcept;
         static_assert(std::is_same_v<
-                          decltype(&vmhook::jni::find_class_with_context_loader),
+                          decltype(&vmhook::find_class),
                           ctx_loader_fn_t>,
                       "find_class_with_context_loader must be klass*(string_view) noexcept");
         static_assert(std::is_same_v<

@@ -170,7 +170,7 @@ static auto find_class_noexcept(std::string_view n) -> bool
 
 static auto jni_find_class_noexcept(std::string_view n) -> bool
 {
-    try { (void)vmhook::jni::find_class(n); return true; }
+    try { (void)vmhook::find_class(n); return true; }
     catch (...) { return false; }
 }
 
@@ -205,9 +205,9 @@ auto main() -> int
 
     // JNI sibling: same null contract on '$'-names.
     check("jni::find_class(host) noexcept",   jni_find_class_noexcept(k_host));
-    check("jni::find_class(host) == nullptr", vmhook::jni::find_class(k_host) == nullptr);
-    check("jni::find_class(static) == nullptr", vmhook::jni::find_class(k_static) == nullptr);
-    check("jni::find_class(inner) == nullptr", vmhook::jni::find_class(k_inner) == nullptr);
+    check("jni::find_class(host) == nullptr", vmhook::find_class(k_host) == nullptr);
+    check("jni::find_class(static) == nullptr", vmhook::find_class(k_static) == nullptr);
+    check("jni::find_class(inner) == nullptr", vmhook::find_class(k_inner) == nullptr);
 
     // Override + evict cycle on a '$'-name: an override seed with a rejected-
     // by-is_valid_pointer sentinel must be evicted by find_class without

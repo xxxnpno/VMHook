@@ -666,24 +666,24 @@ namespace wave21
         // cannot diverge on any branch.
         {
             const bool parity{
-                   vmhook::jni::signature_for_arg<std::string>()    == vmhook::detail::jni_signature_for_arg<std::string>()
-                && vmhook::jni::signature_for_arg<bool>()           == vmhook::detail::jni_signature_for_arg<bool>()
-                && vmhook::jni::signature_for_arg<std::uint16_t>()  == vmhook::detail::jni_signature_for_arg<std::uint16_t>()
-                && vmhook::jni::signature_for_arg<char16_t>()       == vmhook::detail::jni_signature_for_arg<char16_t>()
-                && vmhook::jni::signature_for_arg<char>()           == vmhook::detail::jni_signature_for_arg<char>()
-                && vmhook::jni::signature_for_arg<std::int32_t>()   == vmhook::detail::jni_signature_for_arg<std::int32_t>()
-                && vmhook::jni::signature_for_arg<std::int64_t>()   == vmhook::detail::jni_signature_for_arg<std::int64_t>()
-                && vmhook::jni::signature_for_arg<float>()          == vmhook::detail::jni_signature_for_arg<float>()
-                && vmhook::jni::signature_for_arg<double>()         == vmhook::detail::jni_signature_for_arg<double>() };
+                   vmhook::detail::jni_signature_for_arg<std::string>()    == vmhook::detail::jni_signature_for_arg<std::string>()
+                && vmhook::detail::jni_signature_for_arg<bool>()           == vmhook::detail::jni_signature_for_arg<bool>()
+                && vmhook::detail::jni_signature_for_arg<std::uint16_t>()  == vmhook::detail::jni_signature_for_arg<std::uint16_t>()
+                && vmhook::detail::jni_signature_for_arg<char16_t>()       == vmhook::detail::jni_signature_for_arg<char16_t>()
+                && vmhook::detail::jni_signature_for_arg<char>()           == vmhook::detail::jni_signature_for_arg<char>()
+                && vmhook::detail::jni_signature_for_arg<std::int32_t>()   == vmhook::detail::jni_signature_for_arg<std::int32_t>()
+                && vmhook::detail::jni_signature_for_arg<std::int64_t>()   == vmhook::detail::jni_signature_for_arg<std::int64_t>()
+                && vmhook::detail::jni_signature_for_arg<float>()          == vmhook::detail::jni_signature_for_arg<float>()
+                && vmhook::detail::jni_signature_for_arg<double>()         == vmhook::detail::jni_signature_for_arg<double>() };
             check("wave21_signature_for_arg_parity_across_all_branch_families", parity);
         }
         // And pin the concrete value through the PUBLIC entry on the two most
         // surprising rows so a re-export drift is caught by value, not just by
         // self-comparison: uint16->"C", char->"B".
         check("wave21_public_export_uint16_value_is_C",
-              vmhook::jni::signature_for_arg<std::uint16_t>() == "C");
+              vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C");
         check("wave21_public_export_char_value_is_B",
-              vmhook::jni::signature_for_arg<char>() == "B");
+              vmhook::detail::jni_signature_for_arg<char>() == "B");
     }
 } // namespace wave21
 
@@ -852,14 +852,14 @@ namespace wave23
         // on the sizeof-keyed generic arm either.  All compile-time-safe types.
         {
             const bool parity{
-                   vmhook::jni::signature_for_arg<signed char>()    == vmhook::detail::jni_signature_for_arg<signed char>()
-                && vmhook::jni::signature_for_arg<unsigned char>()  == vmhook::detail::jni_signature_for_arg<unsigned char>()
-                && vmhook::jni::signature_for_arg<short>()          == vmhook::detail::jni_signature_for_arg<short>()
-                && vmhook::jni::signature_for_arg<unsigned short>() == vmhook::detail::jni_signature_for_arg<unsigned short>()
-                && vmhook::jni::signature_for_arg<char32_t>()       == vmhook::detail::jni_signature_for_arg<char32_t>()
-                && vmhook::jni::signature_for_arg<std::int8_t>()    == vmhook::detail::jni_signature_for_arg<std::int8_t>()
-                && vmhook::jni::signature_for_arg<std::uint8_t>()   == vmhook::detail::jni_signature_for_arg<std::uint8_t>()
-                && vmhook::jni::signature_for_arg<std::int16_t>()   == vmhook::detail::jni_signature_for_arg<std::int16_t>() };
+                   vmhook::detail::jni_signature_for_arg<signed char>()    == vmhook::detail::jni_signature_for_arg<signed char>()
+                && vmhook::detail::jni_signature_for_arg<unsigned char>()  == vmhook::detail::jni_signature_for_arg<unsigned char>()
+                && vmhook::detail::jni_signature_for_arg<short>()          == vmhook::detail::jni_signature_for_arg<short>()
+                && vmhook::detail::jni_signature_for_arg<unsigned short>() == vmhook::detail::jni_signature_for_arg<unsigned short>()
+                && vmhook::detail::jni_signature_for_arg<char32_t>()       == vmhook::detail::jni_signature_for_arg<char32_t>()
+                && vmhook::detail::jni_signature_for_arg<std::int8_t>()    == vmhook::detail::jni_signature_for_arg<std::int8_t>()
+                && vmhook::detail::jni_signature_for_arg<std::uint8_t>()   == vmhook::detail::jni_signature_for_arg<std::uint8_t>()
+                && vmhook::detail::jni_signature_for_arg<std::int16_t>()   == vmhook::detail::jni_signature_for_arg<std::int16_t>() };
             check("wave23_signature_for_arg_parity_integral_rows", parity);
         }
     }
@@ -2188,29 +2188,29 @@ int main()
     }
 
     // ---- public jni::signature_for_arg == detail::jni_signature_for_arg ------
-    // The public re-export vmhook::jni::signature_for_arg<T> (vmhook.hpp:11219)
+    // The public re-export vmhook::detail::jni_signature_for_arg<T> (vmhook.hpp:11219)
     // forwards verbatim to detail::jni_signature_for_arg<T>; assert byte-
     // identical output across a representative spread so the two entry points
     // can never diverge.
     check("signature_for_arg_parity_string",
-          vmhook::jni::signature_for_arg<std::string>()
+          vmhook::detail::jni_signature_for_arg<std::string>()
               == vmhook::detail::jni_signature_for_arg<std::string>());
     check("signature_for_arg_parity_bool",
-          vmhook::jni::signature_for_arg<bool>()
+          vmhook::detail::jni_signature_for_arg<bool>()
               == vmhook::detail::jni_signature_for_arg<bool>());
     check("signature_for_arg_parity_uint16_C",
-          vmhook::jni::signature_for_arg<std::uint16_t>()
+          vmhook::detail::jni_signature_for_arg<std::uint16_t>()
               == vmhook::detail::jni_signature_for_arg<std::uint16_t>());
     check("signature_for_arg_parity_uint16_value_is_C",
-          vmhook::jni::signature_for_arg<std::uint16_t>() == "C");
+          vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C");
     check("signature_for_arg_parity_int64_J",
-          vmhook::jni::signature_for_arg<std::int64_t>()
+          vmhook::detail::jni_signature_for_arg<std::int64_t>()
               == vmhook::detail::jni_signature_for_arg<std::int64_t>());
     check("signature_for_arg_parity_double_D",
-          vmhook::jni::signature_for_arg<double>()
+          vmhook::detail::jni_signature_for_arg<double>()
               == vmhook::detail::jni_signature_for_arg<double>());
     check("signature_for_arg_parity_const_char_ptr_String",
-          vmhook::jni::signature_for_arg<const char*>()
+          vmhook::detail::jni_signature_for_arg<const char*>()
               == vmhook::detail::jni_signature_for_arg<const char*>());
 
     // ---- jni_signature_for_arg<T>: class-map wrapper resolution (flaw #5) ----
@@ -3211,16 +3211,16 @@ int main()
               == "(BLjava/lang/String;I)V");
 
     // ---- public re-export parity on the new char rows ------------------------
-    // vmhook::jni::signature_for_arg forwards verbatim, so it must agree on the
+    // vmhook::detail::jni_signature_for_arg forwards verbatim, so it must agree on the
     // character types too — pin parity on the genuinely-new branches.
     check("signature_for_arg_parity_char_B",
-          vmhook::jni::signature_for_arg<char>()
+          vmhook::detail::jni_signature_for_arg<char>()
               == vmhook::detail::jni_signature_for_arg<char>());
     check("signature_for_arg_parity_char16_C",
-          vmhook::jni::signature_for_arg<char16_t>()
+          vmhook::detail::jni_signature_for_arg<char16_t>()
               == vmhook::detail::jni_signature_for_arg<char16_t>());
     check("signature_for_arg_parity_char16_value_is_C",
-          vmhook::jni::signature_for_arg<char16_t>() == "C");
+          vmhook::detail::jni_signature_for_arg<char16_t>() == "C");
 
     // ---- field descriptor: object names whose BYTES collide with tokens ------
     // The object-name scanner consumes everything up to the FIRST ';' verbatim,
@@ -3652,10 +3652,10 @@ int main()
     // narrow type so the re-export is exercised end-to-end into the width helper.
     check("public_export_emit_to_width_int64_is_8",
           vmhook::detail::jvm_primitive_byte_width(
-              vmhook::jni::signature_for_arg<std::int64_t>()) == 8);
+              vmhook::detail::jni_signature_for_arg<std::int64_t>()) == 8);
     check("public_export_emit_to_width_uint16_C_is_2",
           vmhook::detail::jvm_primitive_byte_width(
-              vmhook::jni::signature_for_arg<std::uint16_t>()) == 2);
+              vmhook::detail::jni_signature_for_arg<std::uint16_t>()) == 2);
 
     // =====================================================================
     // EXHAUSTIVE PASS 10 -- additive coverage of inputs/relations NOT reached
@@ -4159,17 +4159,17 @@ int main()
     // value types -- and each comparison is value-vs-value (no narrowing).
     {
         const bool parity_all{
-               vmhook::jni::signature_for_arg<bool>()          == vmhook::detail::jni_signature_for_arg<bool>()
-            && vmhook::jni::signature_for_arg<std::int8_t>()   == vmhook::detail::jni_signature_for_arg<std::int8_t>()
-            && vmhook::jni::signature_for_arg<std::uint8_t>()  == vmhook::detail::jni_signature_for_arg<std::uint8_t>()
-            && vmhook::jni::signature_for_arg<std::int16_t>()  == vmhook::detail::jni_signature_for_arg<std::int16_t>()
-            && vmhook::jni::signature_for_arg<std::uint16_t>() == vmhook::detail::jni_signature_for_arg<std::uint16_t>()
-            && vmhook::jni::signature_for_arg<std::int32_t>()  == vmhook::detail::jni_signature_for_arg<std::int32_t>()
-            && vmhook::jni::signature_for_arg<std::uint32_t>() == vmhook::detail::jni_signature_for_arg<std::uint32_t>()
-            && vmhook::jni::signature_for_arg<std::int64_t>()  == vmhook::detail::jni_signature_for_arg<std::int64_t>()
-            && vmhook::jni::signature_for_arg<std::uint64_t>() == vmhook::detail::jni_signature_for_arg<std::uint64_t>()
-            && vmhook::jni::signature_for_arg<float>()         == vmhook::detail::jni_signature_for_arg<float>()
-            && vmhook::jni::signature_for_arg<double>()        == vmhook::detail::jni_signature_for_arg<double>() };
+               vmhook::detail::jni_signature_for_arg<bool>()          == vmhook::detail::jni_signature_for_arg<bool>()
+            && vmhook::detail::jni_signature_for_arg<std::int8_t>()   == vmhook::detail::jni_signature_for_arg<std::int8_t>()
+            && vmhook::detail::jni_signature_for_arg<std::uint8_t>()  == vmhook::detail::jni_signature_for_arg<std::uint8_t>()
+            && vmhook::detail::jni_signature_for_arg<std::int16_t>()  == vmhook::detail::jni_signature_for_arg<std::int16_t>()
+            && vmhook::detail::jni_signature_for_arg<std::uint16_t>() == vmhook::detail::jni_signature_for_arg<std::uint16_t>()
+            && vmhook::detail::jni_signature_for_arg<std::int32_t>()  == vmhook::detail::jni_signature_for_arg<std::int32_t>()
+            && vmhook::detail::jni_signature_for_arg<std::uint32_t>() == vmhook::detail::jni_signature_for_arg<std::uint32_t>()
+            && vmhook::detail::jni_signature_for_arg<std::int64_t>()  == vmhook::detail::jni_signature_for_arg<std::int64_t>()
+            && vmhook::detail::jni_signature_for_arg<std::uint64_t>() == vmhook::detail::jni_signature_for_arg<std::uint64_t>()
+            && vmhook::detail::jni_signature_for_arg<float>()         == vmhook::detail::jni_signature_for_arg<float>()
+            && vmhook::detail::jni_signature_for_arg<double>()        == vmhook::detail::jni_signature_for_arg<double>() };
         check("signature_for_arg_parity_whole_primitive_set", parity_all);
     }
 

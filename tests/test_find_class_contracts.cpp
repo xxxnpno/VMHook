@@ -5,8 +5,8 @@
 //   vmhook::find_class_via_oop(anchor_oop, class_name)     -> klass*  (null on null anchor)
 //   vmhook::override_class_lookup(name, klass*)            -> void    (seeds the cache)
 //   vmhook::evict_class_lookup(name)                       -> void    (forgets a cache entry)
-//   vmhook::jni::find_class(class_name)                    -> void*   (null w/o JVM)
-//   vmhook::jni::find_class_with_context_loader(name)      -> klass*  (null w/o JVM)
+//   vmhook::find_class(class_name)                    -> void*   (null w/o JVM)
+//   vmhook::find_class(name)      -> klass*  (null w/o JVM)
 //   vmhook::get_class_methods(class_name)                  -> vector  (empty w/o JVM)
 //   vmhook::get_class_methods<T>()                         -> vector  (empty w/o JVM)
 //   vmhook::find_methods_by_signature<T>(desc)            -> vector  (empty w/o JVM)
@@ -140,12 +140,12 @@ namespace
     // even *try*; these helpers double as documentation of the noexcept claim).
     auto jni_find_class_never_throws(std::string_view name) -> bool
     {
-        try { (void)vmhook::jni::find_class(name); return true; }
+        try { (void)vmhook::find_class(name); return true; }
         catch (...) { return false; }
     }
     auto jni_find_class_ctx_never_throws(std::string_view name) -> bool
     {
-        try { (void)vmhook::jni::find_class_with_context_loader(name); return true; }
+        try { (void)vmhook::find_class(name); return true; }
         catch (...) { return false; }
     }
     auto find_class_via_oop_null_never_throws(std::string_view name) -> bool
@@ -175,8 +175,8 @@ namespace
             if (fc1 != nullptr) { return false; }
             if (fc2 != nullptr) { return false; }
             if (fc1 != fc2)     { return false; }                 // determinism
-            if (vmhook::jni::find_class(name) != nullptr) { return false; }
-            if (vmhook::jni::find_class_with_context_loader(name) != nullptr) { return false; }
+            if (vmhook::find_class(name) != nullptr) { return false; }
+            if (vmhook::find_class(name) != nullptr) { return false; }
             if (vmhook::find_class_via_oop(nullptr, name) != nullptr) { return false; }
             if (!vmhook::get_class_methods(name).empty()) { return false; }
             return true;
@@ -244,11 +244,11 @@ int main()
     static_assert(std::is_same_v<decltype(vmhook::find_class(std::string_view{})),
                                  vmhook::hotspot::klass*>,
                   "find_class must return vmhook::hotspot::klass*");
-    static_assert(std::is_same_v<decltype(vmhook::jni::find_class(std::string_view{})),
+    static_assert(std::is_same_v<decltype(vmhook::find_class(std::string_view{})),
                                  void*>,
                   "jni::find_class must return void* (a JNI handle)");
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::find_class_with_context_loader(std::string_view{})),
+                      decltype(vmhook::find_class(std::string_view{})),
                       vmhook::hotspot::klass*>,
                   "jni::find_class_with_context_loader must return klass*");
     static_assert(std::is_same_v<
@@ -642,7 +642,7 @@ int main()
     }
 
     // ---------------------------------------------------------------------
-    // 8. vmhook::jni::find_class(name): public JNI FindClass wrapper.  With no
+    // 8. vmhook::find_class(name): public JNI FindClass wrapper.  With no
     //    JVM, jni_find_class returns nullptr (ensure_current_java_thread false)
     //    for every name.  This is a DISTINCT path from the HotSpot-internal
     //    find_class and is pinned separately, including the empty name.
@@ -663,7 +663,7 @@ int main()
         bool none_threw{ true };
         for (const char* n : names)
         {
-            if (vmhook::jni::find_class(n) != nullptr) { all_null = false; }
+            if (vmhook::find_class(n) != nullptr) { all_null = false; }
             if (!jni_find_class_never_throws(n))       { none_threw = false; }
         }
         check("jni_find_class_all_null_no_jvm", all_null);
@@ -671,11 +671,11 @@ int main()
         // Long name through the JNI wrapper too (it builds a std::string).
         const std::string long_name(8192, 'q');
         check("jni_find_class_long_name_null",
-              vmhook::jni::find_class(long_name) == nullptr);
+              vmhook::find_class(long_name) == nullptr);
     }
 
     // ---------------------------------------------------------------------
-    // 9. vmhook::jni::find_class_with_context_loader(name): the full fallback
+    // 9. vmhook::find_class(name): the full fallback
     //    helper, called DIRECTLY.  With no JVM it bails at the
     //    ensure_current_java_thread() gate and returns nullptr for every name,
     //    including array names and the empty name — never crashing despite the
@@ -696,7 +696,7 @@ int main()
         bool none_threw{ true };
         for (const char* n : names)
         {
-            if (vmhook::jni::find_class_with_context_loader(n) != nullptr) { all_null = false; }
+            if (vmhook::find_class(n) != nullptr) { all_null = false; }
             if (!jni_find_class_ctx_never_throws(n))                       { none_threw = false; }
         }
         check("jni_find_class_with_context_loader_all_null_no_jvm", all_null);
@@ -723,8 +723,8 @@ int main()
         for (const char* n : names)
         {
             const bool fc_null  { vmhook::find_class(n) == nullptr };
-            const bool jni_null { vmhook::jni::find_class(n) == nullptr };
-            const bool ctx_null { vmhook::jni::find_class_with_context_loader(n) == nullptr };
+            const bool jni_null { vmhook::find_class(n) == nullptr };
+            const bool ctx_null { vmhook::find_class(n) == nullptr };
             const bool oop_null { vmhook::find_class_via_oop(nullptr, n) == nullptr };
             const bool m_empty  { vmhook::get_class_methods(n).empty() };
             if (!(fc_null && jni_null && ctx_null && oop_null && m_empty))
@@ -1359,7 +1359,7 @@ int main()
             const std::string other{ "noise/Name/" + std::to_string(i) };
             (void)vmhook::find_class(other);
             vmhook::override_class_lookup(other, nullptr);
-            (void)vmhook::jni::find_class(other);
+            (void)vmhook::find_class(other);
             vmhook::evict_class_lookup(other);
             const auto again{ vmhook::find_class(probe) };
             if (again != baseline) { stable = false; }           // both null
@@ -1377,9 +1377,9 @@ int main()
         for (const char* s : shapes)
         {
             if (vmhook::find_class(s) != vmhook::find_class(s)) { idempotent = false; }
-            if (vmhook::jni::find_class(s) != vmhook::jni::find_class(s)) { idempotent = false; }
-            if (vmhook::jni::find_class_with_context_loader(s)
-                != vmhook::jni::find_class_with_context_loader(s)) { idempotent = false; }
+            if (vmhook::find_class(s) != vmhook::find_class(s)) { idempotent = false; }
+            if (vmhook::find_class(s)
+                != vmhook::find_class(s)) { idempotent = false; }
         }
         check("find_class_entry_points_idempotent_per_name", idempotent);
     }
@@ -1641,8 +1641,8 @@ int main()
         for (const std::string_view e : empties)
         {
             if (vmhook::find_class(e) != nullptr) { all_empty_null = false; }
-            if (vmhook::jni::find_class(e) != nullptr) { all_empty_null = false; }
-            if (vmhook::jni::find_class_with_context_loader(e) != nullptr) { all_empty_null = false; }
+            if (vmhook::find_class(e) != nullptr) { all_empty_null = false; }
+            if (vmhook::find_class(e) != nullptr) { all_empty_null = false; }
             if (vmhook::find_class_via_oop(nullptr, e) != nullptr) { all_empty_null = false; }
             if (!vmhook::get_class_methods(e).empty()) { all_empty_null = false; }
         }
@@ -1976,11 +1976,11 @@ int main()
             const std::string_view sv{ &c, 1 };
             try
             {
-                void* const h1{ vmhook::jni::find_class(sv) };
-                void* const h2{ vmhook::jni::find_class(sv) };
+                void* const h1{ vmhook::find_class(sv) };
+                void* const h2{ vmhook::find_class(sv) };
                 if (h1 != nullptr) { jni_single_byte_null = false; }
                 if (h1 != h2)      { jni_single_byte_stable = false; }   // both null
-                if (vmhook::jni::find_class_with_context_loader(sv) != nullptr)
+                if (vmhook::find_class(sv) != nullptr)
                 {
                     ctx_single_byte_null = false;
                 }
@@ -2006,8 +2006,8 @@ int main()
         for (const char* n : array_descs)
         {
             const bool internal_null{ vmhook::find_class(n) == nullptr };
-            const bool jni_null{ vmhook::jni::find_class(n) == nullptr };
-            const bool ctx_null{ vmhook::jni::find_class_with_context_loader(n) == nullptr };
+            const bool jni_null{ vmhook::find_class(n) == nullptr };
+            const bool ctx_null{ vmhook::find_class(n) == nullptr };
             if (!(internal_null && jni_null && ctx_null)) { channels_agree = false; }
         }
         check("find_class_internal_and_jni_channels_agree_arrays_null", channels_agree);
@@ -2104,17 +2104,17 @@ int main()
         //          (calls into the graph walk which can throw internally; the
         //          empirical never-throws-in-practice contract is exercised by
         //          the runtime try/catch helpers above).
-        //        * vmhook::jni::find_class (~13612)            — noexcept.
-        //        * vmhook::jni::find_class_with_context_loader (~13620) — noexcept.
+        //        * vmhook::find_class (~13612)            — noexcept.
+        //        * vmhook::find_class (~13620) — noexcept.
         //        * vmhook::find_class_via_oop (~13774)        — noexcept.
         //        * override_class_lookup (~13876)              — noexcept.
         //        * evict_class_lookup (~13894)                 — noexcept.
         static_assert(!noexcept(vmhook::find_class(std::string_view{})),
                       "vmhook::find_class is not declared noexcept (characterization)");
-        static_assert(noexcept(vmhook::jni::find_class(std::string_view{})),
-                      "vmhook::jni::find_class must be noexcept");
-        static_assert(noexcept(vmhook::jni::find_class_with_context_loader(std::string_view{})),
-                      "vmhook::jni::find_class_with_context_loader must be noexcept");
+        static_assert(noexcept(vmhook::find_class(std::string_view{})),
+                      "vmhook::find_class must be noexcept");
+        static_assert(noexcept(vmhook::find_class(std::string_view{})),
+                      "vmhook::find_class must be noexcept");
         static_assert(noexcept(vmhook::find_class_via_oop(nullptr, std::string_view{})),
                       "vmhook::find_class_via_oop must be noexcept");
         static_assert(noexcept(vmhook::override_class_lookup(std::string_view{},
@@ -2169,8 +2169,8 @@ int main()
             // Tier 2: the public JNI FindClass wrapper (void* channel).
             try
             {
-                void* const h1{ vmhook::jni::find_class(n) };
-                void* const h2{ vmhook::jni::find_class(n) };
+                void* const h1{ vmhook::find_class(n) };
+                void* const h2{ vmhook::find_class(n) };
                 if (h1 != nullptr) { tier2_all_null = false; }
                 if (h1 != h2)      { tier2_stable = false; }
             }
@@ -2178,8 +2178,8 @@ int main()
             // Tier 3: the context-loader fallback helper (klass* channel).
             try
             {
-                const auto c1{ vmhook::jni::find_class_with_context_loader(n) };
-                const auto c2{ vmhook::jni::find_class_with_context_loader(n) };
+                const auto c1{ vmhook::find_class(n) };
+                const auto c2{ vmhook::find_class(n) };
                 if (c1 != nullptr) { tier3_all_null = false; }
                 if (c1 != c2)      { tier3_stable = false; }
             }
@@ -2202,8 +2202,8 @@ int main()
         for (const char* n : bad16)
         {
             const bool t1{ vmhook::find_class(n) == nullptr };
-            const bool t2{ vmhook::jni::find_class(n) == nullptr };
-            const bool t3{ vmhook::jni::find_class_with_context_loader(n) == nullptr };
+            const bool t2{ vmhook::find_class(n) == nullptr };
+            const bool t3{ vmhook::find_class(n) == nullptr };
             if (!(t1 && t2 && t3)) { per_name_all_three_null = false; }
         }
         check("ledger_fallback_per_name_all_three_tiers_null", per_name_all_three_null);

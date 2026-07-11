@@ -2073,15 +2073,15 @@ int main()
         // jni::signature_for_arg is a thin delegate (13712-13715) — byte-identical
         // to the detail mapping for a representative spread of types.
         check("signature_for_arg_delegates_string",
-              vmhook::jni::signature_for_arg<std::string>() == jni_signature_for_arg<std::string>());
+              vmhook::detail::jni_signature_for_arg<std::string>() == jni_signature_for_arg<std::string>());
         check("signature_for_arg_delegates_bool",
-              vmhook::jni::signature_for_arg<bool>() == jni_signature_for_arg<bool>());
+              vmhook::detail::jni_signature_for_arg<bool>() == jni_signature_for_arg<bool>());
         check("signature_for_arg_delegates_int64",
-              vmhook::jni::signature_for_arg<std::int64_t>() == jni_signature_for_arg<std::int64_t>());
+              vmhook::detail::jni_signature_for_arg<std::int64_t>() == jni_signature_for_arg<std::int64_t>());
         check("signature_for_arg_delegates_double",
-              vmhook::jni::signature_for_arg<double>() == jni_signature_for_arg<double>());
+              vmhook::detail::jni_signature_for_arg<double>() == jni_signature_for_arg<double>());
         check("signature_for_arg_delegates_char16_C",
-              vmhook::jni::signature_for_arg<char16_t>() == jni_signature_for_arg<char16_t>());
+              vmhook::detail::jni_signature_for_arg<char16_t>() == jni_signature_for_arg<char16_t>());
     }
 
     // ---------------------------------------------------------------------

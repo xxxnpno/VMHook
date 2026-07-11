@@ -1644,7 +1644,7 @@ int main()
         // Unregistered type, no ctor args.
         std::unique_ptr<registry_alpha> a{ reinterpret_cast<registry_alpha*>(0) };
         bool threw{ false };
-        try { a = vmhook::jni::make_unique<registry_alpha>(std::string{ "vmhook/test/ByName" }); }
+        try { a = vmhook::make_unique<registry_alpha>(std::string{ "vmhook/test/ByName" }); }
         catch (...) { threw = true; }
         check("R20_by_name_no_args_no_jvm_null", a == nullptr);
         check("R20_by_name_no_args_does_not_throw", !threw);
@@ -1655,7 +1655,7 @@ int main()
         // signature assembly instantiation, still nullptr (find_class fails).
         std::unique_ptr<factory_wrapper_with_ctor> w{ reinterpret_cast<factory_wrapper_with_ctor*>(0) };
         bool threw{ false };
-        try { w = vmhook::jni::make_unique<factory_wrapper_with_ctor>(std::string{ "vmhook/test/ByName2" }, 42, std::string{ "x" }); }
+        try { w = vmhook::make_unique<factory_wrapper_with_ctor>(std::string{ "vmhook/test/ByName2" }, 42, std::string{ "x" }); }
         catch (...) { threw = true; }
         check("R20_by_name_with_args_no_jvm_null", w == nullptr);
         check("R20_by_name_with_args_does_not_throw", !threw);
@@ -1668,7 +1668,7 @@ int main()
         register_in_maps<registry_gamma>("vmhook/test/ByName3");
         std::unique_ptr<registry_gamma> g{ reinterpret_cast<registry_gamma*>(0) };
         bool threw{ false };
-        try { g = vmhook::jni::make_unique<registry_gamma>(std::string{ "vmhook/test/ByName3" }); }
+        try { g = vmhook::make_unique<registry_gamma>(std::string{ "vmhook/test/ByName3" }); }
         catch (...) { threw = true; }
         check("R20_by_name_registered_no_jvm_null", g == nullptr);
         check("R20_by_name_registered_does_not_throw", !threw);
@@ -2191,11 +2191,11 @@ int main()
         bool ctx_loader_no_throw{ true };
         for (std::size_t i{ 0 }; i < names.size(); ++i)
         {
-            try { if (vmhook::jni::find_class(names[i]) != nullptr) { find_class_all_null = false; } }
+            try { if (vmhook::find_class(names[i]) != nullptr) { find_class_all_null = false; } }
             catch (...) { find_class_no_throw = false; }
             try
             {
-                if (vmhook::jni::find_class_with_context_loader(names[i]) != nullptr)
+                if (vmhook::find_class(names[i]) != nullptr)
                 {
                     ctx_loader_all_null = false;
                 }
@@ -2231,17 +2231,17 @@ int main()
         // detail::jni_signature_for_arg<T> (it forwards directly), so it is fully
         // deterministic with no JVM.  Pin a representative spread of tokens and
         // the wrapper forwarding identity for the read-side argument types.
-        check("J0_jni_sig_bool_Z", vmhook::jni::signature_for_arg<bool>() == "Z");
-        check("J0_jni_sig_int_I", vmhook::jni::signature_for_arg<std::int32_t>() == "I");
-        check("J0_jni_sig_long_J", vmhook::jni::signature_for_arg<std::int64_t>() == "J");
-        check("J0_jni_sig_double_D", vmhook::jni::signature_for_arg<double>() == "D");
-        check("J0_jni_sig_string", vmhook::jni::signature_for_arg<std::string>() == "Ljava/lang/String;");
+        check("J0_jni_sig_bool_Z", vmhook::detail::jni_signature_for_arg<bool>() == "Z");
+        check("J0_jni_sig_int_I", vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I");
+        check("J0_jni_sig_long_J", vmhook::detail::jni_signature_for_arg<std::int64_t>() == "J");
+        check("J0_jni_sig_double_D", vmhook::detail::jni_signature_for_arg<double>() == "D");
+        check("J0_jni_sig_string", vmhook::detail::jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
         check("J0_jni_sig_forwards_to_detail",
-              vmhook::jni::signature_for_arg<std::int32_t>()
+              vmhook::detail::jni_signature_for_arg<std::int32_t>()
               == vmhook::detail::jni_signature_for_arg<std::int32_t>());
         // An unregistered wrapper still falls back to Object through the forwarder.
         check("J0_jni_sig_unregistered_wrapper_object",
-              vmhook::jni::signature_for_arg<registry_unmapped>() == "Ljava/lang/Object;");
+              vmhook::detail::jni_signature_for_arg<registry_unmapped>() == "Ljava/lang/Object;");
     }
     {
         // Handle-taking forwarders whose slot resolves through jni_function: with
@@ -2353,14 +2353,14 @@ int main()
         // find_class_with_context_loader -> klass*, get_string_utf -> std::string,
         // signature_for_arg -> std::string.
         check("T0_jni_find_class_returns_void_ptr",
-              std::is_same_v<decltype(vmhook::jni::find_class(std::string_view{})), void*>);
+              std::is_same_v<decltype(vmhook::find_class(std::string_view{})), void*>);
         check("T0_jni_ctx_loader_returns_klass_ptr",
-              std::is_same_v<decltype(vmhook::jni::find_class_with_context_loader(std::string_view{})),
+              std::is_same_v<decltype(vmhook::find_class(std::string_view{})),
                              vmhook::hotspot::klass*>);
         check("T0_jni_get_string_utf_returns_string",
               std::is_same_v<decltype(vmhook::jni::get_string_utf(nullptr)), std::string>);
         check("T0_jni_signature_for_arg_returns_string",
-              std::is_same_v<decltype(vmhook::jni::signature_for_arg<int>()), std::string>);
+              std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>);
     }
 
     // =====================================================================

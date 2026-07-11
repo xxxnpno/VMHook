@@ -543,17 +543,17 @@ namespace surface_lock
     static_assert(std::is_union_v<vmhook::jni::value>,
                   "jni::value must be a union (the jvalue layout)");
 
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::find_class), std::string_view>,
+    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::find_class), std::string_view>,
                   "jni::find_class(string_view) must return void* (jclass handle)");
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::find_class(std::declval<std::string_view>())), void*>,
+                      decltype(vmhook::find_class(std::declval<std::string_view>())), void*>,
                   "jni::find_class must return void* exactly");
     static_assert(std::is_invocable_r_v<vmhook::hotspot::klass*,
-                                        decltype(&vmhook::jni::find_class_with_context_loader),
+                                        decltype(&vmhook::find_class),
                                         std::string_view>,
                   "jni::find_class_with_context_loader(string_view) must return klass*");
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::find_class_with_context_loader(
+                      decltype(vmhook::find_class(
                           std::declval<std::string_view>())),
                       vmhook::hotspot::klass*>,
                   "jni::find_class_with_context_loader must return klass* exactly (NOT void*)");
@@ -614,25 +614,25 @@ namespace surface_lock
                   "jni::function<index, fn_t>(void* env) must return the requested fn_t");
     // jni::signature_for_arg<T>() -> std::string  (compile-time descriptor table).
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::signature_for_arg<int>()), std::string>,
+                      decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>,
                   "jni::signature_for_arg<int>() must return std::string");
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::signature_for_arg<bool>()), std::string>,
+                      decltype(vmhook::detail::jni_signature_for_arg<bool>()), std::string>,
                   "jni::signature_for_arg<bool>() must return std::string");
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::signature_for_arg<double>()), std::string>,
+                      decltype(vmhook::detail::jni_signature_for_arg<double>()), std::string>,
                   "jni::signature_for_arg<double>() must return std::string");
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::signature_for_arg<std::string>()), std::string>,
+                      decltype(vmhook::detail::jni_signature_for_arg<std::string>()), std::string>,
                   "jni::signature_for_arg<std::string>() must return std::string");
     // jni::make_unique<T>(const string&, args...) -> unique_ptr<T>.
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::make_unique<dummy_wrapper>(
+                      decltype(vmhook::make_unique<dummy_wrapper>(
                           std::declval<const std::string&>())),
                       std::unique_ptr<dummy_wrapper>>,
                   "jni::make_unique<T>(const string&) must return unique_ptr<T>");
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::make_unique<dummy_wrapper>(
+                      decltype(vmhook::make_unique<dummy_wrapper>(
                           std::declval<const std::string&>(), 1, 2.0)),
                       std::unique_ptr<dummy_wrapper>>,
                   "jni::make_unique<T>(const string&, args...) must return unique_ptr<T>");

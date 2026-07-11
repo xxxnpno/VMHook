@@ -800,27 +800,27 @@ static auto test_return_value_set_nullptr_for_wrapper() -> void
 static auto test_jni_namespace_signature_for_arg() -> void
 {
     check("jni::signature_for_arg<bool> == 'Z'",
-          vmhook::jni::signature_for_arg<bool>() == "Z");
+          vmhook::detail::jni_signature_for_arg<bool>() == "Z");
     check("jni::signature_for_arg<int8_t> == 'B'",
-          vmhook::jni::signature_for_arg<std::int8_t>() == "B");
+          vmhook::detail::jni_signature_for_arg<std::int8_t>() == "B");
     check("jni::signature_for_arg<int16_t> == 'S'",
-          vmhook::jni::signature_for_arg<std::int16_t>() == "S");
+          vmhook::detail::jni_signature_for_arg<std::int16_t>() == "S");
     check("jni::signature_for_arg<uint16_t> == 'C'",
-          vmhook::jni::signature_for_arg<std::uint16_t>() == "C");
+          vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C");
     check("jni::signature_for_arg<int32_t> == 'I'",
-          vmhook::jni::signature_for_arg<std::int32_t>() == "I");
+          vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I");
     check("jni::signature_for_arg<int64_t> == 'J'",
-          vmhook::jni::signature_for_arg<std::int64_t>() == "J");
+          vmhook::detail::jni_signature_for_arg<std::int64_t>() == "J");
     check("jni::signature_for_arg<float> == 'F'",
-          vmhook::jni::signature_for_arg<float>() == "F");
+          vmhook::detail::jni_signature_for_arg<float>() == "F");
     check("jni::signature_for_arg<double> == 'D'",
-          vmhook::jni::signature_for_arg<double>() == "D");
+          vmhook::detail::jni_signature_for_arg<double>() == "D");
     check("jni::signature_for_arg<string> == 'Ljava/lang/String;'",
-          vmhook::jni::signature_for_arg<std::string>() == "Ljava/lang/String;");
+          vmhook::detail::jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
     check("jni::signature_for_arg<string_view> == 'Ljava/lang/String;'",
-          vmhook::jni::signature_for_arg<std::string_view>() == "Ljava/lang/String;");
+          vmhook::detail::jni_signature_for_arg<std::string_view>() == "Ljava/lang/String;");
     check("jni::signature_for_arg<const char*> == 'Ljava/lang/String;'",
-          vmhook::jni::signature_for_arg<const char*>() == "Ljava/lang/String;");
+          vmhook::detail::jni_signature_for_arg<const char*>() == "Ljava/lang/String;");
 
     // Cross-check that the wrapper returns the same string as the underlying
     // implementation it delegates to.  Catches accidental drift between the
@@ -829,13 +829,13 @@ static auto test_jni_namespace_signature_for_arg() -> void
     // lazily, so without this check the wrapper would just silently fall to
     // the default 'I' branch).
     check("jni::signature_for_arg<bool> matches detail::jni_signature_for_arg<bool>",
-          vmhook::jni::signature_for_arg<bool>()
+          vmhook::detail::jni_signature_for_arg<bool>()
           == vmhook::detail::jni_signature_for_arg<bool>());
     check("jni::signature_for_arg<string> matches detail::jni_signature_for_arg<string>",
-          vmhook::jni::signature_for_arg<std::string>()
+          vmhook::detail::jni_signature_for_arg<std::string>()
           == vmhook::detail::jni_signature_for_arg<std::string>());
     check("jni::signature_for_arg<int64_t> matches detail::jni_signature_for_arg<int64_t>",
-          vmhook::jni::signature_for_arg<std::int64_t>()
+          vmhook::detail::jni_signature_for_arg<std::int64_t>()
           == vmhook::detail::jni_signature_for_arg<std::int64_t>());
 }
 
@@ -2046,7 +2046,7 @@ static auto test_factory_registry_roundtrip() -> void
 
     // ---- The public jni:: wrapper must delegate without drift.
     check("registry_public_signature_for_arg_matches_detail",
-          vmhook::jni::signature_for_arg<registry_wrapper>()
+          vmhook::detail::jni_signature_for_arg<registry_wrapper>()
               == jni_signature_for_arg<registry_wrapper>());
 
     // ---- The stored factory builds a wrapper from a raw oop, and the wrapper
@@ -2105,7 +2105,7 @@ template <typename arg_type>
 static auto sig_pair_ok(const char* tag, std::string_view want) -> void
 {
     const std::string detail_sig{ vmhook::detail::jni_signature_for_arg<arg_type>() };
-    const std::string public_sig{ vmhook::jni::signature_for_arg<arg_type>() };
+    const std::string public_sig{ vmhook::detail::jni_signature_for_arg<arg_type>() };
     check(tag, detail_sig == want && public_sig == want && detail_sig == public_sig);
 }
 
