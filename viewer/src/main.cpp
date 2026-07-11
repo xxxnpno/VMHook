@@ -137,60 +137,64 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
 // ── style + fonts ─────────────────────────────────────────────────────────────
 namespace
 {
+    // Reworked theme: a deep, cohesive dark palette (inspired by the community
+    // "Moonlight" theme, github.com/Madam-Herta/Moonlight) with a modern blue
+    // accent and softer rounding.
     void apply_modern_style()
     {
         ImGuiStyle& s{ ImGui::GetStyle() };
-        // Rounding — consistent, soft.
-        s.WindowRounding = 8.0f; s.ChildRounding = 8.0f; s.FrameRounding = 6.0f;
-        s.PopupRounding = 8.0f; s.GrabRounding = 6.0f; s.ScrollbarRounding = 10.0f; s.TabRounding = 6.0f;
-        // Spacing / padding — roomier so controls breathe and line up.
-        s.WindowPadding = ImVec2(14, 12); s.FramePadding = ImVec2(11, 7);
-        s.ItemSpacing = ImVec2(9, 8); s.ItemInnerSpacing = ImVec2(8, 6); s.CellPadding = ImVec2(9, 5);
-        s.ScrollbarSize = 14.0f; s.GrabMinSize = 12.0f;
-        s.WindowBorderSize = 0.0f; s.FrameBorderSize = 1.0f; s.ChildBorderSize = 1.0f; s.PopupBorderSize = 1.0f;
+        // Rounding — softer, more modern.
+        s.WindowRounding = 10.0f; s.ChildRounding = 8.0f; s.FrameRounding = 8.0f;
+        s.PopupRounding = 8.0f; s.GrabRounding = 8.0f; s.ScrollbarRounding = 12.0f; s.TabRounding = 8.0f;
+        // Spacing / padding.
+        s.WindowPadding = ImVec2(14, 12); s.FramePadding = ImVec2(12, 7);
+        s.ItemSpacing = ImVec2(9, 8); s.ItemInnerSpacing = ImVec2(8, 6); s.CellPadding = ImVec2(10, 6);
+        s.ScrollbarSize = 13.0f; s.GrabMinSize = 11.0f;
+        s.WindowBorderSize = 0.0f; s.FrameBorderSize = 0.0f; s.ChildBorderSize = 1.0f; s.PopupBorderSize = 1.0f;
         s.SeparatorTextBorderSize = 2.0f; s.SeparatorTextPadding = ImVec2(20, 6);
         s.WindowTitleAlign = ImVec2(0.0f, 0.5f);
+        s.FrameBorderSize = 0.0f;
 
         ImVec4* c{ s.Colors };
-        const ImVec4 accent  { 0.26f, 0.56f, 0.96f, 1.00f };
-        const ImVec4 accentHi{ 0.34f, 0.63f, 1.00f, 1.00f };
-        c[ImGuiCol_Text]                 = ImVec4(0.92f, 0.93f, 0.96f, 1.00f);
-        c[ImGuiCol_TextDisabled]         = ImVec4(0.46f, 0.49f, 0.56f, 1.00f);
-        c[ImGuiCol_WindowBg]             = ImVec4(0.070f, 0.074f, 0.090f, 1.00f);
-        c[ImGuiCol_ChildBg]              = ImVec4(0.100f, 0.106f, 0.126f, 1.00f);
-        c[ImGuiCol_PopupBg]              = ImVec4(0.115f, 0.122f, 0.145f, 0.99f);
-        c[ImGuiCol_Border]               = ImVec4(1.00f, 1.00f, 1.00f, 0.090f);
+        const ImVec4 accent  { 0.26f, 0.55f, 0.98f, 1.00f };
+        const ImVec4 accentHi{ 0.42f, 0.66f, 1.00f, 1.00f };
+        c[ImGuiCol_Text]                 = ImVec4(0.93f, 0.94f, 0.97f, 1.00f);
+        c[ImGuiCol_TextDisabled]         = ImVec4(0.43f, 0.47f, 0.56f, 1.00f);
+        c[ImGuiCol_WindowBg]             = ImVec4(0.066f, 0.072f, 0.088f, 1.00f);
+        c[ImGuiCol_ChildBg]              = ImVec4(0.091f, 0.099f, 0.118f, 1.00f);
+        c[ImGuiCol_PopupBg]              = ImVec4(0.074f, 0.081f, 0.099f, 0.99f);
+        c[ImGuiCol_Border]               = ImVec4(0.145f, 0.158f, 0.190f, 1.00f);
         c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_FrameBg]              = ImVec4(0.155f, 0.165f, 0.200f, 1.00f);
-        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.200f, 0.215f, 0.260f, 1.00f);
-        c[ImGuiCol_FrameBgActive]        = ImVec4(0.230f, 0.250f, 0.310f, 1.00f);
-        c[ImGuiCol_TitleBg]              = ImVec4(0.08f, 0.09f, 0.11f, 1.00f);
+        c[ImGuiCol_FrameBg]              = ImVec4(0.120f, 0.132f, 0.162f, 1.00f);
+        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.160f, 0.176f, 0.216f, 1.00f);
+        c[ImGuiCol_FrameBgActive]        = ImVec4(0.190f, 0.210f, 0.256f, 1.00f);
+        c[ImGuiCol_TitleBg]              = ImVec4(0.055f, 0.061f, 0.075f, 1.00f);
         c[ImGuiCol_TitleBgActive]        = ImVec4(0.10f, 0.14f, 0.24f, 1.00f);
-        c[ImGuiCol_MenuBarBg]            = ImVec4(0.11f, 0.12f, 0.14f, 1.00f);
+        c[ImGuiCol_MenuBarBg]            = ImVec4(0.10f, 0.11f, 0.13f, 1.00f);
         c[ImGuiCol_ScrollbarBg]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.28f, 0.30f, 0.37f, 1.00f);
-        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.36f, 0.39f, 0.47f, 1.00f);
+        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.24f, 0.27f, 0.33f, 1.00f);
+        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.33f, 0.37f, 0.45f, 1.00f);
         c[ImGuiCol_ScrollbarGrabActive]  = accent;
         c[ImGuiCol_CheckMark]            = accentHi;
         c[ImGuiCol_SliderGrab]           = accent;
         c[ImGuiCol_SliderGrabActive]     = accentHi;
-        c[ImGuiCol_Button]               = ImVec4(0.22f, 0.43f, 0.80f, 1.00f);
-        c[ImGuiCol_ButtonHovered]        = ImVec4(0.28f, 0.53f, 0.94f, 1.00f);
-        c[ImGuiCol_ButtonActive]         = ImVec4(0.19f, 0.37f, 0.70f, 1.00f);
-        c[ImGuiCol_Header]               = ImVec4(0.22f, 0.42f, 0.74f, 0.55f);
-        c[ImGuiCol_HeaderHovered]        = ImVec4(0.25f, 0.47f, 0.82f, 0.75f);
-        c[ImGuiCol_HeaderActive]         = ImVec4(0.27f, 0.52f, 0.90f, 0.92f);
-        c[ImGuiCol_Separator]            = ImVec4(1.00f, 1.00f, 1.00f, 0.090f);
+        c[ImGuiCol_Button]               = ImVec4(0.20f, 0.42f, 0.86f, 1.00f);
+        c[ImGuiCol_ButtonHovered]        = ImVec4(0.26f, 0.52f, 0.98f, 1.00f);
+        c[ImGuiCol_ButtonActive]         = ImVec4(0.17f, 0.35f, 0.72f, 1.00f);
+        c[ImGuiCol_Header]               = ImVec4(0.20f, 0.40f, 0.78f, 0.55f);
+        c[ImGuiCol_HeaderHovered]        = ImVec4(0.23f, 0.46f, 0.86f, 0.72f);
+        c[ImGuiCol_HeaderActive]         = ImVec4(0.25f, 0.50f, 0.92f, 0.90f);
+        c[ImGuiCol_Separator]            = ImVec4(0.145f, 0.158f, 0.190f, 1.00f);
         c[ImGuiCol_SeparatorHovered]     = accent;
         c[ImGuiCol_SeparatorActive]      = accentHi;
         c[ImGuiCol_ResizeGrip]           = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
         c[ImGuiCol_ResizeGripHovered]    = accent;
         c[ImGuiCol_ResizeGripActive]     = accentHi;
-        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.140f, 0.150f, 0.185f, 1.00f);
-        c[ImGuiCol_TableBorderStrong]    = ImVec4(1.00f, 1.00f, 1.00f, 0.100f);
-        c[ImGuiCol_TableBorderLight]     = ImVec4(1.00f, 1.00f, 1.00f, 0.050f);
+        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.100f, 0.110f, 0.135f, 1.00f);
+        c[ImGuiCol_TableBorderStrong]    = ImVec4(1.00f, 1.00f, 1.00f, 0.080f);
+        c[ImGuiCol_TableBorderLight]     = ImVec4(1.00f, 1.00f, 1.00f, 0.040f);
         c[ImGuiCol_TableRowBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.00f, 1.00f, 1.00f, 0.022f);
+        c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.00f, 1.00f, 1.00f, 0.020f);
         c[ImGuiCol_TextSelectedBg]       = ImVec4(accent.x, accent.y, accent.z, 0.35f);
         c[ImGuiCol_TextLink]             = accentHi;  // the extends / field-type jump links
         c[ImGuiCol_NavHighlight]         = accent;
@@ -216,6 +220,7 @@ namespace
                 0xF002, 0xF002,  // magnifying-glass
                 0xF00D, 0xF00D,  // xmark
                 0xF059, 0xF059,  // circle-question
+                0xF060, 0xF061,  // arrow-left / arrow-right
                 0xF065, 0xF066,  // expand / compress
                 0xF068, 0xF068,  // minus
                 0xF1E6, 0xF1E6,  // plug
@@ -486,16 +491,6 @@ namespace
 
     void draw_toolbar(viewer::App& app)
     {
-        // brand — all toolbar text is frame-aligned so it sits centered against
-        // the combo/buttons on this row.
-        ImGui::AlignTextToFramePadding();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.72f, 1.0f, 1.0f));
-        ImGui::TextUnformatted("vmhook");
-        ImGui::PopStyleColor();
-        ImGui::SameLine(0.0f, em(0.4f));
-        row_label_disabled("viewer");
-        row_divider();
-
         // JVM label + adaptive combo (list auto-refreshes every 2s; no Refresh btn)
         row_label(ICON_FA_MUG_HOT "  JVM");
         ImGui::SameLine();
@@ -505,22 +500,26 @@ namespace
         if (app.selected_jvm >= 0 && app.selected_jvm < (int)app.jvms.size())
         {
             const auto& p{ app.jvms[(std::size_t)app.selected_jvm] };
-            preview = std::to_string(p.pid) + " — " + (p.command_line.empty() ? p.image_name : p.command_line);
+            preview = p.display_name + "  -  " + std::to_string(p.pid);
         }
         push_combo_style();
         ImGui::BeginDisabled(app.busy());  // don't swap JVM mid-attach
         const bool combo_open{ ImGui::BeginCombo("##jvm", preview.c_str()) };
-        // Full command line on hover — the preview/items clip long classpaths.
+        // Full command line on hover (the name/pid preview hides it).
         if (!combo_open && app.selected_jvm >= 0 && app.selected_jvm < (int)app.jvms.size() && ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", preview.c_str());
+        {
+            const auto& p{ app.jvms[(std::size_t)app.selected_jvm] };
+            ImGui::SetTooltip("%s", p.command_line.empty() ? p.image_name.c_str() : p.command_line.c_str());
+        }
         if (combo_open)
         {
             for (int i = 0; i < (int)app.jvms.size(); ++i)
             {
                 const auto& p{ app.jvms[(std::size_t)i] };
-                std::string item{ std::to_string(p.pid) + " — " + (p.command_line.empty() ? p.image_path.empty() ? p.image_name : p.image_path : p.command_line) };
+                std::string item{ p.display_name + "  -  " + std::to_string(p.pid) };
                 if (ImGui::Selectable(item.c_str(), app.selected_jvm == i)) app.selected_jvm = i;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", item.c_str());
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", p.command_line.empty() ? p.image_name.c_str() : p.command_line.c_str());
             }
             ImGui::EndCombo();
         }
@@ -865,15 +864,16 @@ namespace
         const viewer::ClassInfo& c{ app.classes[(std::size_t)g_selected_class] };
 
         // back / forward navigation (browser-style, pairs with `extends` jumps).
-        // Subtle frame-coloured buttons so they don't compete with Attach.
+        // Subtle frame-coloured square buttons with Font Awesome arrows.
+        const float navw{ ImGui::GetFrameHeight() };
         push_combo_style();
         ImGui::BeginDisabled(g_nav_back.empty());
-        if (ImGui::ArrowButton("##nav_back", ImGuiDir_Left)) nav_back();
+        if (ImGui::Button(ICON_FA_ARROW_L "##nav_back", ImVec2(navw, navw))) nav_back();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !g_nav_back.empty()) ImGui::SetTooltip("Back (Alt+Left)");
         ImGui::SameLine(0.0f, em(0.25f));
         ImGui::BeginDisabled(g_nav_fwd.empty());
-        if (ImGui::ArrowButton("##nav_fwd", ImGuiDir_Right)) nav_forward();
+        if (ImGui::Button(ICON_FA_ARROW_R "##nav_fwd", ImVec2(navw, navw))) nav_forward();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !g_nav_fwd.empty()) ImGui::SetTooltip("Forward (Alt+Right)");
         pop_combo_style();
@@ -1238,9 +1238,20 @@ namespace
         ImGui::SetNextWindowPos(vp->WorkPos);
         ImGui::SetNextWindowSize(vp->WorkSize);
         ImGui::Begin("root", nullptr,
-            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings);
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
         draw_toolbar(app);
+        // Drag the borderless window by the empty part of the top toolbar strip.
+        const float toolbar_bottom{ ImGui::GetCursorScreenPos().y };
+        if (g_hwnd && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            !ImGui::IsAnyItemHovered() && !ImGui::IsAnyItemActive() &&
+            ImGui::GetIO().MousePos.y >= vp->WorkPos.y && ImGui::GetIO().MousePos.y < toolbar_bottom)
+        {
+            ReleaseCapture();
+            SendMessageW(g_hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+            ImGui::GetIO().MouseDown[0] = false;  // the native move loop ate the button-up
+        }
         ImGui::Separator();
 
         // main split: left classes / right details, with a draggable splitter

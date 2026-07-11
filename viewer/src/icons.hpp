@@ -10,6 +10,8 @@
 // Tight glyph set (codepoint pairs) so the atlas only rasterizes what we use.
 #define ICON_FA_SEARCH   "\xef\x80\x82"  // U+F002 magnifying-glass
 #define ICON_FA_XMARK    "\xef\x80\x8d"  // U+F00D
+#define ICON_FA_ARROW_L  "\xef\x81\xa0"  // U+F060 arrow-left  (nav back)
+#define ICON_FA_ARROW_R  "\xef\x81\xa1"  // U+F061 arrow-right (nav forward)
 #define ICON_FA_EXPAND   "\xef\x81\xa5"  // U+F065 expand   (maximize)
 #define ICON_FA_COMPRESS "\xef\x81\xa6"  // U+F066 compress (restore)
 #define ICON_FA_MINUS    "\xef\x81\xa8"  // U+F068

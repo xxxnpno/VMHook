@@ -65,6 +65,7 @@ namespace viewer
         std::string   image_name;    // "javaw.exe"
         std::string   image_path;    // full path if resolvable
         std::string   command_line;  // e.g. "java -cp out com.example.demo.ExampleApp"
+        std::string   display_name;  // window title, else main class, else image name
     };
 
     enum class Status
@@ -202,6 +203,64 @@ namespace viewer
         return to_utf8(wide.c_str(), static_cast<int>(wide.size()));
     }
 
+    // Title of the process's first visible top-level window (empty for console
+    // apps, whose console window belongs to conhost, not the JVM).
+    inline auto resolve_window_title(std::uint32_t pid) -> std::string
+    {
+        struct ctx_t { std::uint32_t pid; std::string title; } ctx{ pid, {} };
+        EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL
+        {
+            auto* const c{ reinterpret_cast<ctx_t*>(lp) };
+            DWORD wpid{ 0 };
+            GetWindowThreadProcessId(hwnd, &wpid);
+            if (wpid == c->pid && IsWindowVisible(hwnd))
+            {
+                const int len{ GetWindowTextLengthW(hwnd) };
+                if (len > 0)
+                {
+                    std::wstring buf(static_cast<std::size_t>(len) + 1, L'\0');
+                    GetWindowTextW(hwnd, buf.data(), len + 1);
+                    buf.resize(static_cast<std::size_t>(len));
+                    std::string t{ to_utf8(buf.c_str()) };
+                    if (!t.empty()) { c->title = std::move(t); return FALSE; }
+                }
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        return ctx.title;
+    }
+
+    // A short, friendly name for a JVM: its window title if any, else the main
+    // class / jar (last command-line token that looks like one), else the image.
+    inline auto friendly_name(const JvmProcess& p) -> std::string
+    {
+        // Prefer a real window title, but skip console "titles" that are just the
+        // launching exe path (Windows sets those) — the main class reads cleaner.
+        if (std::string title{ resolve_window_title(p.pid) }; !title.empty())
+        {
+            const bool exe_path{ (title.find('\\') != std::string::npos || title.find('/') != std::string::npos)
+                                 && (title.ends_with(".exe") || title.ends_with(".EXE")) };
+            if (!exe_path) return title;
+        }
+        const std::string& cmd{ p.command_line };
+        std::size_t end{ cmd.size() };
+        while (end > 0)
+        {
+            const std::size_t sp{ cmd.find_last_of(' ', end - 1) };
+            const std::size_t start{ sp == std::string::npos ? 0 : sp + 1 };
+            std::string tok{ cmd.substr(start, end - start) };
+            while (!tok.empty() && tok.front() == '"') tok.erase(tok.begin());
+            while (!tok.empty() && tok.back() == '"') tok.pop_back();
+            if (!tok.empty() && tok.front() != '-' && tok.find('.') != std::string::npos)
+            {
+                return tok;
+            }
+            if (sp == std::string::npos) break;
+            end = sp;
+        }
+        return p.image_name;
+    }
+
     inline auto enumerate_jvms() -> std::vector<JvmProcess>
     {
         std::vector<JvmProcess> result{};
@@ -220,7 +279,9 @@ namespace viewer
                 const std::uint32_t pid{ entry.th32ProcessID };
                 if (pid != 0 && pid != GetCurrentProcessId() && process_has_jvm(pid, image_name))
                 {
-                    result.push_back(JvmProcess{ pid, image_name, resolve_image_path(pid), resolve_command_line(pid) });
+                    JvmProcess jp{ pid, image_name, resolve_image_path(pid), resolve_command_line(pid), {} };
+                    jp.display_name = friendly_name(jp);
+                    result.push_back(std::move(jp));
                 }
             } while (Process32NextW(snapshot, &entry));
         }
