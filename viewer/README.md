@@ -1,0 +1,68 @@
+# vmhook viewer
+
+A C++23 / ImGui (Win32 + DirectX 11) desktop tool that turns the header-only
+`vmhook` library into an interactive JVM inspector.
+
+It:
+
+1. Lists every running **HotSpot JVM** on the machine (any process with
+   `jvm.dll` loaded — `java.exe`, `javaw.exe`, modded Minecraft, embedded VMs…).
+2. Injects the **`vmhook_payload.dll`** into the JVM you pick.
+3. That DLL uses `vmhook` — **pure-VM, no JNI / no JVMTI** — to walk every loaded
+   Java class and enumerate each class's declared **methods** and **fields**, then
+   streams the whole surface back over a named pipe.
+4. The viewer shows it in an MCPMappingViewer-style layout: a searchable class
+   list up top, methods and fields below. Everything is discovered **dynamically
+   at runtime** — there are no mappings.
+
+## Layout
+
+```
+┌ Running JVMs  [Refresh] [Attach & Enumerate]  Status: Done ──────────────┐
+│  PID   Process     Path                                                   │
+│  10720 javaw.exe   C:\...\javaw.exe                                       │
+├──────────────────────────────────────────────────────────────────────────┤
+│  [Search classes]                     12994 classes loaded                │
+│  Package                                              Class                │
+│  net/minecraft/client                                Minecraft            │
+│  net/minecraft/client/gui/toasts                     ToastGui             │
+├────────────────────────────────┬─────────────────────────────────────────┤
+│ Methods (42)                    │ Fields (73)                             │
+│  Name          Descriptor       │  Name         Type          Static     │
+│  getInstance   ()Lbdl;          │  instance     Lbdl;         yes        │
+└────────────────────────────────┴─────────────────────────────────────────┘
+```
+
+## Build (MSVC)
+
+Requires Visual Studio 2022 (or Build Tools) with the C++ workload and the
+Windows SDK. ImGui is fetched into `third_party/imgui` (git-ignored):
+
+```bat
+:: from the repo root
+git clone --depth 1 https://github.com/ocornut/imgui viewer/third_party/imgui
+cmake -S viewer -B build-viewer -G "Visual Studio 17 2022" -A x64
+cmake --build build-viewer --config Release
+```
+
+Outputs `vmhook_viewer.exe` and `vmhook_payload.dll` side by side in
+`build-viewer/bin/Release/`. Run the exe from that directory (it loads the
+payload DLL next to itself). The MSVC runtime is static-linked, so the payload
+is self-contained when injected.
+
+## Notes
+
+- **Same bitness:** inject a 64-bit payload into a 64-bit JVM (the CMake targets
+  build x64). vmhook's runtime hooking is x86_64-only.
+- **Permissions:** attaching to some JVMs needs the same/higher privilege; run
+  the viewer elevated if `OpenProcess` fails.
+- **Pipe:** the viewer creates `\\.\pipe\vmhook_viewer` before injecting; the
+  payload connects to it and streams `C`/`M`/`F` records terminated by `DONE`.
+
+## How it maps onto vmhook
+
+| Viewer step            | vmhook API                                   |
+|------------------------|----------------------------------------------|
+| list classes           | `vmhook::for_each_loaded_class`              |
+| a class's methods       | `vmhook::detail::collect_klass_methods`      |
+| a class's fields        | `klass::collect_fields()` (added for this)   |

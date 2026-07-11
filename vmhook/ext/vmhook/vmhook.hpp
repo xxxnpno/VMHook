@@ -4207,6 +4207,135 @@ namespace vmhook
 
                 return std::nullopt;
             }
+
+            /*
+                @brief Enumerates EVERY field this class declares directly (not
+                inherited), returning (name, JVM type descriptor, is_static) for
+                each.  Same two storage formats as find_field(): the JDK 21+
+                _fieldinfo_stream (UNSIGNED5) and the JDK 8-20 _fields Array<u2>.
+                Pure metadata read (used by tooling like the vmhook viewer to list
+                a class's whole field surface); returns {} on any failure.
+            */
+            auto collect_fields() const noexcept
+                -> std::vector<std::tuple<std::string, std::string, bool>>
+            {
+                std::vector<std::tuple<std::string, std::string, bool>> result{};
+                try
+                {
+                    static const vmhook::hotspot::vm_struct_entry_t* const fields_entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fields") };
+                    static const vmhook::hotspot::vm_struct_entry_t* const fis_entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream") };
+                    static const vmhook::hotspot::vm_struct_entry_t* const constants_entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_constants") };
+
+                    if (!vmhook::hotspot::is_valid_pointer(this) || !constants_entry)
+                    {
+                        return result;
+                    }
+
+                    vmhook::hotspot::constant_pool* const constant_pool_ptr{ *reinterpret_cast<vmhook::hotspot::constant_pool**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::klass*>(this)) + constants_entry->offset) };
+                    if (!vmhook::hotspot::is_valid_pointer(constant_pool_ptr))
+                    {
+                        return result;
+                    }
+                    void** const constant_pool_base{ constant_pool_ptr->get_base() };
+                    if (!vmhook::hotspot::is_valid_pointer(constant_pool_base))
+                    {
+                        return result;
+                    }
+                    const std::int32_t cp_length{ constant_pool_ptr->get_length() };
+
+                    // -- JDK 21+ path: FieldInfoStream (Array<u1>, UNSIGNED5) --
+                    if (fis_entry)
+                    {
+                        const void* const arr_ptr{ *reinterpret_cast<void* const*>(reinterpret_cast<const std::uint8_t*>(this) + fis_entry->offset) };
+                        if (!vmhook::hotspot::is_valid_pointer(arr_ptr))
+                        {
+                            return result;
+                        }
+                        const std::int32_t length{ *reinterpret_cast<const std::int32_t*>(arr_ptr) };
+                        if (length <= 0 || length > 0x4000)
+                        {
+                            return result;
+                        }
+                        const std::uint8_t* const data{ reinterpret_cast<const std::uint8_t*>(arr_ptr) + 4 };
+                        std::int32_t stream_pos{ 0 };
+                        const std::uint32_t num_java_fields{ decode_u5(data, stream_pos) };
+                        const std::uint32_t num_injected_fields{ decode_u5(data, stream_pos) };
+                        if (num_java_fields == ~0u || num_injected_fields == ~0u || num_java_fields + num_injected_fields > 4096u)
+                        {
+                            return result;
+                        }
+                        for (std::uint32_t field_index{ 0 }; field_index < num_java_fields + num_injected_fields && stream_pos < length; ++field_index)
+                        {
+                            const std::uint32_t name_index{ decode_u5(data, stream_pos) };
+                            if (name_index == ~0u)
+                            {
+                                break;
+                            }
+                            const std::uint32_t sig_index{ decode_u5(data, stream_pos) };
+                            static_cast<void>(decode_u5(data, stream_pos));  // field_offset (unused for listing)
+                            const std::uint32_t access_flags{ decode_u5(data, stream_pos) };
+                            const std::uint32_t field_flags{ decode_u5(data, stream_pos) };
+                            if (field_flags & 0x01u) { vmhook::hotspot::klass::decode_u5(data, stream_pos); }
+                            if (field_flags & 0x04u) { vmhook::hotspot::klass::decode_u5(data, stream_pos); }
+                            if (field_flags & 0x10u) { vmhook::hotspot::klass::decode_u5(data, stream_pos); }
+
+                            const vmhook::hotspot::symbol* const name_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, name_index, cp_length) };
+                            if (!vmhook::hotspot::is_valid_pointer(name_symbol))
+                            {
+                                continue;
+                            }
+                            const vmhook::hotspot::symbol* const signature_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, sig_index, cp_length) };
+                            std::string signature{ vmhook::hotspot::is_valid_pointer(signature_symbol) ? signature_symbol->to_string() : std::string{} };
+                            result.emplace_back(name_symbol->to_string(), std::move(signature), (access_flags & 0x0008u) != 0u);
+                        }
+                        return result;
+                    }
+
+                    // -- JDK 8-20 path: _fields Array<u2>, 6 slots per field --
+                    if (!fields_entry)
+                    {
+                        return result;
+                    }
+                    void* const fields_array{ *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::klass*>(this)) + fields_entry->offset) };
+                    if (!vmhook::hotspot::is_valid_pointer(fields_array))
+                    {
+                        return result;
+                    }
+                    std::int32_t array_length{ 0 };
+                    if (!vmhook::os::safe_read(&array_length, fields_array, sizeof(array_length)))
+                    {
+                        return result;
+                    }
+                    static const std::int32_t field_slots{ 6 };
+                    if (array_length <= 0 || array_length < field_slots)
+                    {
+                        return result;
+                    }
+                    const std::uint16_t* const data{ reinterpret_cast<const std::uint16_t*>(reinterpret_cast<const std::uint8_t*>(fields_array) + 4) };
+                    for (std::int32_t field_slot_index{ 0 }; field_slot_index < array_length / field_slots; ++field_slot_index)
+                    {
+                        const std::uint16_t name_index{ data[field_slot_index * field_slots + 1] };
+                        if (!name_index)
+                        {
+                            continue;
+                        }
+                        const vmhook::hotspot::symbol* const name_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, name_index, cp_length) };
+                        if (!vmhook::hotspot::is_valid_pointer(name_symbol))
+                        {
+                            continue;
+                        }
+                        const std::uint16_t access_flags{ data[field_slot_index * field_slots + 0] };
+                        const std::uint16_t sig_index{ data[field_slot_index * field_slots + 2] };
+                        const vmhook::hotspot::symbol* const signature_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, sig_index, cp_length) };
+                        std::string signature{ vmhook::hotspot::is_valid_pointer(signature_symbol) ? signature_symbol->to_string() : std::string{} };
+                        result.emplace_back(name_symbol->to_string(), std::move(signature), (access_flags & 0x0008u) != 0u);
+                    }
+                }
+                catch (const std::exception&)
+                {
+                }
+                return result;
+            }
         };
 
         /*

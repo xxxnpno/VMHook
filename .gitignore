@@ -55,3 +55,7 @@ audit/graph/categories/features/
 # Foreign droppings from side-loaded MCP tooling that writes to CWD (e.g. the
 # Cheat-Engine MCP server's process whitelist) — not part of vmhook.
 process_whitelist.json
+
+# vmhook viewer: vendored ImGui (cloned, not tracked)
+viewer/third_party/imgui/
+build-viewer/
