@@ -104,6 +104,25 @@ TOOLS = [
             "required": ["pid", "class_name"],
         },
     },
+    {
+        "name": "get_instances",
+        "description": (
+            "Scan a JVM's live heap for instances of one class (by internal '/'-separated name) and "
+            "return each instance's address plus its field values (own + inherited), read live from the "
+            "heap. Matches the exact class only (subclasses have their own class). A value like "
+            "'<java/util/ArrayList>' is a reference field; '\"...\"' is a String. Injects the payload if "
+            "needed, so no prior enumerate_jvm is required."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "class_name": {"type": "string", "description": "internal name, e.g. 'com/example/demo/ExampleApp$Worker'"},
+                "cap": {"type": "integer", "description": "max instances to scan (default 1000)"},
+            },
+            "required": ["pid", "class_name"],
+        },
+    },
 ]
 
 
@@ -119,6 +138,11 @@ def call_tool(name: str, args: dict) -> str:
         return run_cli(cli_args)
     if name == "get_class":
         return run_cli(["class", str(args["pid"]), str(args["class_name"])])
+    if name == "get_instances":
+        cli_args = ["instances", str(args["pid"]), str(args["class_name"])]
+        if args.get("cap"):
+            cli_args.append(str(args["cap"]))
+        return run_cli(cli_args)
     return json.dumps({"error": f"unknown tool: {name}"})
 
 
