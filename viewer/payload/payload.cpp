@@ -372,6 +372,51 @@ namespace
         FlushFileBuffers(pipe);
     }
 
+    // Stream a class's STATIC field values.  Static fields live inside the class's
+    // java.lang.Class mirror; the field offset is mirror-relative, so read_field_value
+    // reads them by passing the mirror oop as the base (get_field adds the offset).
+    // Streamed as one "instance" (the mirror) with a V record per static field.
+    void stream_statics(HANDLE pipe, const std::string& classname)
+    {
+        pipe_writer writer{ pipe };
+        vmhook::hotspot::klass* const k{ vmhook::find_class(classname) };
+        if (!k || !vmhook::hotspot::is_valid_pointer(k))
+        {
+            writer.put("DONE\t0\n"); writer.flush(); FlushFileBuffers(pipe); return;
+        }
+        void* const mirror{ k->get_java_mirror() };
+        if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
+        {
+            writer.put("DONE\t0\n"); writer.flush(); FlushFileBuffers(pipe); return;
+        }
+
+        char addr[32];
+        std::snprintf(addr, sizeof(addr), "0x%llX",
+                      static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(mirror)));
+        writer.put("O\t"); writer.put(addr); writer.put("\n");
+
+        std::uint64_t count{ 0 };
+        for (const auto& [fname, fdesc, facc] : k->collect_fields())
+        {
+            if ((facc & 0x0008u) != 0u)  // static fields only
+            {
+                writer.put("V\t");
+                writer.put(sanitize(fname));
+                writer.put("\t");
+                writer.put(sanitize(read_field_value(mirror, k, fname, fdesc)));
+                writer.put("\t");
+                writer.put("\n");
+                ++count;
+            }
+        }
+
+        writer.put("DONE\t");
+        writer.put(std::to_string(count));
+        writer.put("\n");
+        writer.flush();
+        FlushFileBuffers(pipe);
+    }
+
     // Serve every attach: the payload stays loaded and, each time a viewer/CLI
     // creates the pipe server, connects to it and streams whatever the current
     // request asks for (class surface by default, or live instances).  This makes
@@ -399,6 +444,10 @@ namespace
             if (req.rfind("INST\t", 0) == 0)
             {
                 stream_instances(pipe, req.substr(5));
+            }
+            else if (req.rfind("STAT\t", 0) == 0)
+            {
+                stream_statics(pipe, req.substr(5));
             }
             else
             {

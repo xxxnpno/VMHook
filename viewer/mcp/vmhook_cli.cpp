@@ -290,6 +290,43 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (cmd == "statics" && argc >= 4)
+    {
+        const std::uint32_t pid{ (std::uint32_t)std::strtoul(argv[2], nullptr, 10) };
+        const std::string cls{ argv[3] };
+        wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring w{ exe }; const std::size_t s{ w.find_last_of(L"\\/") };
+        if (s != std::wstring::npos) w.resize(s + 1);
+        const std::wstring dll{ w + L"vmhook_payload.dll" };
+        std::string raw, err;
+        if (!enumerate_raw(pid, dll, raw, err, "STAT\t" + cls))
+        { std::printf("{\"error\":\"%s\"}\n", json_escape(err).c_str()); return 1; }
+
+        std::printf("{\"pid\":%u,\"class\":\"%s\",\"statics\":{", pid, json_escape(cls).c_str());
+        std::size_t p{ 0 }; bool first{ true };
+        while (p < raw.size())
+        {
+            std::size_t nl{ raw.find('\n', p) };
+            if (nl == std::string::npos) nl = raw.size();
+            const std::string_view line{ raw.data() + p, nl - p };
+            p = nl + 1;
+            if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t')
+            {
+                const std::size_t t2{ line.find('\t', 2) };
+                if (t2 != std::string_view::npos)
+                {
+                    const std::size_t t3{ line.find('\t', t2 + 1) };
+                    const std::string name{ line.substr(2, t2 - 2) };
+                    const std::string val{ line.substr(t2 + 1, (t3 == std::string_view::npos ? line.size() : t3) - (t2 + 1)) };
+                    std::printf("%s\"%s\":\"%s\"", first ? "" : ",", json_escape(name).c_str(), json_escape(val).c_str());
+                    first = false;
+                }
+            }
+        }
+        std::printf("}}\n");
+        return 0;
+    }
+
     if (cmd == "classes" && argc >= 3)
     {
         const std::uint32_t pid{ (std::uint32_t)std::strtoul(argv[2], nullptr, 10) };
