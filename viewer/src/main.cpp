@@ -242,6 +242,8 @@ namespace
     bool         g_pretty{ true };
     bool         g_full_names{ false };
     bool         g_show_inherited{ false };  // details: include super-chain members
+    bool         g_show_instances{ false };  // live-instances window open
+    std::string  g_pending_instance_request; // deferred so we don't re-lock data_mutex
     bool         g_focus_search{ false };
     int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
     int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
@@ -946,6 +948,18 @@ namespace
         if (ImGui::SmallButton("Export .txt"))
             app.status_message = export_class(c) ? "Exported to vmhook_export.txt (next to the viewer)."
                                                  : "Export failed — is the viewer's folder writable?";
+        ImGui::SameLine();
+        // Live heap instances — deferred (request_instances re-locks data_mutex
+        // which this function already holds).
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_Header));
+        if (ImGui::SmallButton(ICON_FA_SEARCH " Live instances"))
+        {
+            g_pending_instance_request = c.internal_name;
+            g_show_instances = true;
+        }
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Scan the heap for live objects of this class and show their field values");
         ImGui::Spacing();
         ui::Toggle("Show inherited members", &g_show_inherited);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include methods & fields from superclasses (shown dimmed)");
@@ -1101,6 +1115,90 @@ namespace
         ImGui::EndChild();
     }
 
+    // Floating window listing the live heap instances of a class (one row per
+    // instance, one column per declared instance field, cells = field values).
+    void draw_instances_window(viewer::App& app)
+    {
+        ImGui::SetNextWindowSize(ImVec2(em(54.0f), em(30.0f)), ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin("Live instances", &g_show_instances))
+        {
+            ImGui::End();
+            return;
+        }
+        std::lock_guard<std::mutex> lock{ app.data_mutex };
+
+        std::string dotted{ app.inst_class };
+        for (char& ch : dotted) if (ch == '/') ch = '.';
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
+        ImGui::TextUnformatted(dotted.empty() ? "(no class selected)" : dotted.c_str());
+        ImGui::PopStyleColor();
+
+        const viewer::Status st{ app.inst_status.load() };
+        ImGui::SameLine(0.0f, em(0.8f));
+        if (st == viewer::Status::Receiving)
+        {
+            const float r{ ImGui::GetFrameHeight() * 0.30f };
+            ui::Spinner("##iscan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ImGui::SameLine(0.0f, em(0.4f));
+        }
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", app.inst_message.c_str());
+
+        // Columns = the class's declared instance (non-static) fields.
+        std::vector<const viewer::FieldInfo*> cols;
+        if (const auto it{ app.name_to_index.find(app.inst_class) };
+            it != app.name_to_index.end() && it->second >= 0 && it->second < (int)app.classes.size())
+        {
+            for (const auto& f : app.classes[(std::size_t)it->second].fields)
+                if (!f.is_static) cols.push_back(&f);
+        }
+
+        ImGui::Separator();
+        if (app.instances.empty())
+        {
+            if (st != viewer::Status::Receiving)
+                ImGui::TextDisabled("No live instances found on the heap for this class.");
+        }
+        else if (cols.empty())
+        {
+            ImGui::TextDisabled("%zu live instance(s); this class declares no instance fields.",
+                                app.instances.size());
+        }
+        else if (ImGui::BeginTable("instances", 1 + (int)cols.size(),
+                     ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                     ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable))
+        {
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, em(3.0f));
+            for (const viewer::FieldInfo* f : cols)
+                ImGui::TableSetupColumn(f->name.c_str(), ImGuiTableColumnFlags_WidthFixed, em(11.0f));
+            ImGui::TableSetupScrollFreeze(1, 1);
+            ImGui::TableHeadersRow();
+
+            ImGuiListClipper clip;
+            clip.Begin((int)app.instances.size());
+            while (clip.Step())
+                for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r)
+                {
+                    const viewer::InstanceInfo& inst{ app.instances[(std::size_t)r] };
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextDisabled("%d", r);
+                    for (int cidx = 0; cidx < (int)cols.size(); ++cidx)
+                    {
+                        ImGui::TableSetColumnIndex(cidx + 1);
+                        if (cidx >= (int)inst.fields.size()) continue;
+                        const std::string& v{ inst.fields[(std::size_t)cidx].second };
+                        if (v == "null") ImGui::TextDisabled("null");
+                        else             ImGui::TextUnformatted(v.c_str());
+                        if (ImGui::IsItemHovered() && v.size() > 18) ImGui::SetTooltip("%s", v.c_str());
+                    }
+                }
+            ImGui::EndTable();
+        }
+        ImGui::End();
+    }
+
     void render_ui(viewer::App& app)
     {
         // Ctrl+F focuses the class search; Esc clears all filters.
@@ -1217,6 +1315,19 @@ namespace
         }
 
         ImGui::End();
+
+        // Deferred instance request (issued from draw_details, which holds
+        // data_mutex; request_instances re-locks it, so it must run here) + the
+        // floating instances window, both outside the root window's Begin/End.
+        if (!g_pending_instance_request.empty())
+        {
+            app.request_instances(g_pending_instance_request);
+            g_pending_instance_request.clear();
+        }
+        if (g_show_instances)
+        {
+            draw_instances_window(app);
+        }
     }
 }
 

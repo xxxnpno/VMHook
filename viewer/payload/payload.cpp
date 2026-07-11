@@ -10,10 +10,15 @@
 //   C <TAB> internal/Class/Name <TAB> super/Internal/Name <TAB> <classAccessFlags>
 //   M <TAB> methodName <TAB> (descriptor)ret <TAB> <methodAccessFlags>
 //   F <TAB> fieldName  <TAB> descriptor <TAB> <fieldAccessFlags>
-//   DONE <TAB> <classCount>
-// Methods/fields belong to the most recently emitted C record.  Access-flag
-// fields are decimal JVM class-file flag words (older readers ignore extra
-// trailing tab-separated fields, so appending the class flags stays compatible).
+//   O                                    (start of a live instance)
+//   V <TAB> fieldName <TAB> value        (a field value of the current instance)
+//   DONE <TAB> <count>
+// Methods/fields belong to the most recently emitted C record; V records to the
+// most recent O.  Which stream is produced depends on the request the viewer
+// leaves in %TEMP%\vmhook_viewer_req.txt before it opens the pipe:
+//   "ENUM"          (or missing)  -> the full class surface (C/M/F).
+//   "INST" <TAB> internal/Class/Name  -> live instances of that class (O/V).
+// Access-flag fields are decimal JVM class-file flag words.
 
 #include <vmhook/vmhook.hpp>
 
@@ -25,6 +30,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 
 namespace
 {
@@ -160,13 +166,171 @@ namespace
         FlushFileBuffers(pipe);
     }
 
+    // Read (and consume) the one-line request the viewer left in
+    // %TEMP%\vmhook_viewer_req.txt.  Missing / empty -> "ENUM", so the CLI/MCP
+    // (which never writes one) and every plain attach keep getting the class
+    // surface.  The file is deleted after reading so a stale INST request can't
+    // leak into the next enumerate.
+    auto read_request() -> std::string
+    {
+        wchar_t tmp[MAX_PATH]{};
+        const DWORD n{ GetTempPathW(MAX_PATH, tmp) };
+        if (n == 0 || n >= MAX_PATH)
+        {
+            return "ENUM";
+        }
+        std::wstring path{ tmp, n };
+        path += L"vmhook_viewer_req.txt";
+
+        HANDLE f{ CreateFileW(path.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, 0, nullptr) };
+        if (f == INVALID_HANDLE_VALUE)
+        {
+            return "ENUM";
+        }
+        std::string req{};
+        char buf[1024];
+        DWORD rd{ 0 };
+        while (ReadFile(f, buf, sizeof(buf), &rd, nullptr) && rd > 0)
+        {
+            req.append(buf, rd);
+        }
+        CloseHandle(f);
+        DeleteFileW(path.c_str());
+
+        while (!req.empty() && (req.back() == '\n' || req.back() == '\r' || req.back() == ' '))
+        {
+            req.pop_back();
+        }
+        return req.empty() ? std::string{ "ENUM" } : req;
+    }
+
+    // Tab/newline are legal in some obfuscated identifiers and in String values;
+    // they'd corrupt the tab/newline framing, so flatten them to spaces (this is
+    // display data, so lossy sanitising is fine).
+    auto sanitize(std::string s) -> std::string
+    {
+        for (char& c : s)
+        {
+            if (c == '\t' || c == '\n' || c == '\r')
+            {
+                c = ' ';
+            }
+        }
+        return s;
+    }
+
+    // Read one instance field's value and format it for display.  All reads go
+    // through the fault-safe vmhook accessors (get_field returns a default on any
+    // failure), so a stale/garbage oop from the conservative scan can't fault.
+    auto read_field_value(void* const oop, vmhook::hotspot::klass* const k,
+                          const std::string& name, const std::string& desc) -> std::string
+    {
+        if (desc.empty())
+        {
+            return "?";
+        }
+        switch (desc[0])
+        {
+        case 'Z': return vmhook::get_field<std::uint8_t>(oop, k, name) != 0 ? "true" : "false";
+        case 'B': return std::to_string(static_cast<int>(vmhook::get_field<std::int8_t>(oop, k, name)));
+        case 'C':
+        {
+            const std::uint16_t ch{ vmhook::get_field<std::uint16_t>(oop, k, name) };
+            if (ch >= 32u && ch < 127u) { return std::string{ "'" } + static_cast<char>(ch) + "'"; }
+            return std::to_string(static_cast<unsigned>(ch));
+        }
+        case 'S': return std::to_string(static_cast<int>(vmhook::get_field<std::int16_t>(oop, k, name)));
+        case 'I': return std::to_string(vmhook::get_field<std::int32_t>(oop, k, name));
+        case 'F': return std::to_string(vmhook::get_field<float>(oop, k, name));
+        case 'J': return std::to_string(vmhook::get_field<std::int64_t>(oop, k, name));
+        case 'D': return std::to_string(vmhook::get_field<double>(oop, k, name));
+        case 'L':
+        case '[':
+        {
+            // Reference field: read the (compressed) oop, decode, and describe it.
+            const std::uint32_t compressed{ vmhook::get_field<std::uint32_t>(oop, k, name) };
+            if (compressed == 0u)
+            {
+                return "null";
+            }
+            void* const ref{ vmhook::hotspot::decode_oop_pointer(compressed) };
+            if (!ref || !vmhook::hotspot::is_valid_pointer(ref))
+            {
+                return "null";
+            }
+            if (desc == "Ljava/lang/String;")
+            {
+                return std::string{ "\"" } + vmhook::read_java_string(ref) + "\"";
+            }
+            if (vmhook::hotspot::klass* const rk{ vmhook::klass_from_oop(ref) };
+                rk && vmhook::hotspot::is_valid_pointer(rk))
+            {
+                if (const vmhook::hotspot::symbol* const rn{ rk->get_name() };
+                    rn && vmhook::hotspot::is_valid_pointer(rn))
+                {
+                    return std::string{ "<" } + rn->to_string() + ">";
+                }
+            }
+            return "<object>";
+        }
+        default: return "?";
+        }
+    }
+
+    // Stream up to 200 live instances of `classname`, each with its declared
+    // instance (non-static) field values.
+    void stream_instances(HANDLE pipe, const std::string& classname)
+    {
+        pipe_writer writer{ pipe };
+        vmhook::hotspot::klass* const k{ vmhook::find_class(classname) };
+        if (!k || !vmhook::hotspot::is_valid_pointer(k))
+        {
+            writer.put("DONE\t0\n");
+            writer.flush();
+            FlushFileBuffers(pipe);
+            return;
+        }
+
+        struct field_info { std::string name; std::string desc; };
+        std::vector<field_info> fields;
+        for (const auto& [fname, fdesc, facc] : k->collect_fields())
+        {
+            if ((facc & 0x0008u) == 0u)  // instance (non-static) fields only
+            {
+                fields.push_back({ fname, fdesc });
+            }
+        }
+
+        std::uint64_t count{ 0 };
+        vmhook::for_each_instance_of(k, [&](void* const oop)
+        {
+            writer.put("O\n");
+            for (const field_info& f : fields)
+            {
+                writer.put("V\t");
+                writer.put(sanitize(f.name));
+                writer.put("\t");
+                writer.put(sanitize(read_field_value(oop, k, f.name, f.desc)));
+                writer.put("\n");
+            }
+            ++count;
+        }, 200);
+
+        writer.put("DONE\t");
+        writer.put(std::to_string(count));
+        writer.put("\n");
+        writer.flush();
+        FlushFileBuffers(pipe);
+    }
+
     // Serve every attach: the payload stays loaded and, each time a viewer/CLI
-    // creates the pipe server, connects to it and re-streams the current class
-    // surface.  This makes RE-ATTACH robust — a second attach just re-uses this
-    // already-running server (LoadLibrary of an already-loaded DLL never re-runs
-    // DllMain, so relying on re-injection to re-enumerate would hang).  Low
-    // overhead: it sleeps between connect attempts and blocks in the OS while a
-    // client is reading.  The payload only READS VM metadata (no hooks).
+    // creates the pipe server, connects to it and streams whatever the current
+    // request asks for (class surface by default, or live instances).  This makes
+    // RE-ATTACH robust — a second attach just re-uses this already-running server
+    // (LoadLibrary of an already-loaded DLL never re-runs DllMain, so relying on
+    // re-injection would hang).  The payload only READS VM metadata (no hooks).
     void serve_forever()
     {
         for (;;)
@@ -184,7 +348,15 @@ namespace
                 }
                 continue;
             }
-            stream_to(pipe);
+            const std::string req{ read_request() };
+            if (req.rfind("INST\t", 0) == 0)
+            {
+                stream_instances(pipe, req.substr(5));
+            }
+            else
+            {
+                stream_to(pipe);
+            }
             CloseHandle(pipe);
         }
     }

@@ -52,6 +52,13 @@ namespace viewer
         std::vector<FieldInfo>  fields;
     };
 
+    // One live heap instance of a class: its instance fields, each with a
+    // formatted value string (as read by the payload).
+    struct InstanceInfo
+    {
+        std::vector<std::pair<std::string, std::string>> fields;  // (name, value)
+    };
+
     struct JvmProcess
     {
         std::uint32_t pid{ 0 };
@@ -304,6 +311,12 @@ namespace viewer
         std::atomic<std::uint64_t> classes_streamed{ 0 };
         std::string               status_message{ "Idle." };
 
+        // Live-instance inspection (guarded by data_mutex, driven on `worker`).
+        std::atomic<Status>       inst_status{ Status::Idle };
+        std::string               inst_message{};
+        std::string               inst_class{};    // internal name being inspected
+        std::vector<InstanceInfo> instances;
+
         App()
         {
             refresh_jvms();
@@ -341,6 +354,36 @@ namespace viewer
             return s == Status::Injecting || s == Status::Receiving;
         }
 
+        bool inst_busy() const
+        {
+            const Status s{ inst_status.load() };
+            return s == Status::Injecting || s == Status::Receiving;
+        }
+
+        // Scan the attached JVM's heap for live instances of `internal_class` and
+        // read their instance-field values.  The payload must already be loaded
+        // (i.e. a class enumeration has happened) — this reuses that server via a
+        // request file, no re-injection.
+        void request_instances(const std::string& internal_class)
+        {
+            if (busy() || inst_busy() || selected_jvm < 0 || selected_jvm >= static_cast<int>(jvms.size()))
+            {
+                return;
+            }
+            if (worker.joinable())
+            {
+                worker.join();
+            }
+            inst_status.store(Status::Receiving);
+            {
+                std::lock_guard<std::mutex> lock{ data_mutex };
+                inst_class = internal_class;
+                inst_message = "Scanning heap for live instances...";
+                instances.clear();
+            }
+            worker = std::thread([this, internal_class] { run_instances(internal_class); });
+        }
+
         // Launch: create the pipe, inject, receive, parse, publish. Runs on a
         // detached-ish worker thread (joined in the dtor / before relaunch).
         void attach_selected(const std::wstring& dll_path)
@@ -375,8 +418,132 @@ namespace viewer
             status_message = std::move(message);
         }
 
+        void inst_fail(std::string message)
+        {
+            {
+                std::lock_guard<std::mutex> lock{ data_mutex };
+                inst_message = std::move(message);
+            }
+            inst_status.store(Status::Error);
+        }
+
+        // Leave a one-line request for the payload in %TEMP%\vmhook_viewer_req.txt
+        // (read + deleted by the payload on its next pipe connect).
+        void write_request(const std::string& req)
+        {
+            wchar_t tmp[MAX_PATH]{};
+            const DWORD n{ GetTempPathW(MAX_PATH, tmp) };
+            if (n == 0 || n >= MAX_PATH) return;
+            std::wstring path{ tmp, n };
+            path += L"vmhook_viewer_req.txt";
+            HANDLE f{ CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                  nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr) };
+            if (f == INVALID_HANDLE_VALUE) return;
+            DWORD written{ 0 };
+            WriteFile(f, req.data(), static_cast<DWORD>(req.size()), &written, nullptr);
+            CloseHandle(f);
+        }
+
+        static void parse_instances(const std::string& raw, std::vector<InstanceInfo>& out)
+        {
+            std::size_t line_start{ 0 };
+            while (line_start < raw.size())
+            {
+                const std::size_t nl{ raw.find('\n', line_start) };
+                const std::size_t end{ nl == std::string::npos ? raw.size() : nl };
+                const std::string_view line{ raw.data() + line_start, end - line_start };
+                line_start = (nl == std::string::npos ? raw.size() : nl + 1);
+                if (line.empty()) continue;
+
+                if (line[0] == 'O')
+                {
+                    out.emplace_back();
+                }
+                else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t' && !out.empty())
+                {
+                    const std::size_t t2{ line.find('\t', 2) };
+                    if (t2 != std::string_view::npos)
+                    {
+                        out.back().fields.emplace_back(std::string{ line.substr(2, t2 - 2) },
+                                                       std::string{ line.substr(t2 + 1) });
+                    }
+                }
+            }
+        }
+
+        void run_instances(const std::string& classname)
+        {
+            write_request("INST\t" + classname);
+
+            HANDLE pipe{ CreateNamedPipeW(
+                k_pipe_name, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 0, 1u << 20, 0, nullptr) };
+            if (pipe == INVALID_HANDLE_VALUE)
+            {
+                inst_fail("CreateNamedPipe failed (error " + std::to_string(GetLastError()) + ").");
+                return;
+            }
+
+            // No injection: the payload's serve_forever (from the initial attach)
+            // connects and streams instances.
+            HANDLE ev{ CreateEventW(nullptr, TRUE, FALSE, nullptr) };
+            OVERLAPPED ov{};
+            ov.hEvent = ev;
+            const BOOL connected{ ConnectNamedPipe(pipe, &ov) };
+            const DWORD ce{ GetLastError() };
+            if (!connected && ce == ERROR_IO_PENDING)
+            {
+                if (WaitForSingleObject(ev, 15000) != WAIT_OBJECT_0)
+                {
+                    CloseHandle(ev); CloseHandle(pipe);
+                    inst_fail("Timed out — is the payload still attached? Try Attach again.");
+                    return;
+                }
+            }
+            else if (!connected && ce != ERROR_PIPE_CONNECTED)
+            {
+                CloseHandle(ev); CloseHandle(pipe);
+                inst_fail("ConnectNamedPipe failed (error " + std::to_string(ce) + ").");
+                return;
+            }
+
+            std::string raw{};
+            std::vector<char> buffer(64u * 1024u);
+            for (;;)
+            {
+                ResetEvent(ev);
+                OVERLAPPED rov{};
+                rov.hEvent = ev;
+                DWORD read_bytes{ 0 };
+                const BOOL ok{ ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &read_bytes, &rov) };
+                if (!ok && GetLastError() == ERROR_IO_PENDING)
+                {
+                    if (WaitForSingleObject(ev, 30000) != WAIT_OBJECT_0) break;
+                    if (!GetOverlappedResult(pipe, &rov, &read_bytes, FALSE)) break;
+                }
+                else if (!ok)
+                {
+                    break;
+                }
+                if (read_bytes == 0) break;
+                raw.append(buffer.data(), read_bytes);
+            }
+            CloseHandle(ev);
+            CloseHandle(pipe);
+
+            std::vector<InstanceInfo> parsed{};
+            parse_instances(raw, parsed);
+            {
+                std::lock_guard<std::mutex> lock{ data_mutex };
+                instances = std::move(parsed);
+                inst_message = "Found " + std::to_string(instances.size()) + " live instance(s).";
+            }
+            inst_status.store(Status::Done);
+        }
+
         void run_attach(std::uint32_t pid, std::wstring dll_path)
         {
+            write_request("ENUM");  // ensure a stale INST request can't leak in
             // 1) Create the pipe server BEFORE injecting so the payload can connect.
             HANDLE pipe{ CreateNamedPipeW(
                 k_pipe_name,

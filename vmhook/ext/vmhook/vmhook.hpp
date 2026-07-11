@@ -9279,6 +9279,133 @@ namespace vmhook
     }
 
     /*
+        @brief Runtime-klass variant of for_each_instance.
+        @details
+        Scans the heap for live instances whose klass == target_klass and hands
+        each raw oop (void*) to `visit`.  Identical conservative, crash-safe
+        chunked scan as for_each_instance (every structure-derived read goes
+        through safe_read), but keyed on a klass* resolved at RUNTIME — e.g.
+        from vmhook::find_class("some/Class") — instead of a compile-time
+        register_class<T>() wrapper.  This is what a tool inspecting an arbitrary,
+        user-selected class needs (no C++ type exists for it).
+
+        The visitor receives the live heap oop as a plain void*; it must only read
+        through the fault-safe accessors (vmhook::get_field / read_java_string /
+        klass_from_oop), never a raw deref — the conservative scan can admit a
+        stale/garbage header whose backing page is unmapped.
+
+        @tparam visitor_type Callable accepting `void*` (the instance oop).
+        @param  target_klass Klass to match (from find_class); no-op if null.
+        @param  visit        Visitor invoked for each match.
+        @param  max_visits   Stop after this many matches.  Defaults to no limit.
+        @return Number of instances reported to the visitor.
+    */
+    template<typename visitor_type>
+    inline auto for_each_instance_of(vmhook::hotspot::klass* const target_klass,
+                                     visitor_type&& visit,
+                                     std::size_t max_visits = std::numeric_limits<std::size_t>::max())
+        -> std::size_t
+    {
+        if (!target_klass || !vmhook::hotspot::is_valid_pointer(target_klass))
+        {
+            return 0;
+        }
+
+        static const auto* const heap_static_entry{
+            vmhook::hotspot::iterate_struct_entries("Universe", "_collectedHeap") };
+        static const auto* const reserved_offset{
+            vmhook::hotspot::iterate_struct_entries("CollectedHeap", "_reserved") };
+        static const auto* const memregion_start_offset{
+            vmhook::hotspot::iterate_struct_entries("MemRegion", "_start") };
+        static const auto* const memregion_word_size_offset{
+            vmhook::hotspot::iterate_struct_entries("MemRegion", "_word_size") };
+        if (!heap_static_entry || !heap_static_entry->address
+         || !reserved_offset || !memregion_start_offset || !memregion_word_size_offset)
+        {
+            return 0;
+        }
+
+        const void* const collected_heap{
+            vmhook::hotspot::safe_read_pointer(heap_static_entry->address) };
+        if (!vmhook::hotspot::is_valid_pointer(collected_heap))
+        {
+            return 0;
+        }
+
+        auto* const memregion_addr{
+            reinterpret_cast<const std::uint8_t*>(collected_heap) + reserved_offset->offset };
+        const void* const heap_start{
+            vmhook::hotspot::safe_read_pointer(memregion_addr + memregion_start_offset->offset) };
+        std::size_t heap_word_count{ 0 };
+        if (!vmhook::os::safe_read(&heap_word_count,
+                                   memregion_addr + memregion_word_size_offset->offset,
+                                   sizeof(heap_word_count)))
+        {
+            return 0;
+        }
+        if (!vmhook::hotspot::is_valid_pointer(heap_start) || heap_word_count == 0)
+        {
+            return 0;
+        }
+
+        constexpr std::size_t max_scan_bytes{ std::size_t{ 64 } << 30 };  // 64 GiB
+        constexpr std::size_t max_scan_words{ max_scan_bytes / sizeof(void*) };
+        if (heap_word_count > max_scan_words)
+        {
+            heap_word_count = max_scan_words;
+        }
+        const std::size_t heap_byte_size{ heap_word_count * sizeof(void*) };
+
+        auto* const scan_begin{ static_cast<const std::uint8_t*>(heap_start) };
+        const std::uintptr_t begin_addr{ reinterpret_cast<std::uintptr_t>(scan_begin) };
+        const std::size_t room_to_ceiling{
+            (begin_addr < vmhook::os::user_address_ceiling)
+                ? static_cast<std::size_t>(vmhook::os::user_address_ceiling - begin_addr)
+                : std::size_t{ 0 } };
+        const std::size_t bounded_byte_size{ std::min<std::size_t>(heap_byte_size, room_to_ceiling) };
+        if (bounded_byte_size == 0)
+        {
+            return 0;
+        }
+        auto* const scan_end{ scan_begin + bounded_byte_size };
+
+        constexpr std::size_t chunk_size{ 4096 };
+        constexpr std::size_t stride{ 8 };
+        alignas(8) std::uint8_t buffer[chunk_size];
+        std::size_t visits{ 0 };
+
+        for (auto* p{ scan_begin }; p < scan_end && visits < max_visits; p += chunk_size)
+        {
+            const std::size_t to_read{
+                std::min<std::size_t>(chunk_size, static_cast<std::size_t>(scan_end - p)) };
+            if (!vmhook::os::safe_read(buffer, p, to_read))
+            {
+                continue;
+            }
+            for (std::size_t off{ 0 }; off + 16 <= to_read && visits < max_visits; off += stride)
+            {
+                vmhook::hotspot::klass* const decoded{
+                    vmhook::hotspot::read_klass_from_header_buffer(buffer + off) };
+                if (!decoded || decoded != target_klass)
+                {
+                    continue;
+                }
+                try
+                {
+                    visit(const_cast<void*>(static_cast<const void*>(p + off)));
+                }
+                catch (const std::exception& ex)
+                {
+                    VMHOOK_LOG("{} for_each_instance_of visitor: {}", vmhook::error_tag, ex.what());
+                }
+                ++visits;
+            }
+        }
+
+        return visits;
+    }
+
+    /*
         @brief Associates a C++ type with its corresponding Java class name.
         @tparam T The C++ type to register.
         @param class_name The internal JVM class name using '/' separators.
