@@ -276,7 +276,10 @@ namespace
         if (app.status.load() == viewer::Status::Receiving)
         {
             ImGui::SameLine();
-            ImGui::Text("%llu classes...", (unsigned long long)app.classes_streamed.load());
+            const char spin[]{ '|', '/', '-', '\\' };
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.6f, 0.95f, 1));
+            ImGui::Text("%c %llu classes...", spin[(int)(ImGui::GetTime() * 8) & 3], (unsigned long long)app.classes_streamed.load());
+            ImGui::PopStyleColor();
         }
     }
 
@@ -298,12 +301,13 @@ namespace
 
         ImGui::TextDisabled("%d / %zu classes", (int)g_filtered.size(), app.classes.size());
 
-        if (ImGui::BeginTable("classes", 2,
+        if (ImGui::BeginTable("classes", 3,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                 ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate))
         {
             ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableSetupColumn("Class", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+            ImGui::TableSetupColumn("m/f", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 72.0f);
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();
 
@@ -343,6 +347,8 @@ namespace
                     copy_menu("cls", c.internal_name);
                     ImGui::TableSetColumnIndex(1);
                     ImGui::TextUnformatted(c.simple_name.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextDisabled("%zu/%zu", c.methods.size(), c.fields.size());
                     ImGui::PopID();
                 }
             }
@@ -374,8 +380,20 @@ namespace
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f,0.82f,1.0f,1));
         ImGui::TextUnformatted(dotted.c_str());
         ImGui::PopStyleColor();
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 168.0f);
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 250.0f);
         if (ImGui::SmallButton("Copy name")) ImGui::SetClipboardText(c.internal_name.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy all"))
+        {
+            std::string all{ "class " + dotted + " {\n" };
+            for (const auto& f : c.fields)
+                all += "  " + viewer::access_modifiers(f.access, false) + " " + viewer::pretty_field(f.descriptor) + " " + f.name + ";\n";
+            all += "\n";
+            for (const auto& m : c.methods)
+                all += "  " + viewer::access_modifiers(m.access, true) + " " + m.name + viewer::pretty_method(m.descriptor) + "\n";
+            all += "}\n";
+            ImGui::SetClipboardText(all.c_str());
+        }
         ImGui::SameLine();
         if (ImGui::SmallButton("Export .txt")) export_class(c);
         ImGui::Separator();
@@ -457,6 +475,15 @@ namespace
     {
         // Ctrl+F focuses the class search.
         if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyPressed(ImGuiKey_F, false)) g_focus_search = true;
+
+        // Auto-refresh the JVM list every 2s so new/closed JVMs appear without a
+        // manual Refresh (selection is preserved by pid).
+        static double last_refresh{ 0.0 };
+        if (!app.busy() && (ImGui::GetTime() - last_refresh) > 2.0)
+        {
+            app.refresh_jvms();
+            last_refresh = ImGui::GetTime();
+        }
 
         const ImGuiViewport* vp{ ImGui::GetMainViewport() };
         ImGui::SetNextWindowPos(vp->WorkPos);
