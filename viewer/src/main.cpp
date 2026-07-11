@@ -1549,8 +1549,11 @@ namespace
                 ImGui::SameLine(0.0f, em(0.4f));
                 if (ImGui::SmallButton("Copy all"))
                 {
-                    std::string tsv{ sel->address };
-                    for (const auto& f : sel->fields) { tsv += '\n'; tsv += f.name; tsv += '\t'; tsv += f.value; }
+                    std::string tsv{ dcls + " @ " + sel->address + "\nField\tValue\tFrom\n" };
+                    for (const viewer::InstField& f : sel->fields)
+                    {
+                        tsv += f.name; tsv += '\t'; tsv += f.value; tsv += '\t'; tsv += f.owner; tsv += '\n';
+                    }
                     ImGui::SetClipboardText(tsv.c_str());
                 }
                 ImGui::Separator();
