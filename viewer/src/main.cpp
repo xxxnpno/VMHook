@@ -911,21 +911,27 @@ namespace
                     {
                         const viewer::FieldInfo& f{ c.fields[(std::size_t)mi] };
                         ImGui::PushStyleColor(ImGuiCol_Text, vis_color(f.access));
-                        const bool clicked{ ImGui::Selectable(f.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) };
+                        const bool clicked{ ImGui::Selectable(f.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap) };
                         ImGui::PopStyleColor();
                         if (clicked) { navigate_to(ci); std::snprintf(g_field_filter, sizeof(g_field_filter), "%s", g_search); }
                         ImGui::TableSetColumnIndex(1);
-                        ImGui::TextUnformatted((g_pretty ? viewer::pretty_field(f.descriptor, g_full_names) : f.descriptor).c_str());
+                        {
+                            const std::string ty{ g_pretty ? viewer::pretty_field(f.descriptor, g_full_names) : f.descriptor };
+                            const std::string refn{ ref_internal_name(f.descriptor) };
+                            const auto rit{ refn.empty() ? app.name_to_index.end() : app.name_to_index.find(refn) };
+                            if (rit != app.name_to_index.end()) { if (ImGui::TextLink(ty.c_str())) navigate_to(rit->second); }
+                            else ImGui::TextUnformatted(ty.c_str());
+                        }
                     }
                     else
                     {
                         const viewer::MethodInfo& m{ c.methods[(std::size_t)mi] };
                         ImGui::PushStyleColor(ImGuiCol_Text, vis_color(m.access));
-                        const bool clicked{ ImGui::Selectable(m.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) };
+                        const bool clicked{ ImGui::Selectable(m.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap) };
                         ImGui::PopStyleColor();
                         if (clicked) { navigate_to(ci); std::snprintf(g_method_filter, sizeof(g_method_filter), "%s", g_search); }
                         ImGui::TableSetColumnIndex(1);
-                        ImGui::TextUnformatted((g_pretty ? viewer::pretty_method(m.descriptor, g_full_names) : m.descriptor).c_str());
+                        render_method_signature(app, m.descriptor);
                     }
                     ImGui::TableSetColumnIndex(2);
                     ImGui::TextDisabled("%s", dotted.c_str());
