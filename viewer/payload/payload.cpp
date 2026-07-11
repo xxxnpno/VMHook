@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 
 namespace
 {
@@ -99,10 +100,19 @@ namespace
         pipe_writer writer{ pipe };
         std::uint64_t class_count{ 0 };
 
+        // The ClassLoaderDataGraph walk can surface the same class name more than
+        // once (bootstrap dictionary + _klasses list, distinct Klass* per node).
+        // Dedup by internal name for a clean, unique class list.
+        std::unordered_set<std::string> seen{};
+
         vmhook::for_each_loaded_class(
             [&](const std::string& name, vmhook::hotspot::klass* const klass)
             {
-                if (!klass || !vmhook::hotspot::is_valid_pointer(klass))
+                if (!klass || !vmhook::hotspot::is_valid_pointer(klass) || name.empty())
+                {
+                    return;
+                }
+                if (!seen.insert(name).second)
                 {
                     return;
                 }

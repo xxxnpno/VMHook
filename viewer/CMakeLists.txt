@@ -66,3 +66,9 @@ endif()
 
 # Build the payload alongside the viewer.
 add_dependencies(vmhook_viewer vmhook_payload)
+
+# ── headless end-to-end probe (test) ─────────────────────────────────────────
+add_executable(vmhook_cli_probe test/cli_probe.cpp)
+target_include_directories(vmhook_cli_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_features(vmhook_cli_probe PRIVATE cxx_std_23)
+add_dependencies(vmhook_cli_probe vmhook_payload)
