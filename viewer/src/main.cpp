@@ -420,32 +420,41 @@ namespace
         ImGui::Text("Methods (%zu)", c.methods.size());
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##mf", "filter methods", g_method_filter, sizeof(g_method_filter));
-        if (ImGui::BeginTable("mt", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
         {
-            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 150.0f);
-            ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 118.0f);
-            ImGui::TableSetupColumn(g_pretty ? "Signature" : "Descriptor", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableHeadersRow();
             const std::string mf{ g_method_filter };
-            for (const auto& m : c.methods)
+            static std::vector<int> mrows;
+            mrows.clear();
+            for (int i = 0; i < (int)c.methods.size(); ++i)
+                if (icontains(c.methods[(std::size_t)i].name, mf) || icontains(c.methods[(std::size_t)i].descriptor, mf))
+                    mrows.push_back(i);
+            if (ImGui::BeginTable("mt", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
             {
-                if (!icontains(m.name, mf) && !icontains(m.descriptor, mf)) continue;
-                ImGui::TableNextRow(); ImGui::TableNextColumn();
-                ImGui::PushID(&m);
-                ImGui::TextUnformatted(m.name.c_str());
-                copy_menu("m", m.name, m.descriptor);
-                ImGui::TableNextColumn();
-                ImGui::PushStyleColor(ImGuiCol_Text, vis_color(m.access));
-                ImGui::TextUnformatted(viewer::access_modifiers(m.access, true).c_str());
-                ImGui::PopStyleColor();
-                ImGui::TableNextColumn();
-                const std::string sig{ g_pretty ? viewer::pretty_method(m.descriptor, g_full_names) : m.descriptor };
-                ImGui::TextUnformatted(sig.c_str());
-                if (g_pretty && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m.descriptor.c_str());
-                ImGui::PopID();
+                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 118.0f);
+                ImGui::TableSetupColumn(g_pretty ? "Signature" : "Descriptor", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+                ImGuiListClipper clip; clip.Begin((int)mrows.size());
+                while (clip.Step())
+                    for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r)
+                    {
+                        const viewer::MethodInfo& m{ c.methods[(std::size_t)mrows[(std::size_t)r]] };
+                        ImGui::TableNextRow(); ImGui::TableNextColumn();
+                        ImGui::PushID(r);
+                        ImGui::TextUnformatted(m.name.c_str());
+                        copy_menu("m", m.name, m.descriptor);
+                        ImGui::TableNextColumn();
+                        ImGui::PushStyleColor(ImGuiCol_Text, vis_color(m.access));
+                        ImGui::TextUnformatted(viewer::access_modifiers(m.access, true).c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::TableNextColumn();
+                        const std::string sig{ g_pretty ? viewer::pretty_method(m.descriptor, g_full_names) : m.descriptor };
+                        ImGui::TextUnformatted(sig.c_str());
+                        if (g_pretty && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m.descriptor.c_str());
+                        ImGui::PopID();
+                    }
+                ImGui::EndTable();
             }
-            ImGui::EndTable();
         }
         ImGui::EndChild();
 
@@ -456,32 +465,41 @@ namespace
         ImGui::Text("Fields (%zu)", c.fields.size());
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##ff", "filter fields", g_field_filter, sizeof(g_field_filter));
-        if (ImGui::BeginTable("ft", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
         {
-            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-            ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 118.0f);
-            ImGui::TableSetupColumn(g_pretty ? "Type" : "Descriptor", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableHeadersRow();
             const std::string ff{ g_field_filter };
-            for (const auto& f : c.fields)
+            static std::vector<int> frows;
+            frows.clear();
+            for (int i = 0; i < (int)c.fields.size(); ++i)
+                if (icontains(c.fields[(std::size_t)i].name, ff) || icontains(c.fields[(std::size_t)i].descriptor, ff))
+                    frows.push_back(i);
+            if (ImGui::BeginTable("ft", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
             {
-                if (!icontains(f.name, ff) && !icontains(f.descriptor, ff)) continue;
-                ImGui::TableNextRow(); ImGui::TableNextColumn();
-                ImGui::PushID(&f);
-                ImGui::TextUnformatted(f.name.c_str());
-                copy_menu("f", f.name, f.descriptor);
-                ImGui::TableNextColumn();
-                ImGui::PushStyleColor(ImGuiCol_Text, vis_color(f.access));
-                ImGui::TextUnformatted(viewer::access_modifiers(f.access, false).c_str());
-                ImGui::PopStyleColor();
-                ImGui::TableNextColumn();
-                const std::string ty{ g_pretty ? viewer::pretty_field(f.descriptor, g_full_names) : f.descriptor };
-                ImGui::TextUnformatted(ty.c_str());
-                if (g_pretty && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", f.descriptor.c_str());
-                ImGui::PopID();
+                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 118.0f);
+                ImGui::TableSetupColumn(g_pretty ? "Type" : "Descriptor", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+                ImGuiListClipper clip; clip.Begin((int)frows.size());
+                while (clip.Step())
+                    for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r)
+                    {
+                        const viewer::FieldInfo& f{ c.fields[(std::size_t)frows[(std::size_t)r]] };
+                        ImGui::TableNextRow(); ImGui::TableNextColumn();
+                        ImGui::PushID(r);
+                        ImGui::TextUnformatted(f.name.c_str());
+                        copy_menu("f", f.name, f.descriptor);
+                        ImGui::TableNextColumn();
+                        ImGui::PushStyleColor(ImGuiCol_Text, vis_color(f.access));
+                        ImGui::TextUnformatted(viewer::access_modifiers(f.access, false).c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::TableNextColumn();
+                        const std::string ty{ g_pretty ? viewer::pretty_field(f.descriptor, g_full_names) : f.descriptor };
+                        ImGui::TextUnformatted(ty.c_str());
+                        if (g_pretty && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", f.descriptor.c_str());
+                        ImGui::PopID();
+                    }
+                ImGui::EndTable();
             }
-            ImGui::EndTable();
         }
         ImGui::EndChild();
     }
