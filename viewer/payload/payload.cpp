@@ -158,8 +158,15 @@ extern "C" BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(module);
-        // Do the walk off the loader lock on a detached worker thread.
-        std::thread(enumerate_and_stream).detach();
+        // Walk off the loader lock on a detached worker, then UNLOAD ourselves so
+        // a subsequent attach re-runs the enumeration (LoadLibrary of an already-
+        // loaded DLL would otherwise skip DLL_PROCESS_ATTACH).  Safe: the payload
+        // only READS VM metadata — it installs no hooks/detours to leave dangling.
+        std::thread([module]
+        {
+            enumerate_and_stream();
+            FreeLibraryAndExitThread(module, 0);  // never returns
+        }).detach();
     }
     return TRUE;
 }

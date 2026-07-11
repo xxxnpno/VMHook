@@ -330,12 +330,20 @@ namespace viewer
                 classes.clear();
             }
             status.store(Status::Injecting);
-            status_message = "Creating pipe + injecting...";
+            set_status("Creating pipe + injecting...");
             worker = std::thread([this, pid, dll_path] { run_attach(pid, dll_path); });
         }
 
     private:
         std::thread worker;
+
+        // status_message is read by the UI thread under data_mutex; every write
+        // from the worker must take the same lock.
+        void set_status(std::string message)
+        {
+            std::lock_guard<std::mutex> lock{ data_mutex };
+            status_message = std::move(message);
+        }
 
         void run_attach(std::uint32_t pid, std::wstring dll_path)
         {
@@ -363,7 +371,7 @@ namespace viewer
             }
 
             status.store(Status::Receiving);
-            status_message = "Waiting for the JVM to stream its class surface...";
+            set_status("Waiting for the JVM to stream its class surface...");
 
             // 3) Wait for the payload to connect (bounded).
             OVERLAPPED overlapped{};
@@ -437,7 +445,7 @@ namespace viewer
 
         void fail(std::string message)
         {
-            status_message = std::move(message);
+            set_status(std::move(message));
             status.store(Status::Error);
         }
 
