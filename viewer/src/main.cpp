@@ -1523,7 +1523,16 @@ namespace
             }
             else
             {
+                // class name @ address, so the (movable) popup is self-describing.
+                std::string dcls{ app.inst_class };
+                for (char& ch : dcls) if (ch == '/') ch = '.';
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
+                ImGui::TextUnformatted(dcls.c_str());
+                ImGui::PopStyleColor();
+                ImGui::SameLine(0.0f, em(0.35f));
+                ImGui::TextDisabled("@");
+                ImGui::SameLine(0.0f, em(0.35f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.68f, 0.82f, 1.0f));
                 ImGui::TextUnformatted(sel->address.c_str());
                 ImGui::PopStyleColor();
                 ImGui::SameLine(0.0f, em(0.8f));
