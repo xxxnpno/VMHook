@@ -20,6 +20,7 @@ JVM's classes / methods / fields — all discovered live, no mappings.
 | `list_classes`  | `pid`, `filter?`         | `[ "java/util/HashMap", … ]` (from cache) |
 | `get_class`     | `pid`, `class_name`      | `{name, super, kind, access, methods:[{name,descriptor,signature,modifiers,access}], fields:[{name,descriptor,type,modifiers,access,static}]}` |
 | `get_instances` | `pid`, `class_name`, `cap?` | `{pid, class, instances:[{address, fields:{name:value, …}}]}` — live heap objects of the class + their field values (own + inherited); injects if needed, so no prior `enumerate_jvm` required |
+| `get_statics`   | `pid`, `class_name`      | `{pid, class, statics:{name:value, …}}` — the class's STATIC field values, read live from its `java.lang.Class` mirror (class-level state the instance tools don't show) |
 
 `kind` is one of `class` / `interface` / `enum` / `abstract` / `annotation` /
 `record` (from the class-file access flags); `access` is the raw flag word.

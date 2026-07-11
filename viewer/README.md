@@ -105,3 +105,4 @@ is self-contained when injected.
 | a class's fields         | `klass::collect_fields()` (added for this)   |
 | live instances of a class| `vmhook::for_each_instance_of` (added) + `vmhook::get_field<T>` |
 | a field's value          | `vmhook::get_field<T>` / `read_java_string` / `decode_oop_pointer` |
+| a class's static values  | `klass::get_java_mirror()` + `vmhook::get_field<T>` (mirror-relative offset) |
