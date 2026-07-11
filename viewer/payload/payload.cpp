@@ -312,18 +312,32 @@ namespace
         // not just what its own class declares.  Each field remembers its
         // declaring klass so a shadowed name is read at the correct offset
         // (vmhook::find_field walks supers and would otherwise pick the subclass).
-        struct field_info { std::string name; std::string desc; vmhook::hotspot::klass* owner; };
+        // owner_tag = declaring class's simple name when the field is INHERITED
+        // (declared by a super, not by k), else empty.  Precomputed once per
+        // field (identical across instances).
+        struct field_info { std::string name; std::string desc; vmhook::hotspot::klass* owner; std::string owner_tag; };
         std::vector<field_info> fields;
         int hops{ 0 };
         for (vmhook::hotspot::klass* kk{ k };
              kk && vmhook::hotspot::is_valid_pointer(kk) && hops < 64;
              kk = kk->get_super(), ++hops)
         {
+            std::string tag;
+            if (kk != k)
+            {
+                if (const vmhook::hotspot::symbol* const on{ kk->get_name() };
+                    on && vmhook::hotspot::is_valid_pointer(on))
+                {
+                    const std::string full{ on->to_string() };
+                    const std::size_t p{ full.find_last_of("/$") };
+                    tag = (p == std::string::npos) ? full : full.substr(p + 1);
+                }
+            }
             for (const auto& [fname, fdesc, facc] : kk->collect_fields())
             {
                 if ((facc & 0x0008u) == 0u)  // instance (non-static) fields only
                 {
-                    fields.push_back({ fname, fdesc, kk });
+                    fields.push_back({ fname, fdesc, kk, tag });
                 }
             }
         }
@@ -344,6 +358,8 @@ namespace
                 writer.put(sanitize(f.name));
                 writer.put("\t");
                 writer.put(sanitize(read_field_value(oop, f.owner, f.name, f.desc)));
+                writer.put("\t");
+                writer.put(sanitize(f.owner_tag));  // empty = declared by the inspected class
                 writer.put("\n");
             }
             ++count;

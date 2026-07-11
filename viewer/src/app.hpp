@@ -52,12 +52,22 @@ namespace viewer
         std::vector<FieldInfo>  fields;
     };
 
-    // One live heap instance of a class: its heap address + its instance fields,
-    // each with a formatted value string (as read by the payload).
+    // One instance field: name, formatted value, and (if inherited) the simple
+    // name of the class that declares it — empty when declared by the inspected
+    // class itself.
+    struct InstField
+    {
+        std::string name;
+        std::string value;
+        std::string owner;
+    };
+
+    // One live heap instance of a class: its heap address + its instance fields
+    // (declared then inherited), each with a formatted value (as read by the payload).
     struct InstanceInfo
     {
         std::string address;  // "0x..." oop address
-        std::vector<std::pair<std::string, std::string>> fields;  // (name, value)
+        std::vector<InstField> fields;
     };
 
     struct JvmProcess
@@ -533,11 +543,23 @@ namespace viewer
                 }
                 else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t' && !out.empty())
                 {
+                    // V <TAB> name <TAB> value [<TAB> owner]  (owner absent on older payloads)
                     const std::size_t t2{ line.find('\t', 2) };
                     if (t2 != std::string_view::npos)
                     {
-                        out.back().fields.emplace_back(std::string{ line.substr(2, t2 - 2) },
-                                                       std::string{ line.substr(t2 + 1) });
+                        const std::size_t t3{ line.find('\t', t2 + 1) };
+                        InstField f;
+                        f.name = std::string{ line.substr(2, t2 - 2) };
+                        if (t3 == std::string_view::npos)
+                        {
+                            f.value = std::string{ line.substr(t2 + 1) };
+                        }
+                        else
+                        {
+                            f.value = std::string{ line.substr(t2 + 1, t3 - (t2 + 1)) };
+                            f.owner = std::string{ line.substr(t3 + 1) };
+                        }
+                        out.back().fields.push_back(std::move(f));
                     }
                 }
             }

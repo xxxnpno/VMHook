@@ -1164,8 +1164,8 @@ namespace
         }
         static const std::string empty{};
         const int fi{ col - 2 };
-        const std::string& xs{ fi < (int)A.fields.size() ? A.fields[(std::size_t)fi].second : empty };
-        const std::string& ys{ fi < (int)B.fields.size() ? B.fields[(std::size_t)fi].second : empty };
+        const std::string& xs{ fi < (int)A.fields.size() ? A.fields[(std::size_t)fi].value : empty };
+        const std::string& ys{ fi < (int)B.fields.size() ? B.fields[(std::size_t)fi].value : empty };
         return cmp_num_or_str(xs, ys);
     }
 
@@ -1199,13 +1199,14 @@ namespace
         ImGui::SameLine(0.0f, em(0.7f));
         if (ImGui::SmallButton("Refresh")) g_instances_refresh_now = true;
 
-        // Columns = the field names actually streamed for these instances
-        // (declared + inherited, in payload order).  Taken from the first
-        // instance — every instance of the same class streams the same fields.
-        std::vector<std::string> cols;
+        // Columns = the fields actually streamed for these instances (declared
+        // then inherited, in payload order): (name, owner) where a non-empty
+        // owner means the field is inherited from that class.  Taken from the
+        // first instance — every instance of the same class streams the same fields.
+        std::vector<std::pair<std::string, std::string>> cols;
         if (!app.instances.empty())
             for (const auto& fv : app.instances.front().fields)
-                cols.push_back(fv.first);
+                cols.emplace_back(fv.name, fv.owner);
 
         // Filter order: keep the rows whose address or any value matches (the
         // InputText below updates g_instance_filter, so this is last frame's
@@ -1219,7 +1220,7 @@ namespace
             if (needle.empty()) { view.push_back(i); continue; }
             const viewer::InstanceInfo& in{ app.instances[(std::size_t)i] };
             bool hit{ contains_ci(in.address, needle) };
-            for (const auto& fv : in.fields) if (!hit && contains_ci(fv.second, needle)) hit = true;
+            for (const auto& fv : in.fields) if (!hit && contains_ci(fv.value, needle)) hit = true;
             if (hit) view.push_back(i);
         }
 
@@ -1267,10 +1268,22 @@ namespace
         {
             ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort, em(2.8f));
             ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, em(11.0f));
-            for (const std::string& cn : cols)
-                ImGui::TableSetupColumn(cn.c_str(), ImGuiTableColumnFlags_WidthFixed, em(11.0f));
+            for (const auto& cn : cols)
+                ImGui::TableSetupColumn(cn.first.c_str(), ImGuiTableColumnFlags_WidthFixed, em(11.0f));
             ImGui::TableSetupScrollFreeze(2, 1);
-            ImGui::TableHeadersRow();
+
+            // Header row (manual, so inherited columns render dimmed + tooltipped).
+            ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+            for (int c = 0; c < 2 + (int)cols.size(); ++c)
+            {
+                if (!ImGui::TableSetColumnIndex(c)) continue;
+                const bool inherited{ c >= 2 && !cols[(std::size_t)(c - 2)].second.empty() };
+                if (inherited) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.60f, 0.72f, 1.0f));
+                ImGui::TableHeader(ImGui::TableGetColumnName(c));
+                if (inherited) ImGui::PopStyleColor();
+                if (inherited && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("inherited from %s", cols[(std::size_t)(c - 2)].second.c_str());
+            }
 
             if (ImGuiTableSortSpecs* ss{ ImGui::TableGetSortSpecs() }; ss && ss->SpecsCount > 0)
             {
@@ -1309,7 +1322,7 @@ namespace
                     {
                         ImGui::TableSetColumnIndex(cidx + 2);
                         if (cidx >= (int)inst.fields.size()) continue;
-                        const std::string& v{ inst.fields[(std::size_t)cidx].second };
+                        const std::string& v{ inst.fields[(std::size_t)cidx].value };
                         if (v == "null") ImGui::TextDisabled("null");
                         else             ImGui::TextUnformatted(v.c_str());
                         if (ImGui::IsItemHovered() && v.size() > 18) ImGui::SetTooltip("%s", v.c_str());
