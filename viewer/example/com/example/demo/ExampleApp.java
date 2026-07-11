@@ -72,16 +72,30 @@ public class ExampleApp
 
     enum Color { RED, GREEN, BLUE }
 
+    // A subclass so the instance inspector can show INHERITED fields (id, ticks,
+    // label, active, ... all come from ExampleApp) alongside Worker's own (seq, team).
+    public static class Worker extends ExampleApp
+    {
+        public  int    seq;
+        private String team;
+        Worker(int id, String label, int seq)
+        {
+            super(id, label);
+            this.seq  = seq;
+            this.team = "team-" + (seq % 4);
+        }
+    }
+
     // Keep many live instances alive (a real heap has more than one) so the
     // viewer's instance inspector has rows to sort / filter — each mutates every tick.
-    static final List<ExampleApp> live = new ArrayList<>();
+    static final List<Worker> live = new ArrayList<>();
 
     // ── entry point (runs forever so it stays attachable) ────────────────────
     public static void main(String[] args) throws Exception
     {
         Greeter g = who -> "Hello, " + who + "!";
         scores.put("player", 100);
-        for (int n = 0; n < 40; n++) live.add(new ExampleApp(n, "worker-" + n));
+        for (int n = 0; n < 40; n++) live.add(new Worker(n, "worker-" + n, n));
 
         System.out.println("[ExampleApp] JVM up — attach the vmhook viewer to this process.");
         System.out.println(g.greet("vmhook") + " color=" + defaultColor

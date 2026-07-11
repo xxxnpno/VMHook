@@ -1199,23 +1199,44 @@ namespace
         ImGui::SameLine(0.0f, em(0.7f));
         if (ImGui::SmallButton("Refresh")) g_instances_refresh_now = true;
 
+        // Columns = the field names actually streamed for these instances
+        // (declared + inherited, in payload order).  Taken from the first
+        // instance — every instance of the same class streams the same fields.
+        std::vector<std::string> cols;
+        if (!app.instances.empty())
+            for (const auto& fv : app.instances.front().fields)
+                cols.push_back(fv.first);
+
+        // Filter order: keep the rows whose address or any value matches (the
+        // InputText below updates g_instance_filter, so this is last frame's
+        // text — a 1-frame lag that's imperceptible).
+        std::string needle{ g_instance_filter };
+        for (char& ch : needle) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        std::vector<int> view;
+        view.reserve(app.instances.size());
+        for (int i = 0; i < (int)app.instances.size(); ++i)
+        {
+            if (needle.empty()) { view.push_back(i); continue; }
+            const viewer::InstanceInfo& in{ app.instances[(std::size_t)i] };
+            bool hit{ contains_ci(in.address, needle) };
+            for (const auto& fv : in.fields) if (!hit && contains_ci(fv.second, needle)) hit = true;
+            if (hit) view.push_back(i);
+        }
+
+        // "Found N" (+ filtered count + cap warning) on one line.
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%s", app.inst_message.c_str());
+        if (!needle.empty())
+        {
+            ImGui::SameLine(0.0f, em(0.5f));
+            ImGui::TextDisabled("· %d shown", (int)view.size());
+        }
         if (app.inst_cap > 0 && (int)app.instances.size() >= app.inst_cap)
         {
             ImGui::SameLine(0.0f, em(0.6f));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.75f, 0.35f, 1.0f));
             ImGui::TextUnformatted("scan cap reached — raise it to see more");
             ImGui::PopStyleColor();
-        }
-
-        // Columns = the class's declared instance (non-static) fields.
-        std::vector<const viewer::FieldInfo*> cols;
-        if (const auto it{ app.name_to_index.find(app.inst_class) };
-            it != app.name_to_index.end() && it->second >= 0 && it->second < (int)app.classes.size())
-        {
-            for (const auto& f : app.classes[(std::size_t)it->second].fields)
-                if (!f.is_static) cols.push_back(&f);
         }
 
         // Row: substring filter (address or any value) + the heap-scan cap.
@@ -1233,26 +1254,6 @@ namespace
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Max instances to scan for on the heap (drag or double-click to edit)");
 
-        // Display order: filter first, then sort by the table's sort spec.
-        std::string needle{ g_instance_filter };
-        for (char& ch : needle) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        std::vector<int> view;
-        view.reserve(app.instances.size());
-        for (int i = 0; i < (int)app.instances.size(); ++i)
-        {
-            if (needle.empty()) { view.push_back(i); continue; }
-            const viewer::InstanceInfo& in{ app.instances[(std::size_t)i] };
-            bool hit{ contains_ci(in.address, needle) };
-            for (const auto& fv : in.fields) if (!hit && contains_ci(fv.second, needle)) hit = true;
-            if (hit) view.push_back(i);
-        }
-        if (!needle.empty())
-        {
-            ImGui::SameLine(0.0f, em(0.6f));
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("%d / %d", (int)view.size(), (int)app.instances.size());
-        }
-
         ImGui::Separator();
         if (app.instances.empty())
         {
@@ -1266,8 +1267,8 @@ namespace
         {
             ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort, em(2.8f));
             ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, em(11.0f));
-            for (const viewer::FieldInfo* f : cols)
-                ImGui::TableSetupColumn(f->name.c_str(), ImGuiTableColumnFlags_WidthFixed, em(11.0f));
+            for (const std::string& cn : cols)
+                ImGui::TableSetupColumn(cn.c_str(), ImGuiTableColumnFlags_WidthFixed, em(11.0f));
             ImGui::TableSetupScrollFreeze(2, 1);
             ImGui::TableHeadersRow();
 

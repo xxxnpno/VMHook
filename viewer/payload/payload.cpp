@@ -307,13 +307,24 @@ namespace
             return;
         }
 
-        struct field_info { std::string name; std::string desc; };
+        // Declared instance (non-static) fields of k, then inherited ones by
+        // walking the super chain — so the table shows an object's FULL state,
+        // not just what its own class declares.  Each field remembers its
+        // declaring klass so a shadowed name is read at the correct offset
+        // (vmhook::find_field walks supers and would otherwise pick the subclass).
+        struct field_info { std::string name; std::string desc; vmhook::hotspot::klass* owner; };
         std::vector<field_info> fields;
-        for (const auto& [fname, fdesc, facc] : k->collect_fields())
+        int hops{ 0 };
+        for (vmhook::hotspot::klass* kk{ k };
+             kk && vmhook::hotspot::is_valid_pointer(kk) && hops < 64;
+             kk = kk->get_super(), ++hops)
         {
-            if ((facc & 0x0008u) == 0u)  // instance (non-static) fields only
+            for (const auto& [fname, fdesc, facc] : kk->collect_fields())
             {
-                fields.push_back({ fname, fdesc });
+                if ((facc & 0x0008u) == 0u)  // instance (non-static) fields only
+                {
+                    fields.push_back({ fname, fdesc, kk });
+                }
             }
         }
 
@@ -332,7 +343,7 @@ namespace
                 writer.put("V\t");
                 writer.put(sanitize(f.name));
                 writer.put("\t");
-                writer.put(sanitize(read_field_value(oop, k, f.name, f.desc)));
+                writer.put(sanitize(read_field_value(oop, f.owner, f.name, f.desc)));
                 writer.put("\n");
             }
             ++count;
