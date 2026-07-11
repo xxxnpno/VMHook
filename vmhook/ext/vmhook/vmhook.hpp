@@ -8378,6 +8378,11 @@ namespace vmhook
     inline std::unordered_map<std::string, vmhook::hotspot::klass*> klass_lookup_cache{};
     inline std::mutex klass_lookup_cache_mutex{};
 
+    // Pure-VM array-klass resolution by JVM descriptor (defined after find_class,
+    // which it calls for the component type of object arrays).
+    static auto resolve_array_klass(std::string_view descriptor) noexcept
+        -> vmhook::hotspot::klass*;
+
     /*
         @brief Finds a loaded Java class by its internal name using HotSpot internals only.
         @param class_name The internal JVM class name using '/' separators
@@ -8423,15 +8428,11 @@ namespace vmhook
         // JNI call (the unconditional clear is a no-op on the success path).  Library #5.
         if (class_name.front() == '[')
         {
-            void* const array_mirror{ vmhook::detail::jni_find_class(class_name) };
-            vmhook::hotspot::klass* array_klass{ nullptr };
-            if (array_mirror)
-            {
-                array_klass = vmhook::detail::jni_klass_from_class_mirror(array_mirror);
-                vmhook::detail::jni_delete_local_ref(array_mirror);
-            }
-            vmhook::detail::jni_exception_clear();
-            return array_klass;
+            // Pure-VM array-klass resolution (was JNIEnv::FindClass).  The CLDG
+            // _klasses walk lists array klasses on JDK 21+; resolve_array_klass
+            // covers JDK 8-17 (per-CLD Dictionary is InstanceKlass-only) via the
+            // Universe primitive-array statics + InstanceKlass::_array_klasses.
+            return vmhook::resolve_array_klass(class_name);
         }
 
         {
@@ -8487,11 +8488,11 @@ namespace vmhook
 
             if (!found_klass)
             {
-                found_klass = vmhook::detail::jni_find_class_with_context_loader(class_name);
-                if (!found_klass)
-                {
-                    return nullptr;
-                }
+                // Pure-VM: no JNI context-loader loadClass fallback.  The CLDG walk
+                // above enumerates every LOADED class across all loaders; a miss means
+                // the class is not yet loaded (vmhook observes live VM state and does
+                // not trigger class loading).
+                return nullptr;
             }
 
             {
@@ -8513,6 +8514,101 @@ namespace vmhook
             VMHOOK_LOG("{} vmhook::find_class() for {}: {}", vmhook::error_tag, class_name, exception.what());
             return nullptr;
         }
+    }
+
+    /*
+        @brief Pure-VM resolution of an array klass by JVM descriptor.
+        @details Replaces the former JNIEnv::FindClass path for '[' names.  The
+        ClassLoaderDataGraph _klasses walk already enumerates array klasses on
+        JDK 21+; this covers JDK 8-17, whose per-CLD Dictionary lists
+        InstanceKlasses only:
+          [X (primitive) -> Universe::_<type>ArrayKlassObj static  (1-dim TypeArrayKlass)
+          [Lfoo;         -> component InstanceKlass::_array_klasses (1-dim ObjArrayKlass)
+          [[...          -> one ArrayKlass::_higher_dimension hop per extra leading '['
+        All reads go through os::safe_read / VMStructs; returns nullptr if a
+        required field is not exported on the running JDK.
+    */
+    static auto resolve_array_klass(const std::string_view descriptor) noexcept
+        -> vmhook::hotspot::klass*
+    {
+        if (descriptor.size() < 2 || descriptor.front() != '[')
+        {
+            return nullptr;
+        }
+
+        std::size_t dimensions{ 0 };
+        while (dimensions < descriptor.size() && descriptor[dimensions] == '[')
+        {
+            ++dimensions;
+        }
+        const std::string_view element{ descriptor.substr(dimensions) };
+        if (element.empty())
+        {
+            return nullptr;
+        }
+
+        // Read a Klass* out of an address (a static's address or base+offset),
+        // fault-safe.  Returns nullptr on an unmapped page or an implausible value.
+        const auto read_klass_at{ [](const void* const address) noexcept -> vmhook::hotspot::klass*
+        {
+            if (!address)
+            {
+                return nullptr;
+            }
+            vmhook::hotspot::klass* const result{
+                reinterpret_cast<vmhook::hotspot::klass*>(
+                    const_cast<void*>(vmhook::hotspot::safe_read_pointer(address))) };
+            return vmhook::hotspot::is_valid_pointer(result) ? result : nullptr;
+        } };
+
+        const auto read_klass_field{ [&](vmhook::hotspot::klass* const base, const char* const type, const char* const field) noexcept -> vmhook::hotspot::klass*
+        {
+            const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries(type, field) };
+            if (!entry || !base || !vmhook::hotspot::is_valid_pointer(base))
+            {
+                return nullptr;
+            }
+            return read_klass_at(reinterpret_cast<const std::uint8_t*>(base) + entry->offset);
+        } };
+
+        vmhook::hotspot::klass* one_dimensional{ nullptr };
+        if (element.size() == 1)
+        {
+            const char* universe_field{ nullptr };
+            switch (element[0])
+            {
+                case 'Z': universe_field = "_boolArrayKlassObj";   break;
+                case 'B': universe_field = "_byteArrayKlassObj";   break;
+                case 'C': universe_field = "_charArrayKlassObj";   break;
+                case 'S': universe_field = "_shortArrayKlassObj";  break;
+                case 'I': universe_field = "_intArrayKlassObj";    break;
+                case 'J': universe_field = "_longArrayKlassObj";   break;
+                case 'F': universe_field = "_singleArrayKlassObj"; break;
+                case 'D': universe_field = "_doubleArrayKlassObj"; break;
+                default:  return nullptr;
+            }
+            const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Universe", universe_field) };
+            if (entry)
+            {
+                one_dimensional = read_klass_at(entry->address);
+            }
+        }
+        else if (element.front() == 'L' && element.back() == ';')
+        {
+            const std::string component{ element.substr(1, element.size() - 2) };
+            vmhook::hotspot::klass* const component_klass{ vmhook::find_class(component) };
+            if (component_klass)
+            {
+                one_dimensional = read_klass_field(component_klass, "InstanceKlass", "_array_klasses");
+            }
+        }
+
+        vmhook::hotspot::klass* result{ one_dimensional };
+        for (std::size_t dimension{ 1 }; dimension < dimensions && result; ++dimension)
+        {
+            result = read_klass_field(result, "ArrayKlass", "_higher_dimension");
+        }
+        return result;
     }
 
     /*
@@ -14321,31 +14417,11 @@ namespace vmhook
             return nullptr;
         }
 
-        // Always prefer NewObjectA: it lets the JVM allocate the object,
-        // set its mark word + (compressed) klass pointer, AND run the full
-        // constructor chain via the standard interpreter path.  That last
-        // bit matters - the TLAB fallback below dispatches <init> through
-        // method_proxy::call_jni, which uses CallVoidMethodA on <init>;
-        // that is JNI undefined behaviour and on some JDKs (notably JDK
-        // 21+ where StubRoutines::_call_stub_entry is missing from
-        // VMStructs) it skips the constructor body entirely, leaving
-        // super-class fields (e.g. ChatComponentStyle.siblings, .style)
-        // null.  Host code (Lunar's Adventure chat adapter, Forge's
-        // wrapped GuiNewChat) then NPEs / throws when it walks those
-        // fields.  Trying jni_make_unique first removes that whole class
-        // of bug.
-        if (std::unique_ptr<wrapper_type> jni_result{ vmhook::detail::jni_make_unique<wrapper_type>(map_entry->second, std::forward<args_t>(args)...) })
-        {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): constructed via NewObjectA.",
-                       vmhook::info_tag, typeid(wrapper_type).name());
-            return jni_result;
-        }
-
-        VMHOOK_LOG("{} vmhook::make_unique<{}>(): NewObjectA path unavailable - "
-                   "falling back to TLAB + <init>.  Object fields may be only "
-                   "partially initialised on this JDK.",
-                   vmhook::warning_tag, typeid(wrapper_type).name());
-
+        // Pure-VM construction: allocate + stamp the object header via
+        // make_java_object (TLAB path), then run the wrapper's C++-side
+        // construct() for field initialisation.  The former NewObjectA (JNI)
+        // first-try that ran the Java <init> chain is gone; a wrapper that needs
+        // Java constructor effects should implement construct() to set them.
         vmhook::hotspot::klass* const klass{ vmhook::find_class(map_entry->second) };
         if (!klass)
         {
@@ -14753,41 +14829,9 @@ namespace vmhook
             return nullptr;
         }
 
-        vmhook::hotspot::klass* array_klass{ vmhook::find_class(class_name) };
-        // JDK 8 fallback: find_class resolves names through ClassLoader.loadClass,
-        // which rejects array descriptors ("[B", "[Ljava/lang/Object;").  On JDK 9+
-        // the array klass is reachable by name so this branch never triggers; on
-        // JDK 8 it misses, so fall back to JNIEnv::FindClass, which DOES accept
-        // array descriptors, and convert the returned jclass mirror to its Klass*.
-        if (!array_klass && !class_name.empty() && class_name.front() == '[')
-        {
-            void* const h{ vmhook::detail::jni_find_class(class_name) };
-            if (h)
-            {
-                array_klass = vmhook::detail::jni_klass_from_class_mirror(h);
-                vmhook::detail::jni_delete_local_ref(h);
-            }
-            // CRITICAL: JNIEnv::FindClass leaves a pending exception
-            // (NoClassDefFoundError / ClassNotFoundException) on a MISS — and
-            // jni_find_class does NOT clear it.  The previous code only cleared
-            // inside `if (h)`, so a '[' descriptor whose ELEMENT class is missing
-            // (e.g. "[Lvmhook/fixtures/NoSuchClass;", where FindClass returns null)
-            // left that exception pending on the thread.  Under -Xcheck:jni
-            // (fastdebug HotSpot) the leaked exception aborts the next JNI call, and
-            // it can surface when the interpreter resumes after a detour.  Clear it
-            // unconditionally after the attempt — on the success path (h non-null)
-            // FindClass left nothing pending, so this is a no-op there.
-            vmhook::detail::jni_exception_clear();
-        }
+        vmhook::hotspot::klass* const array_klass{ vmhook::find_class(class_name) };
         if (!array_klass)
         {
-            // Belt-and-braces: clear any pending JNI exception from the resolution
-            // attempt above before returning, so a make_java_array miss never hands
-            // a leaked exception back to the caller (JNI-spec safety / -Xcheck:jni).
-            // find_class()'s context-loader path already clears on its own misses,
-            // so this is normally a no-op; it closes the residual window left by any
-            // resolution arm that did not.
-            vmhook::detail::jni_exception_clear();
             VMHOOK_LOG("{} vmhook::make_java_array('{}'): array klass not found - the array "
                        "descriptor is not loaded yet, or class_name uses the wrong syntax "
                        "(e.g. should be \"[B\" not \"byte[]\").",
@@ -17484,14 +17528,14 @@ namespace vmhook
             void* const call_stub{ vmhook::detail::find_call_stub_entry() };
             if (!call_stub)
             {
-                if (!vmhook::hotspot::ensure_current_java_thread())
-                {
-                    VMHOOK_LOG("{} method_proxy::call('{}{}'): call_stub_entry missing AND "
-                               "ensure_current_java_thread() failed - cannot dispatch via either path.",
-                               vmhook::error_tag, this->name(), this->signature_text);
-                    return value_t{ std::monostate{} };
-                }
-                return this->call_jni(std::forward<args_t>(args)...);
+                // Pure-VM: no JNI CallXxxMethod fallback.  method_proxy::call routes
+                // through StubRoutines::_call_stub_entry (resolved via VMStructs).  On
+                // a JDK build that does not export it, invocation is unavailable rather
+                // than dispatched through JNI.
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): StubRoutines::_call_stub_entry not "
+                           "resolvable via VMStructs on this JDK; pure-VM invocation unavailable.",
+                           vmhook::error_tag, this->name(), this->signature_text);
+                return value_t{ std::monostate{} };
             }
 
             vmhook::hotspot::method* const selected_method{ this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
@@ -22116,64 +22160,46 @@ namespace vmhook
             global_ref() noexcept = default;
 
             explicit global_ref(vmhook::oop_t const raw_oop) noexcept
+                : oop_{ raw_oop }
             {
-                if (!raw_oop)
-                {
-                    return;
-                }
-                void* storage{};
-                void* const local_handle{ vmhook::detail::jni_oop_handle(raw_oop, storage) };
-                this->handle_ = vmhook::detail::jni_new_global_ref(local_handle);
             }
 
-            ~global_ref() noexcept
-            {
-                vmhook::detail::jni_delete_global_ref(this->handle_);
-            }
+            ~global_ref() noexcept = default;
 
             global_ref(const global_ref&)                    = delete;
             auto operator=(const global_ref&) -> global_ref& = delete;
 
             global_ref(global_ref&& other) noexcept
-                : handle_{ other.handle_ }
+                : oop_{ other.oop_ }
             {
-                other.handle_ = nullptr;
+                other.oop_ = nullptr;
             }
 
             auto operator=(global_ref&& other) noexcept -> global_ref&
             {
                 if (this != &other)
                 {
-                    vmhook::detail::jni_delete_global_ref(this->handle_);
-                    this->handle_ = other.handle_;
-                    other.handle_ = nullptr;
+                    this->oop_ = other.oop_;
+                    other.oop_ = nullptr;
                 }
                 return *this;
             }
 
             /*
-                @brief The pinned object's CURRENT heap OOP, or nullptr if empty.
-                @details Dereferences the global-ref slot, so the returned address
-                reflects any relocation the JVM performed since the pin was taken.
+                @brief The pinned object's heap OOP, or nullptr if empty.
+                @details PURE-VM LIMITATION: creating a real GC root (what
+                JNIEnv::NewGlobalRef used to do) requires a call into the VM,
+                which is exactly the JNI dependency this build removes.  vmhook
+                therefore stores the raw OOP captured at construction and returns
+                it as-is.  It stays valid across NON-relocating collections and
+                while the object has not moved, but a relocating GC that moves the
+                object between the pin and this call leaves the address stale.
+                Hold pins only across GC-quiet windows, or keep the object
+                reachable from live Java state.
             */
             auto oop() const noexcept -> vmhook::oop_t
             {
-                if (!this->handle_)
-                {
-                    return nullptr;
-                }
-                // HotSpot tags JNI handles in the low bits (JDK 9+: a small type
-                // tag distinguishing local / global / weak-global; the underlying
-                // OopStorage slot is 8-byte aligned).  A NewGlobalRef handle on a
-                // modern JDK therefore is NOT directly dereferenceable — its low
-                // bits hold the tag, so `*(void**)handle` reads a MISaligned,
-                // garbage oop.  Masking the low 3 bits recovers the real slot
-                // address.  This is a no-op on JDK 8 (untagged, already-aligned
-                // handles), which is why the raw deref worked there but returned
-                // garbage on the CI's JDK 11-25.
-                const std::uintptr_t slot{
-                    reinterpret_cast<std::uintptr_t>(this->handle_) & ~std::uintptr_t{ 0b111 } };
-                return *reinterpret_cast<void**>(slot);
+                return this->oop_;
             }
 
             /*
@@ -22181,25 +22207,24 @@ namespace vmhook
             */
             auto reset() noexcept -> void
             {
-                vmhook::detail::jni_delete_global_ref(this->handle_);
-                this->handle_ = nullptr;
+                this->oop_ = nullptr;
             }
 
             /*
-                @brief The raw JNI global handle (for advanced JNI interop).  May be null.
+                @brief The raw OOP (retained for API compatibility).  May be null.
             */
             auto handle() const noexcept -> void*
             {
-                return this->handle_;
+                return this->oop_;
             }
 
             explicit operator bool() const noexcept
             {
-                return this->handle_ != nullptr;
+                return this->oop_ != nullptr;
             }
 
         private:
-            void* handle_{ nullptr };
+            vmhook::oop_t oop_{ nullptr };
         };
     }
 
