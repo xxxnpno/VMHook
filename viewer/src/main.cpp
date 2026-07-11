@@ -34,6 +34,7 @@ namespace
     IDXGISwapChain*         g_swap_chain{ nullptr };
     ID3D11RenderTargetView* g_rtv{ nullptr };
     HWND                    g_hwnd{ nullptr };  // for the custom min/close controls
+    float                   g_dpi_scale{ 1.0f };  // physical DPI / 96 (set at startup)
 
     void create_rtv()
     {
@@ -138,51 +139,66 @@ namespace
     void apply_modern_style()
     {
         ImGuiStyle& s{ ImGui::GetStyle() };
-        s.WindowRounding = 6.0f; s.ChildRounding = 6.0f; s.FrameRounding = 5.0f;
-        s.PopupRounding = 5.0f; s.GrabRounding = 5.0f; s.ScrollbarRounding = 9.0f; s.TabRounding = 5.0f;
-        s.WindowPadding = ImVec2(12, 12); s.FramePadding = ImVec2(9, 6);
-        s.ItemSpacing = ImVec2(8, 7); s.ItemInnerSpacing = ImVec2(7, 5); s.CellPadding = ImVec2(7, 4);
-        s.ScrollbarSize = 13.0f; s.GrabMinSize = 11.0f;
-        s.WindowBorderSize = 0.0f; s.FrameBorderSize = 0.0f; s.ChildBorderSize = 1.0f; s.PopupBorderSize = 1.0f;
+        // Rounding — consistent, soft.
+        s.WindowRounding = 8.0f; s.ChildRounding = 8.0f; s.FrameRounding = 6.0f;
+        s.PopupRounding = 8.0f; s.GrabRounding = 6.0f; s.ScrollbarRounding = 10.0f; s.TabRounding = 6.0f;
+        // Spacing / padding — roomier so controls breathe and line up.
+        s.WindowPadding = ImVec2(14, 12); s.FramePadding = ImVec2(11, 7);
+        s.ItemSpacing = ImVec2(9, 8); s.ItemInnerSpacing = ImVec2(8, 6); s.CellPadding = ImVec2(9, 5);
+        s.ScrollbarSize = 14.0f; s.GrabMinSize = 12.0f;
+        s.WindowBorderSize = 0.0f; s.FrameBorderSize = 1.0f; s.ChildBorderSize = 1.0f; s.PopupBorderSize = 1.0f;
+        s.SeparatorTextBorderSize = 2.0f; s.SeparatorTextPadding = ImVec2(20, 6);
+        s.WindowTitleAlign = ImVec2(0.0f, 0.5f);
 
         ImVec4* c{ s.Colors };
-        const ImVec4 accent{ 0.24f, 0.52f, 0.92f, 1.0f };
-        c[ImGuiCol_Text]                 = ImVec4(0.92f, 0.93f, 0.95f, 1.00f);
-        c[ImGuiCol_TextDisabled]         = ImVec4(0.48f, 0.50f, 0.55f, 1.00f);
-        c[ImGuiCol_WindowBg]             = ImVec4(0.075f, 0.078f, 0.094f, 1.00f);
-        c[ImGuiCol_ChildBg]              = ImVec4(0.105f, 0.110f, 0.130f, 1.00f);
-        c[ImGuiCol_PopupBg]              = ImVec4(0.11f, 0.115f, 0.135f, 0.98f);
-        c[ImGuiCol_Border]               = ImVec4(1.00f, 1.00f, 1.00f, 0.075f);
-        c[ImGuiCol_FrameBg]              = ImVec4(0.16f, 0.17f, 0.20f, 1.00f);
-        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.21f, 0.22f, 0.26f, 1.00f);
-        c[ImGuiCol_FrameBgActive]        = ImVec4(0.24f, 0.26f, 0.31f, 1.00f);
+        const ImVec4 accent  { 0.26f, 0.56f, 0.96f, 1.00f };
+        const ImVec4 accentHi{ 0.34f, 0.63f, 1.00f, 1.00f };
+        c[ImGuiCol_Text]                 = ImVec4(0.92f, 0.93f, 0.96f, 1.00f);
+        c[ImGuiCol_TextDisabled]         = ImVec4(0.46f, 0.49f, 0.56f, 1.00f);
+        c[ImGuiCol_WindowBg]             = ImVec4(0.070f, 0.074f, 0.090f, 1.00f);
+        c[ImGuiCol_ChildBg]              = ImVec4(0.100f, 0.106f, 0.126f, 1.00f);
+        c[ImGuiCol_PopupBg]              = ImVec4(0.115f, 0.122f, 0.145f, 0.99f);
+        c[ImGuiCol_Border]               = ImVec4(1.00f, 1.00f, 1.00f, 0.090f);
+        c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+        c[ImGuiCol_FrameBg]              = ImVec4(0.155f, 0.165f, 0.200f, 1.00f);
+        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.200f, 0.215f, 0.260f, 1.00f);
+        c[ImGuiCol_FrameBgActive]        = ImVec4(0.230f, 0.250f, 0.310f, 1.00f);
         c[ImGuiCol_TitleBg]              = ImVec4(0.08f, 0.09f, 0.11f, 1.00f);
         c[ImGuiCol_TitleBgActive]        = ImVec4(0.10f, 0.14f, 0.24f, 1.00f);
         c[ImGuiCol_MenuBarBg]            = ImVec4(0.11f, 0.12f, 0.14f, 1.00f);
         c[ImGuiCol_ScrollbarBg]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.30f, 0.32f, 0.38f, 1.00f);
-        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.38f, 0.40f, 0.47f, 1.00f);
-        c[ImGuiCol_CheckMark]            = accent;
+        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.28f, 0.30f, 0.37f, 1.00f);
+        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.36f, 0.39f, 0.47f, 1.00f);
+        c[ImGuiCol_ScrollbarGrabActive]  = accent;
+        c[ImGuiCol_CheckMark]            = accentHi;
         c[ImGuiCol_SliderGrab]           = accent;
-        c[ImGuiCol_Button]               = ImVec4(0.20f, 0.34f, 0.58f, 0.70f);
-        c[ImGuiCol_ButtonHovered]        = ImVec4(0.24f, 0.44f, 0.76f, 0.95f);
-        c[ImGuiCol_ButtonActive]         = accent;
-        c[ImGuiCol_Header]               = ImVec4(0.22f, 0.40f, 0.70f, 0.55f);
-        c[ImGuiCol_HeaderHovered]        = ImVec4(0.24f, 0.44f, 0.78f, 0.70f);
-        c[ImGuiCol_HeaderActive]         = ImVec4(0.26f, 0.50f, 0.86f, 0.90f);
-        c[ImGuiCol_Separator]            = ImVec4(1.00f, 1.00f, 1.00f, 0.08f);
-        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.145f, 0.155f, 0.185f, 1.00f);
-        c[ImGuiCol_TableBorderStrong]    = ImVec4(1.00f, 1.00f, 1.00f, 0.10f);
-        c[ImGuiCol_TableBorderLight]     = ImVec4(1.00f, 1.00f, 1.00f, 0.05f);
+        c[ImGuiCol_SliderGrabActive]     = accentHi;
+        c[ImGuiCol_Button]               = ImVec4(0.22f, 0.43f, 0.80f, 1.00f);
+        c[ImGuiCol_ButtonHovered]        = ImVec4(0.28f, 0.53f, 0.94f, 1.00f);
+        c[ImGuiCol_ButtonActive]         = ImVec4(0.19f, 0.37f, 0.70f, 1.00f);
+        c[ImGuiCol_Header]               = ImVec4(0.22f, 0.42f, 0.74f, 0.55f);
+        c[ImGuiCol_HeaderHovered]        = ImVec4(0.25f, 0.47f, 0.82f, 0.75f);
+        c[ImGuiCol_HeaderActive]         = ImVec4(0.27f, 0.52f, 0.90f, 0.92f);
+        c[ImGuiCol_Separator]            = ImVec4(1.00f, 1.00f, 1.00f, 0.090f);
+        c[ImGuiCol_SeparatorHovered]     = accent;
+        c[ImGuiCol_SeparatorActive]      = accentHi;
+        c[ImGuiCol_ResizeGrip]           = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
+        c[ImGuiCol_ResizeGripHovered]    = accent;
+        c[ImGuiCol_ResizeGripActive]     = accentHi;
+        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.140f, 0.150f, 0.185f, 1.00f);
+        c[ImGuiCol_TableBorderStrong]    = ImVec4(1.00f, 1.00f, 1.00f, 0.100f);
+        c[ImGuiCol_TableBorderLight]     = ImVec4(1.00f, 1.00f, 1.00f, 0.050f);
         c[ImGuiCol_TableRowBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
         c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.00f, 1.00f, 1.00f, 0.022f);
+        c[ImGuiCol_TextSelectedBg]       = ImVec4(accent.x, accent.y, accent.z, 0.35f);
         c[ImGuiCol_NavHighlight]         = accent;
     }
 
-    void load_fonts()
+    void load_fonts(float dpi_scale)
     {
         ImGuiIO& io{ ImGui::GetIO() };
-        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
+        const float base_px{ 18.0f * dpi_scale };
+        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", base_px);
         if (io.Fonts->Fonts.empty())
         {
             io.Fonts->AddFontDefault();
@@ -205,9 +221,9 @@ namespace
             ImFontConfig cfg{};
             cfg.MergeMode        = true;
             cfg.PixelSnapH       = true;
-            cfg.GlyphMinAdvanceX = 16.0f;      // keep icons a consistent width
-            cfg.GlyphOffset      = ImVec2(0.0f, 2.0f);  // sit on the text baseline
-            io.Fonts->AddFontFromFileTTF(icon_ttf.c_str(), 15.0f, &cfg, icon_ranges);
+            cfg.GlyphMinAdvanceX = 16.0f * dpi_scale;  // keep icons a consistent width
+            cfg.GlyphOffset      = ImVec2(0.0f, 2.0f * dpi_scale);  // sit on the text baseline
+            io.Fonts->AddFontFromFileTTF(icon_ttf.c_str(), 15.0f * dpi_scale, &cfg, icon_ranges);
         }
     }
 }
@@ -306,6 +322,8 @@ namespace
         }
     }
 
+    float em(float n);  // fwd (defined in the panes namespace)
+
     void status_pill(viewer::Status st)
     {
         ImVec4 col; const char* text;
@@ -317,8 +335,18 @@ namespace
         case viewer::Status::Done:      col = ImVec4(0.35f,0.8f,0.45f,1);text = "Done";      break;
         default:                        col = ImVec4(0.9f,0.35f,0.35f,1);text = "Error";     break;
         }
+        // Status dot drawn as a filled circle (no font-glyph dependency), text
+        // vertically centered against the toolbar's framed widgets.
+        ImGui::AlignTextToFramePadding();
+        const ImVec2 p{ ImGui::GetCursorScreenPos() };
+        const float  r{ em(0.28f) };
+        const float  cy{ p.y + ImGui::GetFrameHeight() * 0.5f };
+        ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + r, cy), r, ImGui::GetColorU32(col));
+        ImGui::Dummy(ImVec2(r * 2.0f + em(0.35f), ImGui::GetFrameHeight()));
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::AlignTextToFramePadding();
         ImGui::PushStyleColor(ImGuiCol_Text, col);
-        ImGui::Text("%s %s", "\xE2\x97\x8f", text);  // ● dot
+        ImGui::TextUnformatted(text);
         ImGui::PopStyleColor();
     }
 
@@ -407,25 +435,69 @@ namespace
 // ── panes ─────────────────────────────────────────────────────────────────────
 namespace
 {
+    // Font-relative unit ("em"): scales with both DPI and the user's Ctrl+/- zoom,
+    // so layout math stays adaptive instead of using magic pixel constants.
+    inline float em(float n) { return ImGui::GetFontSize() * n; }
+
+    // Text vertically centered against framed widgets on the same row.
+    inline void row_label(const char* text)
+    {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(text);
+    }
+    inline void row_label_disabled(const char* text)
+    {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", text);
+    }
+
+    // Make a combo's dropdown-arrow box blend into its frame instead of showing
+    // as a bright accent button — cleaner, more integrated look.
+    inline void push_combo_style()
+    {
+        const ImVec4* col{ ImGui::GetStyle().Colors };
+        ImGui::PushStyleColor(ImGuiCol_Button,        col[ImGuiCol_FrameBg]);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col[ImGuiCol_FrameBgHovered]);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  col[ImGuiCol_FrameBgActive]);
+    }
+    inline void pop_combo_style() { ImGui::PopStyleColor(3); }
+
+    // A thin vertical divider that lines up with the row's framed widgets.
+    inline void row_divider()
+    {
+        ImGui::SameLine(0.0f, em(0.6f));
+        const ImVec2 p{ ImGui::GetCursorScreenPos() };
+        const float  h{ ImGui::GetFrameHeight() };
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y + h * 0.18f), ImVec2(p.x, p.y + h * 0.82f),
+                                            ImGui::GetColorU32(ImGuiCol_Border), 1.0f);
+        ImGui::Dummy(ImVec2(1.0f, h));
+        ImGui::SameLine(0.0f, em(0.6f));
+    }
+
     void draw_toolbar(viewer::App& app)
     {
+        // brand — all toolbar text is frame-aligned so it sits centered against
+        // the combo/buttons on this row.
+        ImGui::AlignTextToFramePadding();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.72f, 1.0f, 1.0f));
-        ImGui::Text("vmhook");
+        ImGui::TextUnformatted("vmhook");
         ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::TextDisabled("viewer");
-        ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+        ImGui::SameLine(0.0f, em(0.4f));
+        row_label_disabled("viewer");
+        row_divider();
 
-        // JVM combo (list auto-refreshes every 2s; no manual Refresh button)
-        ImGui::TextUnformatted(ICON_FA_MUG_HOT "  JVM");
+        // JVM label + adaptive combo (list auto-refreshes every 2s; no Refresh btn)
+        row_label(ICON_FA_MUG_HOT "  JVM");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(600.0f);
+        const float combo_w{ std::clamp(ImGui::GetContentRegionMax().x - em(34.0f), em(16.0f), em(64.0f)) };
+        ImGui::SetNextItemWidth(combo_w);
         std::string preview{ "Select a running JVM..." };
         if (app.selected_jvm >= 0 && app.selected_jvm < (int)app.jvms.size())
         {
             const auto& p{ app.jvms[(std::size_t)app.selected_jvm] };
             preview = std::to_string(p.pid) + " — " + (p.command_line.empty() ? p.image_name : p.command_line);
         }
+        push_combo_style();
         if (ImGui::BeginCombo("##jvm", preview.c_str()))
         {
             for (int i = 0; i < (int)app.jvms.size(); ++i)
@@ -436,19 +508,21 @@ namespace
             }
             ImGui::EndCombo();
         }
-        ImGui::SameLine();
+        pop_combo_style();
+        ImGui::SameLine(0.0f, em(0.5f));
         ImGui::BeginDisabled(app.busy() || app.selected_jvm < 0);
         if (ImGui::Button(ICON_FA_PLUG "  Attach")) { app.attach_selected(g_dll_path); g_selected_class = -1; g_nav_back.clear(); g_nav_fwd.clear(); }
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !ImGui::IsItemActive())
             ImGui::SetTooltip("Inject vmhook and enumerate every class, method and field");
 
-        ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+        row_divider();
         status_pill(app.status.load());
         if (app.status.load() == viewer::Status::Receiving)
         {
-            ImGui::SameLine();
+            ImGui::SameLine(0.0f, em(0.5f));
             const char spin[]{ '|', '/', '-', '\\' };
+            ImGui::AlignTextToFramePadding();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.6f, 0.95f, 1));
             ImGui::Text("%c %llu classes...", spin[(int)(ImGui::GetTime() * 8) & 3], (unsigned long long)app.classes_streamed.load());
             ImGui::PopStyleColor();
@@ -456,19 +530,28 @@ namespace
 
         // Right-aligned window controls: help (?), minimize, close — the app is
         // borderless (no native title bar), so these replace the caption buttons.
-        const float bw{ 30.0f };
-        ImGui::SameLine(ImGui::GetWindowWidth() - bw * 3.0f - 20.0f);
-        if (ImGui::Button(ICON_FA_CIRCLE_Q "##help", ImVec2(bw, 0))) ImGui::OpenPopup("shortcuts");
+        // Square buttons (width = row height) sized/spaced in font-relative units.
+        const float bw{ ImGui::GetFrameHeight() };
+        const float gap{ em(0.35f) };
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - (bw * 3.0f + gap * 2.0f));
+        // Ghost (transparent) window controls that only tint on hover — subtle
+        // chrome rather than three loud primary buttons.
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.10f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1.0f, 1.0f, 1.0f, 0.16f));
+        if (ImGui::Button(ICON_FA_CIRCLE_Q "##help", ImVec2(bw, bw))) ImGui::OpenPopup("shortcuts");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyboard shortcuts (F1)");
         if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) ImGui::OpenPopup("shortcuts");
-        ImGui::SameLine(0.0f, 5.0f);
-        if (ImGui::Button(ICON_FA_MINUS "##min", ImVec2(bw, 0)) && g_hwnd) ShowWindow(g_hwnd, SW_MINIMIZE);
+        ImGui::SameLine(0.0f, gap);
+        if (ImGui::Button(ICON_FA_MINUS "##min", ImVec2(bw, bw)) && g_hwnd) ShowWindow(g_hwnd, SW_MINIMIZE);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimize");
-        ImGui::SameLine(0.0f, 5.0f);
+        ImGui::PopStyleColor(3);
+        ImGui::SameLine(0.0f, gap);
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.86f, 0.26f, 0.26f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.70f, 0.17f, 0.17f, 1.0f));
-        if (ImGui::Button(ICON_FA_XMARK "##close", ImVec2(bw, 0)) && g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
-        ImGui::PopStyleColor(2);
+        if (ImGui::Button(ICON_FA_XMARK "##close", ImVec2(bw, bw)) && g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        ImGui::PopStyleColor(3);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close");
         if (ImGui::BeginPopup("shortcuts"))
         {
@@ -526,10 +609,14 @@ namespace
             g_filtered.push_back(i);
         }
 
+        ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%d / %zu classes", (int)g_filtered.size(), app.classes.size());
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(130.0f);
+        const float kind_w{ em(8.5f) };
+        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - kind_w, ImGui::GetCursorPosX() + em(0.5f)));
+        ImGui::SetNextItemWidth(kind_w);
+        push_combo_style();
         ImGui::Combo("##kind", &g_kind_filter, k_kind_names, IM_ARRAYSIZE(k_kind_names));
+        pop_combo_style();
 
         if (ImGui::BeginTable("classes", 3,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
@@ -627,16 +714,17 @@ namespace
         if (ImGui::ArrowButton("##nav_back", ImGuiDir_Left)) nav_back();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !g_nav_back.empty()) ImGui::SetTooltip("Back (Alt+Left)");
-        ImGui::SameLine(0.0f, 3.0f);
+        ImGui::SameLine(0.0f, em(0.25f));
         ImGui::BeginDisabled(g_nav_fwd.empty());
         if (ImGui::ArrowButton("##nav_fwd", ImGuiDir_Right)) nav_forward();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !g_nav_fwd.empty()) ImGui::SetTooltip("Forward (Alt+Right)");
-        ImGui::SameLine();
+        ImGui::SameLine(0.0f, em(0.6f));
 
-        // header
+        // header — one frame-align sets the baseline for the whole line (name + badges)
         std::string dotted{ c.internal_name };
         for (char& ch : dotted) if (ch == '/') ch = '.';
+        ImGui::AlignTextToFramePadding();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f,0.82f,1.0f,1));
         ImGui::TextUnformatted(dotted.c_str());
         ImGui::PopStyleColor();
@@ -675,7 +763,7 @@ namespace
                 ImGui::TextDisabled("%s", sd.c_str());
             }
         }
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 250.0f);
+        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(20.0f), ImGui::GetCursorPosX() + em(0.5f)));
         if (ImGui::SmallButton("Copy name")) ImGui::SetClipboardText(c.internal_name.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("Copy all"))
@@ -728,7 +816,7 @@ namespace
             ImGui::SetTooltip("inherited from %s", od.c_str());
         } };
 
-        const float half{ ImGui::GetContentRegionAvail().x * 0.5f - 4.0f };
+        const float half{ ImGui::GetContentRegionAvail().x * 0.5f - em(0.25f) };
 
         // Methods
         ImGui::BeginChild("methods", ImVec2(half, 0), ImGuiChildFlags_Borders);
@@ -891,10 +979,10 @@ namespace
         ImGui::EndChild();
 
         ImGui::SameLine();
-        ImGui::InvisibleButton("splitter", ImVec2(7.0f, avail_y));
+        ImGui::InvisibleButton("splitter", ImVec2(em(0.45f), avail_y));
         if (ImGui::IsItemActive()) g_left_width += ImGui::GetIO().MouseDelta.x;
         if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-        g_left_width = std::clamp(g_left_width, 240.0f, vp->WorkSize.x - 360.0f);
+        g_left_width = std::clamp(g_left_width, em(14.0f), vp->WorkSize.x - em(20.0f));
         {
             const ImVec2 p0{ ImGui::GetItemRectMin() }, p1{ ImGui::GetItemRectMax() };
             const float x{ (p0.x + p1.x) * 0.5f };
@@ -915,15 +1003,17 @@ namespace
                 nclasses = app.classes.size();
                 for (const auto& c : app.classes) { nmethods += c.methods.size(); nfields += c.fields.size(); }
             }
-            ImGui::Text("%zu classes  ·  %zu methods  ·  %zu fields", nclasses, nmethods, nfields);
-            ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%zu classes  \xC2\xB7  %zu methods  \xC2\xB7  %zu fields", nclasses, nmethods, nfields);
+            ImGui::SameLine(0.0f, em(0.8f));
             {
                 std::lock_guard<std::mutex> lock{ app.data_mutex };
-                ImGui::TextDisabled("   %s", app.status_message.c_str());
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextDisabled("%s", app.status_message.c_str());
             }
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 230.0f);
+            ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(22.0f), ImGui::GetCursorPosX() + em(0.5f)));
             ImGui::Checkbox("Pretty signatures", &g_pretty);
-            ImGui::SameLine();
+            ImGui::SameLine(0.0f, em(0.8f));
             ImGui::BeginDisabled(!g_pretty);
             ImGui::Checkbox("Full names", &g_full_names);
             ImGui::EndDisabled();
@@ -935,6 +1025,16 @@ namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 {
+    // Per-monitor DPI awareness (V2) so the window renders crisp at native
+    // resolution on high-DPI displays instead of being bitmap-stretched.
+    // Loaded dynamically to stay independent of the SDK header version.
+    if (HMODULE user32{ GetModuleHandleW(L"user32.dll") })
+    {
+        using set_ctx_fn = BOOL(WINAPI*)(HANDLE);
+        if (auto set_ctx{ reinterpret_cast<set_ctx_fn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext")) })
+            set_ctx(reinterpret_cast<HANDLE>(-4));  // PER_MONITOR_AWARE_V2
+    }
+
     WNDCLASSEXW wc{ sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandleW(nullptr), nullptr, LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW)), nullptr, nullptr, L"vmhook_viewer", nullptr };
     RegisterClassExW(&wc);
     // Borderless (no native title bar) — a custom in-app toolbar provides the
@@ -950,12 +1050,25 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     ShowWindow(hwnd, SW_SHOWMAXIMIZED);
     UpdateWindow(hwnd);
 
+    // Resolve the window's DPI scale (physical dpi / 96) for font + style scaling.
+    if (HMODULE user32{ GetModuleHandleW(L"user32.dll") })
+    {
+        using get_dpi_fn = UINT(WINAPI*)(HWND);
+        if (auto get_dpi{ reinterpret_cast<get_dpi_fn>(GetProcAddress(user32, "GetDpiForWindow")) })
+        {
+            const UINT dpi{ get_dpi(hwnd) };
+            if (dpi >= 48u) g_dpi_scale = static_cast<float>(dpi) / 96.0f;
+        }
+    }
+    g_left_width *= g_dpi_scale;  // scale the default split (load_settings may override)
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::GetIO().IniFilename = nullptr;
     apply_modern_style();
-    load_fonts();
+    ImGui::GetStyle().ScaleAllSizes(g_dpi_scale);  // scale padding/rounding to DPI
+    load_fonts(g_dpi_scale);
     load_settings();  // restore the user's remembered UI preferences
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_device, g_context);
