@@ -276,6 +276,20 @@ namespace
         return kw;
     }
 
+    // The internal class name a (possibly array) field descriptor refers to, or
+    // "" for a primitive/void.  "[[Lcom/foo/Bar;" -> "com/foo/Bar", "I" -> "".
+    std::string ref_internal_name(const std::string& desc)
+    {
+        std::size_t i{ 0 };
+        while (i < desc.size() && desc[i] == '[') ++i;
+        if (i < desc.size() && desc[i] == 'L')
+        {
+            const std::size_t semi{ desc.find(';', i) };
+            if (semi != std::string::npos) return desc.substr(i + 1, semi - i - 1);
+        }
+        return {};
+    }
+
     void copy_menu(const char* id, const std::string& primary, const std::string& secondary = {})
     {
         if (ImGui::BeginPopupContextItem(id))
@@ -656,8 +670,19 @@ namespace
                         ImGui::PopStyleColor();
                         ImGui::TableNextColumn();
                         const std::string ty{ g_pretty ? viewer::pretty_field(f.descriptor, g_full_names) : f.descriptor };
-                        ImGui::TextUnformatted(ty.c_str());
-                        if (g_pretty && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", f.descriptor.c_str());
+                        const std::string ref{ ref_internal_name(f.descriptor) };
+                        const auto rit{ ref.empty() ? app.name_to_index.end() : app.name_to_index.find(ref) };
+                        if (rit != app.name_to_index.end())
+                        {
+                            if (ImGui::TextLink(ty.c_str())) navigate_to(rit->second);
+                        }
+                        else
+                        {
+                            ImGui::TextUnformatted(ty.c_str());
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("%s%s", f.descriptor.c_str(),
+                                rit != app.name_to_index.end() ? "  (click to open)" : "");
                         ImGui::PopID();
                     }
                 ImGui::EndTable();
@@ -679,6 +704,17 @@ namespace
         {
             if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow,  false)) nav_back();
             if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) nav_forward();
+        }
+        // Ctrl +/-/0 scales the UI font (accessibility / dense-listing zoom).
+        if (ImGui::GetIO().KeyCtrl)
+        {
+            ImGuiIO& kio{ ImGui::GetIO() };
+            if (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))
+                kio.FontGlobalScale = std::clamp(kio.FontGlobalScale + 0.1f, 0.7f, 2.0f);
+            if (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))
+                kio.FontGlobalScale = std::clamp(kio.FontGlobalScale - 0.1f, 0.7f, 2.0f);
+            if (ImGui::IsKeyPressed(ImGuiKey_0, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad0, false))
+                kio.FontGlobalScale = 1.0f;
         }
 
         // Auto-refresh the JVM list every 2s so new/closed JVMs appear without a
