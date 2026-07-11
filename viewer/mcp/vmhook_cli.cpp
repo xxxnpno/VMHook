@@ -6,6 +6,7 @@
 //   vmhook_cli classes  <pid> [substr]  -> [class internal names] (from cache)
 //   vmhook_cli class    <pid> <name>    -> {name, methods:[...], fields:[...]} (from cache)
 //   vmhook_cli instances <pid> <class> [cap] -> {pid,class,instances:[{address,fields:{...}}]} (live heap)
+//   vmhook_cli statics  <pid> <class>   -> {pid,class,statics:{name:value, ...}} (from the class mirror)
 //
 // `enumerate` caches the raw stream to %TEMP%\vmhook_mcp_<pid>.txt so the class/
 // classes queries are cheap and don't re-inject.  `instances` reads the live heap
@@ -389,6 +390,6 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::printf("{\"error\":\"usage: vmhook_cli list | enumerate <pid> | classes <pid> [substr] | class <pid> <name> | instances <pid> <class> [cap]\"}\n");
+    std::printf("{\"error\":\"usage: vmhook_cli list | enumerate <pid> | classes <pid> [substr] | class <pid> <name> | instances <pid> <class> [cap] | statics <pid> <class>\"}\n");
     return 2;
 }

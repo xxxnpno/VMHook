@@ -123,6 +123,23 @@ TOOLS = [
             "required": ["pid", "class_name"],
         },
     },
+    {
+        "name": "get_statics",
+        "description": (
+            "Read a class's STATIC field values live from its java.lang.Class mirror (by internal "
+            "'/'-separated name): the class-level state the instance tools don't show. Returns "
+            "{pid, class, statics:{name:value, …}} where a '<internal/name>' value is a reference field "
+            "and '\"...\"' is a String. Injects the payload if needed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "class_name": {"type": "string", "description": "internal name, e.g. 'com/example/demo/ExampleApp'"},
+            },
+            "required": ["pid", "class_name"],
+        },
+    },
 ]
 
 
@@ -143,6 +160,8 @@ def call_tool(name: str, args: dict) -> str:
         if args.get("cap"):
             cli_args.append(str(args["cap"]))
         return run_cli(cli_args)
+    if name == "get_statics":
+        return run_cli(["statics", str(args["pid"]), str(args["class_name"])])
     return json.dumps({"error": f"unknown tool: {name}"})
 
 
