@@ -17,6 +17,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "app.hpp"
@@ -372,6 +373,38 @@ namespace
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.6f, 0.95f, 1));
             ImGui::Text("%c %llu classes...", spin[(int)(ImGui::GetTime() * 8) & 3], (unsigned long long)app.classes_streamed.load());
             ImGui::PopStyleColor();
+        }
+
+        // Right-aligned "?" opens the keyboard-shortcuts cheatsheet (also F1).
+        ImGui::SameLine(ImGui::GetWindowWidth() - 40.0f);
+        if (ImGui::Button("?")) ImGui::OpenPopup("shortcuts");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyboard shortcuts (F1)");
+        if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) ImGui::OpenPopup("shortcuts");
+        if (ImGui::BeginPopup("shortcuts"))
+        {
+            ImGui::SeparatorText("Keyboard shortcuts");
+            const std::pair<const char*, const char*> keys[]{
+                { "Ctrl+F",       "Focus the class search" },
+                { "Esc",          "Clear all filters" },
+                { "Alt+\xE2\x86\x90 / Alt+\xE2\x86\x92", "Navigate back / forward" },
+                { "Ctrl+= / Ctrl+-", "Zoom the UI font in / out" },
+                { "Ctrl+0",       "Reset the font zoom" },
+            };
+            if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_SizingFixedFit))
+            {
+                for (const auto& [k, desc] : keys)
+                {
+                    ImGui::TableNextRow(); ImGui::TableNextColumn();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.72f, 1.0f, 1.0f));
+                    ImGui::TextUnformatted(k);
+                    ImGui::PopStyleColor();
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(desc);
+                }
+                ImGui::EndTable();
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled("Tip: click a field's type or 'extends' to jump to that class.");
+            ImGui::EndPopup();
         }
     }
 
