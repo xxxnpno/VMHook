@@ -15033,7 +15033,10 @@ namespace vmhook
                 params[param_idx++] = reinterpret_cast<std::intptr_t>(this->object);
             }
 
-            auto pack = [&](auto&& a) noexcept
+            // [[maybe_unused]]: with zero call arguments the fold below
+            // `(pack(args), ...)` expands to nothing, so `pack` is legitimately
+            // never invoked — silence -Wunused-but-set-variable on that path.
+            [[maybe_unused]] auto pack = [&](auto&& a) noexcept
                 {
                     if (param_idx >= 8)
                     {
