@@ -18,7 +18,10 @@ JVM's classes / methods / fields — all discovered live, no mappings.
 | `list_jvms`     | –                        | `[{pid, image, cmdline}, …]` |
 | `enumerate_jvm` | `pid`                    | injects + enumerates + caches; `{pid, classes, methods, fields}` |
 | `list_classes`  | `pid`, `filter?`         | `[ "java/util/HashMap", … ]` (from cache) |
-| `get_class`     | `pid`, `class_name`      | `{name, methods:[{name,descriptor,signature}], fields:[{name,descriptor,type,static}]}` |
+| `get_class`     | `pid`, `class_name`      | `{name, super, kind, access, methods:[{name,descriptor,signature,modifiers,access}], fields:[{name,descriptor,type,modifiers,access,static}]}` |
+
+`kind` is one of `class` / `interface` / `enum` / `abstract` / `annotation` /
+`record` (from the class-file access flags); `access` is the raw flag word.
 
 Typical flow: `list_jvms` → pick a pid → `enumerate_jvm(pid)` → then
 `list_classes` / `get_class` as much as you like (they read the cache; re-run

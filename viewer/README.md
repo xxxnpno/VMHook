@@ -10,11 +10,20 @@ Claude/other AIs can drive it (see [`mcp/`](mcp/README.md)).
 - Auto-refreshing JVM list showing each JVM's **command line** (not just `java.exe`).
 - Class list with instant search (Ctrl+F), sortable columns, method/field counts,
   and smooth scrolling over tens of thousands of classes (clipped).
+- **Class-kind badges** — every class is tagged `[interface]` / `[enum]` /
+  `[abstract]` / `[annotation]` / `[record]` / `[class]` (+ `[final]` / `[nested]`)
+  from its real class-file access flags, and the class list is **colour-coded by
+  kind**. A **kind filter** narrows the list to one kind at a time.
 - Per-class **methods & fields** with **access modifiers** colour-coded by
   visibility (public/private/protected), pretty-printed signatures
   (`(int, double) : double`, toggle to raw descriptors), per-pane filters, and
   right-click copy.
-- Superclass shown as `extends X` — **click it to jump** to that class.
+- **Navigate the class graph like a browser:** superclass shown as `extends X`
+  and every field whose type is a loaded class is a **clickable link** — jump in,
+  then **Back / Forward** (◀ ▶ buttons or `Alt+←` / `Alt+→`).
+- **Show inherited members** — one toggle folds in methods & fields from the whole
+  superclass chain (inherited rows dimmed, hover shows the declaring class).
+- **Ctrl +/−/0** scales the UI font for accessibility / dense listings.
 - One-click **Copy all** (Java-like listing) / **Export .txt**.
 - Re-attach works (the payload serves every attach; no restart needed).
 
