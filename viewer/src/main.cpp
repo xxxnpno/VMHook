@@ -179,8 +179,8 @@ namespace
                 ImVec2(0.0f, 120.0f)))
         {
             ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-            ImGui::TableSetupColumn("Process", ImGuiTableColumnFlags_WidthFixed, 130.0f);
-            ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Process", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn("Command line", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableHeadersRow();
             for (int i = 0; i < static_cast<int>(app.jvms.size()); ++i)
             {
@@ -196,7 +196,12 @@ namespace
                 ImGui::TableSetColumnIndex(1);
                 ImGui::TextUnformatted(p.image_name.c_str());
                 ImGui::TableSetColumnIndex(2);
-                ImGui::TextUnformatted(p.image_path.empty() ? "<unknown>" : p.image_path.c_str());
+                const std::string& detail{ !p.command_line.empty() ? p.command_line : p.image_path };
+                ImGui::TextUnformatted(detail.empty() ? "<unknown>" : detail.c_str());
+                if (!detail.empty() && ImGui::IsItemHovered())
+                {
+                    ImGui::SetTooltip("%s", detail.c_str());
+                }
             }
             ImGui::EndTable();
         }

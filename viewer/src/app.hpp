@@ -49,8 +49,9 @@ namespace viewer
     struct JvmProcess
     {
         std::uint32_t pid{ 0 };
-        std::string   image_name;   // "javaw.exe"
-        std::string   image_path;   // full path if resolvable
+        std::string   image_name;    // "javaw.exe"
+        std::string   image_path;    // full path if resolvable
+        std::string   command_line;  // e.g. "java -cp out com.example.demo.ExampleApp"
     };
 
     enum class Status
@@ -125,6 +126,69 @@ namespace viewer
         return result;
     }
 
+    // Reads a target process's command line by walking its PEB (x64 offsets).
+    // Lets the viewer show "java ... com.example.demo.ExampleApp" instead of just
+    // "java.exe".  Best-effort: returns "" for protected / unreadable processes.
+    inline auto resolve_command_line(std::uint32_t pid) -> std::string
+    {
+        HANDLE process{ OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid) };
+        if (!process)
+        {
+            return {};
+        }
+        using NtQueryInformationProcessFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+        static NtQueryInformationProcessFn nt_query{
+            reinterpret_cast<NtQueryInformationProcessFn>(
+                GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess")) };
+        if (!nt_query)
+        {
+            CloseHandle(process);
+            return {};
+        }
+
+        struct BasicInfo
+        {
+            PVOID     reserved1;
+            PVOID     peb_base;         // PROCESS_BASIC_INFORMATION::PebBaseAddress
+            PVOID     reserved2[2];
+            ULONG_PTR unique_process_id;
+            PVOID     reserved3;
+        } info{};
+        if (nt_query(process, 0 /*ProcessBasicInformation*/, &info, sizeof(info), nullptr) != 0 || !info.peb_base)
+        {
+            CloseHandle(process);
+            return {};
+        }
+
+        // x64: PEB.ProcessParameters @ +0x20; RTL_USER_PROCESS_PARAMETERS.CommandLine @ +0x70.
+        PVOID params{ nullptr };
+        if (!ReadProcessMemory(process, static_cast<char*>(info.peb_base) + 0x20, &params, sizeof(params), nullptr) || !params)
+        {
+            CloseHandle(process);
+            return {};
+        }
+        struct UnicodeString
+        {
+            USHORT length;
+            USHORT maximum_length;
+            PWSTR  buffer;
+        } command{};
+        if (!ReadProcessMemory(process, static_cast<char*>(params) + 0x70, &command, sizeof(command), nullptr) ||
+            command.length == 0 || !command.buffer)
+        {
+            CloseHandle(process);
+            return {};
+        }
+        std::wstring wide(command.length / sizeof(wchar_t), L'\0');
+        if (!ReadProcessMemory(process, command.buffer, wide.data(), command.length, nullptr))
+        {
+            CloseHandle(process);
+            return {};
+        }
+        CloseHandle(process);
+        return to_utf8(wide.c_str(), static_cast<int>(wide.size()));
+    }
+
     inline auto enumerate_jvms() -> std::vector<JvmProcess>
     {
         std::vector<JvmProcess> result{};
@@ -143,7 +207,7 @@ namespace viewer
                 const std::uint32_t pid{ entry.th32ProcessID };
                 if (pid != 0 && pid != GetCurrentProcessId() && process_has_jvm(pid, image_name))
                 {
-                    result.push_back(JvmProcess{ pid, image_name, resolve_image_path(pid) });
+                    result.push_back(JvmProcess{ pid, image_name, resolve_image_path(pid), resolve_command_line(pid) });
                 }
             } while (Process32NextW(snapshot, &entry));
         }

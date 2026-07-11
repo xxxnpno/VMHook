@@ -63,3 +63,6 @@ build-viewer/
 # viewer e2e test artifacts
 viewer/test/*.class
 viewer/test/sleeper.log
+
+viewer/example/out/
+viewer/example/app.log

@@ -21,6 +21,8 @@ int main(int argc, char** argv)
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 0, 1u << 20, 0, nullptr) };
     if (pipe == INVALID_HANDLE_VALUE) { std::printf("CreateNamedPipe fail %lu\n", GetLastError()); return 1; }
 
+    std::printf("target cmdline: %s\n", viewer::resolve_command_line(pid).c_str());
+
     std::string err;
     if (!viewer::inject_dll(pid, dll, err)) { std::printf("inject fail: %s\n", err.c_str()); return 1; }
     std::printf("injected into pid %u; waiting for stream...\n", pid);
