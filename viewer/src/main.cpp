@@ -478,7 +478,7 @@ namespace
         const float  h{ ImGui::GetFrameHeight() };
         ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y + h * 0.18f), ImVec2(p.x, p.y + h * 0.82f),
                                             ImGui::GetColorU32(ImGuiCol_Border), 1.0f);
-        ImGui::Dummy(ImVec2(1.0f, h));
+        ImGui::Dummy(ImVec2(em(0.06f), h));
         ImGui::SameLine(0.0f, em(0.6f));
     }
 
@@ -532,7 +532,7 @@ namespace
             ImGui::SameLine(0.0f, em(0.6f));
             const float r{ ImGui::GetFrameHeight() * 0.32f };
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetFrameHeight() * 0.5f - r) - ImGui::GetStyle().FramePadding.y);
-            ui::Spinner("##spin", r, (std::max)(r * 0.35f, 2.0f), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ui::Spinner("##spin", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
             ImGui::SameLine(0.0f, em(0.45f));
             ImGui::AlignTextToFramePadding();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.74f, 1.0f, 1.0f));
@@ -904,7 +904,9 @@ namespace
                 ImGui::TextDisabled("%s", sd.c_str());
             }
         }
-        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(20.0f), ImGui::GetCursorPosX() + em(0.5f)));
+        // Action buttons on their own row so a long class name / extends link can
+        // never push them off the right edge (adaptive, no overflow).
+        ImGui::Spacing();
         // These run while draw_details holds data_mutex, so status_message
         // (also guarded by it) can be written directly for lightweight feedback.
         if (ImGui::SmallButton("Copy name"))
@@ -1143,7 +1145,7 @@ namespace
             const ImVec2 p0{ ImGui::GetItemRectMin() }, p1{ ImGui::GetItemRectMax() };
             const float x{ (p0.x + p1.x) * 0.5f };
             const ImU32 col{ ImGui::GetColorU32(ImGui::IsItemActive() ? ImGuiCol_ButtonActive : ImGuiCol_Border) };
-            ImGui::GetWindowDrawList()->AddLine(ImVec2(x, p0.y + 2), ImVec2(x, p1.y - 2), col, 2.0f);
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(x, p0.y + em(0.15f)), ImVec2(x, p1.y - em(0.15f)), col, (std::max)(em(0.12f), 1.0f));
         }
         ImGui::SameLine();
         ImGui::BeginChild("right", ImVec2(0, avail_y), ImGuiChildFlags_Borders);
