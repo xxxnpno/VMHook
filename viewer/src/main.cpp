@@ -424,11 +424,11 @@ namespace
         {
             ImGui::SeparatorText("Keyboard shortcuts");
             const std::pair<const char*, const char*> keys[]{
-                { "Ctrl+F",       "Focus the class search" },
-                { "Esc",          "Clear all filters" },
-                { "Alt+\xE2\x86\x90 / Alt+\xE2\x86\x92", "Navigate back / forward" },
-                { "Ctrl+= / Ctrl+-", "Zoom the UI font in / out" },
-                { "Ctrl+0",       "Reset the font zoom" },
+                { "Ctrl+F",           "Focus the class search" },
+                { "Esc",              "Clear all filters" },
+                { "Alt+Left / Right", "Navigate back / forward" },
+                { "Ctrl+= / Ctrl+-",  "Zoom the UI font in / out" },
+                { "Ctrl+0",           "Reset the font zoom" },
             };
             if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_SizingFixedFit))
             {
