@@ -257,6 +257,7 @@ namespace
     std::string  g_detail_addr;              // address of the instance the popup shows
     bool         g_copy_instance_table{ false };   // request a TSV copy of the instance table
     int          g_instance_cap{ 1000 };     // persisted mirror of App::inst_cap
+    bool         g_inst_show_inherited{ true };  // show inherited columns in the instance table
     bool         g_focus_search{ false };
     int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
     int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
@@ -318,7 +319,8 @@ namespace
             << "left_width="     << g_left_width              << "\n"
             << "font_scale="     << ImGui::GetIO().FontGlobalScale << "\n"
             << "inst_cap="       << g_instance_cap            << "\n"
-            << "inst_live="      << (g_instances_live ? 1 : 0)<< "\n";
+            << "inst_live="      << (g_instances_live ? 1 : 0)<< "\n"
+            << "inst_inherited=" << (g_inst_show_inherited ? 1 : 0) << "\n";
     }
 
     void load_settings()
@@ -342,6 +344,7 @@ namespace
                 else if (key == "font_scale") ImGui::GetIO().FontGlobalScale = std::clamp(std::stof(val), 0.7f, 2.0f);
                 else if (key == "inst_cap")   g_instance_cap  = std::clamp(std::stoi(val), 20, 200000);
                 else if (key == "inst_live")  g_instances_live = (std::stoi(val) != 0);
+                else if (key == "inst_inherited") g_inst_show_inherited = (std::stoi(val) != 0);
             }
             catch (...) { /* ignore a malformed value, keep the default */ }
         }
@@ -1303,14 +1306,16 @@ namespace
         if (ImGui::SmallButton("Copy table")) g_copy_instance_table = true;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the filtered + sorted rows to the clipboard as TSV");
 
-        // Columns = the fields actually streamed for these instances (declared
-        // then inherited, in payload order): (name, owner) where a non-empty
-        // owner means the field is inherited from that class.  Taken from the
-        // first instance — every instance of the same class streams the same fields.
-        std::vector<std::pair<std::string, std::string>> cols;
+        // Columns = indices into the streamed fields (declared then inherited),
+        // filtered by the "Inherited" toggle.  Carrying the field index (rather
+        // than name/owner) keeps value lookup + sorting correct when inherited
+        // columns are hidden.  Taken from the first instance — every instance of
+        // the same class streams the same fields.
+        std::vector<int> cols;
         if (!app.instances.empty())
-            for (const auto& fv : app.instances.front().fields)
-                cols.emplace_back(fv.name, fv.owner);
+            for (int fi = 0; fi < (int)app.instances.front().fields.size(); ++fi)
+                if (g_inst_show_inherited || app.instances.front().fields[(std::size_t)fi].owner.empty())
+                    cols.push_back(fi);
 
         // Filter order: keep the rows whose address or any value matches (the
         // InputText below updates g_instance_filter, so this is last frame's
@@ -1344,10 +1349,13 @@ namespace
             ImGui::PopStyleColor();
         }
 
-        // Row: substring filter (address or any value) + the heap-scan cap.
-        ImGui::SetNextItemWidth((std::max)(ImGui::GetContentRegionAvail().x - em(9.3f), em(6.0f)));
+        // Row: substring filter (address or any value) + inherited toggle + cap.
+        ImGui::SetNextItemWidth((std::max)(ImGui::GetContentRegionAvail().x - em(18.5f), em(6.0f)));
         ImGui::InputTextWithHint("##ifilter", ICON_FA_SEARCH "  Filter instances",
                                  g_instance_filter, sizeof(g_instance_filter));
+        ImGui::SameLine(0.0f, em(0.6f));
+        ImGui::Checkbox("Inherited", &g_inst_show_inherited);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show columns for fields inherited from a superclass");
         ImGui::SameLine(0.0f, em(0.6f));
         ImGui::SetNextItemWidth(em(8.5f));
         int cap{ app.inst_cap };
@@ -1373,8 +1381,8 @@ namespace
         {
             ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort, em(2.8f));
             ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, em(11.0f));
-            for (const auto& cn : cols)
-                ImGui::TableSetupColumn(cn.first.c_str(), ImGuiTableColumnFlags_WidthFixed, em(11.0f));
+            for (const int fi : cols)
+                ImGui::TableSetupColumn(app.instances.front().fields[(std::size_t)fi].name.c_str(), ImGuiTableColumnFlags_WidthFixed, em(11.0f));
             ImGui::TableSetupScrollFreeze(2, 1);
 
             // Header row (manual, so inherited columns render dimmed + tooltipped).
@@ -1382,12 +1390,13 @@ namespace
             for (int c = 0; c < 2 + (int)cols.size(); ++c)
             {
                 if (!ImGui::TableSetColumnIndex(c)) continue;
-                const bool inherited{ c >= 2 && !cols[(std::size_t)(c - 2)].second.empty() };
+                const std::string* owner{ c >= 2 ? &app.instances.front().fields[(std::size_t)cols[(std::size_t)(c - 2)]].owner : nullptr };
+                const bool inherited{ owner != nullptr && !owner->empty() };
                 if (inherited) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.60f, 0.72f, 1.0f));
                 ImGui::TableHeader(ImGui::TableGetColumnName(c));
                 if (inherited) ImGui::PopStyleColor();
                 if (inherited && ImGui::IsItemHovered())
-                    ImGui::SetTooltip("inherited from %s", cols[(std::size_t)(c - 2)].second.c_str());
+                    ImGui::SetTooltip("inherited from %s", owner->c_str());
             }
 
             if (ImGuiTableSortSpecs* ss{ ImGui::TableGetSortSpecs() }; ss && ss->SpecsCount > 0)
@@ -1397,8 +1406,12 @@ namespace
                     for (int s = 0; s < ss->SpecsCount; ++s)
                     {
                         const ImGuiTableColumnSortSpecs& sp{ ss->Specs[s] };
+                        // Map the (possibly filtered) table column to the real field
+                        // index, biased by +2 so cmp_instance's (col-2) recovers it.
+                        const int vcol{ (sp.ColumnIndex >= 2 && sp.ColumnIndex - 2 < (int)cols.size())
+                                            ? cols[(std::size_t)(sp.ColumnIndex - 2)] + 2 : (int)sp.ColumnIndex };
                         const int c{ cmp_instance(app.instances[(std::size_t)a], app.instances[(std::size_t)b],
-                                                  sp.ColumnIndex, a, b) };
+                                                  vcol, a, b) };
                         if (c != 0)
                             return sp.SortDirection == ImGuiSortDirection_Ascending ? c < 0 : c > 0;
                     }
@@ -1434,8 +1447,9 @@ namespace
                     for (int cidx = 0; cidx < (int)cols.size(); ++cidx)
                     {
                         ImGui::TableSetColumnIndex(cidx + 2);
-                        if (cidx >= (int)inst.fields.size()) continue;
-                        const std::string& v{ inst.fields[(std::size_t)cidx].value };
+                        const int fi{ cols[(std::size_t)cidx] };
+                        if (fi >= (int)inst.fields.size()) continue;
+                        const std::string& v{ inst.fields[(std::size_t)fi].value };
                         render_field_value(v);
                         if (ImGui::IsItemHovered() && v.size() > 18) ImGui::SetTooltip("%s", v.c_str());
                     }
@@ -1450,7 +1464,7 @@ namespace
         {
             g_copy_instance_table = false;
             std::string tsv{ "#\tAddress" };
-            for (const auto& c : cols) { tsv += '\t'; tsv += c.first; }
+            for (const int fi : cols) { tsv += '\t'; tsv += app.instances.front().fields[(std::size_t)fi].name; }
             tsv += '\n';
             for (const int rr : view)
             {
@@ -1458,7 +1472,7 @@ namespace
                 tsv += std::to_string(rr);
                 tsv += '\t';
                 tsv += in.address;
-                for (const viewer::InstField& f : in.fields) { tsv += '\t'; tsv += f.value; }
+                for (const int fi : cols) { tsv += '\t'; if (fi < (int)in.fields.size()) tsv += in.fields[(std::size_t)fi].value; }
                 tsv += '\n';
             }
             ImGui::SetClipboardText(tsv.c_str());
