@@ -253,6 +253,8 @@ namespace
     bool         g_instances_refresh_now{ false };  // force an immediate re-scan
     std::string  g_instances_class;          // internal name shown in the window
     char         g_instance_filter[128]{};   // substring filter over the instance rows
+    bool         g_open_instance_detail{ false };  // request the per-instance detail popup
+    std::string  g_detail_addr;              // address of the instance the popup shows
     bool         g_focus_search{ false };
     int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
     int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
@@ -1311,7 +1313,15 @@ namespace
                     ImGui::TableNextRow();
                     ImGui::PushID(r);
                     ImGui::TableSetColumnIndex(0);
-                    ImGui::TextDisabled("%d", r);
+                    char idxlbl[24];
+                    std::snprintf(idxlbl, sizeof(idxlbl), "%d", r);
+                    if (ImGui::Selectable(idxlbl, g_detail_addr == inst.address,
+                            ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
+                    {
+                        g_detail_addr = inst.address;
+                        g_open_instance_detail = true;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click for full detail");
                     ImGui::TableSetColumnIndex(1);
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.68f, 0.82f, 1.0f));
                     ImGui::TextUnformatted(inst.address.c_str());
@@ -1330,6 +1340,58 @@ namespace
                     ImGui::PopID();
                 }
             ImGui::EndTable();
+        }
+
+        // Per-instance detail popup (click a row): a vertical Field/Value/From
+        // view — readable for objects with many columns, and live (re-looked-up
+        // by address each frame so its values keep updating).
+        if (g_open_instance_detail) { ImGui::OpenPopup("Instance detail"); g_open_instance_detail = false; }
+        if (ImGui::BeginPopup("Instance detail"))
+        {
+            const viewer::InstanceInfo* sel{ nullptr };
+            for (const auto& in : app.instances) if (in.address == g_detail_addr) { sel = &in; break; }
+            if (!sel)
+            {
+                ImGui::TextDisabled("(instance no longer on the heap)");
+            }
+            else
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
+                ImGui::TextUnformatted(sel->address.c_str());
+                ImGui::PopStyleColor();
+                ImGui::SameLine(0.0f, em(0.8f));
+                if (ImGui::SmallButton("Copy addr")) ImGui::SetClipboardText(sel->address.c_str());
+                ImGui::SameLine(0.0f, em(0.4f));
+                if (ImGui::SmallButton("Copy all"))
+                {
+                    std::string tsv{ sel->address };
+                    for (const auto& f : sel->fields) { tsv += '\n'; tsv += f.name; tsv += '\t'; tsv += f.value; }
+                    ImGui::SetClipboardText(tsv.c_str());
+                }
+                ImGui::Separator();
+                if (ImGui::BeginTable("idetail", 3,
+                        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                        ImVec2(em(32.0f), em(18.0f))))
+                {
+                    ImGui::TableSetupColumn("Field", ImGuiTableColumnFlags_WidthFixed, em(9.0f));
+                    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableSetupColumn("From",  ImGuiTableColumnFlags_WidthFixed, em(7.0f));
+                    ImGui::TableHeadersRow();
+                    for (const viewer::InstField& f : sel->fields)
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(f.name.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        if (f.value == "null") ImGui::TextDisabled("null");
+                        else                   ImGui::TextWrapped("%s", f.value.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        if (!f.owner.empty()) ImGui::TextDisabled("%s", f.owner.c_str());
+                    }
+                    ImGui::EndTable();
+                }
+            }
+            ImGui::EndPopup();
         }
         ImGui::End();
     }
