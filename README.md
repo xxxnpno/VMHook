@@ -22,7 +22,7 @@ The library currently supports:
 - event-driven class-load notifications
 - event-driven field-change notifications (Windows trap-based)
 - hook argument replacement through `vmhook::return_value::set_arg`
-- HotSpot metadata lookup with JNI fallbacks where needed
+- HotSpot metadata lookup — pure VMStructs + direct memory, no JNI or JVMTI
 
 ## Scope
 
@@ -381,8 +381,8 @@ vmhook::hook<player>(mapping::player::send_chat_message,
 ```
 
 `set_arg` accepts primitive values, object wrappers, object pointers, string
-views, strings, and C strings. For Java strings, vmhook creates a JNI string
-when possible and falls back to direct Java string allocation.
+views, strings, and C strings. Java strings are built directly from the VM heap
+(TLAB allocation + UTF-16 `value`/`coder` field encode) with no JNI.
 
 Remove installed hooks before unloading:
 
@@ -729,15 +729,17 @@ auto component{ vmhook::make_unique<chat_component_text>("hello") };
 
 ## Class Lookup
 
-vmhook first searches HotSpot class metadata through VMStructs. If that path
-cannot see application classes, it falls back to JNI class-loader lookup:
+vmhook resolves classes purely through HotSpot metadata, with no JNI. It walks
+the ClassLoaderDataGraph (every ClassLoaderData's loaded-class list, plus the
+SystemDictionary on JDK 8-17) entirely via VMStructs, and resolves array classes
+(`[I`, `[Ljava/lang/String;`, …) through the `Universe` primitive-array klasses
+and the `InstanceKlass::_array_klasses` / `ArrayKlass::_higher_dimension` chain.
 
-- current thread context class loader
-- system class loader
-- LaunchWrapper's `net.minecraft.launchwrapper.Launch.classLoader`
-
-This matters in custom class-loader environments where injected native threads
-often do not have the same visibility as the application thread.
+There is no `FindClass` / `loadClass` fallback: lookup finds any class that is
+already **loaded** (under any loader) but does not itself trigger class loading.
+In custom class-loader environments, pin the right loader's copy against a live
+anchor object with `find_class_via_oop` / `reanchor_classes_via_oop`, or seed the
+cache directly with `override_class_lookup`.
 
 ## Example And CI
 

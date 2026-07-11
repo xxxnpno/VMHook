@@ -1620,15 +1620,17 @@ namespace vmhook
             -> std::uint32_t;
 
         /*
-            @brief Attaches the calling native thread to the JVM as a Java thread if needed.
+            @brief Adopts the calling thread's HotSpot JavaThread* if it has one.
             @details
-            Checks whether the current OS thread is already registered in HotSpot's
-            thread list.  If not, performs the attach dance so that JNI calls and heap
-            allocations from C++ code are legal.
+            PURE-VM (no JNI): checks whether the current OS thread is already a
+            registered HotSpot JavaThread and, if so, caches it.  It does NOT
+            attach a fresh native thread (that needs a VM call) — inside a detour /
+            hooked method the calling thread is always a JavaThread, and heap
+            allocation walks the whole thread list rather than requiring THIS thread.
             Defined later in the file after java_thread is fully declared.
 
             Complexity: O(N) where N = number of active Java threads (thread-list walk).
-            Exception safety: noexcept — returns false on failure.
+            Exception safety: noexcept — returns false when the thread is not a JavaThread.
         */
         static auto ensure_current_java_thread() noexcept
             -> bool;
@@ -1638,10 +1640,6 @@ namespace vmhook
     {
         inline auto find_call_stub_entry() noexcept -> void*;
 
-        /*
-            @brief Forward declaration for the host-context-classloader inheritance
-                   helper, defined further down alongside the JNI helpers it relies on.
-        */
         // inherit_host_context_classloader_for_current_thread() removed
         // (JNI-based host-loader inheritance; pure-VM build no longer attaches
         // native threads, so there is nothing to inherit onto).
