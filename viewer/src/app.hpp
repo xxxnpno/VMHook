@@ -262,10 +262,28 @@ namespace viewer
             return false;
         }
 
-        WaitForSingleObject(thread, 15000);
+        // Verify LoadLibraryW actually loaded the DLL: the remote thread's exit
+        // code is the low 32 bits of the HMODULE it returned (0 == load failed).
+        // Without this, a missing / wrong-bitness / broken payload is reported as
+        // a successful injection and the caller then hangs waiting for a pipe
+        // connection that never comes.
+        const DWORD wait_result{ WaitForSingleObject(thread, 15000) };
+        DWORD load_result{ 0 };
+        GetExitCodeThread(thread, &load_result);
         CloseHandle(thread);
         VirtualFreeEx(process, remote, 0, MEM_RELEASE);
         CloseHandle(process);
+        if (wait_result != WAIT_OBJECT_0)
+        {
+            error = "The injected LoadLibrary thread did not finish within 15s.";
+            return false;
+        }
+        if (load_result == 0)
+        {
+            error = "LoadLibraryW failed inside the target JVM — is vmhook_payload.dll "
+                    "present next to the viewer and 64-bit (matching the JVM)?";
+            return false;
+        }
         return true;
     }
 
@@ -362,7 +380,7 @@ namespace viewer
             // 1) Create the pipe server BEFORE injecting so the payload can connect.
             HANDLE pipe{ CreateNamedPipeW(
                 k_pipe_name,
-                PIPE_ACCESS_INBOUND,
+                PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,  // async so the waits below are real
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 1,                       // one instance
                 0, 1u << 20,             // out / in buffer sizes
@@ -385,30 +403,36 @@ namespace viewer
             status.store(Status::Receiving);
             set_status("Waiting for the JVM to stream its class surface...");
 
-            // 3) Wait for the payload to connect (bounded).
+            // 3) Wait for the payload to connect — genuinely bounded now that the
+            //    pipe is FILE_FLAG_OVERLAPPED (ConnectNamedPipe/ReadFile are async,
+            //    so a failed attach reports an error instead of hanging forever and
+            //    wedging the worker thread the destructor join()s).
+            HANDLE ev{ CreateEventW(nullptr, TRUE, FALSE, nullptr) };
             OVERLAPPED overlapped{};
-            overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            overlapped.hEvent = ev;
             const BOOL connected_now{ ConnectNamedPipe(pipe, &overlapped) };
-            if (!connected_now && GetLastError() == ERROR_IO_PENDING)
+            const DWORD connect_err{ GetLastError() };
+            if (!connected_now && connect_err == ERROR_IO_PENDING)
             {
-                if (WaitForSingleObject(overlapped.hEvent, 30000) != WAIT_OBJECT_0)
+                if (WaitForSingleObject(ev, 30000) != WAIT_OBJECT_0)
                 {
-                    CloseHandle(overlapped.hEvent);
+                    CloseHandle(ev);
                     CloseHandle(pipe);
-                    fail("Timed out waiting for the payload to connect (is jvm.dll present / is the JVM alive?).");
+                    fail("Timed out waiting for the payload to connect (did the DLL load / is the JVM alive?).");
                     return;
                 }
             }
-            else if (!connected_now && GetLastError() != ERROR_PIPE_CONNECTED)
+            else if (!connected_now && connect_err != ERROR_PIPE_CONNECTED)
             {
-                CloseHandle(overlapped.hEvent);
+                CloseHandle(ev);
                 CloseHandle(pipe);
-                fail("ConnectNamedPipe failed (error " + std::to_string(GetLastError()) + ").");
+                fail("ConnectNamedPipe failed (error " + std::to_string(connect_err) + ").");
                 return;
             }
-            CloseHandle(overlapped.hEvent);
 
-            // 4) Read + parse the stream into a fresh model, then publish.
+            // 4) Read + parse the stream into a fresh model, then publish.  Each
+            //    read is overlapped with a 30s ceiling so a stalled payload can't
+            //    wedge the worker thread.
             std::vector<ClassInfo> parsed{};
             std::string            leftover{};
             std::vector<char>      buffer(256u * 1024u);
@@ -416,11 +440,29 @@ namespace viewer
 
             while (!done)
             {
+                ResetEvent(ev);
+                OVERLAPPED rov{};
+                rov.hEvent = ev;
                 DWORD read_bytes{ 0 };
-                const BOOL ok{ ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &read_bytes, nullptr) };
-                if (!ok || read_bytes == 0)
+                const BOOL ok{ ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &read_bytes, &rov) };
+                if (!ok && GetLastError() == ERROR_IO_PENDING)
                 {
-                    break;  // pipe closed by the payload (EOF)
+                    if (WaitForSingleObject(ev, 30000) != WAIT_OBJECT_0)
+                    {
+                        break;  // stalled payload — stop rather than hang
+                    }
+                    if (!GetOverlappedResult(pipe, &rov, &read_bytes, FALSE))
+                    {
+                        break;  // pipe closed / error
+                    }
+                }
+                else if (!ok)
+                {
+                    break;  // pipe closed by the payload (EOF) or error
+                }
+                if (read_bytes == 0)
+                {
+                    break;
                 }
                 leftover.append(buffer.data(), read_bytes);
 
@@ -439,6 +481,7 @@ namespace viewer
                 classes_streamed.store(parsed.size());
             }
 
+            CloseHandle(ev);
             CloseHandle(pipe);
 
             for (ClassInfo& c : parsed)
