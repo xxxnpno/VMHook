@@ -586,7 +586,7 @@ namespace
         // search box (Ctrl+F focuses it), with a magnifier icon
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(ICON_FA_SEARCH);
-        ImGui::SameLine(0.0f, 6.0f);
+        ImGui::SameLine(0.0f, em(0.4f));
         if (g_focus_search) { ImGui::SetKeyboardFocusHere(); g_focus_search = false; }
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##search", "Search classes  (Ctrl+F)", g_search, sizeof(g_search));
@@ -696,7 +696,7 @@ namespace
         std::lock_guard<std::mutex> lock{ app.data_mutex };
         if (g_selected_class < 0 || g_selected_class >= (int)app.classes.size())
         {
-            ImGui::Dummy(ImVec2(0, 40));
+            ImGui::Dummy(ImVec2(0, em(2.2f)));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f,0.5f,0.55f,1));
             const char* hint{ app.classes.empty()
                 ? "Pick a JVM above and click \"Attach\" to load its classes."
