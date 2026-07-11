@@ -256,6 +256,7 @@ namespace
     bool         g_open_instance_detail{ false };  // request the per-instance detail popup
     std::string  g_detail_addr;              // address of the instance the popup shows
     bool         g_copy_instance_table{ false };   // request a TSV copy of the instance table
+    int          g_instance_cap{ 1000 };     // persisted mirror of App::inst_cap
     bool         g_focus_search{ false };
     int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
     int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
@@ -315,7 +316,9 @@ namespace
             << "inherited="      << (g_show_inherited ? 1 : 0)<< "\n"
             << "kind_filter="    << g_kind_filter             << "\n"
             << "left_width="     << g_left_width              << "\n"
-            << "font_scale="     << ImGui::GetIO().FontGlobalScale << "\n";
+            << "font_scale="     << ImGui::GetIO().FontGlobalScale << "\n"
+            << "inst_cap="       << g_instance_cap            << "\n"
+            << "inst_live="      << (g_instances_live ? 1 : 0)<< "\n";
     }
 
     void load_settings()
@@ -337,6 +340,8 @@ namespace
                 else if (key == "kind_filter"){ int k{ std::stoi(val) }; if (k >= 0 && k <= 6) g_kind_filter = k; }
                 else if (key == "left_width") g_left_width    = std::clamp(std::stof(val), 240.0f, 2000.0f);
                 else if (key == "font_scale") ImGui::GetIO().FontGlobalScale = std::clamp(std::stof(val), 0.7f, 2.0f);
+                else if (key == "inst_cap")   g_instance_cap  = std::clamp(std::stoi(val), 20, 200000);
+                else if (key == "inst_live")  g_instances_live = (std::stoi(val) != 0);
             }
             catch (...) { /* ignore a malformed value, keep the default */ }
         }
@@ -1274,6 +1279,7 @@ namespace
         if (ImGui::DragInt("##icap", &cap, 10.0f, 20, 200000, "cap %d"))
         {
             app.inst_cap = std::clamp(cap, 20, 200000);
+            g_instance_cap = app.inst_cap;   // remember for next launch
             g_instances_refresh_now = true;  // re-scan with the new cap
         }
         if (ImGui::IsItemHovered())
@@ -1649,6 +1655,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 
     g_dll_path = payload_dll_path();
     viewer::App app{};
+    app.inst_cap = g_instance_cap;  // apply the remembered heap-scan cap
 
     bool running{ true };
     while (running)
