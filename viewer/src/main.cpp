@@ -1402,8 +1402,15 @@ namespace
         ImGui::Separator();
         if (app.instances.empty())
         {
-            if (st != viewer::Status::Receiving)
-                ImGui::TextDisabled("No live instances found on the heap for this class.");
+            // Show guidance once a scan has actually completed with 0 hits (the
+            // worker sets "Found 0…"); it persists across live re-scans, unlike a
+            // status check which a 0-instance class spends re-Receiving.
+            if (app.inst_message.rfind("Found 0", 0) == 0)
+            {
+                ImGui::TextDisabled("No live instances of this exact class on the heap.");
+                ImGui::TextDisabled("The scan matches this class only — if it is abstract, or just its");
+                ImGui::TextDisabled("subclasses are instantiated, inspect a subclass instead.");
+            }
         }
         else if (ImGui::BeginTable("instances", 2 + (int)cols.size(),
                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
