@@ -1032,15 +1032,40 @@ namespace
         ImGui::SameLine();
         if (ImGui::SmallButton("Copy all"))
         {
+            // WYSIWYG with the tables: include inherited members (grouped under a
+            // "// inherited from X" comment) when the Show-inherited toggle is on.
+            std::vector<const viewer::ClassInfo*> ch{ &c };
+            if (g_show_inherited)
+            {
+                const viewer::ClassInfo* cur{ &c };
+                for (int hops = 0; hops < 200; ++hops)
+                {
+                    if (cur->super_name.empty() || cur->super_name == "java/lang/Object") break;
+                    const auto it{ app.name_to_index.find(cur->super_name) };
+                    if (it == app.name_to_index.end()) break;
+                    cur = &app.classes[(std::size_t)it->second];
+                    if (cur == &c) break;
+                    ch.push_back(cur);
+                }
+            }
             std::string all{ class_decl(c) + " " + dotted + " {\n" };
-            for (const auto& f : c.fields)
-                all += "  " + viewer::access_modifiers(f.access, false) + " " + viewer::pretty_field(f.descriptor) + " " + f.name + ";\n";
-            all += "\n";
-            for (const auto& m : c.methods)
-                all += "  " + viewer::access_modifiers(m.access, true) + " " + m.name + viewer::pretty_method(m.descriptor) + "\n";
+            for (const viewer::ClassInfo* oc : ch)
+            {
+                if (oc != &c)
+                {
+                    std::string od{ oc->internal_name };
+                    for (char& x : od) if (x == '/') x = '.';
+                    all += "\n  // inherited from " + od + "\n";
+                }
+                for (const auto& f : oc->fields)
+                    all += "  " + viewer::access_modifiers(f.access, false) + " " + viewer::pretty_field(f.descriptor) + " " + f.name + ";\n";
+                for (const auto& m : oc->methods)
+                    all += "  " + viewer::access_modifiers(m.access, true) + " " + m.name + viewer::pretty_method(m.descriptor) + "\n";
+            }
             all += "}\n";
             ImGui::SetClipboardText(all.c_str());
-            app.status_message = "Copied class listing to clipboard.";
+            app.status_message = g_show_inherited ? "Copied class listing (with inherited members) to clipboard."
+                                                  : "Copied class listing to clipboard.";
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Export .txt"))
