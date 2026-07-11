@@ -65,10 +65,27 @@ namespace
         return w;
     }
 
-    // Inject the payload and read the raw C/M/F stream into `raw`.  Overlapped
-    // I/O with timeouts so a failed attach reports an error instead of hanging.
-    auto enumerate_raw(std::uint32_t pid, const std::wstring& dll, std::string& raw, std::string& err) -> bool
+    // Leave a one-line request for the payload (read + deleted on its next
+    // connect): "ENUM" (class surface) or "INST\t<class>\t<max>" (live instances).
+    void write_request(const std::string& req)
     {
+        wchar_t tmp[MAX_PATH]{};
+        const DWORD n{ GetTempPathW(MAX_PATH, tmp) };
+        if (n == 0 || n >= MAX_PATH) return;
+        std::wstring path{ tmp, n }; path += L"vmhook_viewer_req.txt";
+        HANDLE f{ CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr) };
+        if (f == INVALID_HANDLE_VALUE) return;
+        DWORD wn{ 0 }; WriteFile(f, req.data(), static_cast<DWORD>(req.size()), &wn, nullptr); CloseHandle(f);
+    }
+
+    // Inject the payload and read the raw stream into `raw`.  Overlapped I/O with
+    // timeouts so a failed attach reports an error instead of hanging.  `request`
+    // selects what the payload streams (the class surface by default).
+    auto enumerate_raw(std::uint32_t pid, const std::wstring& dll, std::string& raw, std::string& err,
+                       const std::string& request = "ENUM") -> bool
+    {
+        write_request(request);
         HANDLE pipe{ CreateNamedPipeW(viewer::k_pipe_name, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 0, 1u << 20, 0, nullptr) };
         if (pipe == INVALID_HANDLE_VALUE) { err = "CreateNamedPipe failed"; return false; }
@@ -223,6 +240,54 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (cmd == "instances" && argc >= 4)
+    {
+        const std::uint32_t pid{ (std::uint32_t)std::strtoul(argv[2], nullptr, 10) };
+        const std::string cls{ argv[3] };                        // internal name, e.g. com/example/demo/Foo
+        const std::string cap{ argc >= 5 ? argv[4] : "1000" };
+        wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring w{ exe }; const std::size_t s{ w.find_last_of(L"\\/") };
+        if (s != std::wstring::npos) w.resize(s + 1);
+        const std::wstring dll{ w + L"vmhook_payload.dll" };
+        std::string raw, err;
+        if (!enumerate_raw(pid, dll, raw, err, "INST\t" + cls + "\t" + cap))
+        { std::printf("{\"error\":\"%s\"}\n", json_escape(err).c_str()); return 1; }
+
+        // O <TAB> 0x<addr> starts an instance; V <TAB> name <TAB> value [<TAB> owner].
+        std::printf("{\"pid\":%u,\"class\":\"%s\",\"instances\":[", pid, json_escape(cls).c_str());
+        std::size_t p{ 0 }; bool first_inst{ true }; bool first_field{ false };
+        while (p < raw.size())
+        {
+            std::size_t nl{ raw.find('\n', p) };
+            if (nl == std::string::npos) nl = raw.size();
+            const std::string_view line{ raw.data() + p, nl - p };
+            p = nl + 1;
+            if (line.empty()) continue;
+            if (line[0] == 'O')
+            {
+                const std::string addr{ line.size() > 2 && line[1] == '\t' ? std::string{ line.substr(2) } : std::string{} };
+                if (!first_inst) std::printf("}},");
+                std::printf("{\"address\":\"%s\",\"fields\":{", json_escape(addr).c_str());
+                first_inst = false; first_field = true;
+            }
+            else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t' && !first_inst)
+            {
+                const std::size_t t2{ line.find('\t', 2) };
+                if (t2 != std::string_view::npos)
+                {
+                    const std::size_t t3{ line.find('\t', t2 + 1) };
+                    const std::string name{ line.substr(2, t2 - 2) };
+                    const std::string val{ line.substr(t2 + 1, (t3 == std::string_view::npos ? line.size() : t3) - (t2 + 1)) };
+                    std::printf("%s\"%s\":\"%s\"", first_field ? "" : ",", json_escape(name).c_str(), json_escape(val).c_str());
+                    first_field = false;
+                }
+            }
+        }
+        if (!first_inst) std::printf("}}");
+        std::printf("]}\n");
+        return 0;
+    }
+
     if (cmd == "classes" && argc >= 3)
     {
         const std::uint32_t pid{ (std::uint32_t)std::strtoul(argv[2], nullptr, 10) };
@@ -285,6 +350,6 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::printf("{\"error\":\"usage: vmhook_cli list | enumerate <pid> | classes <pid> [substr] | class <pid> <name>\"}\n");
+    std::printf("{\"error\":\"usage: vmhook_cli list | enumerate <pid> | classes <pid> [substr] | class <pid> <name> | instances <pid> <class> [cap]\"}\n");
     return 2;
 }
