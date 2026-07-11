@@ -1172,6 +1172,24 @@ namespace
         return cmp_num_or_str(xs, ys);
     }
 
+    // Colour a formatted field value by its kind so the table scans easily:
+    // strings, object refs (<...>), booleans, and null each get their own tint.
+    ImVec4 value_color(const std::string& v)
+    {
+        if (v == "null")                 return ImVec4(0.55f, 0.57f, 0.62f, 1.0f);  // dim grey
+        if (v == "true" || v == "false") return ImVec4(0.90f, 0.66f, 0.40f, 1.0f);  // amber
+        if (!v.empty() && v.front() == '"') return ImVec4(0.56f, 0.81f, 0.58f, 1.0f);  // string green
+        if (!v.empty() && v.front() == '<') return ImVec4(0.56f, 0.71f, 0.96f, 1.0f);  // ref blue
+        return ImGui::GetStyleColorVec4(ImGuiCol_Text);                             // number/default
+    }
+
+    void render_field_value(const std::string& v)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, value_color(v));
+        ImGui::TextUnformatted(v.c_str());
+        ImGui::PopStyleColor();
+    }
+
     void draw_instances_window(viewer::App& app)
     {
         ImGui::SetNextWindowSize(ImVec2(em(58.0f), em(32.0f)), ImGuiCond_FirstUseEver);
@@ -1337,8 +1355,7 @@ namespace
                         ImGui::TableSetColumnIndex(cidx + 2);
                         if (cidx >= (int)inst.fields.size()) continue;
                         const std::string& v{ inst.fields[(std::size_t)cidx].value };
-                        if (v == "null") ImGui::TextDisabled("null");
-                        else             ImGui::TextUnformatted(v.c_str());
+                        render_field_value(v);
                         if (ImGui::IsItemHovered() && v.size() > 18) ImGui::SetTooltip("%s", v.c_str());
                     }
                     ImGui::PopID();
@@ -1407,8 +1424,9 @@ namespace
                         ImGui::TableSetColumnIndex(0);
                         ImGui::TextUnformatted(f.name.c_str());
                         ImGui::TableSetColumnIndex(1);
-                        if (f.value == "null") ImGui::TextDisabled("null");
-                        else                   ImGui::TextWrapped("%s", f.value.c_str());
+                        ImGui::PushStyleColor(ImGuiCol_Text, value_color(f.value));
+                        ImGui::TextWrapped("%s", f.value.c_str());
+                        ImGui::PopStyleColor();
                         ImGui::TableSetColumnIndex(2);
                         if (!f.owner.empty()) ImGui::TextDisabled("%s", f.owner.c_str());
                     }
