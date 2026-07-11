@@ -235,7 +235,7 @@ namespace
     char         g_method_filter[128]{};
     char         g_field_filter[128]{};
     int          g_selected_class{ -1 };
-    float        g_left_width{ 420.0f };
+    float        g_left_width{ 500.0f };  // default; DPI-scaled + persisted
     bool         g_pretty{ true };
     bool         g_full_names{ false };
     bool         g_show_inherited{ false };  // details: include super-chain members
@@ -622,9 +622,9 @@ namespace
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                 ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate))
         {
-            ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Class", ImGuiTableColumnFlags_WidthFixed, 150.0f);
-            ImGui::TableSetupColumn("m/f", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 72.0f);
+            ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("Class",   ImGuiTableColumnFlags_WidthStretch, 1.15f);
+            ImGui::TableSetupColumn("m/f",     ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, em(4.2f));
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();
 
