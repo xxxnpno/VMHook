@@ -416,7 +416,9 @@ namespace
         ImGui::InputTextWithHint("##search", "Search classes  (Ctrl+F)", g_search, sizeof(g_search));
 
         std::lock_guard<std::mutex> lock{ app.data_mutex };
-        const std::string needle{ g_search };
+        // Match either slash- or dot-qualified queries ("java.lang" == "java/lang").
+        std::string needle{ g_search };
+        for (char& ch : needle) if (ch == '.') ch = '/';
 
         static const char* k_kind_names[]{ "All kinds", "class", "interface", "enum", "abstract", "annotation", "record" };
         const char* want_kind{ g_kind_filter > 0 ? k_kind_names[g_kind_filter] : nullptr };
