@@ -1,7 +1,22 @@
 # vmhook viewer
 
 A C++23 / ImGui (Win32 + DirectX 11) desktop tool that turns the header-only
-`vmhook` library into an interactive JVM inspector.
+`vmhook` library into an interactive JVM inspector — plus an **MCP server** so
+Claude/other AIs can drive it (see [`mcp/`](mcp/README.md)).
+
+**Highlights**
+
+- Modern dark UI (Segoe UI font, custom theme) with a resizable IDE-style split.
+- Auto-refreshing JVM list showing each JVM's **command line** (not just `java.exe`).
+- Class list with instant search (Ctrl+F), sortable columns, method/field counts,
+  and smooth scrolling over tens of thousands of classes (clipped).
+- Per-class **methods & fields** with **access modifiers** colour-coded by
+  visibility (public/private/protected), pretty-printed signatures
+  (`(int, double) : double`, toggle to raw descriptors), per-pane filters, and
+  right-click copy.
+- Superclass shown as `extends X` — **click it to jump** to that class.
+- One-click **Copy all** (Java-like listing) / **Export .txt**.
+- Re-attach works (the payload serves every attach; no restart needed).
 
 It:
 
