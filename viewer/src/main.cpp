@@ -709,7 +709,9 @@ namespace
         }
         const viewer::ClassInfo& c{ app.classes[(std::size_t)g_selected_class] };
 
-        // back / forward navigation (browser-style, pairs with `extends` jumps)
+        // back / forward navigation (browser-style, pairs with `extends` jumps).
+        // Subtle frame-coloured buttons so they don't compete with Attach.
+        push_combo_style();
         ImGui::BeginDisabled(g_nav_back.empty());
         if (ImGui::ArrowButton("##nav_back", ImGuiDir_Left)) nav_back();
         ImGui::EndDisabled();
@@ -719,6 +721,7 @@ namespace
         if (ImGui::ArrowButton("##nav_fwd", ImGuiDir_Right)) nav_forward();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !g_nav_fwd.empty()) ImGui::SetTooltip("Forward (Alt+Right)");
+        pop_combo_style();
         ImGui::SameLine(0.0f, em(0.6f));
 
         // header — one frame-align sets the baseline for the whole line (name + badges)
