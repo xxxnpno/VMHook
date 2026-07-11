@@ -42,6 +42,12 @@ public class ExampleApp
     float[]                            samples;
     List<String>                       tags;
     Inner                              inner;
+    // extra instance primitives so the instance-value path covers every descriptor
+    char                               ch    = 'Z';
+    byte                               b8    = 42;
+    short                              s16   = 1000;
+    long                               lVal  = 9_000_000_000L;
+    double                             dVal  = 2.718281828;
 
     public ExampleApp(int id, String label)
     {
