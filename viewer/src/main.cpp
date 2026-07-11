@@ -190,16 +190,20 @@ namespace
     // and class-list clicks) so browsing the class graph feels like a browser.
     std::vector<int> g_nav_back;
     std::vector<int> g_nav_fwd;
+    bool             g_scroll_to_selected{ false };  // sync the list to a jump
 
     // Select a class, recording the previous selection for Back.  Clears the
     // per-pane member filters (a fresh class shouldn't inherit stale filters).
-    void navigate_to(int idx)
+    // scroll_into_view syncs the class list to the target — set for link/history
+    // jumps, cleared for list clicks (the clicked row is already visible).
+    void navigate_to(int idx, bool scroll_into_view = true)
     {
         if (idx == g_selected_class) return;
         if (g_selected_class >= 0) g_nav_back.push_back(g_selected_class);
         g_nav_fwd.clear();
         g_selected_class = idx;
         g_method_filter[0] = 0; g_field_filter[0] = 0;
+        if (scroll_into_view) g_scroll_to_selected = true;
     }
 
     void nav_back()
@@ -208,6 +212,7 @@ namespace
         if (g_selected_class >= 0) g_nav_fwd.push_back(g_selected_class);
         g_selected_class = g_nav_back.back(); g_nav_back.pop_back();
         g_method_filter[0] = 0; g_field_filter[0] = 0;
+        g_scroll_to_selected = true;
     }
 
     void nav_forward()
@@ -216,6 +221,7 @@ namespace
         if (g_selected_class >= 0) g_nav_back.push_back(g_selected_class);
         g_selected_class = g_nav_fwd.back(); g_nav_fwd.pop_back();
         g_method_filter[0] = 0; g_field_filter[0] = 0;
+        g_scroll_to_selected = true;
     }
 
     void status_pill(viewer::Status st)
@@ -425,6 +431,16 @@ namespace
 
             ImGuiListClipper clipper;
             clipper.Begin((int)g_filtered.size());
+            // A link/history jump changed the selection off-screen: force that row
+            // to be submitted so we can scroll it into view this frame.
+            int scroll_row{ -1 };
+            if (g_scroll_to_selected && g_selected_class >= 0)
+            {
+                for (int i = 0; i < (int)g_filtered.size(); ++i)
+                    if (g_filtered[(std::size_t)i] == g_selected_class) { scroll_row = i; break; }
+                if (scroll_row >= 0) clipper.IncludeItemByIndex(scroll_row);
+                else g_scroll_to_selected = false;  // target filtered out — nothing to sync
+            }
             while (clipper.Step())
             {
                 for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row)
@@ -437,7 +453,7 @@ namespace
                     if (ImGui::Selectable(c.package.empty() ? "(default)" : c.package.c_str(),
                             g_selected_class == idx, ImGuiSelectableFlags_SpanAllColumns))
                     {
-                        navigate_to(idx);
+                        navigate_to(idx, false);  // clicked row already visible
                     }
                     copy_menu("cls", c.internal_name);
                     ImGui::TableSetColumnIndex(1);
@@ -449,6 +465,11 @@ namespace
                     ImGui::TableSetColumnIndex(2);
                     ImGui::TextDisabled("%zu/%zu", c.methods.size(), c.fields.size());
                     ImGui::PopID();
+                    if (row == scroll_row && g_scroll_to_selected)
+                    {
+                        ImGui::SetScrollHereY(0.5f);
+                        g_scroll_to_selected = false;
+                    }
                 }
             }
             ImGui::EndTable();
