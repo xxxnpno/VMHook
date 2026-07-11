@@ -431,6 +431,83 @@ namespace
         return {};
     }
 
+    // Render a method's pretty signature inline, with each CLASS type (params +
+    // return) drawn as a clickable link that navigates to that class.  Falls
+    // back to plain text in raw-descriptor mode or on a malformed descriptor.
+    void render_method_signature(viewer::App& app, const std::string& desc)
+    {
+        if (!g_pretty || desc.size() < 2 || desc[0] != '(')
+        {
+            ImGui::TextUnformatted((g_pretty ? viewer::pretty_method(desc, g_full_names) : desc).c_str());
+            return;
+        }
+
+        auto render_type = [&](std::size_t& i)
+        {
+            const std::size_t start{ i };
+            int arrays{ 0 };
+            while (i < desc.size() && desc[i] == '[') { ++arrays; ++i; }
+            std::string base, internal;
+            if (i >= desc.size()) { base = "?"; }
+            else
+            {
+                switch (desc[i])
+                {
+                case 'V': base = "void";    ++i; break;
+                case 'Z': base = "boolean"; ++i; break;
+                case 'B': base = "byte";    ++i; break;
+                case 'C': base = "char";    ++i; break;
+                case 'S': base = "short";   ++i; break;
+                case 'I': base = "int";     ++i; break;
+                case 'J': base = "long";    ++i; break;
+                case 'F': base = "float";   ++i; break;
+                case 'D': base = "double";  ++i; break;
+                case 'L':
+                {
+                    const std::size_t semi{ desc.find(';', i) };
+                    const std::size_t end{ semi == std::string::npos ? desc.size() : semi };
+                    internal = desc.substr(i + 1, end - i - 1);
+                    if (g_full_names) { base = internal; for (char& ch : base) if (ch == '/') ch = '.'; }
+                    else { const std::size_t sl{ internal.find_last_of('/') }; base = (sl == std::string::npos ? internal : internal.substr(sl + 1)); for (char& ch : base) if (ch == '$') ch = '.'; }
+                    i = (semi == std::string::npos ? desc.size() : semi + 1);
+                    break;
+                }
+                default: base = std::string(1, desc[i]); ++i; break;
+                }
+            }
+            for (int a = 0; a < arrays; ++a) base += "[]";
+
+            ImGui::PushID((int)start);
+            const auto it{ internal.empty() ? app.name_to_index.end() : app.name_to_index.find(internal) };
+            if (it != app.name_to_index.end())
+            {
+                if (ImGui::TextLink(base.c_str())) navigate_to(it->second);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to open)", internal.c_str());
+            }
+            else
+            {
+                ImGui::TextUnformatted(base.c_str());
+            }
+            ImGui::PopID();
+        };
+
+        std::size_t i{ 1 };
+        ImGui::TextUnformatted("(");
+        bool first{ true };
+        while (i < desc.size() && desc[i] != ')')
+        {
+            ImGui::SameLine(0.0f, 0.0f);
+            if (!first) { ImGui::TextUnformatted(", "); ImGui::SameLine(0.0f, 0.0f); }
+            render_type(i);
+            first = false;
+        }
+        if (i < desc.size()) ++i;  // skip ')'
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::TextUnformatted(") : ");
+        ImGui::SameLine(0.0f, 0.0f);
+        render_type(i);
+    }
+
     void copy_menu(const char* id, const std::string& primary, const std::string& secondary = {})
     {
         if (ImGui::BeginPopupContextItem(id))
@@ -1053,9 +1130,7 @@ namespace
                         ImGui::TextUnformatted(viewer::access_modifiers(m.access, true).c_str());
                         ImGui::PopStyleColor();
                         ImGui::TableNextColumn();
-                        const std::string sig{ g_pretty ? viewer::pretty_method(m.descriptor, g_full_names) : m.descriptor };
-                        ImGui::TextUnformatted(sig.c_str());
-                        if (g_pretty && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m.descriptor.c_str());
+                        render_method_signature(app, m.descriptor);
                         ImGui::PopID();
                     }
                 ImGui::EndTable();
