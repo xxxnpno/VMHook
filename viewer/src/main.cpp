@@ -248,7 +248,9 @@ namespace
     bool         g_full_names{ false };
     bool         g_show_inherited{ false };  // details: include super-chain members
     bool         g_show_instances{ false };  // live-instances window open
-    std::string  g_pending_instance_request; // deferred so we don't re-lock data_mutex
+    bool         g_instances_live{ true };   // auto-refresh the instances window
+    bool         g_instances_refresh_now{ false };  // force an immediate re-scan
+    std::string  g_instances_class;          // internal name shown in the window
     bool         g_focus_search{ false };
     int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
     int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
@@ -954,7 +956,8 @@ namespace
         ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_Header));
         if (ImGui::SmallButton(ICON_FA_SEARCH " Live instances"))
         {
-            g_pending_instance_request = c.internal_name;
+            g_instances_class = c.internal_name;
+            g_instances_refresh_now = true;  // immediate first scan
             g_show_instances = true;
         }
         ImGui::PopStyleColor();
@@ -1116,32 +1119,38 @@ namespace
     }
 
     // Floating window listing the live heap instances of a class (one row per
-    // instance, one column per declared instance field, cells = field values).
+    // instance: heap address + one column per declared instance field, cells =
+    // field values).  Auto-refreshes while "Live" so values update in real time.
     void draw_instances_window(viewer::App& app)
     {
-        ImGui::SetNextWindowSize(ImVec2(em(54.0f), em(30.0f)), ImGuiCond_FirstUseEver);
-        if (!ImGui::Begin("Live instances", &g_show_instances))
-        {
-            ImGui::End();
-            return;
-        }
-        std::lock_guard<std::mutex> lock{ app.data_mutex };
+        ImGui::SetNextWindowSize(ImVec2(em(58.0f), em(32.0f)), ImGuiCond_FirstUseEver);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em(0.85f), em(0.7f)));
+        const bool open{ ImGui::Begin("Live instances", &g_show_instances, ImGuiWindowFlags_NoCollapse) };
+        ImGui::PopStyleVar();
+        if (!open) { ImGui::End(); return; }
 
+        std::lock_guard<std::mutex> lock{ app.data_mutex };
+        const viewer::Status st{ app.inst_status.load() };
+
+        // Header: class name (+ tiny spinner while scanning) ... Live | Refresh.
         std::string dotted{ app.inst_class };
         for (char& ch : dotted) if (ch == '/') ch = '.';
         ImGui::AlignTextToFramePadding();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
         ImGui::TextUnformatted(dotted.empty() ? "(no class selected)" : dotted.c_str());
         ImGui::PopStyleColor();
-
-        const viewer::Status st{ app.inst_status.load() };
-        ImGui::SameLine(0.0f, em(0.8f));
         if (st == viewer::Status::Receiving)
         {
-            const float r{ ImGui::GetFrameHeight() * 0.30f };
+            ImGui::SameLine(0.0f, em(0.5f));
+            const float r{ ImGui::GetFrameHeight() * 0.28f };
             ui::Spinner("##iscan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
-            ImGui::SameLine(0.0f, em(0.4f));
         }
+        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(11.5f), ImGui::GetCursorPosX() + em(1.0f)));
+        ui::Toggle("Live", &g_instances_live);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Re-scan the heap ~every 1.5s so field values update live");
+        ImGui::SameLine(0.0f, em(0.7f));
+        if (ImGui::SmallButton("Refresh")) g_instances_refresh_now = true;
+
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%s", app.inst_message.c_str());
 
@@ -1160,19 +1169,15 @@ namespace
             if (st != viewer::Status::Receiving)
                 ImGui::TextDisabled("No live instances found on the heap for this class.");
         }
-        else if (cols.empty())
-        {
-            ImGui::TextDisabled("%zu live instance(s); this class declares no instance fields.",
-                                app.instances.size());
-        }
-        else if (ImGui::BeginTable("instances", 1 + (int)cols.size(),
+        else if (ImGui::BeginTable("instances", 2 + (int)cols.size(),
                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                      ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable))
         {
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, em(3.0f));
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, em(2.6f));
+            ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, em(11.0f));
             for (const viewer::FieldInfo* f : cols)
                 ImGui::TableSetupColumn(f->name.c_str(), ImGuiTableColumnFlags_WidthFixed, em(11.0f));
-            ImGui::TableSetupScrollFreeze(1, 1);
+            ImGui::TableSetupScrollFreeze(2, 1);
             ImGui::TableHeadersRow();
 
             ImGuiListClipper clip;
@@ -1182,17 +1187,25 @@ namespace
                 {
                     const viewer::InstanceInfo& inst{ app.instances[(std::size_t)r] };
                     ImGui::TableNextRow();
+                    ImGui::PushID(r);
                     ImGui::TableSetColumnIndex(0);
                     ImGui::TextDisabled("%d", r);
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.68f, 0.82f, 1.0f));
+                    ImGui::TextUnformatted(inst.address.c_str());
+                    ImGui::PopStyleColor();
+                    copy_menu("addr", inst.address);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (right-click to copy)", inst.address.c_str());
                     for (int cidx = 0; cidx < (int)cols.size(); ++cidx)
                     {
-                        ImGui::TableSetColumnIndex(cidx + 1);
+                        ImGui::TableSetColumnIndex(cidx + 2);
                         if (cidx >= (int)inst.fields.size()) continue;
                         const std::string& v{ inst.fields[(std::size_t)cidx].second };
                         if (v == "null") ImGui::TextDisabled("null");
                         else             ImGui::TextUnformatted(v.c_str());
                         if (ImGui::IsItemHovered() && v.size() > 18) ImGui::SetTooltip("%s", v.c_str());
                     }
+                    ImGui::PopID();
                 }
             ImGui::EndTable();
         }
@@ -1327,13 +1340,26 @@ namespace
 
         ImGui::End();
 
-        // Deferred instance request (issued from draw_details, which holds
-        // data_mutex; request_instances re-locks it, so it must run here) + the
-        // floating instances window, both outside the root window's Begin/End.
-        if (!g_pending_instance_request.empty())
+        // Live instances: (re)scan the heap outside the root window's Begin/End
+        // and outside draw_details' data_mutex lock (request_instances re-locks
+        // it).  The next auto-scan is scheduled a fixed delay AFTER the previous
+        // one COMPLETES (not after it starts) — otherwise a heap scan slower than
+        // the interval would re-fire back-to-back and never show a result.
+        if (g_show_instances && !g_instances_class.empty())
         {
-            app.request_instances(g_pending_instance_request);
-            g_pending_instance_request.clear();
+            static bool   was_busy{ false };
+            static double next_scan{ 0.0 };
+            const bool now_busy{ app.inst_busy() };
+            if (was_busy && !now_busy) next_scan = ImGui::GetTime() + 1.2;  // just finished
+            was_busy = now_busy;
+
+            const bool due{ g_instances_refresh_now || (g_instances_live && ImGui::GetTime() >= next_scan) };
+            if (due && !now_busy)
+            {
+                app.request_instances(g_instances_class);
+                g_instances_refresh_now = false;
+                next_scan = ImGui::GetTime() + 1.0e9;  // reset on completion above
+            }
         }
         if (g_show_instances)
         {

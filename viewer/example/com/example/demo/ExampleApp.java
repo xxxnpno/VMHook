@@ -29,6 +29,7 @@ public class ExampleApp
 
     // ── instance fields (various types) ──────────────────────────────────────
     public              int            id;
+    public              int            ticks;   // mutated every second (live demo)
     private             String         label;
     protected           boolean        active;
     float[]                            samples;
@@ -85,6 +86,10 @@ public class ExampleApp
         while (true)
         {
             ExampleApp.tick();
+            // Mutate the live instance's own fields so the viewer shows them change.
+            app.ticks  = (int) i;
+            app.label  = "main#" + i;
+            app.active = (i % 2 == 0);
             history[(int) (i % history.length)] = i;
             app.compute((int) i, ratio);
             Thread.sleep(1000);

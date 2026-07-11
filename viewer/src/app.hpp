@@ -52,10 +52,11 @@ namespace viewer
         std::vector<FieldInfo>  fields;
     };
 
-    // One live heap instance of a class: its instance fields, each with a
-    // formatted value string (as read by the payload).
+    // One live heap instance of a class: its heap address + its instance fields,
+    // each with a formatted value string (as read by the payload).
     struct InstanceInfo
     {
+        std::string address;  // "0x..." oop address
         std::vector<std::pair<std::string, std::string>> fields;  // (name, value)
     };
 
@@ -438,9 +439,14 @@ namespace viewer
             inst_status.store(Status::Receiving);
             {
                 std::lock_guard<std::mutex> lock{ data_mutex };
+                // Only clear when switching classes — a live re-scan keeps the
+                // current rows visible until the new results replace them.
+                if (inst_class != internal_class)
+                {
+                    instances.clear();
+                    inst_message = "Scanning heap for live instances...";
+                }
                 inst_class = internal_class;
-                inst_message = "Scanning heap for live instances...";
-                instances.clear();
             }
             worker = std::thread([this, internal_class] { run_instances(internal_class); });
         }
@@ -519,6 +525,10 @@ namespace viewer
                 if (line[0] == 'O')
                 {
                     out.emplace_back();
+                    if (line.size() > 2 && line[1] == '\t')  // O <TAB> 0x<addr>
+                    {
+                        out.back().address = std::string{ line.substr(2) };
+                    }
                 }
                 else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t' && !out.empty())
                 {

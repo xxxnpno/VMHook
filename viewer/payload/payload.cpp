@@ -10,7 +10,7 @@
 //   C <TAB> internal/Class/Name <TAB> super/Internal/Name <TAB> <classAccessFlags>
 //   M <TAB> methodName <TAB> (descriptor)ret <TAB> <methodAccessFlags>
 //   F <TAB> fieldName  <TAB> descriptor <TAB> <fieldAccessFlags>
-//   O                                    (start of a live instance)
+//   O <TAB> 0x<addr>                      (start of a live instance, its oop address)
 //   V <TAB> fieldName <TAB> value        (a field value of the current instance)
 //   DONE <TAB> <count>
 // Methods/fields belong to the most recently emitted C record; V records to the
@@ -26,6 +26,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -306,7 +307,13 @@ namespace
         std::uint64_t count{ 0 };
         vmhook::for_each_instance_of(k, [&](void* const oop)
         {
-            writer.put("O\n");
+            // O <TAB> 0x<heap address of the instance oop>
+            char addr[32];
+            std::snprintf(addr, sizeof(addr), "0x%llX",
+                          static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(oop)));
+            writer.put("O\t");
+            writer.put(addr);
+            writer.put("\n");
             for (const field_info& f : fields)
             {
                 writer.put("V\t");
