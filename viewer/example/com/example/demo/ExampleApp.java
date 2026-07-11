@@ -26,6 +26,13 @@ public class ExampleApp
     static              long[]         history      = new long[16];
     static              Map<String, Integer> scores = new HashMap<>();
     protected static    Color          defaultColor = Color.GREEN;
+    // extra static primitives to exercise every descriptor in the static-value path
+    public static       boolean        debug        = true;
+    public static       char           grade        = 'A';
+    public static       byte           level        = 7;
+    public static       short          port         = 8080;
+    public static       long           epoch        = 1_700_000_000_000L;
+    public static       float          piF          = 3.14159f;
 
     // ── instance fields (various types) ──────────────────────────────────────
     public              int            id;
