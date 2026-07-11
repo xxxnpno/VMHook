@@ -6,7 +6,10 @@ Claude/other AIs can drive it (see [`mcp/`](mcp/README.md)).
 
 **Highlights**
 
-- Modern dark UI (Segoe UI font, custom theme) with a resizable IDE-style split.
+- Modern dark UI (Segoe UI + Font Awesome icons, custom theme) with a resizable
+  IDE-style split. **Borderless** window with in-app min/close controls.
+- **DPI-aware and adaptive** — crisp on high-DPI displays, and every size is
+  font-relative so the whole UI scales with `Ctrl +/-` zoom and the display DPI.
 - Auto-refreshing JVM list showing each JVM's **command line** (not just `java.exe`).
 - Class list with instant search (Ctrl+F), sortable columns, method/field counts,
   and smooth scrolling over tens of thousands of classes (clipped).
