@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -180,8 +181,41 @@ namespace
     bool         g_pretty{ true };
     bool         g_full_names{ false };
     bool         g_focus_search{ false };
+    int          g_kind_filter{ 0 };  // 0=all; else index into k_kind_names
     std::wstring g_dll_path{};
     std::vector<int> g_filtered;  // rebuilt each frame from the search box
+
+    // Back/forward navigation history (paired with the clickable `extends` jump
+    // and class-list clicks) so browsing the class graph feels like a browser.
+    std::vector<int> g_nav_back;
+    std::vector<int> g_nav_fwd;
+
+    // Select a class, recording the previous selection for Back.  Clears the
+    // per-pane member filters (a fresh class shouldn't inherit stale filters).
+    void navigate_to(int idx)
+    {
+        if (idx == g_selected_class) return;
+        if (g_selected_class >= 0) g_nav_back.push_back(g_selected_class);
+        g_nav_fwd.clear();
+        g_selected_class = idx;
+        g_method_filter[0] = 0; g_field_filter[0] = 0;
+    }
+
+    void nav_back()
+    {
+        if (g_nav_back.empty()) return;
+        if (g_selected_class >= 0) g_nav_fwd.push_back(g_selected_class);
+        g_selected_class = g_nav_back.back(); g_nav_back.pop_back();
+        g_method_filter[0] = 0; g_field_filter[0] = 0;
+    }
+
+    void nav_forward()
+    {
+        if (g_nav_fwd.empty()) return;
+        if (g_selected_class >= 0) g_nav_back.push_back(g_selected_class);
+        g_selected_class = g_nav_fwd.back(); g_nav_fwd.pop_back();
+        g_method_filter[0] = 0; g_field_filter[0] = 0;
+    }
 
     void status_pill(viewer::Status st)
     {
@@ -305,7 +339,7 @@ namespace
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(app.busy() || app.selected_jvm < 0);
-        if (ImGui::Button("Attach & Enumerate")) { app.attach_selected(g_dll_path); g_selected_class = -1; }
+        if (ImGui::Button("Attach & Enumerate")) { app.attach_selected(g_dll_path); g_selected_class = -1; g_nav_back.clear(); g_nav_fwd.clear(); }
         ImGui::EndDisabled();
 
         ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
@@ -330,13 +364,23 @@ namespace
         std::lock_guard<std::mutex> lock{ app.data_mutex };
         const std::string needle{ g_search };
 
+        static const char* k_kind_names[]{ "All kinds", "class", "interface", "enum", "abstract", "annotation", "record" };
+        const char* want_kind{ g_kind_filter > 0 ? k_kind_names[g_kind_filter] : nullptr };
+
         g_filtered.clear();
         g_filtered.reserve(app.classes.size());
         for (int i = 0; i < (int)app.classes.size(); ++i)
-            if (icontains(app.classes[(std::size_t)i].internal_name, needle))
-                g_filtered.push_back(i);
+        {
+            const viewer::ClassInfo& ci{ app.classes[(std::size_t)i] };
+            if (!icontains(ci.internal_name, needle)) continue;
+            if (want_kind && std::strcmp(class_kind(ci).label, want_kind) != 0) continue;
+            g_filtered.push_back(i);
+        }
 
         ImGui::TextDisabled("%d / %zu classes", (int)g_filtered.size(), app.classes.size());
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(130.0f);
+        ImGui::Combo("##kind", &g_kind_filter, k_kind_names, IM_ARRAYSIZE(k_kind_names));
 
         if (ImGui::BeginTable("classes", 3,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
@@ -378,8 +422,7 @@ namespace
                     if (ImGui::Selectable(c.package.empty() ? "(default)" : c.package.c_str(),
                             g_selected_class == idx, ImGuiSelectableFlags_SpanAllColumns))
                     {
-                        g_selected_class = idx;
-                        g_method_filter[0] = 0; g_field_filter[0] = 0;
+                        navigate_to(idx);
                     }
                     copy_menu("cls", c.internal_name);
                     ImGui::TableSetColumnIndex(1);
@@ -415,6 +458,18 @@ namespace
         }
         const viewer::ClassInfo& c{ app.classes[(std::size_t)g_selected_class] };
 
+        // back / forward navigation (browser-style, pairs with `extends` jumps)
+        ImGui::BeginDisabled(g_nav_back.empty());
+        if (ImGui::ArrowButton("##nav_back", ImGuiDir_Left)) nav_back();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered() && !g_nav_back.empty()) ImGui::SetTooltip("Back (Alt+Left)");
+        ImGui::SameLine(0.0f, 3.0f);
+        ImGui::BeginDisabled(g_nav_fwd.empty());
+        if (ImGui::ArrowButton("##nav_fwd", ImGuiDir_Right)) nav_forward();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered() && !g_nav_fwd.empty()) ImGui::SetTooltip("Forward (Alt+Right)");
+        ImGui::SameLine();
+
         // header
         std::string dotted{ c.internal_name };
         for (char& ch : dotted) if (ch == '/') ch = '.';
@@ -449,7 +504,7 @@ namespace
             const auto it{ app.name_to_index.find(c.super_name) };
             if (it != app.name_to_index.end())
             {
-                if (ImGui::TextLink(sd.c_str())) { g_selected_class = it->second; g_method_filter[0] = 0; g_field_filter[0] = 0; }
+                if (ImGui::TextLink(sd.c_str())) { navigate_to(it->second); }
             }
             else
             {
@@ -572,6 +627,12 @@ namespace
         if (ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
         {
             g_search[0] = 0; g_method_filter[0] = 0; g_field_filter[0] = 0;
+        }
+        // Alt+Left / Alt+Right walk the class navigation history (browser-style).
+        if (ImGui::IsKeyDown(ImGuiKey_LeftAlt) || ImGui::IsKeyDown(ImGuiKey_RightAlt))
+        {
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow,  false)) nav_back();
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) nav_forward();
         }
 
         // Auto-refresh the JVM list every 2s so new/closed JVMs appear without a
