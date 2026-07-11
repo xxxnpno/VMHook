@@ -21,11 +21,21 @@ Claude/other AIs can drive it (see [`mcp/`](mcp/README.md)).
   visibility (public/private/protected), pretty-printed signatures
   (`(int, double) : double`, toggle to raw descriptors), per-pane filters, and
   right-click copy.
-- **Navigate the class graph like a browser:** superclass shown as `extends X`
-  and every field whose type is a loaded class is a **clickable link** — jump in,
-  then **Back / Forward** (◀ ▶ buttons or `Alt+←` / `Alt+→`).
+- **Navigate the class graph like a browser:** superclass shown as `extends X`,
+  and every field **and method** type that resolves to a loaded class is a
+  **clickable link** — in the per-class view *and* the global member search — so
+  you can jump in, then **Back / Forward** (◀ ▶ buttons or `Alt+←` / `Alt+→`).
+- **Search members across every class** — switch the search scope to
+  **Methods** / **Fields** to find a member by name anywhere in the JVM.
 - **Show inherited members** — one toggle folds in methods & fields from the whole
-  superclass chain (inherited rows dimmed, hover shows the declaring class).
+  superclass chain (inherited rows dimmed, hover shows the declaring class); it
+  also drives **Copy all**.
+- **Live heap inspection** — pick a class and hit **Live instances** to scan the
+  heap for its live objects. Each instance's **address** and **field values** show
+  in a **sortable, filterable, live-updating grid** — own *and* inherited fields
+  (inherited columns dimmed, toggle to hide), colour-coded by type (strings, refs,
+  booleans, null). Click a row for a vertical Field / Value / From detail popup;
+  ref values and the address are copyable; **Copy table** exports the rows as TSV.
 - **Ctrl +/−/0** scales the UI font for accessibility / dense listings.
 - One-click **Copy all** (Java-like listing) / **Export .txt**.
 - Re-attach works (the payload serves every attach; no restart needed).
@@ -45,7 +55,7 @@ It:
 ## Layout
 
 ```
-┌ Running JVMs  [Refresh] [Attach & Enumerate]  Status: Done ──────────────┐
+┌ JVM  [com.example.demo.ExampleApp - 21544  ▾]  [Attach]  Done ───────────┐
 │  PID   Process     Path                                                   │
 │  10720 javaw.exe   C:\...\javaw.exe                                       │
 ├──────────────────────────────────────────────────────────────────────────┤
@@ -90,6 +100,8 @@ is self-contained when injected.
 
 | Viewer step            | vmhook API                                   |
 |------------------------|----------------------------------------------|
-| list classes           | `vmhook::for_each_loaded_class`              |
-| a class's methods       | `vmhook::detail::collect_klass_methods`      |
-| a class's fields        | `klass::collect_fields()` (added for this)   |
+| list classes            | `vmhook::for_each_loaded_class`              |
+| a class's methods        | `vmhook::detail::collect_klass_methods`      |
+| a class's fields         | `klass::collect_fields()` (added for this)   |
+| live instances of a class| `vmhook::for_each_instance_of` (added) + `vmhook::get_field<T>` |
+| a field's value          | `vmhook::get_field<T>` / `read_java_string` / `decode_oop_pointer` |
