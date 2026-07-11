@@ -225,6 +225,46 @@ namespace
         g_scroll_to_selected = true;
     }
 
+    // Persist a few UI preferences next to the exe so the tool remembers how the
+    // user likes it.  Best-effort: any I/O or parse error is silently ignored.
+    auto settings_path() -> std::string { return exe_dir() + "vmhook_viewer.ini"; }
+
+    void save_settings()
+    {
+        std::ofstream out{ settings_path(), std::ios::trunc };
+        if (!out) return;
+        out << "pretty="        << (g_pretty ? 1 : 0)        << "\n"
+            << "full_names="     << (g_full_names ? 1 : 0)    << "\n"
+            << "inherited="      << (g_show_inherited ? 1 : 0)<< "\n"
+            << "kind_filter="    << g_kind_filter             << "\n"
+            << "left_width="     << g_left_width              << "\n"
+            << "font_scale="     << ImGui::GetIO().FontGlobalScale << "\n";
+    }
+
+    void load_settings()
+    {
+        std::ifstream in{ settings_path() };
+        if (!in) return;
+        std::string line;
+        while (std::getline(in, line))
+        {
+            const std::size_t eq{ line.find('=') };
+            if (eq == std::string::npos) continue;
+            const std::string key{ line.substr(0, eq) };
+            const std::string val{ line.substr(eq + 1) };
+            try
+            {
+                if      (key == "pretty")     g_pretty        = (std::stoi(val) != 0);
+                else if (key == "full_names") g_full_names    = (std::stoi(val) != 0);
+                else if (key == "inherited")  g_show_inherited= (std::stoi(val) != 0);
+                else if (key == "kind_filter"){ int k{ std::stoi(val) }; if (k >= 0 && k <= 6) g_kind_filter = k; }
+                else if (key == "left_width") g_left_width    = std::clamp(std::stof(val), 240.0f, 2000.0f);
+                else if (key == "font_scale") ImGui::GetIO().FontGlobalScale = std::clamp(std::stof(val), 0.7f, 2.0f);
+            }
+            catch (...) { /* ignore a malformed value, keep the default */ }
+        }
+    }
+
     void status_pill(viewer::Status st)
     {
         ImVec4 col; const char* text;
@@ -856,6 +896,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     ImGui::GetIO().IniFilename = nullptr;
     apply_modern_style();
     load_fonts();
+    load_settings();  // restore the user's remembered UI preferences
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_device, g_context);
 
@@ -885,6 +926,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
         g_swap_chain->Present(1, 0);
     }
 
+    save_settings();  // remember preferences for next launch
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
