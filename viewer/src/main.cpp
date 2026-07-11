@@ -507,13 +507,18 @@ namespace
         }
         push_combo_style();
         ImGui::BeginDisabled(app.busy());  // don't swap JVM mid-attach
-        if (ImGui::BeginCombo("##jvm", preview.c_str()))
+        const bool combo_open{ ImGui::BeginCombo("##jvm", preview.c_str()) };
+        // Full command line on hover — the preview/items clip long classpaths.
+        if (!combo_open && app.selected_jvm >= 0 && app.selected_jvm < (int)app.jvms.size() && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", preview.c_str());
+        if (combo_open)
         {
             for (int i = 0; i < (int)app.jvms.size(); ++i)
             {
                 const auto& p{ app.jvms[(std::size_t)i] };
                 std::string item{ std::to_string(p.pid) + " — " + (p.command_line.empty() ? p.image_path.empty() ? p.image_name : p.image_path : p.command_line) };
                 if (ImGui::Selectable(item.c_str(), app.selected_jvm == i)) app.selected_jvm = i;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", item.c_str());
             }
             ImGui::EndCombo();
         }
