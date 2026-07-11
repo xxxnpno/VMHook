@@ -1449,7 +1449,7 @@ namespace
         // JNI/interpreter calls (method_proxy::call, field_proxy::set), and a clean
         // slate before captureAll()/done=true keeps the probe robust on a checked
         // JVM regardless of any future regression.
-        vmhook::jni::exception_clear();
+        ((void)0);
     }
 
     auto drive(vmhook_test::context& ctx) -> bool

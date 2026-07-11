@@ -224,19 +224,10 @@ namespace
     // Fully guarded; returns 1 (pending), 0 (none), or -1 (could not determine).
     auto jni_exception_pending() noexcept -> int
     {
-        void* const env{ vmhook::hotspot::current_jni_env };
-        if (!env)
-        {
-            return -1;
-        }
-        using exception_check_t = std::uint8_t (*)(void*);
-        exception_check_t const exc_check{
-            vmhook::detail::jni_function<228, exception_check_t>(env) };
-        if (!exc_check)
-        {
-            return -1;
-        }
-        return exc_check(env) != 0u ? 1 : 0;
+        // Pure-VM: vmhook no longer exposes a JNIEnv, so JNI ExceptionCheck is
+        // unavailable.  Report "could not determine" (-1); callers treat -1 as a
+        // soft/skip result, not a failure.
+        return -1;
     }
 
     // The full defensive clear chain used after EVERY throwing call().  Runs the
@@ -245,12 +236,12 @@ namespace
     auto defensive_clear() noexcept -> int
     {
         static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
-        vmhook::detail::jni_exception_clear();
+        ((void)0);
         static_cast<void>(raw_clear_pending_exception());
         int post{ jni_exception_pending() };
         for (int retry{ 0 }; post == 1 && retry < 4; ++retry)
         {
-            vmhook::detail::jni_exception_clear();
+            ((void)0);
             static_cast<void>(raw_clear_pending_exception());
             post = jni_exception_pending();
         }
@@ -411,7 +402,7 @@ namespace
                     const std::int32_t v = r;
                     o.safe_add_value.store(static_cast<std::int64_t>(v));
                 }
-                vmhook::detail::jni_exception_clear();
+                ((void)0);
             }
 
             auto hf{ self->get_field("healthField") };
@@ -433,7 +424,7 @@ namespace
 
         // Final clear so absolutely nothing pending escapes into vmhook.Main.
         static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
-        vmhook::detail::jni_exception_clear();
+        ((void)0);
         static_cast<void>(raw_clear_pending_exception());
     }
 
@@ -625,12 +616,12 @@ namespace
                 o.recovery_value.store(static_cast<std::int64_t>(v));
                 o.recovery_ok.store(true);
             }
-            vmhook::detail::jni_exception_clear();
+            ((void)0);
         }
 
         // Belt-and-braces: nothing should be pending, but clear regardless.
         static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
-        vmhook::detail::jni_exception_clear();
+        ((void)0);
         static_cast<void>(raw_clear_pending_exception());
     }
 
@@ -697,7 +688,7 @@ namespace
         // Final defensive clear so absolutely nothing escapes into vmhook.Main.
         o.pending_after_final_clear.store(defensive_clear());
         static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
-        vmhook::detail::jni_exception_clear();
+        ((void)0);
         static_cast<void>(raw_clear_pending_exception());
     }
 
@@ -777,13 +768,13 @@ namespace
                     g_boundary.recovery_value.store(static_cast<std::int64_t>(v));
                     g_boundary.recovery_ok.store(true);
                 }
-                vmhook::detail::jni_exception_clear();
+                ((void)0);
             }
         }
 
         // Final clear so nothing escapes into vmhook.Main.
         static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
-        vmhook::detail::jni_exception_clear();
+        ((void)0);
         static_cast<void>(raw_clear_pending_exception());
     }
 

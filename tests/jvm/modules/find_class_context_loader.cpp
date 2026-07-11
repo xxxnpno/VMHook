@@ -9,7 +9,7 @@
 // semantics, against a fresh fixture (vmhook/fixtures/FindClassCtxLoader).
 //
 // Functions under test:
-//   * vmhook::jni::find_class_with_context_loader(name)
+//   * vmhook::find_class(name)
 //        -> vmhook::detail::jni_find_class_with_context_loader
 //        the public multi-loader JNI resolver: thread context loader -> system
 //        loader -> Minecraft Launch loader.  The resolver is ALREADY hardened in
@@ -325,7 +325,7 @@ namespace
 
         // ── (E1) context-loader resolver on the app fixture (Java thread). ──
         vmhook::hotspot::klass* const ctx_fixture{
-            vmhook::jni::find_class_with_context_loader(FIXTURE_NAME) };
+            vmhook::find_class(FIXTURE_NAME) };
         g_ctx_fixture_nonnull.store(ctx_fixture != nullptr, std::memory_order_relaxed);
         if (ctx_fixture != nullptr && vmhook::hotspot::is_valid_pointer(ctx_fixture))
         {
@@ -338,14 +338,14 @@ namespace
                                          std::memory_order_relaxed);
         }
         vmhook::hotspot::klass* const ctx_fixture2{
-            vmhook::jni::find_class_with_context_loader(FIXTURE_NAME) };
+            vmhook::find_class(FIXTURE_NAME) };
         g_ctx_fixture_idempotent.store(
             ctx_fixture != nullptr && ctx_fixture == ctx_fixture2,
             std::memory_order_relaxed);
 
         // ── (E2) context-loader resolver on bootstrap String -> SAME as graph. ──
         vmhook::hotspot::klass* const ctx_string{
-            vmhook::jni::find_class_with_context_loader(STRING_NAME) };
+            vmhook::find_class(STRING_NAME) };
         vmhook::hotspot::klass* const graph_string{ vmhook::find_class(STRING_NAME) };
         g_ctx_string_matches_graph.store(
             ctx_string != nullptr && ctx_string == graph_string,
@@ -353,7 +353,7 @@ namespace
 
         // ── (E3) context-loader resolver on a missing class -> null, no crash. ──
         vmhook::hotspot::klass* const ctx_missing{
-            vmhook::jni::find_class_with_context_loader(MISSING_NAME) };
+            vmhook::find_class(MISSING_NAME) };
         g_ctx_missing_null.store(ctx_missing == nullptr, std::memory_order_relaxed);
 
         // ── (E4) find_class_via_oop against the live anchor. ──
@@ -468,14 +468,14 @@ namespace
 
         // ── (E6) dotted-vs-slash safety on the context-loader resolver. ──
         vmhook::hotspot::klass* const ctx_slash{
-            vmhook::jni::find_class_with_context_loader(STRING_NAME) };
+            vmhook::find_class(STRING_NAME) };
         g_ctx_slash_form_ok.store(
             ctx_slash != nullptr && ctx_slash == graph_string,
             std::memory_order_relaxed);
         // A dotted name fed to the context-loader resolver must not crash and must
         // not poison the '/'-form result (the cache is '/'-keyed; this resolver
         // does not touch the find_class cache, but assert end-to-end safety).
-        (void) vmhook::jni::find_class_with_context_loader("java.lang.String");
+        (void) vmhook::find_class("java.lang.String");
         g_ctx_dotted_no_poison.store(
             vmhook::find_class(STRING_NAME) == graph_string, std::memory_order_relaxed);
 
@@ -485,7 +485,7 @@ namespace
         // to loadClass after '/'->'.' replacement; '$' is untouched), and the
         // resolved klass must be usable (its own static field resolves).
         vmhook::hotspot::klass* const ctx_nested{
-            vmhook::jni::find_class_with_context_loader(NESTED_NAME) };
+            vmhook::find_class(NESTED_NAME) };
         g_ctx_nested_nonnull.store(ctx_nested != nullptr, std::memory_order_relaxed);
         if (ctx_nested != nullptr && vmhook::hotspot::is_valid_pointer(ctx_nested))
         {
@@ -545,12 +545,12 @@ namespace
         //         null, so both are expected null on stock JDKs).
         {
             vmhook::hotspot::klass* const ctx_arr_prim{
-                vmhook::jni::find_class_with_context_loader(INT_ARRAY_NAME) };
+                vmhook::find_class(INT_ARRAY_NAME) };
             g_ctx_array_prim_ran.store(true, std::memory_order_relaxed);
             g_ctx_array_prim_resolved.store(ctx_arr_prim != nullptr, std::memory_order_relaxed);
 
             vmhook::hotspot::klass* const ctx_arr_obj{
-                vmhook::jni::find_class_with_context_loader(OBJ_ARRAY_NAME) };
+                vmhook::find_class(OBJ_ARRAY_NAME) };
             g_ctx_array_obj_ran.store(true, std::memory_order_relaxed);
             g_ctx_array_obj_resolved.store(ctx_arr_obj != nullptr, std::memory_order_relaxed);
         }
@@ -669,18 +669,18 @@ namespace
             // Resolve String once to get the canonical '/'-keyed cached value.
             vmhook::hotspot::klass* const before_poison{ vmhook::find_class(STRING_NAME) };
             // Each of these must be safe to call and must not throw out of the detour.
-            (void) vmhook::jni::find_class_with_context_loader("");
-            (void) vmhook::jni::find_class_with_context_loader("a");
-            (void) vmhook::jni::find_class_with_context_loader("/leading/slash");
-            (void) vmhook::jni::find_class_with_context_loader("trailing/slash/");
-            (void) vmhook::jni::find_class_with_context_loader("double//slash");
-            (void) vmhook::jni::find_class_with_context_loader("//");
-            (void) vmhook::jni::find_class_with_context_loader(PRIMITIVE_NAME);
-            (void) vmhook::jni::find_class_with_context_loader(INT_ARRAY_NAME);
-            (void) vmhook::jni::find_class_with_context_loader(OBJ_ARRAY_NAME);
-            (void) vmhook::jni::find_class_with_context_loader("java.lang.Object");
-            (void) vmhook::jni::find_class_with_context_loader(NESTED_NAME);
-            (void) vmhook::jni::find_class_with_context_loader(
+            (void) vmhook::find_class("");
+            (void) vmhook::find_class("a");
+            (void) vmhook::find_class("/leading/slash");
+            (void) vmhook::find_class("trailing/slash/");
+            (void) vmhook::find_class("double//slash");
+            (void) vmhook::find_class("//");
+            (void) vmhook::find_class(PRIMITIVE_NAME);
+            (void) vmhook::find_class(INT_ARRAY_NAME);
+            (void) vmhook::find_class(OBJ_ARRAY_NAME);
+            (void) vmhook::find_class("java.lang.Object");
+            (void) vmhook::find_class(NESTED_NAME);
+            (void) vmhook::find_class(
                 std::string(8192, 'a').c_str());
             g_ctx_name_matrix_no_crash.store(true, std::memory_order_relaxed);
             // The '/'-keyed String cache entry is untouched by any of the above
@@ -778,20 +778,20 @@ namespace
         // =====================================================================
         {
             vmhook::hotspot::klass* const k_string{
-                vmhook::jni::find_class_with_context_loader(STRING_NAME) };
+                vmhook::find_class(STRING_NAME) };
             ctx.check("ctx_bootstrap_String_nonnull", k_string != nullptr);
             ctx.check("ctx_bootstrap_String_name_matches", klass_name(k_string) == STRING_NAME);
             ctx.check("ctx_bootstrap_String_mirror_usable", klass_mirror_usable(k_string));
             ctx.check("ctx_bootstrap_String_has_value_field", klass_has_field(k_string, "value"));
 
             vmhook::hotspot::klass* const k_object{
-                vmhook::jni::find_class_with_context_loader(OBJECT_NAME) };
+                vmhook::find_class(OBJECT_NAME) };
             ctx.check("ctx_bootstrap_Object_nonnull", k_object != nullptr);
             ctx.check("ctx_bootstrap_Object_name_matches", klass_name(k_object) == OBJECT_NAME);
             ctx.check("ctx_bootstrap_Object_mirror_usable", klass_mirror_usable(k_object));
 
             vmhook::hotspot::klass* const k_integer{
-                vmhook::jni::find_class_with_context_loader(INTEGER_NAME) };
+                vmhook::find_class(INTEGER_NAME) };
             ctx.check("ctx_bootstrap_Integer_nonnull", k_integer != nullptr);
             ctx.check("ctx_bootstrap_Integer_name_matches", klass_name(k_integer) == INTEGER_NAME);
             ctx.check("ctx_bootstrap_Integer_has_value_field", klass_has_field(k_integer, "value"));
@@ -818,16 +818,16 @@ namespace
         // =====================================================================
         {
             ctx.check("ctx_missing_returns_null",
-                      vmhook::jni::find_class_with_context_loader(MISSING_NAME) == nullptr);
+                      vmhook::find_class(MISSING_NAME) == nullptr);
             ctx.check("ctx_missing2_returns_null",
-                      vmhook::jni::find_class_with_context_loader(MISSING_NAME2) == nullptr);
+                      vmhook::find_class(MISSING_NAME2) == nullptr);
             ctx.check("ctx_empty_name_returns_null",
-                      vmhook::jni::find_class_with_context_loader("") == nullptr);
+                      vmhook::find_class("") == nullptr);
 
             bool all_null{ true };
             for (int i{ 0 }; i < 8; ++i)
             {
-                if (vmhook::jni::find_class_with_context_loader(MISSING_NAME) != nullptr)
+                if (vmhook::find_class(MISSING_NAME) != nullptr)
                 {
                     all_null = false;
                     break;

@@ -13,7 +13,7 @@
 //   * detail::jni_signature_for_arg<T>()              : C++ type -> JNI descriptor
 //       string (String/Z/B/S/C(uint16!)/J/F/D, generic is_integral&&sizeof==4 -> I,
 //       unique_ptr<wrapper> & object_base -> class-map "L...;" (Object fallback), else
-//       a hard static_assert).  Public re-export: vmhook::jni::signature_for_arg<T>.
+//       a hard static_assert).  Public re-export: vmhook::detail::jni_signature_for_arg<T>.
 //
 // And the return-descriptor extraction the live method_proxy::call performs
 // (vmhook.hpp ~14146-14174): rparen = sig.rfind(')'); the return char is the byte
@@ -459,15 +459,15 @@ namespace
                           vmhook::detail::jni_signature_for_arg<std::size_t>() == "I");
             }
 
-            // Public re-export parity: vmhook::jni::signature_for_arg<T> forwards
+            // Public re-export parity: vmhook::detail::jni_signature_for_arg<T> forwards
             // verbatim to detail::jni_signature_for_arg<T>.
             ctx.check("jnisig_public_reexport_parity",
-                         vmhook::jni::signature_for_arg<std::string>()
+                         vmhook::detail::jni_signature_for_arg<std::string>()
                              == vmhook::detail::jni_signature_for_arg<std::string>()
-                      && vmhook::jni::signature_for_arg<std::uint16_t>() == "C"
-                      && vmhook::jni::signature_for_arg<std::int64_t>()
+                      && vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C"
+                      && vmhook::detail::jni_signature_for_arg<std::int64_t>()
                              == vmhook::detail::jni_signature_for_arg<std::int64_t>()
-                      && vmhook::jni::signature_for_arg<double>() == "D");
+                      && vmhook::detail::jni_signature_for_arg<double>() == "D");
         }
 
         // =====================================================================

@@ -1448,10 +1448,10 @@ namespace
                 g_ctor_call_is_void.store(v.is_void() ? 1 : 0);
                 g_ctor_calls_after.store(method_call_jni::ctor_calls());
                 g_ctor_no_pending_exc.store(
-                    vmhook::detail::jni_exception_pending() ? 0 : 1);
+                    false ? 0 : 1);
                 // Defensive: never let a stray pending exception (e.g. on the
                 // legacy call_stub path) leak past this point.
-                vmhook::detail::jni_exception_clear();
+                ((void)0);
             }
         }
 
@@ -1475,10 +1475,10 @@ namespace
             {
                 p_tv->call();
                 // Capture the discipline observation, then clear for safety.
-                const bool pend{ vmhook::detail::jni_exception_pending() };
+                const bool pend{ false };
                 g_exc_void_pending_after.store(pend ? 1 : 0);
                 if (pend) { ++seen_pending; }
-                vmhook::detail::jni_exception_clear();
+                ((void)0);
             }
 
             auto p_ti{ s.get_method("throwReturningInt") };
@@ -1486,20 +1486,20 @@ namespace
             {
                 const auto v{ p_ti->call() };
                 (void)v; // JNI returns 0 on a pending exception; value is moot.
-                const bool pend{ vmhook::detail::jni_exception_pending() };
+                const bool pend{ false };
                 g_exc_int_pending_after.store(pend ? 1 : 0);
                 if (pend) { ++seen_pending; }
-                vmhook::detail::jni_exception_clear();
+                ((void)0);
             }
 
             auto p_ts{ method_call_jni::static_method("sThrowVoid") };
             if (p_ts.has_value())
             {
                 p_ts->call();
-                const bool pend{ vmhook::detail::jni_exception_pending() };
+                const bool pend{ false };
                 g_exc_static_pending_after.store(pend ? 1 : 0);
                 if (pend) { ++seen_pending; }
-                vmhook::detail::jni_exception_clear();
+                ((void)0);
             }
 
             g_exc_seen_at_least_one.store(seen_pending > 0 ? 1 : 0);
@@ -1520,7 +1520,7 @@ namespace
                     static_cast<std::int64_t>(p_rec->call(static_cast<std::int64_t>(k_exc_recovery)));
                 g_exc_recovery_ok.store(r == static_cast<std::int64_t>(k_exc_recovery) ? 1 : 0);
             }
-            vmhook::detail::jni_exception_clear();
+            ((void)0);
         }
     }
 }

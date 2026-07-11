@@ -41,17 +41,22 @@ extern "C" auto run_vmhook_vs_jni_speedtest() -> void
     using clock = std::chrono::steady_clock;
     using ns    = std::chrono::nanoseconds;
 
-    // Make sure the calling thread is attached so current_jni_env is
-    // populated.  ensure_current_java_thread() also calls
-    // attach_current_native_thread() as a side effect.
-    if (!vmhook::hotspot::ensure_current_java_thread())
+    // vmhook.hpp is now JNI-free and no longer caches a JNIEnv, so this bench TU
+    // (which legitimately uses jni.h for its pure-JNI leg) acquires its own env
+    // directly from the running JavaVM via the Invocation API.
+    using get_created_vms_t = jint (*)(JavaVM**, jsize, jsize*);
+    auto* const get_created_vms{ reinterpret_cast<get_created_vms_t>(
+        vmhook::os::get_proc_address(vmhook::hotspot::get_jvm_module(), "JNI_GetCreatedJavaVMs")) };
+    JavaVM* vms[1]{};
+    jsize vm_count{ 0 };
+    if (!get_created_vms || get_created_vms(vms, 1, &vm_count) != JNI_OK || vm_count < 1 || !vms[0])
     {
-        std::fprintf(stdout, "[BENCH] cannot attach to JavaThread; speedtest skipped\n");
+        std::fprintf(stdout, "[BENCH] no JavaVM; speedtest skipped\n");
         std::fflush(stdout);
         return;
     }
-    auto* const env_void{ vmhook::hotspot::current_jni_env };
-    if (!env_void)
+    void* env_void{ nullptr };
+    if (vms[0]->GetEnv(&env_void, JNI_VERSION_1_8) != JNI_OK || !env_void)
     {
         std::fprintf(stdout, "[BENCH] no JNIEnv; speedtest skipped\n");
         std::fflush(stdout);

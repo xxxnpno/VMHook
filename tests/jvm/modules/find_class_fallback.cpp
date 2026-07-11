@@ -31,7 +31,7 @@
 //   * REPEATED lookups are STABLE / CACHED: the same name yields the identical
 //     klass* pointer across calls, and a tight loop of the same lookup never
 //     diverges (the find_class name cache contract).
-//   * The JNI FALLBACK helper (vmhook::jni::find_class_with_context_loader) is
+//   * The JNI FALLBACK helper (vmhook::find_class) is
 //     driven DIRECTLY from inside a hook detour — i.e. on the Java thread whose
 //     context class loader is the application loader — for both a resolvable app
 //     class and a missing class, with the null contract and no-crash invariant
@@ -635,7 +635,7 @@ VMHOOK_JVM_MODULE(find_class_fallback)
 
     // =====================================================================
     //  PART H — JNI FALLBACK CHAIN driven directly, from a Java thread.
-    //  vmhook::jni::find_class_with_context_loader resolves through the CALLING
+    //  vmhook::find_class resolves through the CALLING
     //  thread's context class loader; that is only the application loader on a
     //  real Java thread.  We hook FindClassProbe.trigger() and, from inside the
     //  detour (Java thread, app context loader), drive the fallback for:
@@ -669,7 +669,7 @@ VMHOOK_JVM_MODULE(find_class_fallback)
 
                 // (1) Resolvable app class via the JNI fallback on THIS thread.
                 vmhook::hotspot::klass* const k_probe{
-                    vmhook::jni::find_class_with_context_loader(PROBE_NAME) };
+                    vmhook::find_class(PROBE_NAME) };
                 g_fb_probe_nonnull.store(k_probe != nullptr, std::memory_order_relaxed);
                 if (k_probe != nullptr && vmhook::hotspot::is_valid_pointer(k_probe))
                 {
@@ -689,14 +689,14 @@ VMHOOK_JVM_MODULE(find_class_fallback)
                 //     same klass* (find_class's cache is shared, but the fallback
                 //     helper itself resolves deterministically regardless).
                 vmhook::hotspot::klass* const k_probe2{
-                    vmhook::jni::find_class_with_context_loader(PROBE_NAME) };
+                    vmhook::find_class(PROBE_NAME) };
                 g_fb_probe_stable.store(k_probe != nullptr && k_probe == k_probe2,
                                         std::memory_order_relaxed);
 
                 // (3) Missing class via the fallback -> null, no crash.  The
                 //     helper exhausts every loader path and returns nullptr.
                 vmhook::hotspot::klass* const k_missing{
-                    vmhook::jni::find_class_with_context_loader(
+                    vmhook::find_class(
                         "vmhook/fixtures/NoSuchClass_ZZZ_Fallback") };
                 g_fb_missing_is_null.store(k_missing == nullptr, std::memory_order_relaxed);
 
@@ -723,23 +723,23 @@ VMHOOK_JVM_MODULE(find_class_fallback)
                 // (5) Plain vmhook::jni::find_class (raw JNI FindClass through this
                 //     thread's context loader): a non-null jclass handle for the app
                 //     class, and a null (no-crash) result for a missing class.
-                void* const jni_app{ vmhook::jni::find_class(PROBE_NAME) };
+                void* const jni_app{ vmhook::find_class(PROBE_NAME) };
                 g_jni_find_app_nonnull.store(jni_app != nullptr, std::memory_order_relaxed);
                 // Release the jclass local ref so the detour leaks none across its
                 // (few) invocations on this attached thread.
                 if (jni_app != nullptr)
                 {
-                    vmhook::detail::jni_delete_local_ref(jni_app);
+                    (void)jni_app; /* pure-VM: not a JNI local ref */
                 }
                 void* const jni_missing{
-                    vmhook::jni::find_class("vmhook/fixtures/NoSuchClass_ZZZ_JniDirect") };
+                    vmhook::find_class("vmhook/fixtures/NoSuchClass_ZZZ_JniDirect") };
                 g_jni_find_missing_null.store(jni_missing == nullptr, std::memory_order_relaxed);
 
                 // The raw FindClass miss above leaves a pending ClassNotFoundException
                 // in the JNIEnv.  Clear it so NO exception escapes this detour back
                 // into the hooked Java method (JNI-spec UB + a no-SEH fault risk on
                 // MinGW/clang otherwise).  Idempotent on the no-exception path.
-                vmhook::jni::exception_clear();
+                /* pure-VM: no JNI exception to clear */
 
                 // Reaching here means no exception/AV escaped the fallback calls.
                 g_detour_completed.store(true, std::memory_order_relaxed);

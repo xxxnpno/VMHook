@@ -835,7 +835,7 @@ namespace
         // exception leaking out of this detour and surfacing — uncaught — on the
         // main thread later (it would void the whole run's TOTAL).  This idempotent,
         // no-JNIEnv-safe clear guarantees the detour returns with a clean thread.
-        vmhook::detail::jni_exception_clear();
+        ((void)0);
     }
 
     // ---- The whole test body (run under try/catch by the wrapper) ----------
