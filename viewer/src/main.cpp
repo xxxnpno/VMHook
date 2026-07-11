@@ -1505,9 +1505,25 @@ namespace
                         ImGui::TableSetColumnIndex(0);
                         ImGui::TextUnformatted(f.name.c_str());
                         ImGui::TableSetColumnIndex(1);
-                        ImGui::PushStyleColor(ImGuiCol_Text, value_color(f.value));
-                        ImGui::TextWrapped("%s", f.value.c_str());
-                        ImGui::PopStyleColor();
+                        // A "<internal/name>" ref value whose class is loaded becomes a
+                        // link that navigates to it (jump from a field to its type).
+                        bool linked{ false };
+                        if (f.value.size() > 2 && f.value.front() == '<' && f.value.back() == '>')
+                        {
+                            const std::string internal{ f.value.substr(1, f.value.size() - 2) };
+                            if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
+                            {
+                                if (ImGui::TextLink(f.value.c_str())) navigate_to(it->second);
+                                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to open)", internal.c_str());
+                                linked = true;
+                            }
+                        }
+                        if (!linked)
+                        {
+                            ImGui::PushStyleColor(ImGuiCol_Text, value_color(f.value));
+                            ImGui::TextWrapped("%s", f.value.c_str());
+                            ImGui::PopStyleColor();
+                        }
                         ImGui::TableSetColumnIndex(2);
                         if (!f.owner.empty()) ImGui::TextDisabled("%s", f.owner.c_str());
                     }
