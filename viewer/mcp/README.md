@@ -19,13 +19,16 @@ JVM's classes / methods / fields — all discovered live, no mappings.
 | `enumerate_jvm` | `pid`                    | injects + enumerates + caches; `{pid, classes, methods, fields}` |
 | `list_classes`  | `pid`, `filter?`         | `[ "java/util/HashMap", … ]` (from cache) |
 | `get_class`     | `pid`, `class_name`      | `{name, super, kind, access, methods:[{name,descriptor,signature,modifiers,access}], fields:[{name,descriptor,type,modifiers,access,static}]}` |
+| `get_instances` | `pid`, `class_name`, `cap?` | `{pid, class, instances:[{address, fields:{name:value, …}}]}` — live heap objects of the class + their field values (own + inherited); injects if needed, so no prior `enumerate_jvm` required |
 
 `kind` is one of `class` / `interface` / `enum` / `abstract` / `annotation` /
 `record` (from the class-file access flags); `access` is the raw flag word.
 
 Typical flow: `list_jvms` → pick a pid → `enumerate_jvm(pid)` → then
 `list_classes` / `get_class` as much as you like (they read the cache; re-run
-`enumerate_jvm` to refresh — re-attach is supported).
+`enumerate_jvm` to refresh — re-attach is supported). `get_instances` reads the
+**live heap** directly (not the cache), so it reflects the current object state
+on every call.
 
 ## Setup
 
