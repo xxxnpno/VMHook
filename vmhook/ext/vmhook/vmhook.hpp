@@ -5210,13 +5210,14 @@ namespace vmhook
 
 
         /*
-            @brief Ensures the calling thread has a valid JavaThread* and JNIEnv*.
+            @brief Adopts the calling thread's HotSpot JavaThread* if it has one (pure-VM, no JNI).
             @details
             Resolution order:
               1. Thread-local current_java_thread is already set — fast return.
               2. Search the HotSpot thread list for the current OS thread ID.
-              3. Attach the thread via JNI (attach_current_native_thread) and retry
-                 up to 64 times with thread yields while HotSpot registers it.
+              3. Not a JavaThread — return false.  (The old JNI AttachCurrentThread
+                 step is gone: pure-VM cannot attach a fresh native thread, and a
+                 detour always runs on a thread that is already a JavaThread.)
 
             Complexity: O(N) worst case on first call, where N = number of live Java threads.
             Exception safety: noexcept — returns false on failure.
