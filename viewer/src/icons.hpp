@@ -18,3 +18,9 @@
 #define ICON_FA_MINUS    "\xef\x81\xa8"  // U+F068
 #define ICON_FA_PLUG     "\xef\x87\xa6"  // U+F1E6
 #define ICON_FA_CIRCLE_Q "\xef\x81\x99"  // U+F059 circle-question
+#define ICON_FA_LOCK     "\xef\x80\xa3"  // U+F023 lock (frozen field)
+#define ICON_FA_UNLOCK   "\xef\x82\x9c"  // U+F09C lock-open (unfrozen field)
+#define ICON_FA_PEN      "\xef\x8c\x84"  // U+F304 pen (edit value)
+#define ICON_FA_THUMBTACK "\xef\x82\x8d" // U+F08D thumbtack (grab object)
+#define ICON_FA_PLAY     "\xef\x81\x8b"  // U+F04B play (call method)
+#define ICON_FA_TRASH    "\xef\x87\xb8"  // U+F1F8 trash (remove saved object)

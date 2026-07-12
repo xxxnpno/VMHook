@@ -64,6 +64,7 @@ namespace viewer
         std::string name;
         std::string value;
         std::string owner;
+        std::string ref_addr;  // "0x..." pointee of a non-null reference field, else "" (for grab/place)
     };
 
     // One live heap instance of a class: its heap address + its instance fields
@@ -73,6 +74,30 @@ namespace viewer
         std::string address;  // "0x..." oop address
         std::vector<InstField> fields;
         double seen_epoch{ 0.0 };  // secs-since-app-start when this address was first observed
+    };
+
+    // An object stashed in the viewer's "clipboard": a raw heap address + the
+    // class it belongs to + a user-facing label.  Used to place a reference into
+    // a field, or pass an object as a method argument.  Best-effort: the address
+    // is captured at grab time and a relocating GC can leave it stale (same caveat
+    // as every raw-oop feature here — pin nothing survives GC pure-VM).
+    struct SavedObject
+    {
+        std::string label;       // e.g. "Worker.inner" or "call result"
+        std::string class_name;  // internal name ("com/example/.../Inner")
+        std::string address;     // "0x..." decoded heap oop
+        double      saved_epoch{ 0.0 };
+    };
+
+    // Result of a one-shot mutating op (set / freeze / call), published to the UI.
+    struct OpResult
+    {
+        bool        ok{ false };
+        std::string disp;    // display value (call result / re-read field value)
+        std::string kind;    // "int"/"ref"/"string"/... for calls; "" for sets
+        std::string raddr;   // "0x..." result object address (ref/string calls)
+        std::string rclass;  // internal name of the result object
+        std::string error;   // human message on failure
     };
 
     struct JvmProcess
@@ -416,6 +441,22 @@ namespace viewer
         std::vector<InstanceInfo> instances;
         int                       inst_cap{ 1000 }; // max instances the payload scans
 
+        // Live static-field inspection (STAT): the class mirror's static fields,
+        // shown/refreshed like instances but on their own channel so both windows
+        // can auto-refresh independently.  statics_obj holds the single "instance"
+        // (the mirror) the payload streams.
+        std::atomic<Status>       stat_status{ Status::Idle };
+        std::string               stat_message{};
+        std::string               stat_class{};    // internal name whose statics are shown
+        InstanceInfo              statics_obj;      // mirror + its static field values
+
+        // One-shot mutating op (set / freeze / unfreeze / call): result published
+        // for the UI to consume when op_seq changes.  Serialised with the other
+        // channels through the single `worker` thread.
+        std::atomic<Status>        op_status{ Status::Idle };
+        std::atomic<std::uint64_t> op_seq{ 0 };     // bumps once per completed op
+        OpResult                   op_result;       // guarded by data_mutex
+
         App()
         {
             refresh_jvms();
@@ -459,13 +500,21 @@ namespace viewer
             return s == Status::Injecting || s == Status::Receiving;
         }
 
+        bool stat_busy() const { return stat_status.load() == Status::Receiving; }
+        bool op_busy()   const { return op_status.load()   == Status::Receiving; }
+
+        // Any pipe operation in flight — every dispatcher checks this so the four
+        // channels (enumerate / instances / statics / op) never overlap on the
+        // single-instance named pipe or the shared worker thread.
+        bool any_busy() const { return busy() || inst_busy() || stat_busy() || op_busy(); }
+
         // Scan the attached JVM's heap for live instances of `internal_class` and
         // read their instance-field values.  The payload must already be loaded
         // (i.e. a class enumeration has happened) — this reuses that server via a
         // request file, no re-injection.
         void request_instances(const std::string& internal_class)
         {
-            if (busy() || inst_busy() || selected_jvm < 0 || selected_jvm >= static_cast<int>(jvms.size()))
+            if (any_busy() || selected_jvm < 0 || selected_jvm >= static_cast<int>(jvms.size()))
             {
                 return;
             }
@@ -493,7 +542,7 @@ namespace viewer
         // detached-ish worker thread (joined in the dtor / before relaunch).
         void attach_selected(const std::wstring& dll_path)
         {
-            if (busy() || selected_jvm < 0 || selected_jvm >= static_cast<int>(jvms.size()))
+            if (any_busy() || selected_jvm < 0 || selected_jvm >= static_cast<int>(jvms.size()))
             {
                 return;
             }
@@ -523,7 +572,7 @@ namespace viewer
         // to flag runtime-loaded/unloaded classes.  Cheap enough to auto-repeat.
         void rescan()
         {
-            if (busy() || inst_busy() || attached_pid_ == 0 || !has_baseline.load())
+            if (any_busy() || attached_pid_ == 0 || !has_baseline.load())
             {
                 return;
             }
@@ -544,7 +593,7 @@ namespace viewer
         // render_ui while "Auto" is on.
         void auto_track(bool full)
         {
-            if (busy() || inst_busy() || attached_pid_ == 0 || !has_baseline.load())
+            if (any_busy() || attached_pid_ == 0 || !has_baseline.load())
             {
                 return;
             }
@@ -558,7 +607,158 @@ namespace viewer
             worker = std::thread([this, pid, dll, full] { run_auto_tracking(pid, dll, full); });
         }
 
+        // Fetch the class mirror's live static-field values (STAT).  Same reuse
+        // model as request_instances: the loaded payload's serve loop answers.
+        void request_statics(const std::string& internal_class)
+        {
+            if (any_busy() || selected_jvm < 0 || selected_jvm >= static_cast<int>(jvms.size()))
+            {
+                return;
+            }
+            if (worker.joinable()) { worker.join(); }
+            stat_status.store(Status::Receiving);
+            {
+                std::lock_guard<std::mutex> lock{ data_mutex };
+                if (stat_class != internal_class)
+                {
+                    statics_obj = InstanceInfo{};
+                    stat_message = "Reading static fields...";
+                }
+                stat_class = internal_class;
+            }
+            worker = std::thread([this, internal_class] { run_statics(internal_class); });
+        }
+
+        // ── one-shot mutating operations (set / freeze / unfreeze / call) ─────
+        // Each builds a request line, runs it on the worker, and publishes an
+        // OpResult the UI consumes when op_seq changes.  scope = 'I' instance,
+        // 'S' static.  All are no-ops while any channel is busy.
+        void set_field_value(char scope, const std::string& cls, const std::string& addr,
+                             const std::string& field, const std::string& value)
+        {
+            const std::string tag{ scope == 'S' ? "SETS\t" : "SETI\t" };
+            const std::string req{ scope == 'S'
+                ? tag + cls + "\t" + field + "\t" + value
+                : tag + cls + "\t" + addr + "\t" + field + "\t" + value };
+            dispatch_op(req, /*want_call=*/false);
+        }
+
+        void freeze_field(char scope, const std::string& cls, const std::string& addr,
+                          const std::string& field, const std::string& value)
+        {
+            std::string req{ "FRZ\t" };
+            req += (scope == 'S' ? "S" : "I");
+            req += "\t" + cls + "\t" + (scope == 'S' ? std::string{} : addr) + "\t" + field + "\t" + value;
+            dispatch_op(req, /*want_call=*/false);
+        }
+
+        void unfreeze_field(char scope, const std::string& cls, const std::string& addr, const std::string& field)
+        {
+            std::string key(1, scope);
+            key += '|'; key += cls;
+            key += '|'; if (scope == 'I') { key += addr; }
+            key += '|'; key += field;
+            dispatch_op("UNF\t" + key, /*want_call=*/false);
+        }
+
+        // args: already-tagged tokens (bare literal / @null / @0x<oop> / #text).
+        void call_method(const std::string& cls, const std::string& addr, const std::string& method,
+                         const std::string& descriptor, const std::vector<std::string>& args)
+        {
+            std::string req{ "CALL\t" + cls + "\t" + (addr.empty() ? "-" : addr) + "\t"
+                             + method + "\t" + descriptor + "\t" + std::to_string(args.size()) };
+            for (const std::string& a : args) { req += "\t"; req += a; }
+            dispatch_op(req, /*want_call=*/true);
+        }
+
     private:
+        void dispatch_op(const std::string& request, bool want_call)
+        {
+            if (any_busy() || attached_pid_ == 0) { return; }
+            if (worker.joinable()) { worker.join(); }
+            op_status.store(Status::Receiving);
+            worker = std::thread([this, request, want_call] { run_op(request, want_call); });
+        }
+
+        // Run a mutating request over the pipe and parse its V / R / E reply into
+        // op_result, then bump op_seq so the UI picks it up exactly once.
+        void run_op(const std::string& request, bool want_call)
+        {
+            OpResult r{};
+            std::string raw;
+            if (!pipe_exchange(request, raw))
+            {
+                r.ok = false;
+                r.error = "Could not reach the payload (is the JVM still attached?).";
+            }
+            else
+            {
+                r.ok = true;  // assume success unless an E record says otherwise
+                std::size_t pos{ 0 };
+                while (pos < raw.size())
+                {
+                    const std::size_t nl{ raw.find('\n', pos) };
+                    const std::size_t end{ nl == std::string::npos ? raw.size() : nl };
+                    const std::string_view line{ raw.data() + pos, end - pos };
+                    pos = (nl == std::string::npos ? raw.size() : nl + 1);
+                    if (line.size() >= 2 && line[0] == 'E' && line[1] == '\t')
+                    {
+                        r.ok = false;
+                        r.error = std::string{ line.substr(2) };
+                    }
+                    else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t')
+                    {
+                        // V <TAB> field <TAB> value [<TAB> owner <TAB> refAddr]
+                        const std::size_t t2{ line.find('\t', 2) };
+                        if (t2 != std::string_view::npos)
+                        {
+                            const std::size_t t3{ line.find('\t', t2 + 1) };
+                            r.disp = std::string{ line.substr(t2 + 1, (t3 == std::string_view::npos ? line.size() : t3) - (t2 + 1)) };
+                        }
+                    }
+                    else if (line.size() >= 2 && line[0] == 'R' && line[1] == '\t' && want_call)
+                    {
+                        // R <TAB> display <TAB> kind <TAB> refAddr <TAB> refClass
+                        std::vector<std::string_view> f;
+                        std::size_t q{ 2 };
+                        while (q <= line.size())
+                        {
+                            const std::size_t tab{ line.find('\t', q) };
+                            if (tab == std::string_view::npos) { f.push_back(line.substr(q)); break; }
+                            f.push_back(line.substr(q, tab - q));
+                            q = tab + 1;
+                        }
+                        if (f.size() >= 1) r.disp   = std::string{ f[0] };
+                        if (f.size() >= 2) r.kind   = std::string{ f[1] };
+                        if (f.size() >= 3) r.raddr  = std::string{ f[2] };
+                        if (f.size() >= 4) r.rclass = std::string{ f[3] };
+                    }
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock{ data_mutex };
+                op_result = std::move(r);
+            }
+            op_seq.fetch_add(1);
+            op_status.store(Status::Done);
+        }
+
+        void run_statics(const std::string& classname)
+        {
+            std::string raw;
+            const bool ok{ pipe_exchange("STAT\t" + classname, raw) };
+            std::vector<InstanceInfo> parsed;
+            if (ok) { parse_instances(raw, parsed); }
+            {
+                std::lock_guard<std::mutex> lock{ data_mutex };
+                statics_obj = parsed.empty() ? InstanceInfo{} : std::move(parsed.front());
+                stat_message = ok
+                    ? ("Read " + std::to_string(statics_obj.fields.size()) + " static field(s).")
+                    : "Could not read statics — is the JVM still attached?";
+            }
+            stat_status.store(ok ? Status::Done : Status::Error);
+        }
+
         std::thread   worker;
         std::uint32_t attached_pid_{ 0 };   // the JVM a successful attach latched onto
         std::wstring  attached_dll_{};      // payload path used for that attach
@@ -710,13 +910,14 @@ namespace viewer
                 }
                 else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t' && !out.empty())
                 {
-                    // V <TAB> name <TAB> value [<TAB> owner]  (owner absent on older payloads)
+                    // V <TAB> name <TAB> value [<TAB> owner [<TAB> refAddr]]  (later
+                    // columns absent on older payloads — parse defensively).
                     const std::size_t t2{ line.find('\t', 2) };
                     if (t2 != std::string_view::npos)
                     {
-                        const std::size_t t3{ line.find('\t', t2 + 1) };
                         InstField f;
                         f.name = std::string{ line.substr(2, t2 - 2) };
+                        const std::size_t t3{ line.find('\t', t2 + 1) };
                         if (t3 == std::string_view::npos)
                         {
                             f.value = std::string{ line.substr(t2 + 1) };
@@ -724,7 +925,16 @@ namespace viewer
                         else
                         {
                             f.value = std::string{ line.substr(t2 + 1, t3 - (t2 + 1)) };
-                            f.owner = std::string{ line.substr(t3 + 1) };
+                            const std::size_t t4{ line.find('\t', t3 + 1) };
+                            if (t4 == std::string_view::npos)
+                            {
+                                f.owner = std::string{ line.substr(t3 + 1) };
+                            }
+                            else
+                            {
+                                f.owner    = std::string{ line.substr(t3 + 1, t4 - (t3 + 1)) };
+                                f.ref_addr = std::string{ line.substr(t4 + 1) };
+                            }
                         }
                         out.back().fields.push_back(std::move(f));
                     }

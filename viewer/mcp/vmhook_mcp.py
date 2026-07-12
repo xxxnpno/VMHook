@@ -206,9 +206,9 @@ TOOLS = [
         "description": (
             "WRITE a STATIC field on a class (mutates the running JVM's class-level state, on the "
             "java.lang.Class mirror). Value parsing matches set_instance_field: primitives always work, "
-            "reference fields take 'null' or a 0x<oop> address, and a new String is best-effort. Returns "
-            "{pid, class, field, value, ok:true} with the re-read value, or {error}. Injects the payload "
-            "if needed."
+            "reference fields take 'null' or a 0x<oop> address, and a new String is built by allocating on "
+            "an attached JavaThread. Returns {pid, class, field, value, ok:true} with the re-read value, or "
+            "{error}. Injects the payload if needed."
         ),
         "inputSchema": {
             "type": "object",
@@ -219,6 +219,74 @@ TOOLS = [
                 "value": {"type": "string", "description": "new value (primitive literal, String text, 'null', or 0x<oop>)"},
             },
             "required": ["pid", "class_name", "field", "value"],
+        },
+    },
+    {
+        "name": "call_method",
+        "description": (
+            "INVOKE a Java method in the running JVM and return its result. For an instance method, give "
+            "the receiver's heap 'address' from get_instances; for a static method, pass '-' as address. "
+            "The descriptor is the raw JVM signature (e.g. '(ID)D', '()Ljava/lang/String;'). Each argument "
+            "is a tagged token: a bare literal for a primitive ('42', '3.14', 'true', 'A'); '@null' for a "
+            "null reference; '@0x<oop>' for an existing object (an address from get_instances / a reference "
+            "field / a previous call result); or '#<text>' to allocate a new java.lang.String. Returns "
+            "{result, kind, ref, refClass, ok:true} where 'kind' is void/bool/int/long/float/double/char/"
+            "string/ref and — for an object/String result — 'ref' is the returned object's 0x address "
+            "(reuse it as a @0x argument or with set_*_field). Runs the call inside a real Java thread "
+            "context, so it works on every JDK. Injects the payload if needed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "class_name": {"type": "string", "description": "internal name of the class declaring the method, e.g. 'com/example/demo/ExampleApp$Worker'"},
+                "address": {"type": "string", "description": "receiver heap address for an instance method, or '-' for a static method"},
+                "method": {"type": "string", "description": "method name, e.g. 'compute'"},
+                "descriptor": {"type": "string", "description": "raw JVM method descriptor, e.g. '(ID)D'"},
+                "args": {"type": "array", "items": {"type": "string"}, "description": "tagged argument tokens (see the description); omit or [] for a no-arg method"},
+            },
+            "required": ["pid", "class_name", "address", "method", "descriptor"],
+        },
+    },
+    {
+        "name": "freeze_field",
+        "description": (
+            "FREEZE a field at a value: a background thread in the payload re-writes it ~50x/second so it "
+            "holds against the program's own writes, until unfrozen (like a memory trainer). scope 'I' is "
+            "an instance field (give the heap 'address'); 'S' is a static field (address ignored, pass '-'). "
+            "The value follows set_*_field rules. Returns {pid, class, field, value, frozen:true}. NOTE: an "
+            "instance freeze pins a raw heap address, so a relocating GC can leave it stale (best-effort); "
+            "static freezes re-resolve the mirror each write. Unfreeze with unfreeze_field. Injects the "
+            "payload if needed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "scope": {"type": "string", "enum": ["I", "S"], "description": "'I' instance field, 'S' static field"},
+                "class_name": {"type": "string", "description": "internal name of the class"},
+                "address": {"type": "string", "description": "instance heap address (scope 'I'), or '-' for a static field"},
+                "field": {"type": "string", "description": "field name"},
+                "value": {"type": "string", "description": "value to hold (primitive literal, String text, 'null', or 0x<oop>)"},
+            },
+            "required": ["pid", "scope", "class_name", "address", "field", "value"],
+        },
+    },
+    {
+        "name": "unfreeze_field",
+        "description": (
+            "Release a freeze created by freeze_field. Pass the exact key '<I|S>|Class|addr|field' "
+            "(the internal class name; addr only for an instance freeze — e.g. "
+            "'I|com/example/demo/ExampleApp$Worker|0x60F451660|ticks' or 'S|com/example/demo/ExampleApp||tickCounter'), "
+            "or '*' to release every freeze. Returns {pid, unfroze, ok:true}."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "key": {"type": "string", "description": "'<I|S>|Class|addr|field' or '*' for all"},
+            },
+            "required": ["pid", "key"],
         },
     },
 ]
@@ -259,6 +327,17 @@ def call_tool(name: str, args: dict) -> str:
     if name == "set_static_field":
         return run_cli(["set-static", str(args["pid"]), str(args["class_name"]),
                         str(args["field"]), str(args["value"])])
+    if name == "call_method":
+        cli_args = ["call", str(args["pid"]), str(args["class_name"]), str(args["address"]),
+                    str(args["method"]), str(args["descriptor"])]
+        for a in args.get("args", []) or []:
+            cli_args.append(str(a))
+        return run_cli(cli_args)
+    if name == "freeze_field":
+        return run_cli(["freeze", str(args["pid"]), str(args["scope"]), str(args["class_name"]),
+                        str(args["address"]), str(args["field"]), str(args["value"])])
+    if name == "unfreeze_field":
+        return run_cli(["unfreeze", str(args["pid"]), str(args["key"])])
     return json.dumps({"error": f"unknown tool: {name}"})
 
 

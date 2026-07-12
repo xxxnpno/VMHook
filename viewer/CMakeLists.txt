@@ -36,9 +36,27 @@ if(NOT EXISTS "${IMGUI_DIR}/imgui.cpp")
         "Fetch it with:  git clone --depth 1 https://github.com/ocornut/imgui \"${IMGUI_DIR}\"")
 endif()
 
+# JNI headers — the payload attaches its serve thread to the JVM and triggers a
+# hook detour via a real JNI call (the only safe way to run a Java method from an
+# external thread; see payload.cpp).  Locate the JDK's jni.h via find_package,
+# falling back to a glob of the standard Windows install dir (JAVA_HOME is often
+# a stale symlink), so the build doesn't hard-code a JDK version.
+find_package(JNI QUIET)
+if(NOT JNI_INCLUDE_DIRS)
+    file(GLOB _vmhook_jdk_jni "C:/Program Files/Java/*/include/jni.h")
+    if(_vmhook_jdk_jni)
+        list(GET _vmhook_jdk_jni 0 _vmhook_jni_h)
+        get_filename_component(_vmhook_jni_inc "${_vmhook_jni_h}" DIRECTORY)
+        set(JNI_INCLUDE_DIRS "${_vmhook_jni_inc}" "${_vmhook_jni_inc}/win32")
+    endif()
+endif()
+if(NOT JNI_INCLUDE_DIRS)
+    message(FATAL_ERROR "JNI headers (jni.h) not found — install a JDK or set JAVA_HOME so the payload can invoke Java methods.")
+endif()
+
 # ── payload DLL — includes vmhook.hpp, enumerates the JVM, streams over a pipe ──
 add_library(vmhook_payload SHARED payload/payload.cpp)
-target_include_directories(vmhook_payload PRIVATE "${VMHOOK_INCLUDE}")
+target_include_directories(vmhook_payload PRIVATE "${VMHOOK_INCLUDE}" ${JNI_INCLUDE_DIRS})
 target_compile_features(vmhook_payload PRIVATE cxx_std_23)
 if(MSVC)
     target_compile_options(vmhook_payload PRIVATE /EHa /bigobj /Zc:preprocessor /Zc:__cplusplus)

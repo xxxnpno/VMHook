@@ -231,7 +231,13 @@ namespace
                 0xF060, 0xF061,  // arrow-left / arrow-right
                 0xF065, 0xF066,  // expand / compress
                 0xF068, 0xF068,  // minus
+                0xF04B, 0xF04B,  // play (call method)
+                0xF08D, 0xF08D,  // thumbtack (grab object)
+                0xF09C, 0xF09C,  // lock-open (unfrozen)
+                0xF023, 0xF023,  // lock (frozen)
                 0xF1E6, 0xF1E6,  // plug
+                0xF1F8, 0xF1F8,  // trash (remove saved object)
+                0xF304, 0xF304,  // pen (edit value)
                 0 };
             ImFontConfig cfg{};
             cfg.MergeMode        = true;
@@ -275,6 +281,37 @@ namespace
     int          g_inst_sort{ 1 };     // instance list: 0=natural, 1=addr↑, 2=addr↓
     float        g_inst_left_width{ 300.0f };  // Live-instances master/detail split
     std::wstring g_dll_path{};
+
+    // ── object clipboard + field editing + method-call UI state ──
+    std::vector<viewer::SavedObject> g_clipboard;          // stashed objects (grab / drag-drop)
+    bool          g_show_clipboard{ false };               // the clipboard strip is visible
+    std::unordered_set<std::string>  g_frozen;             // "scope|cls|addr|field" -> frozen
+    char          g_edit_buf[512]{};                       // shared edit-popup input buffer
+    // Static-fields window (per class, async STAT channel).
+    bool          g_show_statics{ false };
+    std::string   g_statics_class;                         // internal name whose statics show
+    bool          g_statics_live{ true };
+    bool          g_statics_refresh_now{ false };
+    char          g_statics_filter[128]{};
+    float         g_statics_left_width{ 300.0f };
+    // Method-call panel state — one per receiver context (instance detail vs the
+    // statics window) so the two panels never clobber each other's selection.
+    struct CallState
+    {
+        std::string      ctx;                // "cls@addr" the buffers belong to
+        int              method_idx{ -1 };   // selected row in the method list
+        char             filter[96]{};       // method-picker filter
+        char             args[8][256]{};     // per-argument token buffers
+        bool             pending{ false };   // an op it dispatched is in flight
+        bool             has_result{ false };
+        viewer::OpResult result;             // last call result (shown in the panel)
+    };
+    CallState     g_call_inst;                             // instance-detail call panel
+    CallState     g_call_stat;                             // statics-window call panel
+    // Transient toast for set / freeze feedback + op-result de-dup.
+    std::string   g_op_toast;
+    double        g_op_toast_until{ 0.0 };
+    std::uint64_t g_op_seen_seq{ 0 };
     std::vector<int> g_filtered;  // rebuilt each frame from the search box
     // Global member-search results: (class index, member index) pairs.
     std::vector<std::pair<int,int>> g_member_results;
@@ -648,6 +685,18 @@ namespace
         ui::Toggle("Auto", &g_auto_rescan);
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Live class-load tracking: arms the on_class_loaded hook + re-scans on load");
+
+        // Object clipboard toggle (shows the count so it reads at a glance).
+        ImGui::SameLine(0.0f, em(0.7f));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetFrameHeight() * 0.13f);
+        ui::Toggle("Clipboard", &g_show_clipboard);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show the saved-objects strip — stash objects, then place them into fields / method args");
+        if (!g_clipboard.empty())
+        {
+            ImGui::SameLine(0.0f, em(0.3f));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("(%d)", (int)g_clipboard.size());
+        }
 
         row_divider();
         const viewer::Status st{ app.status.load() };
@@ -1172,6 +1221,15 @@ namespace
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Scan the heap for live objects of this class and show their field values");
+        ImGui::SameLine(0.0f, em(0.4f));
+        if (ui::Button("Static fields"))
+        {
+            g_statics_class = c.internal_name;
+            g_statics_refresh_now = true;
+            g_show_statics = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Read this class's live static-field values (editable, freezable) + call static methods");
         ImGui::Spacing();
         ui::Toggle("Show inherited members", &g_show_inherited);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include methods & fields from superclasses (shown dimmed)");
@@ -1348,6 +1406,424 @@ namespace
         return ImGui::GetStyleColorVec4(ImGuiCol_Text);                             // number/default
     }
 
+    // ── object clipboard + field editing + method invocation ──────────────────
+
+    // Cross-window drag-and-drop payload: a heap object (address + class + label).
+    struct DragObj { char address[48]{}; char class_name[200]{}; char label[128]{}; };
+
+    inline std::string cls_short(const std::string& internal)
+    {
+        const std::size_t p{ internal.find_last_of("/$") };
+        return p == std::string::npos ? internal : internal.substr(p + 1);
+    }
+    inline std::string dotted_name(std::string s) { for (char& c : s) if (c == '/') c = '.'; return s; }
+
+    // The internal class name a formatted reference value refers to: "<a/b/C>" ->
+    // "a/b/C"; a "..." string -> java/lang/String; else "".
+    inline std::string class_of_ref_value(const std::string& v)
+    {
+        if (v.size() >= 2 && v.front() == '<' && v.back() == '>') return v.substr(1, v.size() - 2);
+        if (!v.empty() && v.front() == '"')                        return "java/lang/String";
+        return {};
+    }
+    inline std::string frozen_key(char scope, const std::string& cls, const std::string& addr, const std::string& field)
+    {
+        std::string k(1, scope);
+        k += '|'; k += cls;
+        k += '|'; if (scope == 'I') k += addr;
+        k += '|'; k += field;
+        return k;
+    }
+    inline bool desc_is_ref(const std::string& d) { return !d.empty() && (d[0] == 'L' || d[0] == '['); }
+
+    // Turn a displayed field value into a token accepted by the payload's writer:
+    // strings lose their quotes (payload re-allocates), non-string refs use their
+    // pointee address (or null), chars lose their quotes, everything else is verbatim.
+    inline std::string writeable_value(const std::string& desc, const std::string& value, const std::string& ref_addr)
+    {
+        if (desc == "Ljava/lang/String;")
+        {
+            if (value == "null") return "null";
+            if (value.size() >= 2 && value.front() == '"' && value.back() == '"') return value.substr(1, value.size() - 2);
+            return value;
+        }
+        if (desc_is_ref(desc)) return ref_addr.empty() ? std::string{ "null" } : ref_addr;
+        if (value.size() >= 3 && value.front() == '\'' && value.back() == '\'') return value.substr(1, value.size() - 2);
+        return value;
+    }
+
+    void add_saved_object(viewer::App& app, const std::string& label, const std::string& cls, const std::string& addr)
+    {
+        if (addr.empty() || addr == "null") return;
+        for (const auto& s : g_clipboard) if (s.address == addr) return;  // dedup by address
+        g_clipboard.push_back(viewer::SavedObject{ label, cls, addr, app.now_s() });
+        g_show_clipboard = true;
+    }
+
+    // Make the last-submitted item a drag source carrying a heap object.
+    void obj_drag_source(const std::string& addr, const std::string& cls, const std::string& label)
+    {
+        if (addr.empty() || addr == "null") return;
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None))
+        {
+            DragObj d{};
+            std::snprintf(d.address, sizeof(d.address), "%s", addr.c_str());
+            std::snprintf(d.class_name, sizeof(d.class_name), "%s", cls.c_str());
+            std::snprintf(d.label, sizeof(d.label), "%s", label.c_str());
+            ImGui::SetDragDropPayload("VMHOOK_OBJ", &d, sizeof(d));
+            ImGui::TextUnformatted(label.empty() ? addr.c_str() : label.c_str());
+            if (!cls.empty()) ImGui::TextDisabled("%s", dotted_name(cls).c_str());
+            ImGui::TextDisabled("%s", addr.c_str());
+            ImGui::EndDragDropSource();
+        }
+    }
+    // Accept a heap-object drop on the last-submitted item.
+    bool obj_drop_target(DragObj& out)
+    {
+        bool got{ false };
+        if (ImGui::BeginDragDropTarget())
+        {
+            if (const ImGuiPayload* p{ ImGui::AcceptDragDropPayload("VMHOOK_OBJ") })
+                if (p->DataSize == static_cast<int>(sizeof(DragObj))) { std::memcpy(&out, p->Data, sizeof(DragObj)); got = true; }
+            ImGui::EndDragDropTarget();
+        }
+        return got;
+    }
+
+    // name -> JVM descriptor for a class's fields, walking the super chain (so a
+    // detail/statics row can know each field's real type without re-querying).
+    std::unordered_map<std::string, std::string> field_desc_map(viewer::App& app, const std::string& cls, bool want_static)
+    {
+        std::unordered_map<std::string, std::string> out;
+        const auto it0{ app.name_to_index.find(cls) };
+        if (it0 == app.name_to_index.end()) return out;
+        const viewer::ClassInfo* cur{ &app.classes[(std::size_t)it0->second] };
+        for (int hops = 0; hops < 200 && cur; ++hops)
+        {
+            for (const auto& f : cur->fields)
+                if (((f.access & 0x0008u) != 0u) == want_static)
+                    out.emplace(f.name, f.descriptor);  // first (most-derived) wins
+            if (cur->super_name.empty() || cur->super_name == "java/lang/Object") break;
+            const auto it{ app.name_to_index.find(cur->super_name) };
+            if (it == app.name_to_index.end()) break;
+            cur = &app.classes[(std::size_t)it->second];
+        }
+        return out;
+    }
+
+    // Render the lock / edit / grab action icons for one field row (+ the edit
+    // popup) and apply the user's choices.  scope 'I' instance, 'S' static.
+    void field_actions(viewer::App& app, int uid, char scope, const std::string& cls, const std::string& addr,
+                       const std::string& field, const std::string& value, const std::string& desc,
+                       const std::string& ref_addr)
+    {
+        ImGui::PushID(uid);
+        const std::string fkey{ frozen_key(scope, cls, addr, field) };
+        const bool frozen{ g_frozen.count(fkey) != 0 };
+        const bool is_ref{ desc_is_ref(desc) };
+        const bool is_string{ desc == "Ljava/lang/String;" };
+        const auto refreeze_if{ [&](const std::string& v) { if (frozen) app.freeze_field(scope, cls, addr, field, v); } };
+
+        // Freeze lock
+        ImGui::PushStyleColor(ImGuiCol_Text, frozen ? ImVec4(0.36f, 0.63f, 1.0f, 1.0f) : ImVec4(0.52f, 0.54f, 0.60f, 1.0f));
+        const bool lk{ ui::IconButton(frozen ? ICON_FA_LOCK : ICON_FA_UNLOCK, "frz") };
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(frozen ? "Frozen — click to unlock" : "Freeze at the current value");
+        if (lk)
+        {
+            if (frozen) { app.unfreeze_field(scope, cls, addr, field); g_frozen.erase(fkey); }
+            else        { app.freeze_field(scope, cls, addr, field, writeable_value(desc, value, ref_addr)); g_frozen.insert(fkey); }
+        }
+
+        // Edit
+        ImGui::SameLine(0.0f, em(0.1f));
+        if (ui::IconButton(ICON_FA_PEN, "edit"))
+        {
+            std::snprintf(g_edit_buf, sizeof(g_edit_buf), "%s", writeable_value(desc, value, ref_addr).c_str());
+            ImGui::OpenPopup("editfield");
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit value");
+
+        // Grab (references only, non-null)
+        if (is_ref && !ref_addr.empty())
+        {
+            ImGui::SameLine(0.0f, em(0.1f));
+            if (ui::IconButton(ICON_FA_THUMBTACK, "grab"))
+                add_saved_object(app, cls_short(cls) + "." + field, class_of_ref_value(value), ref_addr);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Grab this object into the clipboard");
+            obj_drag_source(ref_addr, class_of_ref_value(value), cls_short(cls) + "." + field);
+        }
+
+        if (ImGui::BeginPopup("editfield"))
+        {
+            ImGui::TextDisabled("%s : %s", field.c_str(), desc.c_str());
+            ImGui::Separator();
+            if (is_ref)
+            {
+                if (!g_clipboard.empty())
+                {
+                    ImGui::TextUnformatted("Place a saved object:");
+                    for (int i = 0; i < (int)g_clipboard.size(); ++i)
+                    {
+                        const viewer::SavedObject& so{ g_clipboard[(std::size_t)i] };
+                        ImGui::PushID(i);
+                        const std::string lbl{ so.label + "   " + dotted_name(cls_short(so.class_name)) + "  " + so.address };
+                        if (ImGui::Selectable(lbl.c_str()))
+                        { app.set_field_value(scope, cls, addr, field, so.address); refreeze_if(so.address); ImGui::CloseCurrentPopup(); }
+                        ImGui::PopID();
+                    }
+                    ImGui::Separator();
+                }
+                if (ImGui::SmallButton("Set null")) { app.set_field_value(scope, cls, addr, field, "null"); refreeze_if("null"); ImGui::CloseCurrentPopup(); }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(em(15.0f));
+                const bool ent{ ImGui::InputText("##ev", g_edit_buf, sizeof(g_edit_buf), ImGuiInputTextFlags_EnterReturnsTrue) };
+                ImGui::SameLine();
+                if (ImGui::SmallButton(is_string ? "Set text" : "Set 0x") || ent)
+                { app.set_field_value(scope, cls, addr, field, g_edit_buf); refreeze_if(g_edit_buf); ImGui::CloseCurrentPopup(); }
+                if (is_string) ImGui::TextDisabled("text = new String; or 0x<oop> / null");
+                else           ImGui::TextDisabled("0x<oop> address, or null");
+            }
+            else if (desc == "Z")
+            {
+                if (ImGui::SmallButton("true"))  { app.set_field_value(scope, cls, addr, field, "true");  refreeze_if("true");  ImGui::CloseCurrentPopup(); }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("false")) { app.set_field_value(scope, cls, addr, field, "false"); refreeze_if("false"); ImGui::CloseCurrentPopup(); }
+            }
+            else
+            {
+                ImGui::SetNextItemWidth(em(12.0f));
+                const bool ent{ ImGui::InputText("##ev", g_edit_buf, sizeof(g_edit_buf), ImGuiInputTextFlags_EnterReturnsTrue) };
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Set") || ent) { app.set_field_value(scope, cls, addr, field, g_edit_buf); refreeze_if(g_edit_buf); ImGui::CloseCurrentPopup(); }
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::PopID();
+    }
+
+    // Build the CALL argument token for one parameter from the user's text box.
+    std::string call_token(const std::string& pd, const char* raw)
+    {
+        std::string s{ raw ? raw : "" };
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))   s.pop_back();
+        if (!desc_is_ref(pd)) return s.empty() ? std::string{ "0" } : s;   // primitive: verbatim
+        if (s.empty() || s == "null" || s == "@null") return "@null";
+        if (s[0] == '@' || s[0] == '#') return s;
+        if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) return "@" + s;
+        const bool stringy{ pd == "Ljava/lang/String;" || pd == "Ljava/lang/CharSequence;" || pd == "Ljava/lang/Object;" };
+        return stringy ? ("#" + s) : ("@" + s);
+    }
+
+    // A method-call panel: pick a method (of `cls` + supers), fill its arguments
+    // (type a primitive, or drop / pick a saved object, or #text for a String),
+    // Call, and see the result — which itself can be grabbed into the clipboard.
+    // addr = the receiver ("" for a static-only context; static methods ignore it).
+    void draw_call_panel(viewer::App& app, const std::string& cls, const std::string& addr, CallState& cs)
+    {
+        struct CallM { const viewer::MethodInfo* m; std::string owner; };
+        std::vector<CallM> methods;
+        {
+            const auto it0{ app.name_to_index.find(cls) };
+            const viewer::ClassInfo* cur{ it0 == app.name_to_index.end() ? nullptr : &app.classes[(std::size_t)it0->second] };
+            for (int hops = 0; hops < 200 && cur; ++hops)
+            {
+                for (const auto& m : cur->methods)
+                {
+                    if (m.name == "<init>" || m.name == "<clinit>") continue;      // not callable here
+                    if (!addr.empty() || (m.access & 0x0008u))                     // static ctx -> statics only
+                        methods.push_back({ &m, cls_short(cur->internal_name) });
+                }
+                if (cur->super_name.empty() || cur->super_name == "java/lang/Object") break;
+                const auto it{ app.name_to_index.find(cur->super_name) };
+                if (it == app.name_to_index.end()) break;
+                cur = &app.classes[(std::size_t)it->second];
+            }
+        }
+
+        // Reset the picker when the receiver context changes.
+        const std::string ctx{ cls + "@" + addr };
+        if (ctx != cs.ctx) { cs.ctx = ctx; cs.method_idx = -1; cs.has_result = false; for (auto& b : cs.args) b[0] = '\0'; }
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Call");
+        ImGui::SameLine(0.0f, em(0.5f));
+        ui::InputText("##callfilter", "filter methods", cs.filter, sizeof(cs.filter), em(12.0f));
+        ImGui::SameLine(0.0f, em(0.4f));
+
+        const std::string flt{ cs.filter };
+        const auto label_of{ [&](const CallM& c) -> std::string
+        {
+            std::string s{ (c.m->access & 0x0008u) ? "[S] " : "" };
+            s += c.m->name;
+            s += g_pretty ? viewer::pretty_method(c.m->descriptor, false) : c.m->descriptor;
+            return s;
+        } };
+        const char* preview{ (cs.method_idx >= 0 && cs.method_idx < (int)methods.size())
+                             ? nullptr : "select a method" };
+        std::string preview_s;
+        if (!preview) { preview_s = label_of(methods[(std::size_t)cs.method_idx]); preview = preview_s.c_str(); }
+        if (ui::BeginCombo("##callm", preview, em(24.0f)))
+        {
+            for (int i = 0; i < (int)methods.size(); ++i)
+            {
+                const std::string lbl{ label_of(methods[(std::size_t)i]) };
+                if (!flt.empty() && !icontains(lbl, flt)) continue;
+                ImGui::PushID(i);
+                if (ImGui::Selectable(lbl.c_str(), i == cs.method_idx))
+                { cs.method_idx = i; cs.has_result = false; for (auto& b : cs.args) b[0] = '\0'; }
+                ImGui::PopID();
+            }
+            ui::EndCombo();
+        }
+
+        if (cs.method_idx < 0 || cs.method_idx >= (int)methods.size()) return;
+        const viewer::MethodInfo& m{ *methods[(std::size_t)cs.method_idx].m };
+        const bool is_static{ (m.access & 0x0008u) != 0u };
+        // Parse parameter descriptors.
+        std::vector<std::string> pds;
+        {
+            const std::string& d{ m.descriptor };
+            std::size_t i{ d.find('(') };
+            if (i != std::string::npos) { ++i; while (i < d.size() && d[i] != ')') { const std::size_t s{ i }; while (i < d.size() && d[i] == '[') ++i; if (i < d.size() && d[i] == 'L') { const std::size_t sc{ d.find(';', i) }; i = (sc == std::string::npos ? d.size() : sc + 1); } else if (i < d.size()) ++i; pds.push_back(d.substr(s, i - s)); } }
+        }
+        if ((int)pds.size() > 8) { ImGui::TextDisabled("(more than 8 arguments — not callable)"); return; }
+
+        for (int a = 0; a < (int)pds.size(); ++a)
+        {
+            ImGui::PushID(a);
+            const std::string ptxt{ g_pretty ? viewer::pretty_field(pds[(std::size_t)a], false) : pds[(std::size_t)a] };
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("arg%d", a); ImGui::SameLine(0.0f, em(0.3f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.71f, 0.96f, 1.0f));
+            ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(ptxt.c_str());
+            ImGui::PopStyleColor();
+            ImGui::SameLine(em(10.0f));
+            ui::InputText("##arg", desc_is_ref(pds[(std::size_t)a]) ? "@null / @0x.. / #text / drop object" : "value",
+                          cs.args[a], sizeof(cs.args[a]), desc_is_ref(pds[(std::size_t)a]) ? em(16.0f) : em(10.0f));
+            if (desc_is_ref(pds[(std::size_t)a]))
+            {
+                DragObj d{};
+                if (obj_drop_target(d)) std::snprintf(cs.args[a], sizeof(cs.args[a]), "@%s", d.address);
+            }
+            ImGui::PopID();
+        }
+
+        const bool can_call{ !app.any_busy() };
+        ImGui::BeginDisabled(!can_call);
+        if (ui::Button(ICON_FA_PLAY "  Call", ImVec2(0, 0), ui::BtnPrimary))
+        {
+            std::vector<std::string> toks;
+            for (int a = 0; a < (int)pds.size(); ++a) toks.push_back(call_token(pds[(std::size_t)a], cs.args[a]));
+            app.call_method(cls, is_static ? std::string{} : addr, m.name, m.descriptor, toks);
+            cs.pending = true; cs.has_result = false;
+        }
+        ImGui::EndDisabled();
+        if (is_static) { ImGui::SameLine(); ImGui::TextDisabled("(static)"); }
+
+        if (cs.has_result)
+        {
+            ImGui::SameLine(0.0f, em(0.8f));
+            ImGui::AlignTextToFramePadding();
+            if (cs.result.ok)
+            {
+                ImGui::TextDisabled("->"); ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, value_color(cs.result.disp));
+                ImGui::TextUnformatted(cs.result.disp.c_str());
+                ImGui::PopStyleColor();
+                if (!cs.result.raddr.empty())
+                {
+                    ImGui::SameLine(0.0f, em(0.5f));
+                    if (ui::Button(ICON_FA_THUMBTACK " Grab result"))
+                        add_saved_object(app, m.name + "()", cs.result.rclass, cs.result.raddr);
+                    obj_drag_source(cs.result.raddr, cs.result.rclass, m.name + "()");
+                }
+            }
+            else
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.46f, 0.46f, 1.0f));
+                ImGui::TextWrapped("%s", cs.result.error.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+    }
+
+    // The floating "Saved objects" clipboard: a drop target (drag an instance /
+    // reference here to stash it) whose chips are themselves drag sources (drag one
+    // onto a field or method argument to place it).
+    void draw_clipboard_panel(viewer::App& app)
+    {
+        ImGui::BeginChild("clipboard", ImVec2(0, em(6.6f)), ImGuiChildFlags_Borders);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(ICON_FA_THUMBTACK "  Saved objects");
+        ImGui::SameLine(0.0f, em(0.5f));
+        ImGui::TextDisabled("(%d)", (int)g_clipboard.size());
+        ImGui::SameLine(0.0f, em(0.6f));
+        ImGui::TextDisabled("drag an object here to stash it · drag a chip onto a field / arg to place it");
+        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(5.0f), ImGui::GetCursorPosX() + em(1.0f)));
+        ImGui::BeginDisabled(g_clipboard.empty());
+        if (ui::Button("Clear")) g_clipboard.clear();
+        ImGui::EndDisabled();
+        ImGui::Separator();
+
+        ImGui::BeginChild("clipscroll", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+        if (g_clipboard.empty())
+            ImGui::TextDisabled("empty — grab a reference field (thumbtack) or drag an object here");
+        int remove{ -1 };
+        for (int i = 0; i < (int)g_clipboard.size(); ++i)
+        {
+            const viewer::SavedObject& so{ g_clipboard[(std::size_t)i] };
+            ImGui::PushID(i);
+            ImGui::BeginGroup();
+            const ImVec2 p0{ ImGui::GetCursorScreenPos() };
+            ImGui::Dummy(ImVec2(em(13.0f), 0));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.9f, 1.0f, 1.0f));
+            ImGui::TextUnformatted(so.label.empty() ? "object" : so.label.c_str());
+            ImGui::PopStyleColor();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.71f, 0.96f, 1.0f));
+            ImGui::TextUnformatted(dotted_name(cls_short(so.class_name)).c_str());
+            ImGui::PopStyleColor();
+            ImGui::TextDisabled("%s", so.address.c_str());
+            ImGui::EndGroup();
+            // Chip frame + hover highlight.
+            const ImVec2 p1{ ImGui::GetItemRectMax() };
+            const bool hov{ ImGui::IsMouseHoveringRect(p0, p1) };
+            ImGui::GetWindowDrawList()->AddRect(ImVec2(p0.x - em(0.3f), p0.y - em(0.2f)), ImVec2(p1.x + em(0.3f), p1.y + em(0.2f)),
+                ImGui::GetColorU32(hov ? ImGuiCol_SliderGrab : ImGuiCol_Border), ImGui::GetStyle().FrameRounding);
+            // Whole chip is a drag source.
+            if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID))
+            {
+                DragObj d{};
+                std::snprintf(d.address, sizeof(d.address), "%s", so.address.c_str());
+                std::snprintf(d.class_name, sizeof(d.class_name), "%s", so.class_name.c_str());
+                std::snprintf(d.label, sizeof(d.label), "%s", so.label.c_str());
+                ImGui::SetDragDropPayload("VMHOOK_OBJ", &d, sizeof(d));
+                ImGui::TextUnformatted(so.label.c_str());
+                ImGui::TextDisabled("%s", so.address.c_str());
+                ImGui::EndDragDropSource();
+            }
+            if (ImGui::BeginPopupContextItem("chipctx"))
+            {
+                if (ImGui::MenuItem("Copy address")) ImGui::SetClipboardText(so.address.c_str());
+                if (ImGui::MenuItem("Remove"))       remove = i;
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+            ImGui::SameLine(0.0f, em(0.9f));
+        }
+        if (remove >= 0) g_clipboard.erase(g_clipboard.begin() + remove);
+        ImGui::EndChild();
+        // Dropping anywhere in the panel stashes the object.
+        if (ImGui::BeginDragDropTarget())
+        {
+            if (const ImGuiPayload* p{ ImGui::AcceptDragDropPayload("VMHOOK_OBJ") })
+                if (p->DataSize == (int)sizeof(DragObj)) { DragObj d{}; std::memcpy(&d, p->Data, sizeof(d)); add_saved_object(app, d.label, d.class_name, d.address); }
+            ImGui::EndDragDropTarget();
+        }
+        ImGui::EndChild();
+    }
+
     void draw_instances_window(viewer::App& app)
     {
         ImGui::SetNextWindowSize(ImVec2(em(64.0f), em(34.0f)), ImGuiCond_FirstUseEver);
@@ -1511,6 +1987,7 @@ namespace
                         if (ImGui::Selectable("##irow", sel, ImGuiSelectableFlags_SpanAllColumns))
                             g_detail_addr = inst.address;
                         copy_menu("addr", inst.address);
+                        obj_drag_source(inst.address, app.inst_class, cls_short(app.inst_class));
                         ImGui::SetCursorScreenPos(rp);
                         ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : ImVec4(0.58f, 0.68f, 0.82f, 1.0f));
                         ImGui::TextUnformatted(inst.address.c_str());
@@ -1574,6 +2051,14 @@ namespace
                     ImGui::TextDisabled("· seen %s ago", fmt_age(now - selp->seen_epoch).c_str());
                 }
                 ImGui::SameLine(0.0f, em(0.8f));
+                if (ui::Button(ICON_FA_THUMBTACK " Grab"))
+                    add_saved_object(app, cls_short(app.inst_class), app.inst_class, selp->address);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stash this instance in the clipboard");
+                obj_drag_source(selp->address, app.inst_class, cls_short(app.inst_class));
+                ImGui::SameLine(0.0f, em(0.4f));
+                if (ui::Button("Statics")) { g_statics_class = app.inst_class; g_statics_refresh_now = true; g_show_statics = true; }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open this class's static fields");
+                ImGui::SameLine(0.0f, em(0.4f));
                 if (ui::Button("Copy addr")) ImGui::SetClipboardText(selp->address.c_str());
                 ImGui::SameLine(0.0f, em(0.4f));
                 if (ui::Button("Copy all"))
@@ -1586,22 +2071,37 @@ namespace
                     ImGui::SetClipboardText(tsv.c_str());
                 }
                 ImGui::Separator();
+
+                const std::unordered_map<std::string, std::string> descOf{ field_desc_map(app, app.inst_class, false) };
+                const auto eff_desc{ [&](const viewer::InstField& f) -> std::string
+                {
+                    if (const auto it{ descOf.find(f.name) }; it != descOf.end()) return it->second;
+                    if (!f.value.empty() && f.value.front() == '"') return "Ljava/lang/String;";
+                    if (!f.ref_addr.empty() || f.value == "null" || (f.value.size() > 1 && f.value.front() == '<')) return "Ljava/lang/Object;";
+                    return {};  // primitive of unknown width — writer still parses the text
+                } };
+
+                // Field | Value (editable / droppable) | Actions
+                const float detail_h{ (std::max)(ImGui::GetContentRegionAvail().y - em(11.0f), em(6.0f)) };
                 if (ImGui::BeginTable("idetail", 3,
-                        ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH))
+                        ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH, ImVec2(0, detail_h)))
                 {
                     ImGui::TableSetupColumn("Field", ImGuiTableColumnFlags_WidthFixed, em(9.0f));
                     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
-                    ImGui::TableSetupColumn("From",  ImGuiTableColumnFlags_WidthFixed, em(7.0f));
+                    ImGui::TableSetupColumn("",      ImGuiTableColumnFlags_WidthFixed, em(4.6f));
                     ImGui::TableSetupScrollFreeze(0, 1);
                     ImGui::TableHeadersRow();
+                    int uid{ 0 };
                     for (const viewer::InstField& f : selp->fields)
                     {
                         if (!g_inst_show_inherited && !f.owner.empty()) continue;
+                        const std::string desc{ eff_desc(f) };
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
                         if (!f.owner.empty()) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
                         ImGui::TextUnformatted(f.name.c_str());
-                        if (!f.owner.empty()) ImGui::PopStyleColor();
+                        if (!f.owner.empty()) { ImGui::PopStyleColor(); if (ImGui::IsItemHovered()) ImGui::SetTooltip("inherited from %s", f.owner.c_str()); }
+
                         ImGui::TableSetColumnIndex(1);
                         bool linked{ false };
                         if (f.value.size() > 2 && f.value.front() == '<' && f.value.back() == '>')
@@ -1610,7 +2110,7 @@ namespace
                             if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
                             {
                                 if (ImGui::TextLink(f.value.c_str())) navigate_to(it->second);
-                                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to open)", internal.c_str());
+                                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to open · drag to grab)", internal.c_str());
                                 linked = true;
                             }
                         }
@@ -1620,11 +2120,27 @@ namespace
                             ImGui::TextWrapped("%s", f.value.c_str());
                             ImGui::PopStyleColor();
                         }
+                        // A reference value is a drag source (grab) and a drop target (place).
+                        if (desc_is_ref(desc))
+                        {
+                            if (!f.ref_addr.empty()) obj_drag_source(f.ref_addr, class_of_ref_value(f.value), cls_short(app.inst_class) + "." + f.name);
+                            DragObj d{};
+                            if (obj_drop_target(d))
+                            {
+                                app.set_field_value('I', app.inst_class, selp->address, f.name, d.address);
+                                if (g_frozen.count(frozen_key('I', app.inst_class, selp->address, f.name))) app.freeze_field('I', app.inst_class, selp->address, f.name, d.address);
+                            }
+                        }
+
                         ImGui::TableSetColumnIndex(2);
-                        if (!f.owner.empty()) ImGui::TextDisabled("%s", f.owner.c_str());
+                        field_actions(app, uid++, 'I', app.inst_class, selp->address, f.name, f.value, desc, f.ref_addr);
                     }
                     ImGui::EndTable();
                 }
+
+                // Method invocation on this instance.
+                ImGui::Separator();
+                draw_call_panel(app, app.inst_class, selp->address, g_call_inst);
             }
         }
         ImGui::EndChild();
@@ -1646,6 +2162,117 @@ namespace
             }
             ImGui::SetClipboardText(tsv.c_str());
         }
+
+        ImGui::End();
+    }
+
+    // The class's live STATIC fields (mirror state the instance view can't show):
+    // editable + freezable like instance fields, plus a static-method call panel.
+    void draw_statics_window(viewer::App& app)
+    {
+        ImGui::SetNextWindowSize(ImVec2(em(46.0f), em(30.0f)), ImGuiCond_FirstUseEver);
+        const bool open{ ImGui::Begin("Static fields", &g_show_statics, ImGuiWindowFlags_NoCollapse) };
+        if (!open) { ImGui::End(); return; }
+
+        std::lock_guard<std::mutex> lock{ app.data_mutex };
+        const viewer::Status st{ app.stat_status.load() };
+        const float toggle_dy{ ImGui::GetFrameHeight() * 0.13f };
+
+        std::string dotted{ app.stat_class };
+        for (char& ch : dotted) if (ch == '/') ch = '.';
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
+        ImGui::TextUnformatted(dotted.empty() ? "(no class)" : dotted.c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0.0f, em(0.35f));
+        ImGui::TextDisabled("· statics");
+        if (st == viewer::Status::Receiving)
+        {
+            ImGui::SameLine(0.0f, em(0.5f));
+            const float r{ ImGui::GetFrameHeight() * 0.28f };
+            ui::Spinner("##sscan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+        }
+        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(11.0f), ImGui::GetCursorPosX() + em(1.0f)));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + toggle_dy);
+        ui::Toggle("Live", &g_statics_live);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Re-read the static fields ~every 1.5s");
+        ImGui::SameLine(0.0f, em(0.6f));
+        if (ui::Button("Refresh")) g_statics_refresh_now = true;
+
+        ui::InputText("##sfilter", ICON_FA_SEARCH "  Filter statics", g_statics_filter, sizeof(g_statics_filter),
+                      (std::max)(ImGui::GetContentRegionAvail().x - em(0.5f), em(6.0f)));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", app.stat_message.c_str());
+        ImGui::Separator();
+
+        if (app.stat_class.empty())
+        {
+            ImGui::TextDisabled("Open statics from a class's Live-instances detail (Statics button).");
+            ImGui::End();
+            return;
+        }
+
+        const std::unordered_map<std::string, std::string> descOf{ field_desc_map(app, app.stat_class, true) };
+        std::string needle{ g_statics_filter };
+        for (char& c : needle) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        const float table_h{ (std::max)(ImGui::GetContentRegionAvail().y - em(11.0f), em(6.0f)) };
+        if (ImGui::BeginTable("sdetail", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH, ImVec2(0, table_h)))
+        {
+            ImGui::TableSetupColumn("Field", ImGuiTableColumnFlags_WidthFixed, em(10.0f));
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("",      ImGuiTableColumnFlags_WidthFixed, em(4.6f));
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableHeadersRow();
+            int uid{ 0 };
+            for (const viewer::InstField& f : app.statics_obj.fields)
+            {
+                if (!needle.empty() && !contains_ci(f.name, needle) && !contains_ci(f.value, needle)) continue;
+                std::string desc;
+                if (const auto it{ descOf.find(f.name) }; it != descOf.end()) desc = it->second;
+                else if (!f.value.empty() && f.value.front() == '"') desc = "Ljava/lang/String;";
+                else if (!f.ref_addr.empty() || f.value == "null" || (f.value.size() > 1 && f.value.front() == '<')) desc = "Ljava/lang/Object;";
+
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(f.name.c_str());
+                ImGui::TableSetColumnIndex(1);
+                bool linked{ false };
+                if (f.value.size() > 2 && f.value.front() == '<' && f.value.back() == '>')
+                {
+                    const std::string internal{ f.value.substr(1, f.value.size() - 2) };
+                    if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
+                    {
+                        if (ImGui::TextLink(f.value.c_str())) navigate_to(it->second);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to open · drag to grab)", internal.c_str());
+                        linked = true;
+                    }
+                }
+                if (!linked)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, value_color(f.value));
+                    ImGui::TextWrapped("%s", f.value.c_str());
+                    ImGui::PopStyleColor();
+                }
+                if (desc_is_ref(desc))
+                {
+                    if (!f.ref_addr.empty()) obj_drag_source(f.ref_addr, class_of_ref_value(f.value), cls_short(app.stat_class) + "." + f.name);
+                    DragObj d{};
+                    if (obj_drop_target(d))
+                    {
+                        app.set_field_value('S', app.stat_class, {}, f.name, d.address);
+                        if (g_frozen.count(frozen_key('S', app.stat_class, {}, f.name))) app.freeze_field('S', app.stat_class, {}, f.name, d.address);
+                    }
+                }
+                ImGui::TableSetColumnIndex(2);
+                field_actions(app, uid++, 'S', app.stat_class, {}, f.name, f.value, desc, f.ref_addr);
+            }
+            ImGui::EndTable();
+        }
+
+        // Static-method invocation (addr empty -> the panel lists statics only).
+        ImGui::Separator();
+        draw_call_panel(app, app.stat_class, {}, g_call_stat);
 
         ImGui::End();
     }
@@ -1719,8 +2346,10 @@ namespace
         }
         ImGui::Separator();
 
-        // main split: left classes / right details, with a draggable splitter
-        const float avail_y{ ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() };
+        // main split: left classes / right details, with a draggable splitter.
+        // Reserve a strip at the bottom for the object clipboard when it's shown.
+        const float clip_h{ g_show_clipboard ? em(7.4f) : 0.0f };
+        const float avail_y{ ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() - clip_h };
         ImGui::BeginChild("left", ImVec2(g_left_width, avail_y), ImGuiChildFlags_Borders);
         draw_class_list(app);
         ImGui::EndChild();
@@ -1740,6 +2369,9 @@ namespace
         ImGui::BeginChild("right", ImVec2(0, avail_y), ImGuiChildFlags_Borders);
         draw_details(app);
         ImGui::EndChild();
+
+        // Object clipboard strip (full width, below the split).
+        if (g_show_clipboard) draw_clipboard_panel(app);
 
         // status bar
         ImGui::Separator();
@@ -1852,7 +2484,7 @@ namespace
             was_busy = now_busy;
 
             const bool due{ g_instances_refresh_now || (g_instances_live && ImGui::GetTime() >= next_scan) };
-            if (due && !now_busy)
+            if (due && !app.any_busy())
             {
                 app.request_instances(g_instances_class);
                 g_instances_refresh_now = false;
@@ -1862,6 +2494,64 @@ namespace
         if (g_show_instances)
         {
             draw_instances_window(app);
+        }
+
+        // Static fields window — same cadence-after-completion scheduling.
+        if (g_show_statics && !g_statics_class.empty())
+        {
+            if (app.stat_class != g_statics_class) g_statics_refresh_now = true;  // class switched
+            static bool   was_busy{ false };
+            static double next_scan{ 0.0 };
+            const bool now_busy{ app.stat_busy() };
+            if (was_busy && !now_busy) next_scan = ImGui::GetTime() + 1.2;
+            was_busy = now_busy;
+
+            const bool due{ g_statics_refresh_now || (g_statics_live && ImGui::GetTime() >= next_scan) };
+            if (due && !app.any_busy())
+            {
+                app.request_statics(g_statics_class);
+                g_statics_refresh_now = false;
+                next_scan = ImGui::GetTime() + 1.0e9;
+            }
+        }
+        if (g_show_statics)
+        {
+            draw_statics_window(app);
+        }
+
+        // Consume a completed mutating op (set / freeze / call) exactly once:
+        // route a call result to whichever panel dispatched it, otherwise show a
+        // transient toast; a successful write triggers an immediate re-read so the
+        // new value surfaces without waiting for the next auto-scan.
+        if (const std::uint64_t seq{ app.op_seq.load() }; seq != g_op_seen_seq)
+        {
+            g_op_seen_seq = seq;
+            viewer::OpResult r;
+            { std::lock_guard<std::mutex> lock{ app.data_mutex }; r = app.op_result; }
+            if (g_call_inst.pending)      { g_call_inst.pending = false; g_call_inst.result = r; g_call_inst.has_result = true; }
+            else if (g_call_stat.pending) { g_call_stat.pending = false; g_call_stat.result = r; g_call_stat.has_result = true; }
+            else
+            {
+                g_op_toast = r.ok ? (r.disp.empty() ? std::string{ "Done." } : ("Set -> " + r.disp)) : ("Error: " + r.error);
+                g_op_toast_until = ImGui::GetTime() + 3.0;
+            }
+            if (r.ok) { g_instances_refresh_now = true; g_statics_refresh_now = true; }
+        }
+        // Floating toast for set / freeze feedback.
+        if (!g_op_toast.empty() && ImGui::GetTime() < g_op_toast_until)
+        {
+            const ImGuiViewport* v{ ImGui::GetMainViewport() };
+            ImGui::SetNextWindowPos(ImVec2(v->WorkPos.x + v->WorkSize.x * 0.5f, v->WorkPos.y + v->WorkSize.y - em(3.0f)), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+            ImGui::SetNextWindowBgAlpha(0.92f);
+            if (ImGui::Begin("##optoast", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav))
+            {
+                const bool err{ g_op_toast.rfind("Error", 0) == 0 };
+                ImGui::PushStyleColor(ImGuiCol_Text, err ? ImVec4(0.96f, 0.5f, 0.5f, 1.0f) : ImVec4(0.6f, 0.85f, 0.65f, 1.0f));
+                ImGui::TextUnformatted(g_op_toast.c_str());
+                ImGui::PopStyleColor();
+            }
+            ImGui::End();
         }
     }
 }
