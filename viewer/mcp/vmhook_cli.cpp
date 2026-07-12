@@ -256,9 +256,19 @@ int main(int argc, char** argv)
         if (!enumerate_raw(pid, dll, raw, err, "INST\t" + cls + "\t" + cap))
         { std::printf("{\"error\":\"%s\"}\n", json_escape(err).c_str()); return 1; }
 
-        // O <TAB> 0x<addr> starts an instance; V <TAB> name <TAB> value [<TAB> owner].
+        // O <TAB> 0x<addr> starts an instance; V <TAB> name <TAB> value <TAB> owner <TAB> refAddr.
+        // A `refs` map exposes each reference field's pointee address, so callers can
+        // feed it back to set-instance / call / array without re-deriving it.
         std::printf("{\"pid\":%u,\"class\":\"%s\",\"instances\":[", pid, json_escape(cls).c_str());
-        std::size_t p{ 0 }; bool first_inst{ true }; bool first_field{ false };
+        std::string fields, refs, addr; bool have_inst{ false }, first_inst{ true };
+        const auto flush_inst{ [&]
+        {
+            if (!have_inst) return;
+            std::printf("%s{\"address\":\"%s\",\"fields\":{%s},\"refs\":{%s}}",
+                first_inst ? "" : ",", json_escape(addr).c_str(), fields.c_str(), refs.c_str());
+            first_inst = false; fields.clear(); refs.clear();
+        } };
+        std::size_t p{ 0 };
         while (p < raw.size())
         {
             std::size_t nl{ raw.find('\n', p) };
@@ -268,12 +278,11 @@ int main(int argc, char** argv)
             if (line.empty()) continue;
             if (line[0] == 'O')
             {
-                const std::string addr{ line.size() > 2 && line[1] == '\t' ? std::string{ line.substr(2) } : std::string{} };
-                if (!first_inst) std::printf("}},");
-                std::printf("{\"address\":\"%s\",\"fields\":{", json_escape(addr).c_str());
-                first_inst = false; first_field = true;
+                flush_inst();
+                addr = (line.size() > 2 && line[1] == '\t') ? std::string{ line.substr(2) } : std::string{};
+                have_inst = true;
             }
-            else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t' && !first_inst)
+            else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t' && have_inst)
             {
                 const std::size_t t2{ line.find('\t', 2) };
                 if (t2 != std::string_view::npos)
@@ -281,12 +290,25 @@ int main(int argc, char** argv)
                     const std::size_t t3{ line.find('\t', t2 + 1) };
                     const std::string name{ line.substr(2, t2 - 2) };
                     const std::string val{ line.substr(t2 + 1, (t3 == std::string_view::npos ? line.size() : t3) - (t2 + 1)) };
-                    std::printf("%s\"%s\":\"%s\"", first_field ? "" : ",", json_escape(name).c_str(), json_escape(val).c_str());
-                    first_field = false;
+                    fields += (fields.empty() ? "" : ",");
+                    fields += "\"" + json_escape(name) + "\":\"" + json_escape(val) + "\"";
+                    if (t3 != std::string_view::npos)  // owner <TAB> refAddr may follow
+                    {
+                        const std::size_t t4{ line.find('\t', t3 + 1) };
+                        if (t4 != std::string_view::npos)
+                        {
+                            const std::string ref{ line.substr(t4 + 1) };
+                            if (!ref.empty())
+                            {
+                                refs += (refs.empty() ? "" : ",");
+                                refs += "\"" + json_escape(name) + "\":\"" + json_escape(ref) + "\"";
+                            }
+                        }
+                    }
                 }
             }
         }
-        if (!first_inst) std::printf("}}");
+        flush_inst();
         std::printf("]}\n");
         return 0;
     }
@@ -304,7 +326,8 @@ int main(int argc, char** argv)
         { std::printf("{\"error\":\"%s\"}\n", json_escape(err).c_str()); return 1; }
 
         std::printf("{\"pid\":%u,\"class\":\"%s\",\"statics\":{", pid, json_escape(cls).c_str());
-        std::size_t p{ 0 }; bool first{ true };
+        std::string refs; bool first{ true };
+        std::size_t p{ 0 };
         while (p < raw.size())
         {
             std::size_t nl{ raw.find('\n', p) };
@@ -321,10 +344,23 @@ int main(int argc, char** argv)
                     const std::string val{ line.substr(t2 + 1, (t3 == std::string_view::npos ? line.size() : t3) - (t2 + 1)) };
                     std::printf("%s\"%s\":\"%s\"", first ? "" : ",", json_escape(name).c_str(), json_escape(val).c_str());
                     first = false;
+                    if (t3 != std::string_view::npos)
+                    {
+                        const std::size_t t4{ line.find('\t', t3 + 1) };
+                        if (t4 != std::string_view::npos)
+                        {
+                            const std::string ref{ line.substr(t4 + 1) };
+                            if (!ref.empty())
+                            {
+                                refs += (refs.empty() ? "" : ",");
+                                refs += "\"" + json_escape(name) + "\":\"" + json_escape(ref) + "\"";
+                            }
+                        }
+                    }
                 }
             }
         }
-        std::printf("}}\n");
+        std::printf("},\"refs\":{%s}}\n", refs.c_str());
         return 0;
     }
 
