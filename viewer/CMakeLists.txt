@@ -56,9 +56,17 @@ target_include_directories(imgui PUBLIC "${IMGUI_DIR}" "${IMGUI_DIR}/backends")
 target_compile_features(imgui PRIVATE cxx_std_17)
 
 # ── viewer GUI exe ────────────────────────────────────────────────────────────
-add_executable(vmhook_viewer WIN32 src/main.cpp assets/vmhook.rc)
-target_include_directories(vmhook_viewer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+# Vendored professional widgets: cmdwtf/imgui_toggle (0BSD) for animated toggle
+# switches — third_party/imgui_toggle/.
+set(TOGGLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui_toggle")
+add_executable(vmhook_viewer WIN32 src/main.cpp assets/vmhook.rc
+    "${TOGGLE_DIR}/imgui_toggle.cpp"
+    "${TOGGLE_DIR}/imgui_toggle_palette.cpp"
+    "${TOGGLE_DIR}/imgui_toggle_presets.cpp"
+    "${TOGGLE_DIR}/imgui_toggle_renderer.cpp")
+target_include_directories(vmhook_viewer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${TOGGLE_DIR}")
 target_compile_features(vmhook_viewer PRIVATE cxx_std_23)
+target_compile_definitions(vmhook_viewer PRIVATE IMGUI_DEFINE_MATH_OPERATORS)
 target_link_libraries(vmhook_viewer PRIVATE imgui d3d11 dxgi dwmapi)
 if(MSVC)
     target_compile_options(vmhook_viewer PRIVATE /Zc:preprocessor /Zc:__cplusplus)

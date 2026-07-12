@@ -138,73 +138,67 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
 // ── style + fonts ─────────────────────────────────────────────────────────────
 namespace
 {
-    // Theme: the community "Moonlight" palette (github.com/Madam-Herta/Moonlight)
-    // — a deep blue-black night palette with pill-rounded frames — adapted to a
-    // data-dense tool: a legible periwinkle accent for interactive controls, and
-    // the two self-defeating Moonlight values fixed (near-white TextSelectedBg,
-    // pure-black table lines) so selected text and table gridlines stay visible.
+    // Theme: a clean, flat, modern-IDE dark palette (VS Code / Linear family) —
+    // moderate rounding, crisp 1px frame borders, a single blue accent for
+    // interactive state.  No gloss/gradients/halos; the widgets are stock ImGui,
+    // so the polish comes entirely from restraint here.
     void apply_modern_style()
     {
         ImGuiStyle& s{ ImGui::GetStyle() };
-        // Rounding — Moonlight's signature soft, pill-shaped frames.
-        s.WindowRounding = 11.5f; s.ChildRounding = 8.0f; s.FrameRounding = 9.0f;
-        s.PopupRounding = 7.0f; s.GrabRounding = 9.0f; s.ScrollbarRounding = 12.0f; s.TabRounding = 8.0f;
-        // Spacing / padding (Moonlight's 20px frame padding is far too wide for a
-        // dense listing — moderated, its rounded character kept).
+        // Rounding — modern-but-restrained (not pill-shaped).
+        s.WindowRounding = 8.0f; s.ChildRounding = 6.0f; s.FrameRounding = 5.0f;
+        s.PopupRounding = 6.0f; s.GrabRounding = 4.0f; s.ScrollbarRounding = 9.0f; s.TabRounding = 6.0f;
+        // Spacing / padding.
         s.WindowPadding = ImVec2(14, 12); s.FramePadding = ImVec2(12, 6);
         s.ItemSpacing = ImVec2(8, 7); s.ItemInnerSpacing = ImVec2(7, 5); s.CellPadding = ImVec2(10, 6);
         s.ScrollbarSize = 12.0f; s.GrabMinSize = 10.0f;
-        s.WindowBorderSize = 0.0f; s.FrameBorderSize = 0.0f; s.ChildBorderSize = 1.0f; s.PopupBorderSize = 1.0f;
+        // Crisp 1px borders on frames — the signature of a clean flat tool UI.
+        s.WindowBorderSize = 0.0f; s.FrameBorderSize = 1.0f; s.ChildBorderSize = 1.0f; s.PopupBorderSize = 1.0f;
         s.SeparatorTextBorderSize = 2.0f; s.SeparatorTextPadding = ImVec2(20, 6);
         s.WindowTitleAlign = ImVec2(0.0f, 0.5f);
         s.ButtonTextAlign = ImVec2(0.5f, 0.5f);
 
         ImVec4* c{ s.Colors };
-        // Periwinkle-indigo accent (Moonlight's night-blue family) for anything
-        // interactive; a muted variant for primary buttons so they read as
-        // "primary" without neon glare.
-        const ImVec4 accent   { 0.33f, 0.48f, 0.94f, 1.00f };
-        const ImVec4 accentHi { 0.47f, 0.60f, 1.00f, 1.00f };
-        const ImVec4 btn      { 0.19f, 0.28f, 0.56f, 1.00f };
-        const ImVec4 btnHi    { 0.27f, 0.40f, 0.80f, 1.00f };
-        const ImVec4 btnDn    { 0.15f, 0.23f, 0.47f, 1.00f };
-        c[ImGuiCol_Text]                 = ImVec4(0.95f, 0.96f, 0.98f, 1.00f);
-        c[ImGuiCol_TextDisabled]         = ImVec4(0.40f, 0.44f, 0.55f, 1.00f);
-        c[ImGuiCol_WindowBg]             = ImVec4(0.078f, 0.086f, 0.102f, 1.00f);
-        c[ImGuiCol_ChildBg]              = ImVec4(0.093f, 0.100f, 0.116f, 1.00f);
-        c[ImGuiCol_PopupBg]              = ImVec4(0.070f, 0.078f, 0.094f, 0.98f);
-        c[ImGuiCol_Border]               = ImVec4(0.157f, 0.169f, 0.192f, 1.00f);
+        const ImVec4 accent   { 0.29f, 0.56f, 0.96f, 1.00f };  // clean modern blue
+        const ImVec4 accentHi { 0.40f, 0.66f, 1.00f, 1.00f };
+        c[ImGuiCol_Text]                 = ImVec4(0.90f, 0.91f, 0.94f, 1.00f);
+        c[ImGuiCol_TextDisabled]         = ImVec4(0.44f, 0.47f, 0.54f, 1.00f);
+        c[ImGuiCol_WindowBg]             = ImVec4(0.086f, 0.092f, 0.106f, 1.00f);
+        c[ImGuiCol_ChildBg]              = ImVec4(0.104f, 0.111f, 0.128f, 1.00f);
+        c[ImGuiCol_PopupBg]              = ImVec4(0.094f, 0.100f, 0.116f, 0.98f);
+        c[ImGuiCol_Border]               = ImVec4(0.196f, 0.208f, 0.235f, 1.00f);
         c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_FrameBg]              = ImVec4(0.112f, 0.126f, 0.155f, 1.00f);
-        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.157f, 0.169f, 0.192f, 1.00f);
-        c[ImGuiCol_FrameBgActive]        = ImVec4(0.185f, 0.205f, 0.245f, 1.00f);
-        c[ImGuiCol_TitleBg]              = ImVec4(0.047f, 0.055f, 0.071f, 1.00f);
-        c[ImGuiCol_TitleBgActive]        = ImVec4(0.047f, 0.055f, 0.071f, 1.00f);
-        c[ImGuiCol_MenuBarBg]            = ImVec4(0.098f, 0.106f, 0.122f, 1.00f);
+        c[ImGuiCol_FrameBg]              = ImVec4(0.140f, 0.150f, 0.172f, 1.00f);
+        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.176f, 0.190f, 0.220f, 1.00f);
+        c[ImGuiCol_FrameBgActive]        = ImVec4(0.205f, 0.222f, 0.256f, 1.00f);
+        c[ImGuiCol_TitleBg]              = ImVec4(0.066f, 0.072f, 0.084f, 1.00f);
+        c[ImGuiCol_TitleBgActive]        = ImVec4(0.066f, 0.072f, 0.084f, 1.00f);
+        c[ImGuiCol_MenuBarBg]            = ImVec4(0.104f, 0.111f, 0.128f, 1.00f);
         c[ImGuiCol_ScrollbarBg]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.20f, 0.22f, 0.26f, 1.00f);
-        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.28f, 0.31f, 0.37f, 1.00f);
+        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.22f, 0.24f, 0.28f, 1.00f);
+        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.30f, 0.33f, 0.38f, 1.00f);
         c[ImGuiCol_ScrollbarGrabActive]  = accent;
         c[ImGuiCol_CheckMark]            = accentHi;
         c[ImGuiCol_SliderGrab]           = accent;
         c[ImGuiCol_SliderGrabActive]     = accentHi;
-        c[ImGuiCol_Button]               = btn;
-        c[ImGuiCol_ButtonHovered]        = btnHi;
-        c[ImGuiCol_ButtonActive]         = btnDn;
-        c[ImGuiCol_Header]               = ImVec4(accent.x, accent.y, accent.z, 0.50f);
-        c[ImGuiCol_HeaderHovered]        = ImVec4(accent.x, accent.y, accent.z, 0.70f);
-        c[ImGuiCol_HeaderActive]         = ImVec4(accent.x, accent.y, accent.z, 0.90f);
-        c[ImGuiCol_Separator]            = ImVec4(0.157f, 0.169f, 0.192f, 1.00f);
+        // Neutral secondary button (Primary/Ghost/Danger are set per-call in ui::Button).
+        c[ImGuiCol_Button]               = ImVec4(0.170f, 0.182f, 0.210f, 1.00f);
+        c[ImGuiCol_ButtonHovered]        = ImVec4(0.215f, 0.232f, 0.268f, 1.00f);
+        c[ImGuiCol_ButtonActive]         = ImVec4(0.135f, 0.145f, 0.168f, 1.00f);
+        c[ImGuiCol_Header]               = ImVec4(accent.x, accent.y, accent.z, 0.32f);
+        c[ImGuiCol_HeaderHovered]        = ImVec4(accent.x, accent.y, accent.z, 0.48f);
+        c[ImGuiCol_HeaderActive]         = ImVec4(accent.x, accent.y, accent.z, 0.64f);
+        c[ImGuiCol_Separator]            = ImVec4(0.196f, 0.208f, 0.235f, 1.00f);
         c[ImGuiCol_SeparatorHovered]     = accent;
         c[ImGuiCol_SeparatorActive]      = accentHi;
         c[ImGuiCol_ResizeGrip]           = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
         c[ImGuiCol_ResizeGripHovered]    = accent;
         c[ImGuiCol_ResizeGripActive]     = accentHi;
-        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.047f, 0.055f, 0.071f, 1.00f);
+        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.066f, 0.072f, 0.084f, 1.00f);
         c[ImGuiCol_TableBorderStrong]    = ImVec4(1.00f, 1.00f, 1.00f, 0.060f);
         c[ImGuiCol_TableBorderLight]     = ImVec4(1.00f, 1.00f, 1.00f, 0.028f);
         c[ImGuiCol_TableRowBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.00f, 1.00f, 1.00f, 0.020f);
+        c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.00f, 1.00f, 1.00f, 0.018f);
         c[ImGuiCol_TextSelectedBg]       = ImVec4(accent.x, accent.y, accent.z, 0.35f);
         c[ImGuiCol_TextLink]             = accentHi;  // the extends / field-type jump links
         c[ImGuiCol_DragDropTarget]       = accentHi;
