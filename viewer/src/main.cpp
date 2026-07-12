@@ -627,9 +627,14 @@ namespace
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && app.has_baseline.load())
             ImGui::SetTooltip("Re-scan loaded classes — new ones are marked, unloaded ones listed");
-        ImGui::SameLine(0.0f, em(0.4f));
+        ImGui::SameLine(0.0f, em(0.5f));
+        // The switch is shorter than the buttons on this row — nudge it down so
+        // it sits vertically centred against Attach / Rescan.
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetFrameHeight() * 0.13f);
+        ImGui::BeginDisabled(!app.has_baseline.load());
         ui::Toggle("Auto", &g_auto_rescan);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Auto re-scan ~every 2s to track runtime class loads live");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Live class-load tracking: arms the on_class_loaded hook + re-scans on load");
 
         row_divider();
         const viewer::Status st{ app.status.load() };
@@ -1679,14 +1684,18 @@ namespace
             last_refresh = ImGui::GetTime();
         }
 
-        // Auto re-scan the attached JVM's classes ~every 2s so runtime-loaded
-        // classes surface live (no re-injection — reuses the loaded payload).
-        static double last_rescan{ 0.0 };
+        // Live class-load tracking: arm the on_class_loaded hook and poll it
+        // ~every 1.5s (cheap; an immediate re-scan fires the moment the hook sees
+        // a class defined), with a full re-scan every ~3s as a safety net that
+        // also catches bootstrap classes the hook can't see.
+        static double last_poll{ 0.0 }, last_full{ 0.0 };
         if (g_auto_rescan && app.has_baseline.load() && !app.busy() && !app.inst_busy() &&
-            (ImGui::GetTime() - last_rescan) > 2.0)
+            (ImGui::GetTime() - last_poll) > 1.5)
         {
-            app.rescan();
-            last_rescan = ImGui::GetTime();
+            const bool full{ (ImGui::GetTime() - last_full) > 3.0 };
+            app.auto_track(full);
+            last_poll = ImGui::GetTime();
+            if (full) last_full = ImGui::GetTime();
         }
 
         const ImGuiViewport* vp{ ImGui::GetMainViewport() };
@@ -1754,6 +1763,16 @@ namespace
                 if (ImGui::TextLink(lbl)) g_show_removed = true;
                 ImGui::PopStyleColor(2);
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Classes unloaded since the previous scan — click to list");
+            }
+            if (app.hook_armed.load())
+            {
+                ImGui::SameLine(0.0f, em(0.6f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.72f, 1.0f, 1.0f));
+                ImGui::Text("\xef\x80\xa1 hook: %llu", (unsigned long long)app.hook_total.load());
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("on_class_loaded hook armed — %llu class(es) defined via ClassLoader.defineClass so far",
+                                      (unsigned long long)app.hook_total.load());
             }
             ImGui::SameLine(0.0f, em(0.8f));
 

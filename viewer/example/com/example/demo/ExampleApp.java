@@ -122,6 +122,37 @@ public class ExampleApp
         "java.util.concurrent.atomic.DoubleAdder", "java.util.stream.Collectors",
     };
 
+    // A custom ClassLoader used to DEFINE brand-new classes at runtime — this
+    // goes through java.lang.ClassLoader.defineClass, which vmhook's
+    // on_class_loaded hook detours, so the viewer sees each one live.
+    static final class RuntimeLoader extends ClassLoader
+    {
+        Class<?> define(String dottedName, byte[] bytes)
+        {
+            return defineClass(dottedName, bytes, 0, bytes.length);
+        }
+    }
+    private static final RuntimeLoader RUNTIME_LOADER = new RuntimeLoader();
+
+    // Build the minimal valid class file for `public class <internalName> {}`.
+    private static byte[] genClass(String internalName) throws Exception
+    {
+        java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+        java.io.DataOutputStream d = new java.io.DataOutputStream(bo);
+        d.writeInt(0xCAFEBABE);
+        d.writeShort(0); d.writeShort(52);          // version: Java 8
+        d.writeShort(5);                            // constant_pool_count (1..4)
+        d.writeByte(7); d.writeShort(2);            // #1 Class -> #2
+        d.writeByte(1); d.writeUTF(internalName);   // #2 Utf8 this-class name
+        d.writeByte(7); d.writeShort(4);            // #3 Class -> #4
+        d.writeByte(1); d.writeUTF("java/lang/Object");  // #4 Utf8 super
+        d.writeShort(0x0021);                       // ACC_PUBLIC | ACC_SUPER
+        d.writeShort(1); d.writeShort(3);           // this_class=#1, super_class=#3
+        d.writeShort(0); d.writeShort(0); d.writeShort(0); d.writeShort(0);  // ifaces/fields/methods/attrs
+        d.flush();
+        return bo.toByteArray();
+    }
+
     public static void main(String[] args) throws Exception
     {
         Greeter g = who -> "Hello, " + who + "!";
@@ -147,12 +178,16 @@ public class ExampleApp
             }
             history[(int) (i % history.length)] = i;
             // Load one new JDK class per tick so the viewer's re-scan detects
-            // runtime-added classes (see LAZY_CLASSES).
+            // runtime-added (bootstrap) classes (see LAZY_CLASSES).
             if (i < LAZY_CLASSES.length)
             {
                 try { Class.forName(LAZY_CLASSES[(int) i]); }
                 catch (Throwable ignored) { }
             }
+            // DEFINE a brand-new class every tick via ClassLoader.defineClass so
+            // the viewer's on_class_loaded hook catches it live.
+            try { RUNTIME_LOADER.define("com.example.demo.RuntimeGen" + i, genClass("com/example/demo/RuntimeGen" + i)); }
+            catch (Throwable ignored) { }
             Thread.sleep(1000);
             i++;
         }

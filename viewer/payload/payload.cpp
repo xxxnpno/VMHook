@@ -23,6 +23,9 @@
 //   "SETI" <TAB> Class <TAB> 0xADDR <TAB> field <TAB> value -> write an instance
 //                                                   field, then stream back V (re-read).
 //   "SETS" <TAB> Class <TAB> field <TAB> value    -> write a static field, then V.
+//   "HOOK"          -> arm the ClassLoader.defineClass hook; reply H <TAB> <1|0>.
+//   "DRAIN"         -> stream (and clear) hook-captured class names as N records:
+//                        N <TAB> internal/Class/Name
 // Access-flag fields are decimal JVM class-file flag words.
 
 #include <vmhook/vmhook.hpp>
@@ -33,6 +36,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -582,6 +587,86 @@ namespace
         FlushFileBuffers(pipe);
     }
 
+    // ── live class-load hook (vmhook::on_class_loaded) ───────────────────────
+    // Event-driven detection of classes DEFINED AT RUNTIME through
+    // java.lang.ClassLoader.defineClass (application / agent / custom-loader
+    // classes — bootstrap java.*/sun.* bypass it).  Each definition appends the
+    // internal name to g_hook_log; the viewer drains it via the DRAIN request.
+    std::mutex                          g_hook_mtx;
+    std::vector<std::string>            g_hook_log;    // names captured since last drain
+    std::optional<vmhook::watch_handle> g_hook;        // keeps the hook installed
+    bool                                g_hook_armed{ false };
+
+    void arm_class_hook()
+    {
+        bool just_armed{ false };
+        {
+            std::lock_guard<std::mutex> lock{ g_hook_mtx };
+            if (g_hook_armed)
+            {
+                return;
+            }
+            auto handle{ vmhook::on_class_loaded([](const std::string& name)
+            {
+                std::lock_guard<std::mutex> lk{ g_hook_mtx };
+                if (g_hook_log.size() < 200000u) g_hook_log.push_back(name);  // bounded
+            }) };
+            if (handle.running())
+            {
+                g_hook.emplace(std::move(handle));  // keep alive → hook stays installed
+                g_hook_armed = true;
+                just_armed  = true;
+            }
+        }
+        // ClassLoader.defineClass is hot and almost always already JIT-compiled,
+        // so the i2i-interpreter-entry detour the hook installs is bypassed and
+        // the hook silently misses (the documented i2i-vs-JIT gap).  Deoptimise
+        // every ClassLoader.defineClass overload once so subsequent calls route
+        // back through the interpreter entry the hook patched.
+        if (just_armed)
+        {
+            vmhook::deoptimize_methods_if([](const std::string& class_name, vmhook::hotspot::method* m)
+            {
+                return class_name == "java/lang/ClassLoader" && m && m->get_name() == "defineClass";
+            });
+        }
+    }
+
+    // HOOK request: arm the class-load hook (once); reply H<TAB><1|0> + DONE.
+    void stream_hook_arm(HANDLE pipe)
+    {
+        arm_class_hook();
+        pipe_writer writer{ pipe };
+        writer.put("H\t");
+        writer.put(g_hook_armed ? "1" : "0");
+        writer.put("\n");
+        writer.put("DONE\t0\n");
+        writer.flush();
+        FlushFileBuffers(pipe);
+    }
+
+    // DRAIN request: stream (and clear) the hook-captured names as N records.
+    void stream_hook_drain(HANDLE pipe)
+    {
+        std::vector<std::string> names;
+        {
+            std::lock_guard<std::mutex> lock{ g_hook_mtx };
+            names.swap(g_hook_log);
+        }
+        pipe_writer writer{ pipe };
+        for (const std::string& n : names)
+        {
+            writer.put("N\t");
+            writer.put(sanitize(n));
+            writer.put("\n");
+        }
+        writer.put("DONE\t");
+        writer.put(std::to_string(names.size()));
+        writer.put("\n");
+        writer.flush();
+        FlushFileBuffers(pipe);
+    }
+
     // Serve every attach: the payload stays loaded and, each time a viewer/CLI
     // creates the pipe server, connects to it and streams whatever the current
     // request asks for (class surface by default, or live instances).  This makes
@@ -621,6 +706,14 @@ namespace
             else if (req.rfind("SETS\t", 0) == 0)
             {
                 stream_set(pipe, req.substr(5), /*is_instance=*/false);
+            }
+            else if (req == "HOOK")
+            {
+                stream_hook_arm(pipe);
+            }
+            else if (req == "DRAIN")
+            {
+                stream_hook_drain(pipe);
             }
             else
             {

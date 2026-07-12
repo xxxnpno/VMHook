@@ -22,6 +22,7 @@ JVM's classes / methods / fields — all discovered live, no mappings.
 | `get_instances` | `pid`, `class_name`, `cap?` | `{pid, class, instances:[{address, fields:{name:value, …}}]}` — live heap objects of the class + their field values (own + inherited); injects if needed, so no prior `enumerate_jvm` required |
 | `get_statics`   | `pid`, `class_name`      | `{pid, class, statics:{name:value, …}}` — the class's STATIC field values, read live from its `java.lang.Class` mirror (class-level state the instance tools don't show) |
 | `search_members`| `pid`, `query`, `scope?` | `[{class, kind, name, descriptor, signature\|type, static?}, …]` — every method/field whose name matches, across all classes (from cache); `scope` ∈ `all`/`methods`/`fields`. Capped at 5000 hits |
+| `watch_class_loads` | `pid`, `seconds?` | `{pid, armed, seconds, loaded:[…]}` — arms the `on_class_loaded` hook (a deoptimised detour on `ClassLoader.defineClass`), waits, and returns every class **defined at runtime** during the window. Event-driven; catches app / agent / custom-loader classes (not bootstrap `java.*`) |
 | `set_instance_field` | `pid`, `class_name`, `address`, `field`, `value` | **writes** one field on the live instance at `address` (from `get_instances`); `{pid, class, field, value, ok:true}` with the re-read value, or `{error}` |
 | `set_static_field`   | `pid`, `class_name`, `field`, `value` | **writes** a static field on the class mirror; same result shape |
 

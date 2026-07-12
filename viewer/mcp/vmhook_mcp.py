@@ -160,6 +160,25 @@ TOOLS = [
         },
     },
     {
+        "name": "watch_class_loads",
+        "description": (
+            "Arm vmhook's on_class_loaded hook (a detour on java.lang.ClassLoader.defineClass, "
+            "deoptimised so it fires even when defineClass is JIT-compiled), wait `seconds`, then "
+            "return every class DEFINED AT RUNTIME during that window: {pid, armed, seconds, loaded:[…]}. "
+            "Event-driven (zero polling). Catches application / agent / custom-loader classes — bootstrap "
+            "java.*/sun.* classes bypass the Java defineClass path and are NOT reported. Injects the "
+            "payload if needed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "seconds": {"type": "integer", "description": "how long to watch (default 5)"},
+            },
+            "required": ["pid"],
+        },
+    },
+    {
         "name": "set_instance_field",
         "description": (
             "WRITE a field on ONE live heap instance (mutates the running JVM). Identify the object by "
@@ -228,6 +247,11 @@ def call_tool(name: str, args: dict) -> str:
         cli_args = ["search", str(args["pid"]), str(args["query"])]
         if args.get("scope"):
             cli_args.append(str(args["scope"]))
+        return run_cli(cli_args)
+    if name == "watch_class_loads":
+        cli_args = ["watch", str(args["pid"])]
+        if args.get("seconds"):
+            cli_args.append(str(args["seconds"]))
         return run_cli(cli_args)
     if name == "set_instance_field":
         return run_cli(["set-instance", str(args["pid"]), str(args["class_name"]),

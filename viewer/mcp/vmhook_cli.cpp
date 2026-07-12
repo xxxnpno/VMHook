@@ -328,6 +328,48 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (cmd == "watch" && argc >= 3)
+    {
+        // Arm vmhook's on_class_loaded hook, wait, then drain the names of every
+        // class DEFINED AT RUNTIME via ClassLoader.defineClass during the window.
+        const std::uint32_t pid{ (std::uint32_t)std::strtoul(argv[2], nullptr, 10) };
+        const int seconds{ argc >= 4 ? std::atoi(argv[3]) : 5 };
+        wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring w{ exe }; const std::size_t s{ w.find_last_of(L"\\/") };
+        if (s != std::wstring::npos) w.resize(s + 1);
+        const std::wstring dll{ w + L"vmhook_payload.dll" };
+
+        std::string raw, err;
+        if (!enumerate_raw(pid, dll, raw, err, "HOOK"))
+        { std::printf("{\"error\":\"%s\"}\n", json_escape(err).c_str()); return 1; }
+        const bool armed{ raw.find("H\t1") != std::string::npos };
+        if (!armed)
+        { std::printf("{\"pid\":%u,\"armed\":false,\"error\":\"on_class_loaded hook failed to install\"}\n", pid); return 1; }
+
+        Sleep((seconds > 0 ? seconds : 5) * 1000);
+
+        raw.clear();
+        if (!enumerate_raw(pid, dll, raw, err, "DRAIN"))
+        { std::printf("{\"error\":\"%s\"}\n", json_escape(err).c_str()); return 1; }
+
+        std::printf("{\"pid\":%u,\"armed\":true,\"seconds\":%d,\"loaded\":[", pid, seconds);
+        std::size_t p{ 0 }; bool first{ true };
+        while (p < raw.size())
+        {
+            std::size_t nl{ raw.find('\n', p) };
+            if (nl == std::string::npos) nl = raw.size();
+            const std::string_view line{ raw.data() + p, nl - p };
+            p = nl + 1;
+            if (line.size() >= 2 && line[0] == 'N' && line[1] == '\t')
+            {
+                std::printf("%s\"%s\"", first ? "" : ",", json_escape(line.substr(2)).c_str());
+                first = false;
+            }
+        }
+        std::printf("]}\n");
+        return 0;
+    }
+
     if ((cmd == "set-instance" || cmd == "set-static") && argc >= 5)
     {
         const bool is_instance{ cmd == "set-instance" };
@@ -486,6 +528,7 @@ int main(int argc, char** argv)
 
     std::printf("{\"error\":\"usage: vmhook_cli list | enumerate <pid> | classes <pid> [substr] | class <pid> <name> | "
                 "search <pid> <query> [methods|fields|all] | instances <pid> <class> [cap] | statics <pid> <class> | "
-                "set-instance <pid> <class> <address> <field> <value> | set-static <pid> <class> <field> <value>\"}\n");
+                "watch <pid> [seconds] | set-instance <pid> <class> <address> <field> <value> | "
+                "set-static <pid> <class> <field> <value>\"}\n");
     return 2;
 }

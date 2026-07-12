@@ -392,6 +392,13 @@ namespace viewer
         std::vector<std::string>  last_removed;       // names present before but gone now
         std::atomic<bool>         has_baseline{ false };
 
+        // Event-driven class-load hook (vmhook::on_class_loaded in the payload):
+        // armed when live tracking is on; the payload logs each defineClass and
+        // the viewer drains the names, which drive an immediate re-scan.
+        std::atomic<bool>          hook_armed{ false };
+        std::atomic<std::uint64_t> hook_total{ 0 };   // cumulative hook-captured loads
+        std::vector<std::string>   hook_recent;        // last N names the hook captured (guarded)
+
         // Live-instance inspection (guarded by data_mutex, driven on `worker`).
         std::atomic<Status>       inst_status{ Status::Idle };
         std::string               inst_message{};
@@ -520,11 +527,119 @@ namespace viewer
             worker = std::thread([this, pid, dll] { run_enumerate(pid, dll, /*inject=*/false); });
         }
 
+        // Live tracking: arm the on_class_loaded hook (once), drain the class
+        // names it captured, and — if any (or on the periodic `full` tick) —
+        // re-enumerate so the new classes surface with a green mark.  Driven from
+        // render_ui while "Auto" is on.
+        void auto_track(bool full)
+        {
+            if (busy() || inst_busy() || attached_pid_ == 0 || !has_baseline.load())
+            {
+                return;
+            }
+            if (worker.joinable())
+            {
+                worker.join();
+            }
+            const std::uint32_t pid{ attached_pid_ };
+            const std::wstring  dll{ attached_dll_ };
+            status.store(Status::Receiving);
+            worker = std::thread([this, pid, dll, full] { run_auto_tracking(pid, dll, full); });
+        }
+
     private:
         std::thread   worker;
         std::uint32_t attached_pid_{ 0 };   // the JVM a successful attach latched onto
         std::wstring  attached_dll_{};      // payload path used for that attach
         std::unordered_set<std::string> prev_names_;  // class names from the previous scan (diff)
+
+        // Send a one-line request to the loaded payload and read its (short)
+        // reply.  Reuses the loaded payload's serve loop (no injection) — the
+        // same overlapped connect/read pattern as the enumerate/instance paths.
+        auto pipe_exchange(const std::string& request, std::string& raw) -> bool
+        {
+            write_request(request);
+            HANDLE pipe{ CreateNamedPipeW(k_pipe_name, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 0, 1u << 20, 0, nullptr) };
+            if (pipe == INVALID_HANDLE_VALUE) return false;
+            HANDLE ev{ CreateEventW(nullptr, TRUE, FALSE, nullptr) };
+            OVERLAPPED ov{}; ov.hEvent = ev;
+            const BOOL connected{ ConnectNamedPipe(pipe, &ov) };
+            const DWORD ce{ GetLastError() };
+            if (!connected && ce == ERROR_IO_PENDING)
+            {
+                if (WaitForSingleObject(ev, 10000) != WAIT_OBJECT_0) { CloseHandle(ev); CloseHandle(pipe); return false; }
+            }
+            else if (!connected && ce != ERROR_PIPE_CONNECTED) { CloseHandle(ev); CloseHandle(pipe); return false; }
+            std::vector<char> buffer(64u * 1024u);
+            for (;;)
+            {
+                ResetEvent(ev);
+                OVERLAPPED rov{}; rov.hEvent = ev;
+                DWORD read_bytes{ 0 };
+                const BOOL ok{ ReadFile(pipe, buffer.data(), (DWORD)buffer.size(), &read_bytes, &rov) };
+                if (!ok && GetLastError() == ERROR_IO_PENDING)
+                {
+                    if (WaitForSingleObject(ev, 15000) != WAIT_OBJECT_0) break;
+                    if (!GetOverlappedResult(pipe, &rov, &read_bytes, FALSE)) break;
+                }
+                else if (!ok) break;
+                if (read_bytes == 0) break;
+                raw.append(buffer.data(), read_bytes);
+            }
+            CloseHandle(ev); CloseHandle(pipe);
+            return true;
+        }
+
+        void run_auto_tracking(std::uint32_t pid, std::wstring dll, bool full)
+        {
+            // 1) Arm the class-load hook once (payload replies "H\t1" on success).
+            if (!hook_armed.load())
+            {
+                std::string raw;
+                if (pipe_exchange("HOOK", raw))
+                    hook_armed.store(raw.find("H\t1") != std::string::npos);
+            }
+            // 2) Drain the names the hook captured since the last poll.
+            std::size_t drained{ 0 };
+            if (hook_armed.load())
+            {
+                std::string raw;
+                if (pipe_exchange("DRAIN", raw))
+                {
+                    std::vector<std::string> names;
+                    std::size_t p{ 0 };
+                    while (p < raw.size())
+                    {
+                        const std::size_t nl{ raw.find('\n', p) };
+                        const std::size_t end{ nl == std::string::npos ? raw.size() : nl };
+                        const std::string_view line{ raw.data() + p, end - p };
+                        p = (nl == std::string::npos ? raw.size() : nl + 1);
+                        if (line.size() >= 2 && line[0] == 'N' && line[1] == '\t')
+                            names.emplace_back(line.substr(2));
+                    }
+                    drained = names.size();
+                    if (!names.empty())
+                    {
+                        std::lock_guard<std::mutex> lock{ data_mutex };
+                        for (auto& n : names) hook_recent.push_back(std::move(n));
+                        if (hook_recent.size() > 500)
+                            hook_recent.erase(hook_recent.begin(), hook_recent.end() - 500);
+                        hook_total.fetch_add(drained);
+                    }
+                }
+            }
+            // 3) Re-enumerate when the hook saw loads, or on the periodic full tick;
+            //    otherwise it was a cheap no-op poll — just settle the status.
+            if (drained > 0 || full)
+            {
+                run_enumerate(pid, dll, /*inject=*/false);  // sets status + diff + publish
+            }
+            else
+            {
+                status.store(Status::Done);
+            }
+        }
 
         // status_message is read by the UI thread under data_mutex; every write
         // from the worker must take the same lock.
