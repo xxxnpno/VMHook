@@ -225,6 +225,7 @@ namespace
         {
             static const ImWchar icon_ranges[]{
                 0xF002, 0xF002,  // magnifying-glass
+                0xF021, 0xF021,  // arrows-rotate (rescan)
                 0xF00D, 0xF00D,  // xmark
                 0xF059, 0xF059,  // circle-question
                 0xF060, 0xF061,  // arrow-left / arrow-right
@@ -267,6 +268,9 @@ namespace
     int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
     int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
     int          g_class_sort{ 0 };    // class list: 0=natural, 1=A→Z, 2=Z→A
+    bool         g_auto_rescan{ false };  // periodically re-scan loaded classes
+    bool         g_new_only{ false };     // class list: show only runtime-loaded classes
+    bool         g_show_removed{ false }; // request the unloaded-classes popup
     std::wstring g_dll_path{};
     std::vector<int> g_filtered;  // rebuilt each frame from the search box
     // Global member-search results: (class index, member index) pairs.
@@ -615,6 +619,18 @@ namespace
         if (ImGui::IsItemHovered() && !ImGui::IsItemActive())
             ImGui::SetTooltip("Inject vmhook and enumerate every class, method and field");
 
+        // Re-scan the already-attached JVM's classes (no re-injection) to catch
+        // ones loaded / unloaded at runtime; + an auto toggle for live tracking.
+        ImGui::SameLine(0.0f, em(0.4f));
+        ImGui::BeginDisabled(app.busy() || !app.has_baseline.load());
+        if (ui::IconButton(ICON_FA_ROTATE, "rescan")) app.rescan();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered() && app.has_baseline.load())
+            ImGui::SetTooltip("Re-scan loaded classes — new ones are marked, unloaded ones listed");
+        ImGui::SameLine(0.0f, em(0.4f));
+        ui::Toggle("Auto", &g_auto_rescan);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Auto re-scan ~every 2s to track runtime class loads live");
+
         row_divider();
         const viewer::Status st{ app.status.load() };
         status_pill(st);
@@ -734,11 +750,15 @@ namespace
 
         const char* want_kind{ g_kind_filter > 0 ? k_kind_names[g_kind_filter] : nullptr };
 
+        const int n_new{ app.last_added.load() };
+        if (g_new_only && n_new == 0) g_new_only = false;  // nothing new left to show
+
         g_filtered.clear();
         g_filtered.reserve(app.classes.size());
         for (int i = 0; i < (int)app.classes.size(); ++i)
         {
             const viewer::ClassInfo& ci{ app.classes[(std::size_t)i] };
+            if (g_new_only && !ci.is_new) continue;
             if (!icontains(ci.internal_name, needle)) continue;
             if (want_kind && std::strcmp(class_kind(ci).label, want_kind) != 0) continue;
             g_filtered.push_back(i);
@@ -746,6 +766,19 @@ namespace
 
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%d / %zu classes", (int)g_filtered.size(), app.classes.size());
+        // Runtime-loaded classes: a green "+N new" chip that filters to them.
+        if (n_new > 0)
+        {
+            ImGui::SameLine(0.0f, em(0.6f));
+            const ImVec4 green{ g_new_only ? ImVec4(0.55f, 0.95f, 0.66f, 1.0f) : ImVec4(0.42f, 0.82f, 0.52f, 1.0f) };
+            ImGui::PushStyleColor(ImGuiCol_Text, green);
+            ImGui::PushStyleColor(ImGuiCol_TextLink, green);
+            char lbl[40];
+            std::snprintf(lbl, sizeof(lbl), "+%d new%s", n_new, g_new_only ? "  (shown)" : "");
+            if (ImGui::TextLink(lbl)) g_new_only = !g_new_only;
+            ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Classes loaded since the previous scan — click to filter to them");
+        }
 
         // Custom "Class" header — a rounded frame matching the combo/input cells
         // (ImGui table headers can't be rounded).  Click to cycle sort: natural →
@@ -850,6 +883,11 @@ namespace
                     ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : class_kind(c).color);
                     ImGui::TextUnformatted(sname.c_str());
                     ImGui::PopStyleColor();
+                    // runtime-loaded classes get a small green dot in the left gutter
+                    if (c.is_new)
+                        ImGui::GetWindowDrawList()->AddCircleFilled(
+                            ImVec2(rp.x - em(0.52f), rp.y + ImGui::GetFontSize() * 0.5f),
+                            em(0.17f), ImGui::GetColorU32(ImVec4(0.42f, 0.85f, 0.52f, 1.0f)));
                     ImGui::PopID();
                     if (row == scroll_row && g_scroll_to_selected)
                     {
@@ -1641,6 +1679,16 @@ namespace
             last_refresh = ImGui::GetTime();
         }
 
+        // Auto re-scan the attached JVM's classes ~every 2s so runtime-loaded
+        // classes surface live (no re-injection — reuses the loaded payload).
+        static double last_rescan{ 0.0 };
+        if (g_auto_rescan && app.has_baseline.load() && !app.busy() && !app.inst_busy() &&
+            (ImGui::GetTime() - last_rescan) > 2.0)
+        {
+            app.rescan();
+            last_rescan = ImGui::GetTime();
+        }
+
         const ImGuiViewport* vp{ ImGui::GetMainViewport() };
         ImGui::SetNextWindowPos(vp->WorkPos);
         ImGui::SetNextWindowSize(vp->WorkSize);
@@ -1686,14 +1734,27 @@ namespace
         // status bar
         ImGui::Separator();
         {
-            std::size_t nclasses{ 0 }, nmethods{ 0 }, nfields{ 0 };
+            std::size_t nclasses{ 0 }, nmethods{ 0 }, nfields{ 0 }, nremoved{ 0 };
             {
                 std::lock_guard<std::mutex> lock{ app.data_mutex };
                 nclasses = app.classes.size();
                 for (const auto& c : app.classes) { nmethods += c.methods.size(); nfields += c.fields.size(); }
+                nremoved = app.last_removed.size();
             }
             ImGui::AlignTextToFramePadding();
             ImGui::Text("%zu classes  \xC2\xB7  %zu methods  \xC2\xB7  %zu fields", nclasses, nmethods, nfields);
+            if (nremoved > 0)
+            {
+                ImGui::SameLine(0.0f, em(0.6f));
+                const ImVec4 red{ 0.92f, 0.56f, 0.46f, 1.0f };
+                ImGui::PushStyleColor(ImGuiCol_Text, red);
+                ImGui::PushStyleColor(ImGuiCol_TextLink, red);
+                char lbl[40];
+                std::snprintf(lbl, sizeof(lbl), "-%zu unloaded", nremoved);
+                if (ImGui::TextLink(lbl)) g_show_removed = true;
+                ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Classes unloaded since the previous scan — click to list");
+            }
             ImGui::SameLine(0.0f, em(0.8f));
 
             // Status message — coloured by severity and ellipsized so a long error
@@ -1730,6 +1791,29 @@ namespace
             ui::Toggle("Full names", &g_full_names);
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show fully-qualified type names (java.lang.String) instead of simple ones (String)");
+        }
+
+        // Popup listing the classes unloaded at the last re-scan (they're gone
+        // from the list, so this is the only place to see them).
+        if (g_show_removed) { ImGui::OpenPopup("Unloaded classes"); g_show_removed = false; }
+        if (ImGui::BeginPopup("Unloaded classes"))
+        {
+            ImGui::SeparatorText("Unloaded since the previous scan");
+            std::lock_guard<std::mutex> lock{ app.data_mutex };
+            if (app.last_removed.empty())
+                ImGui::TextDisabled("(none)");
+            else
+            {
+                ImGui::BeginChild("rmlist", ImVec2(em(26.0f), (std::min)((float)app.last_removed.size() + 0.5f, 14.0f) * em(1.3f)));
+                for (const std::string& nm : app.last_removed)
+                {
+                    std::string d{ nm };
+                    for (char& ch : d) if (ch == '/') ch = '.';
+                    ImGui::TextUnformatted(d.c_str());
+                }
+                ImGui::EndChild();
+            }
+            ImGui::EndPopup();
         }
 
         ImGui::End();

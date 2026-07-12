@@ -20,6 +20,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace viewer
@@ -50,6 +51,7 @@ namespace viewer
         std::uint16_t           access{ 0 };    // class-file access flags (ACC_INTERFACE/ENUM/ABSTRACT/...)
         std::vector<MethodInfo> methods;
         std::vector<FieldInfo>  fields;
+        bool                    is_new{ false }; // loaded since the previous scan (runtime-added)
     };
 
     // One instance field: name, formatted value, and (if inherited) the simple
@@ -383,6 +385,13 @@ namespace viewer
         std::atomic<std::uint64_t> classes_streamed{ 0 };
         std::string               status_message{ "Idle." };
 
+        // Runtime class-load tracking: a re-scan diffs against the previous
+        // snapshot to flag newly-loaded classes (ClassInfo::is_new) and list
+        // ones that vanished (unloaded).  Guarded by data_mutex.
+        std::atomic<int>          last_added{ 0 };    // # classes new since the previous scan
+        std::vector<std::string>  last_removed;       // names present before but gone now
+        std::atomic<bool>         has_baseline{ false };
+
         // Live-instance inspection (guarded by data_mutex, driven on `worker`).
         std::atomic<Status>       inst_status{ Status::Idle };
         std::string               inst_message{};
@@ -475,18 +484,47 @@ namespace viewer
                 worker.join();
             }
             const std::uint32_t pid{ jvms[static_cast<std::size_t>(selected_jvm)].pid };
+            attached_pid_ = pid;
+            attached_dll_ = dll_path;
             classes_streamed.store(0);
             {
                 std::lock_guard<std::mutex> lock{ data_mutex };
                 classes.clear();
+                prev_names_.clear();           // fresh attach = fresh baseline
+                last_removed.clear();
             }
+            last_added.store(0);
+            has_baseline.store(false);
             status.store(Status::Injecting);
             set_status("Creating pipe + injecting...");
-            worker = std::thread([this, pid, dll_path] { run_attach(pid, dll_path); });
+            worker = std::thread([this, pid, dll_path] { run_enumerate(pid, dll_path, /*inject=*/true); });
+        }
+
+        // Re-enumerate the ALREADY-attached JVM (no re-injection — the loaded
+        // payload's serve loop reconnects), diffing against the previous snapshot
+        // to flag runtime-loaded/unloaded classes.  Cheap enough to auto-repeat.
+        void rescan()
+        {
+            if (busy() || inst_busy() || attached_pid_ == 0 || !has_baseline.load())
+            {
+                return;
+            }
+            if (worker.joinable())
+            {
+                worker.join();
+            }
+            const std::uint32_t pid{ attached_pid_ };
+            const std::wstring  dll{ attached_dll_ };
+            status.store(Status::Receiving);
+            set_status("Re-scanning loaded classes...");
+            worker = std::thread([this, pid, dll] { run_enumerate(pid, dll, /*inject=*/false); });
         }
 
     private:
-        std::thread worker;
+        std::thread   worker;
+        std::uint32_t attached_pid_{ 0 };   // the JVM a successful attach latched onto
+        std::wstring  attached_dll_{};      // payload path used for that attach
+        std::unordered_set<std::string> prev_names_;  // class names from the previous scan (diff)
 
         // status_message is read by the UI thread under data_mutex; every write
         // from the worker must take the same lock.
@@ -636,7 +674,11 @@ namespace viewer
             inst_status.store(Status::Done);
         }
 
-        void run_attach(std::uint32_t pid, std::wstring dll_path)
+        // Enumerate the JVM's class surface.  `inject` is true for the first
+        // attach (loads the payload); false for a re-scan, which reuses the
+        // already-loaded payload's serve loop (it reconnects to a fresh pipe) —
+        // no CreateRemoteThread, so it's cheap enough to auto-repeat.
+        void run_enumerate(std::uint32_t pid, std::wstring dll_path, bool inject)
         {
             write_request("ENUM");  // ensure a stale INST request can't leak in
             // 1) Create the pipe server BEFORE injecting so the payload can connect.
@@ -653,17 +695,21 @@ namespace viewer
                 return;
             }
 
-            // 2) Inject the payload DLL.
-            std::string inject_error{};
-            if (!inject_dll(pid, dll_path, inject_error))
+            // 2) Inject the payload DLL (first attach only).
+            if (inject)
             {
-                CloseHandle(pipe);
-                fail(inject_error);
-                return;
+                std::string inject_error{};
+                if (!inject_dll(pid, dll_path, inject_error))
+                {
+                    CloseHandle(pipe);
+                    fail(inject_error);
+                    return;
+                }
             }
 
             status.store(Status::Receiving);
-            set_status("Waiting for the JVM to stream its class surface...");
+            set_status(inject ? "Waiting for the JVM to stream its class surface..."
+                              : "Re-scanning loaded classes...");
 
             // 3) Wait for the payload to connect — genuinely bounded now that the
             //    pipe is FILE_FLAG_OVERLAPPED (ConnectNamedPipe/ReadFile are async,
@@ -751,6 +797,23 @@ namespace viewer
                 split_name(c);
             }
 
+            // Diff against the previous snapshot: flag runtime-loaded classes
+            // (is_new) and collect ones that vanished (unloaded).  The first
+            // attach has no baseline, so nothing is flagged then.
+            const bool had_baseline{ has_baseline.load() };
+            std::unordered_set<std::string> new_names;
+            new_names.reserve(parsed.size());
+            for (ClassInfo& c : parsed) new_names.insert(c.internal_name);
+            int added{ 0 };
+            std::vector<std::string> removed;
+            if (had_baseline)
+            {
+                for (ClassInfo& c : parsed)
+                    if (!prev_names_.count(c.internal_name)) { c.is_new = true; ++added; }
+                for (const auto& old : prev_names_)
+                    if (!new_names.count(old)) removed.push_back(old);
+            }
+
             {
                 std::lock_guard<std::mutex> lock{ data_mutex };
                 classes = std::move(parsed);
@@ -759,8 +822,16 @@ namespace viewer
                 for (int i = 0; i < (int)classes.size(); ++i)
                     name_to_index.emplace(classes[(std::size_t)i].internal_name, i);
                 classes_streamed.store(classes.size());
-                status_message = "Loaded " + std::to_string(classes.size()) + " classes.";
+                prev_names_ = std::move(new_names);
+                last_removed = std::move(removed);
+                if (had_baseline && (added > 0 || !last_removed.empty()))
+                    status_message = "Re-scan: " + std::to_string(classes.size()) + " classes  (+"
+                                   + std::to_string(added) + " new, -" + std::to_string(last_removed.size()) + ")";
+                else
+                    status_message = "Loaded " + std::to_string(classes.size()) + " classes.";
             }
+            last_added.store(added);
+            has_baseline.store(true);
             status.store(Status::Done);
         }
 

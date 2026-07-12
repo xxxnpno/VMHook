@@ -106,6 +106,22 @@ public class ExampleApp
     static final List<Worker> live = new ArrayList<>();
 
     // ── entry point (runs forever so it stays attachable) ────────────────────
+    // A stream of JDK classes not loaded at startup — main() loads one per tick
+    // so a vmhook-viewer re-scan surfaces classes added to the JVM AT RUNTIME
+    // (each forName also pulls in that class's own dependencies).
+    private static final String[] LAZY_CLASSES = {
+        "java.util.StringJoiner", "java.util.Base64", "java.util.BitSet",
+        "java.util.zip.CRC32", "java.util.zip.Adler32", "java.util.UUID",
+        "java.time.Duration", "java.time.Period", "java.time.Year",
+        "java.time.MonthDay", "java.time.DayOfWeek", "java.text.DecimalFormat",
+        "java.util.regex.Pattern", "java.util.StringTokenizer", "java.math.BigInteger",
+        "java.util.Scanner", "java.util.PriorityQueue", "java.util.ArrayDeque",
+        "java.util.concurrent.CountDownLatch", "java.util.concurrent.Semaphore",
+        "java.util.concurrent.CyclicBarrier", "java.util.concurrent.Phaser",
+        "java.util.concurrent.Exchanger", "java.util.concurrent.atomic.LongAdder",
+        "java.util.concurrent.atomic.DoubleAdder", "java.util.stream.Collectors",
+    };
+
     public static void main(String[] args) throws Exception
     {
         Greeter g = who -> "Hello, " + who + "!";
@@ -130,6 +146,13 @@ public class ExampleApp
                 a.compute((int) i, ratio);
             }
             history[(int) (i % history.length)] = i;
+            // Load one new JDK class per tick so the viewer's re-scan detects
+            // runtime-added classes (see LAZY_CLASSES).
+            if (i < LAZY_CLASSES.length)
+            {
+                try { Class.forName(LAZY_CLASSES[(int) i]); }
+                catch (Throwable ignored) { }
+            }
             Thread.sleep(1000);
             i++;
         }
