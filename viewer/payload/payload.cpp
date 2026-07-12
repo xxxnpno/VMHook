@@ -27,6 +27,8 @@
 //   "STAT" <TAB> internal/Class/Name              -> static fields (one O + V's).
 //   "ARR"  <TAB> 0xADDR <TAB> elemDescriptor <TAB> max -> a Java array's elements:
 //                    A <TAB> length ; then V <TAB> index <TAB> value <TAB> <TAB> refAddr.
+//   "ARRSET" <TAB> 0xADDR <TAB> elemDescriptor <TAB> index <TAB> value -> write one
+//                    array element, then V (re-read).
 //   "SETI" <TAB> Class <TAB> 0xADDR <TAB> field <TAB> value -> write an instance
 //                                                   field, then stream back V (re-read).
 //   "SETS" <TAB> Class <TAB> field <TAB> value    -> write a static field, then V.
@@ -744,6 +746,84 @@ namespace
         }
         writer.put("DONE\t"); writer.put(std::to_string(n)); writer.put("\n");
         writer.flush(); FlushFileBuffers(pipe);
+    }
+
+    // Write one array element (bounds-checked by vmhook::set_array_element).  Same
+    // value grammar as apply_set: primitives from the literal; a reference element
+    // takes null / 0x<oop> / (for String[]) the literal text.  Returns "" or error.
+    auto apply_array_set(void* const arr, const std::string& elem_desc, std::int32_t i, const std::string& value) -> std::string
+    {
+        if (elem_desc.empty()) { return "unknown element type"; }
+        const auto to_ll{ [&] { return std::strtoll(value.c_str(), nullptr, 0); } };
+        switch (elem_desc[0])
+        {
+        case 'Z': vmhook::set_array_element<std::uint8_t>(arr, i, (value == "true" || value == "TRUE" || value == "1") ? 1u : 0u); break;
+        case 'B': vmhook::set_array_element<std::int8_t>(arr, i, static_cast<std::int8_t>(to_ll())); break;
+        case 'S': vmhook::set_array_element<std::int16_t>(arr, i, static_cast<std::int16_t>(to_ll())); break;
+        case 'C': vmhook::set_array_element<std::uint16_t>(arr, i, value.size() == 1
+                      ? static_cast<std::uint16_t>(static_cast<unsigned char>(value[0]))
+                      : static_cast<std::uint16_t>(std::strtoul(value.c_str(), nullptr, 0))); break;
+        case 'I': vmhook::set_array_element<std::int32_t>(arr, i, static_cast<std::int32_t>(to_ll())); break;
+        case 'J': vmhook::set_array_element<std::int64_t>(arr, i, static_cast<std::int64_t>(to_ll())); break;
+        case 'F': vmhook::set_array_element<float>(arr, i, std::strtof(value.c_str(), nullptr)); break;
+        case 'D': vmhook::set_array_element<double>(arr, i, std::strtod(value.c_str(), nullptr)); break;
+        case 'L':
+        case '[':
+        {
+            if (value == "null") { vmhook::set_array_element<std::uint32_t>(arr, i, 0u); break; }
+            if (value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0)
+            {
+                void* const ref{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(std::strtoull(value.c_str(), nullptr, 16))) };
+                if (ref && !vmhook::hotspot::is_valid_pointer(ref)) { return "the element oop address is not readable"; }
+                vmhook::set_array_element<std::uint32_t>(arr, i, vmhook::hotspot::encode_oop_pointer(ref));
+                break;
+            }
+            if (elem_desc == "Ljava/lang/String;")
+            {
+                void* const s{ alloc_java_string(value) };
+                if (!s || !vmhook::hotspot::is_valid_pointer(s)) { return "failed to allocate the String element"; }
+                vmhook::set_array_element<std::uint32_t>(arr, i, vmhook::hotspot::encode_oop_pointer(s));
+                break;
+            }
+            return "reference element: pass 'null', a 0x<oop> address, or (for String[]) the literal text";
+        }
+        default: return "unsupported element type";
+        }
+        return "";
+    }
+
+    // ARRSET: write one array element and stream the re-read value back.
+    //   arg = "<0xADDR>\t<elemDescriptor>\t<index>\t<value>"
+    void stream_array_set(HANDLE pipe, const std::string& arg)
+    {
+        pipe_writer writer{ pipe };
+        const auto bail{ [&](const std::string& msg)
+        { writer.put("E\t"); writer.put(sanitize(msg)); writer.put("\n"); writer.put("DONE\t0\n"); writer.flush(); FlushFileBuffers(pipe); } };
+
+        std::vector<std::string> parts;
+        std::size_t pos{ 0 };
+        for (int i = 0; i < 3; ++i)
+        {
+            const std::size_t tab{ arg.find('\t', pos) };
+            if (tab == std::string::npos) { bail("malformed array-set request"); return; }
+            parts.push_back(arg.substr(pos, tab - pos));
+            pos = tab + 1;
+        }
+        parts.push_back(arg.substr(pos));  // value
+
+        void* const arr{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(std::strtoull(parts[0].c_str(), nullptr, 16))) };
+        const std::string elem_desc{ parts[1] };
+        const std::int32_t index{ static_cast<std::int32_t>(std::strtol(parts[2].c_str(), nullptr, 10)) };
+        if (!arr || !vmhook::hotspot::is_valid_pointer(arr)) { bail("invalid array address"); return; }
+        if (index < 0 || index >= vmhook::array_length(arr)) { bail("index out of bounds"); return; }
+
+        if (const std::string err{ apply_array_set(arr, elem_desc, index, parts[3]) }; !err.empty()) { bail(err); return; }
+
+        std::string ref_addr;
+        const std::string reread{ read_array_element(arr, elem_desc, index, &ref_addr) };
+        writer.put("V\t"); writer.put(std::to_string(index)); writer.put("\t");
+        writer.put(sanitize(reread)); writer.put("\t\t"); writer.put(ref_addr); writer.put("\n");
+        writer.put("DONE\t1\n"); writer.flush(); FlushFileBuffers(pipe);
     }
 
     // Find a declared or inherited field's descriptor + static flag by name,
@@ -1513,6 +1593,10 @@ namespace
             else if (req.rfind("STAT\t", 0) == 0)
             {
                 stream_statics(pipe, req.substr(5));
+            }
+            else if (req.rfind("ARRSET\t", 0) == 0)
+            {
+                stream_array_set(pipe, req.substr(7));
             }
             else if (req.rfind("ARR\t", 0) == 0)
             {

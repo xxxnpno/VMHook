@@ -243,6 +243,26 @@ TOOLS = [
         },
     },
     {
+        "name": "set_array_element",
+        "description": (
+            "WRITE one element of a Java array (mutates the running JVM). Give the array's '0x' address, "
+            "its element descriptor (see get_array), the index, and the new value: a primitive literal, "
+            "or for an object array 'null' / a 0x<oop> address / (for a String[]) the literal text. Returns "
+            "{address, index, value, ok:true} with the re-read element, or {error}. Injects if needed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "address": {"type": "string"},
+                "element_type": {"type": "string", "description": "element descriptor, e.g. 'J', 'Ljava/lang/String;'"},
+                "index": {"type": "integer"},
+                "value": {"type": "string"},
+            },
+            "required": ["pid", "address", "element_type", "index", "value"],
+        },
+    },
+    {
         "name": "call_method",
         "description": (
             "INVOKE a Java method in the running JVM and return its result. For an instance method, give "
@@ -353,6 +373,9 @@ def call_tool(name: str, args: dict) -> str:
         if args.get("max"):
             cli_args.append(str(args["max"]))
         return run_cli(cli_args)
+    if name == "set_array_element":
+        return run_cli(["array-set", str(args["pid"]), str(args["address"]), str(args["element_type"]),
+                        str(args["index"]), str(args["value"])])
     if name == "call_method":
         cli_args = ["call", str(args["pid"]), str(args["class_name"]), str(args["address"]),
                     str(args["method"]), str(args["descriptor"])]

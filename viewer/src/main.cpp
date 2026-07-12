@@ -2434,14 +2434,60 @@ namespace
                 if (!e.ref_addr.empty())
                     obj_drag_source(e.ref_addr, class_of_ref_value(e.value), "elem[" + e.name + "]");
                 ImGui::TableSetColumnIndex(2);
+                ImGui::PushID(uid++);
+                const int idx{ std::atoi(e.name.c_str()) };
+                const bool is_ref{ desc_is_ref(g_array_elemdesc) };
+                if (ui::IconButton(ICON_FA_PEN, "edit"))
+                {
+                    std::snprintf(g_edit_buf, sizeof(g_edit_buf), "%s", writeable_value(g_array_elemdesc, e.value, e.ref_addr).c_str());
+                    ImGui::OpenPopup("editelem");
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit element");
                 if (!e.ref_addr.empty())
                 {
-                    ImGui::PushID(uid++);
+                    ImGui::SameLine(0.0f, em(0.1f));
                     if (ui::IconButton(ICON_FA_THUMBTACK, "grab"))
                         add_saved_object(app, "elem[" + e.name + "]", class_of_ref_value(e.value), e.ref_addr);
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Grab this element into the clipboard");
-                    ImGui::PopID();
                 }
+                if (ImGui::BeginPopup("editelem"))
+                {
+                    ImGui::TextDisabled("[%d] : %s", idx, g_array_elemdesc.c_str());
+                    ImGui::Separator();
+                    const auto set_elem{ [&](const std::string& v) { app.set_array_element(g_array_addr, g_array_elemdesc, idx, v); g_array_refresh = true; } };
+                    if (is_ref)
+                    {
+                        for (int ci = 0; ci < (int)g_clipboard.size(); ++ci)
+                        {
+                            const viewer::SavedObject& so{ g_clipboard[(std::size_t)ci] };
+                            ImGui::PushID(ci);
+                            if (ImGui::Selectable((so.label + "   " + so.address).c_str())) { set_elem(so.address); ImGui::CloseCurrentPopup(); }
+                            ImGui::PopID();
+                        }
+                        if (!g_clipboard.empty()) ImGui::Separator();
+                        if (ImGui::SmallButton("Set null")) { set_elem("null"); ImGui::CloseCurrentPopup(); }
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(em(14.0f));
+                        const bool ent{ ImGui::InputText("##ee", g_edit_buf, sizeof(g_edit_buf), ImGuiInputTextFlags_EnterReturnsTrue) };
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(g_array_elemdesc == "Ljava/lang/String;" ? "Set text" : "Set 0x") || ent) { set_elem(g_edit_buf); ImGui::CloseCurrentPopup(); }
+                    }
+                    else if (g_array_elemdesc == "Z")
+                    {
+                        if (ImGui::SmallButton("true"))  { set_elem("true");  ImGui::CloseCurrentPopup(); }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("false")) { set_elem("false"); ImGui::CloseCurrentPopup(); }
+                    }
+                    else
+                    {
+                        ImGui::SetNextItemWidth(em(12.0f));
+                        const bool ent{ ImGui::InputText("##ee", g_edit_buf, sizeof(g_edit_buf), ImGuiInputTextFlags_EnterReturnsTrue) };
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Set") || ent) { set_elem(g_edit_buf); ImGui::CloseCurrentPopup(); }
+                    }
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
             }
             ImGui::EndTable();
         }

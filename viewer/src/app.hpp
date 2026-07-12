@@ -690,6 +690,12 @@ namespace viewer
 
         bool unfreeze_all() { return dispatch_op("UNF\t*", /*want_call=*/false); }
 
+        // Write one element of the array at `addr` (elem_desc = its element type).
+        bool set_array_element(const std::string& addr, const std::string& elem_desc, int index, const std::string& value)
+        {
+            return dispatch_op("ARRSET\t" + addr + "\t" + elem_desc + "\t" + std::to_string(index) + "\t" + value, /*want_call=*/false);
+        }
+
         // args: already-tagged tokens (bare literal / @null / @0x<oop> / #text).
         bool call_method(const std::string& cls, const std::string& addr, const std::string& method,
                          const std::string& descriptor, const std::vector<std::string>& args)

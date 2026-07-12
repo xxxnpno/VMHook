@@ -407,6 +407,37 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (cmd == "array-set" && argc >= 7)
+    {
+        // array-set <pid> <0xaddr> <elemDescriptor> <index> <value>
+        const std::uint32_t pid{ (std::uint32_t)std::strtoul(argv[2], nullptr, 10) };
+        const std::string addr{ argv[3] }, elem{ argv[4] }, index{ argv[5] }, value{ argv[6] };
+        wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring w{ exe }; const std::size_t s{ w.find_last_of(L"\\/") };
+        if (s != std::wstring::npos) w.resize(s + 1);
+        const std::wstring dll{ w + L"vmhook_payload.dll" };
+        std::string raw, err;
+        if (!enumerate_raw(pid, dll, raw, err, "ARRSET\t" + addr + "\t" + elem + "\t" + index + "\t" + value))
+        { std::printf("{\"error\":\"%s\"}\n", json_escape(err).c_str()); return 1; }
+        std::string emsg, newval; bool ok{ false };
+        std::size_t p{ 0 };
+        while (p < raw.size())
+        {
+            std::size_t nl{ raw.find('\n', p) };
+            if (nl == std::string::npos) nl = raw.size();
+            const std::string_view line{ raw.data() + p, nl - p };
+            p = nl + 1;
+            if (line.size() >= 2 && line[0] == 'E' && line[1] == '\t') emsg.assign(line.substr(2));
+            else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t')
+            { const std::size_t t2{ line.find('\t', 2) }; if (t2 != std::string_view::npos)
+              { const std::size_t t3{ line.find('\t', t2 + 1) }; newval.assign(line.substr(t2 + 1, (t3 == std::string_view::npos ? line.size() : t3) - (t2 + 1))); ok = true; } }
+        }
+        if (!ok) { std::printf("{\"error\":\"%s\"}\n", json_escape(emsg.empty() ? "array-set failed" : emsg).c_str()); return 1; }
+        std::printf("{\"pid\":%u,\"address\":\"%s\",\"index\":%s,\"value\":\"%s\",\"ok\":true}\n",
+            pid, json_escape(addr).c_str(), index.c_str(), json_escape(newval).c_str());
+        return 0;
+    }
+
     if (cmd == "watch" && argc >= 3)
     {
         // Arm vmhook's on_class_loaded hook, wait, then drain the names of every
@@ -756,7 +787,7 @@ int main(int argc, char** argv)
 
     std::printf("{\"error\":\"usage: vmhook_cli list | enumerate <pid> | classes <pid> [substr] | class <pid> <name> | "
                 "search <pid> <query> [methods|fields|all] | instances <pid> <class> [cap] | statics <pid> <class> | "
-                "array <pid> <0xaddr> <elemDescriptor> [max] | "
+                "array <pid> <0xaddr> <elemDescriptor> [max] | array-set <pid> <0xaddr> <elemDescriptor> <index> <value> | "
                 "watch <pid> [seconds] | watchf <pid> [seconds] | set-instance <pid> <class> <address> <field> <value> | "
                 "set-static <pid> <class> <field> <value> | "
                 "call <pid> <class> <addr|-> <method> <descriptor> [arg...] | "
