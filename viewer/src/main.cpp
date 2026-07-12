@@ -748,8 +748,16 @@ namespace
 
         // One merged column: the class's full path.  The package prefix is drawn
         // dimmed and the class name in its kind colour, over a full-row selectable.
-        if (ImGui::BeginTable("classes", 1,
-                ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate))
+        // A touch more cell padding so the "Class" header + rows sit comfortably
+        // inside the pane instead of hugging the left edge.
+        // PadOuterX: without borders ImGui defaults to NoPadOuterX, so the left
+        // column would sit flush against the edge — force the outer padding so the
+        // "Class" header + rows are inset by CellPadding.x.
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(em(0.9f), ImGui::GetStyle().CellPadding.y));
+        const bool table_open{ ImGui::BeginTable("classes", 1,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_PadOuterX |
+                ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate) };
+        if (table_open)
         {
             ImGui::TableSetupColumn("Class", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableSetupScrollFreeze(0, 1);
@@ -826,6 +834,7 @@ namespace
             }
             ImGui::EndTable();
         }
+        ImGui::PopStyleVar();  // cell padding kept live through the whole table
     }
 
     // Global search across every class's methods or fields.  Called by
