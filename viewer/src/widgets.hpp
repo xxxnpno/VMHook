@@ -237,6 +237,9 @@ namespace ui
         cfg.AnimationDuration = 0.12f;
         cfg.FrameRounding    = 1.0f;   // pill frame — correct/expected for a switch
         cfg.KnobRounding     = 1.0f;
+        // A touch smaller than a full frame-height switch so it sits quietly in
+        // the flat page style; width follows the golden-ratio default.
+        cfg.Size             = ImVec2(0.0f, ImGui::GetFrameHeight() * 0.74f);
         cfg.On.Palette       = &on;
         cfg.Off.Palette      = &off;
         return ImGui::Toggle(label, v, cfg);

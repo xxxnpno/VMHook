@@ -752,7 +752,9 @@ namespace
         // A→Z → Z→A, shown by a little triangle on the right.
         {
             const ImGuiStyle& st{ ImGui::GetStyle() };
-            const float   hpad{ em(0.9f) };
+            // Match the combo/input text inset (FramePadding.x) so "Class" lines
+            // up exactly under "Classes".
+            const float   hpad{ st.FramePadding.x };
             const ImVec2  p0{ ImGui::GetCursorScreenPos() };
             const float   bar_w{ ImGui::GetContentRegionAvail().x };
             const float   bar_h{ ImGui::GetFrameHeight() };
@@ -790,7 +792,7 @@ namespace
         // PadOuterX: without borders ImGui defaults to NoPadOuterX, so the column
         // would sit flush against the edge — force the outer padding + a touch more
         // CellPadding so rows are inset comfortably and align with the header label.
-        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(em(0.9f), ImGui::GetStyle().CellPadding.y));
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ImGui::GetStyle().FramePadding.x, ImGui::GetStyle().CellPadding.y));
         const bool table_open{ ImGui::BeginTable("classes", 1,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_PadOuterX) };
         if (table_open)
