@@ -1708,8 +1708,11 @@ namespace
             {
                 for (const auto& m : cur->methods)
                 {
-                    if (m.name == "<init>" || m.name == "<clinit>") continue;      // not callable here
-                    if (!addr.empty() || (m.access & 0x0008u))                     // static ctx -> statics only
+                    if (m.name == "<clinit>") continue;                            // static initialiser: not callable
+                    // Constructors are only offered on the class itself (its own <init>s,
+                    // not a superclass's), and create a new object rather than taking a receiver.
+                    if (m.name == "<init>" && cur != (it0 == app.name_to_index.end() ? nullptr : &app.classes[(std::size_t)it0->second])) continue;
+                    if (!addr.empty() || (m.access & 0x0008u) || m.name == "<init>")  // static ctx -> statics + ctors
                         methods.push_back({ &m, cls_short(cur->internal_name) });
                 }
                 if (cur->super_name.empty() || cur->super_name == "java/lang/Object") break;
@@ -1732,6 +1735,8 @@ namespace
         const std::string flt{ cs.filter };
         const auto label_of{ [&](const CallM& c) -> std::string
         {
+            if (c.m->name == "<init>")  // constructor -> "new Class(params)"
+                return "new " + c.owner + viewer::pretty_method(c.m->descriptor, false).substr(0, viewer::pretty_method(c.m->descriptor, false).rfind(" :"));
             std::string s{ (c.m->access & 0x0008u) ? "[S] " : "" };
             s += c.m->name;
             s += g_pretty ? viewer::pretty_method(c.m->descriptor, false) : c.m->descriptor;
@@ -1793,7 +1798,7 @@ namespace
         {
             std::vector<std::string> toks;
             for (int a = 0; a < (int)pds.size(); ++a) toks.push_back(call_token(pds[(std::size_t)a], cs.args[a]));
-            app.call_method(cls, is_static ? std::string{} : addr, m.name, m.descriptor, toks);
+            app.call_method(cls, (is_static || m.name == "<init>") ? std::string{} : addr, m.name, m.descriptor, toks);
             cs.pending = true; cs.has_result = false;
         }
         ImGui::EndDisabled();

@@ -47,10 +47,11 @@ Claude/other AIs can drive it (see [`mcp/`](mcp/README.md)).
   its elements in a table; object elements are clickable / grabbable into the clipboard.
 - **Static fields window** — a class's live static values, editable/freezable like
   instance fields, plus a **static-method call** panel.
-- **Call methods** — invoke any method on an instance (or a static): fill arguments
-  from primitives, `#text` new Strings, `@null`, or saved objects, and see the
-  result inline (which you can grab too). Works on every JDK — the call runs inside
-  a hook detour on a real Java thread and dispatches through JNI.
+- **Call methods & construct objects** — invoke any method on an instance (or a
+  static), or a **constructor** to make a new object; fill arguments from primitives,
+  `#text` new Strings, `@null`, or saved objects, and see the result inline (which you
+  can grab). Works on every JDK — the call runs inside a hook detour on a real Java
+  thread and dispatches through JNI.
 - **Live class-load tracking** — turn on **Auto** and new classes appear the moment
   `ClassLoader.defineClass` defines them (an event-driven `on_class_loaded` hook,
   no full re-scan). **Rescan** does a full re-list + diff (also catches unloads).

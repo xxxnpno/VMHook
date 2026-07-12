@@ -273,8 +273,10 @@ TOOLS = [
             "field / a previous call result); or '#<text>' to allocate a new java.lang.String. Returns "
             "{result, kind, ref, refClass, ok:true} where 'kind' is void/bool/int/long/float/double/char/"
             "string/ref and — for an object/String result — 'ref' is the returned object's 0x address "
-            "(reuse it as a @0x argument or with set_*_field). Runs the call inside a real Java thread "
-            "context, so it works on every JDK. Injects the payload if needed."
+            "(reuse it as a @0x argument or with set_*_field). To CONSTRUCT a new object, pass method "
+            "'<init>' with address '-' and the constructor descriptor (…)V — the result 'ref' is the new "
+            "object's address. Runs the call inside a real Java thread context, so it works on every JDK. "
+            "Injects the payload if needed."
         ),
         "inputSchema": {
             "type": "object",

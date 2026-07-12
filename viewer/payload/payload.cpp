@@ -1319,8 +1319,9 @@ namespace
             }
         }
 
+        const bool is_ctor{ name == "<init>" };
         jobject receiverObj{ nullptr };
-        if (!is_static)
+        if (!is_static && !is_ctor)
         {
             receiverObj = oop_to_jobject(env, receiver);
             if (!receiverObj) { return done("could not wrap the receiver object"); }
@@ -1338,6 +1339,22 @@ namespace
             env->ExceptionClear();
             return true;
         } };
+
+        // A constructor CREATES an object (NewObjectA) rather than returning a value.
+        if (is_ctor)
+        {
+            jobject o{ env->NewObjectA(cls, mid, av) };
+            if (threw()) { return done("the constructor threw an exception (see the JVM's stderr)"); }
+            if (!o) { kind = "null"; disp = "null"; return done(""); }
+            void* const oop{ jobject_to_oop(o) };
+            char rb[32]; std::snprintf(rb, sizeof(rb), "0x%llX", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(oop)));
+            raddr = rb; kind = "ref";
+            if (const vmhook::hotspot::symbol* const kn{ k->get_name() }; kn && vmhook::hotspot::is_valid_pointer(kn))
+            { rclass = kn->to_string(); disp = std::string{ "<" } + rclass + ">"; }
+            else { disp = "<object>"; }
+            env->DeleteLocalRef(o);
+            return done("");
+        }
 
         switch (ret)
         {
@@ -1436,7 +1453,7 @@ namespace
             receiver = reinterpret_cast<void*>(static_cast<std::uintptr_t>(std::strtoull(addrs.c_str(), nullptr, 16)));
             if (receiver && !vmhook::hotspot::is_valid_pointer(receiver)) { bail("invalid instance address: " + addrs); return; }
         }
-        if (!is_static && !receiver) { bail("this instance method needs a receiver address"); return; }
+        if (!is_static && !receiver && mname != "<init>") { bail("this instance method needs a receiver address"); return; }
 
         // Invocation must happen INSIDE a detour on a real JavaThread (the JNI
         // Call* path sets up the proper Java frame there).  run_on_java_thread
