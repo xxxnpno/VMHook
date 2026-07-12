@@ -686,7 +686,7 @@ namespace
         ImGui::BeginDisabled(!app.has_baseline.load());
         ui::Toggle("Auto", &g_auto_rescan);
         ImGui::EndDisabled();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Live class-load tracking: arms the on_class_loaded hook + re-scans on load");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Live class-load tracking: arms the on_class_loaded hook and adds each new class\nthe moment ClassLoader.defineClass defines it — no full re-scan. (Rescan button = full list + diff.)");
 
         // Object clipboard toggle (shows the count so it reads at a glance).
         ImGui::SameLine(0.0f, em(0.7f));
@@ -2338,18 +2338,17 @@ namespace
             last_refresh = ImGui::GetTime();
         }
 
-        // Live class-load tracking: arm the on_class_loaded hook and poll it
-        // ~every 1.5s (cheap; an immediate re-scan fires the moment the hook sees
-        // a class defined), with a full re-scan every ~3s as a safety net that
-        // also catches bootstrap classes the hook can't see.
-        static double last_poll{ 0.0 }, last_full{ 0.0 };
-        if (g_auto_rescan && app.has_baseline.load() && !app.busy() && !app.inst_busy() &&
-            (ImGui::GetTime() - last_poll) > 1.5)
+        // Live class-load tracking: purely hook-driven — poll the on_class_loaded
+        // hook ~every second and append just the classes it captured (with their
+        // full surface).  No full re-enumeration/diff; a class shows up the moment
+        // ClassLoader.defineClass defines it.  (A manual Rescan still does the full
+        // list + diff, which additionally catches unloads and bootstrap classes.)
+        static double last_poll{ 0.0 };
+        if (g_auto_rescan && app.has_baseline.load() && !app.any_busy() &&
+            (ImGui::GetTime() - last_poll) > 1.0)
         {
-            const bool full{ (ImGui::GetTime() - last_full) > 3.0 };
-            app.auto_track(full);
+            app.auto_track();
             last_poll = ImGui::GetTime();
-            if (full) last_full = ImGui::GetTime();
         }
 
         const ImGuiViewport* vp{ ImGui::GetMainViewport() };

@@ -370,6 +370,39 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (cmd == "watchf" && argc >= 3)
+    {
+        // Like `watch`, but drains via DRAINF (each new class's FULL surface) — the
+        // hook-driven path the viewer's Auto uses.  Prints the surfaced class names
+        // (the C records) + a method/field count so the payload path is verifiable.
+        const std::uint32_t pid{ (std::uint32_t)std::strtoul(argv[2], nullptr, 10) };
+        const int seconds{ argc >= 4 ? std::atoi(argv[3]) : 5 };
+        wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring w{ exe }; const std::size_t s{ w.find_last_of(L"\\/") };
+        if (s != std::wstring::npos) w.resize(s + 1);
+        const std::wstring dll{ w + L"vmhook_payload.dll" };
+
+        std::string raw, err;
+        if (!enumerate_raw(pid, dll, raw, err, "HOOK"))
+        { std::printf("{\"error\":\"%s\"}\n", json_escape(err).c_str()); return 1; }
+        if (raw.find("H\t1") == std::string::npos)
+        { std::printf("{\"pid\":%u,\"armed\":false}\n", pid); return 1; }
+
+        Sleep((seconds > 0 ? seconds : 5) * 1000);
+        raw.clear();
+        if (!enumerate_raw(pid, dll, raw, err, "DRAINF"))
+        { std::printf("{\"error\":\"%s\"}\n", json_escape(err).c_str()); return 1; }
+
+        auto classes{ parse(raw) };
+        std::printf("{\"pid\":%u,\"armed\":true,\"seconds\":%d,\"new_classes\":[", pid, seconds);
+        for (std::size_t i = 0; i < classes.size(); ++i)
+            std::printf("%s{\"name\":\"%s\",\"methods\":%zu,\"fields\":%zu}", i ? "," : "",
+                        json_escape(classes[i].internal_name).c_str(),
+                        classes[i].methods.size(), classes[i].fields.size());
+        std::printf("]}\n");
+        return 0;
+    }
+
     if ((cmd == "set-instance" || cmd == "set-static") && argc >= 5)
     {
         const bool is_instance{ cmd == "set-instance" };
@@ -637,7 +670,7 @@ int main(int argc, char** argv)
 
     std::printf("{\"error\":\"usage: vmhook_cli list | enumerate <pid> | classes <pid> [substr] | class <pid> <name> | "
                 "search <pid> <query> [methods|fields|all] | instances <pid> <class> [cap] | statics <pid> <class> | "
-                "watch <pid> [seconds] | set-instance <pid> <class> <address> <field> <value> | "
+                "watch <pid> [seconds] | watchf <pid> [seconds] | set-instance <pid> <class> <address> <field> <value> | "
                 "set-static <pid> <class> <field> <value> | "
                 "call <pid> <class> <addr|-> <method> <descriptor> [arg...] | "
                 "freeze <pid> <I|S> <class> <addr|-> <field> <value> | unfreeze <pid> <key|*>\"}\n");

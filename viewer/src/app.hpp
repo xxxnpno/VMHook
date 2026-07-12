@@ -587,11 +587,12 @@ namespace viewer
             worker = std::thread([this, pid, dll] { run_enumerate(pid, dll, /*inject=*/false); });
         }
 
-        // Live tracking: arm the on_class_loaded hook (once), drain the class
-        // names it captured, and — if any (or on the periodic `full` tick) —
-        // re-enumerate so the new classes surface with a green mark.  Driven from
+        // Live tracking: arm the on_class_loaded hook (once) and drain the classes
+        // it captured, APPENDING just those new classes (with their full surface) to
+        // the model — no full re-enumeration/diff.  Purely event-driven: a class
+        // appears the moment ClassLoader.defineClass defines it.  Driven from
         // render_ui while "Auto" is on.
-        void auto_track(bool full)
+        void auto_track()
         {
             if (any_busy() || attached_pid_ == 0 || !has_baseline.load())
             {
@@ -601,10 +602,8 @@ namespace viewer
             {
                 worker.join();
             }
-            const std::uint32_t pid{ attached_pid_ };
-            const std::wstring  dll{ attached_dll_ };
             status.store(Status::Receiving);
-            worker = std::thread([this, pid, dll, full] { run_auto_tracking(pid, dll, full); });
+            worker = std::thread([this] { run_auto_tracking(); });
         }
 
         // Fetch the class mirror's live static-field values (STAT).  Same reuse
@@ -805,7 +804,7 @@ namespace viewer
             return true;
         }
 
-        void run_auto_tracking(std::uint32_t pid, std::wstring dll, bool full)
+        void run_auto_tracking()
         {
             // 1) Arm the class-load hook once (payload replies "H\t1" on success).
             if (!hook_armed.load())
@@ -814,45 +813,59 @@ namespace viewer
                 if (pipe_exchange("HOOK", raw))
                     hook_armed.store(raw.find("H\t1") != std::string::npos);
             }
-            // 2) Drain the names the hook captured since the last poll.
-            std::size_t drained{ 0 };
-            if (hook_armed.load())
+            if (!hook_armed.load()) { status.store(Status::Done); return; }
+
+            // 2) Drain the hook — DRAINF streams each newly-defined class's full
+            //    surface (C/M/F), so we can ADD those classes without re-listing
+            //    everything.  Most polls drain nothing (a cheap no-op).
+            std::string raw;
+            if (!pipe_exchange("DRAINF", raw)) { status.store(Status::Done); return; }
+
+            std::vector<ClassInfo> parsed;
+            bool done{ false };
+            std::size_t p{ 0 };
+            while (p < raw.size())
             {
-                std::string raw;
-                if (pipe_exchange("DRAIN", raw))
+                const std::size_t nl{ raw.find('\n', p) };
+                const std::size_t end{ nl == std::string::npos ? raw.size() : nl };
+                parse_line(std::string_view{ raw }.substr(p, end - p), parsed, done);
+                p = (nl == std::string::npos ? raw.size() : nl + 1);
+            }
+            for (ClassInfo& c : parsed) split_name(c);
+
+            // 3) Append only the genuinely-new classes (dedup by name), each marked
+            //    new + stamped with its REAL arrival time.
+            const double t{ now_s() };
+            int added{ 0 };
+            {
+                std::lock_guard<std::mutex> lock{ data_mutex };
+                for (ClassInfo& c : parsed)
                 {
-                    std::vector<std::string> names;
-                    std::size_t p{ 0 };
-                    while (p < raw.size())
-                    {
-                        const std::size_t nl{ raw.find('\n', p) };
-                        const std::size_t end{ nl == std::string::npos ? raw.size() : nl };
-                        const std::string_view line{ raw.data() + p, end - p };
-                        p = (nl == std::string::npos ? raw.size() : nl + 1);
-                        if (line.size() >= 2 && line[0] == 'N' && line[1] == '\t')
-                            names.emplace_back(line.substr(2));
-                    }
-                    drained = names.size();
-                    if (!names.empty())
-                    {
-                        std::lock_guard<std::mutex> lock{ data_mutex };
-                        for (auto& n : names) hook_recent.push_back(std::move(n));
-                        if (hook_recent.size() > 500)
-                            hook_recent.erase(hook_recent.begin(), hook_recent.end() - 500);
-                        hook_total.fetch_add(drained);
-                    }
+                    if (c.internal_name.empty() || name_to_index.count(c.internal_name)) continue;
+                    c.is_new = true;
+                    c.seen_epoch = t;
+                    name_to_index.emplace(c.internal_name, static_cast<int>(classes.size()));
+                    prev_names_.insert(c.internal_name);   // a later full Rescan won't re-flag it
+                    class_seen_[c.internal_name] = t;
+                    hook_recent.push_back(c.internal_name);
+                    classes.push_back(std::move(c));
+                    ++added;
+                }
+                if (hook_recent.size() > 500)
+                    hook_recent.erase(hook_recent.begin(), hook_recent.end() - 500);
+                if (added > 0)
+                {
+                    classes_streamed.store(classes.size());
+                    status_message = "+" + std::to_string(added) + " new class(es) via hook  ("
+                                   + std::to_string(classes.size()) + " total)";
                 }
             }
-            // 3) Re-enumerate when the hook saw loads, or on the periodic full tick;
-            //    otherwise it was a cheap no-op poll — just settle the status.
-            if (drained > 0 || full)
+            if (added > 0)
             {
-                run_enumerate(pid, dll, /*inject=*/false);  // sets status + diff + publish
+                last_added.fetch_add(added);
+                hook_total.fetch_add(static_cast<std::uint64_t>(added));
             }
-            else
-            {
-                status.store(Status::Done);
-            }
+            status.store(Status::Done);
         }
 
         // status_message is read by the UI thread under data_mutex; every write

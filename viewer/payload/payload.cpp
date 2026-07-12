@@ -42,6 +42,9 @@
 //   "HOOK"          -> arm the ClassLoader.defineClass hook; reply H <TAB> <1|0>.
 //   "DRAIN"         -> stream (and clear) hook-captured class names as N records:
 //                        N <TAB> internal/Class/Name
+//   "DRAINF"        -> drain the hook and stream each newly-defined class's FULL
+//                        surface (C/M/F), so the viewer can ADD just those classes
+//                        without re-enumerating everything.
 // Access-flag fields are decimal JVM class-file flag words.
 //
 // Method invocation and building a new java.lang.String both need a live
@@ -260,6 +263,72 @@ namespace
         }
     };
 
+    // Emit one class's full surface (C + M + F records) — shared by the full
+    // enumeration and the hook-driven "new class" stream so both are byte-identical.
+    void emit_class_surface(pipe_writer& writer, const std::string& name, vmhook::hotspot::klass* const klass)
+    {
+        writer.put("C\t");
+        writer.put(name);
+        writer.put("\t");
+        // Superclass internal name (empty for java/lang/Object / interfaces).
+        if (vmhook::hotspot::klass* const super_klass{ klass->get_super() };
+            super_klass && vmhook::hotspot::is_valid_pointer(super_klass))
+        {
+            if (const vmhook::hotspot::symbol* const super_name{ super_klass->get_name() };
+                super_name && vmhook::hotspot::is_valid_pointer(super_name))
+            {
+                writer.put(super_name->to_string());
+            }
+        }
+        writer.put("\t");
+        // Class-file access flags (interface/enum/abstract/... kind + vis).
+        writer.put(std::to_string(klass->get_class_access_flags()));
+        writer.put("\n");
+
+        // Declared methods: (name, descriptor, access flags).  Array klasses have
+        // no _methods array, so skip them ('[' names).
+        if (name.empty() || name.front() != '[')
+        {
+            const std::int32_t method_count{ klass->get_methods_count() };
+            vmhook::hotspot::method** const methods{ klass->get_methods_ptr() };
+            if (methods && method_count > 0)
+            {
+                for (std::int32_t mi = 0; mi < method_count; ++mi)
+                {
+                    vmhook::hotspot::method* const m{ methods[mi] };
+                    if (!m || !vmhook::hotspot::is_valid_pointer(m))
+                    {
+                        continue;
+                    }
+                    std::uint32_t flags{ 0 };
+                    if (std::uint32_t* const fp{ m->get_access_flags() })
+                    {
+                        vmhook::os::safe_read(&flags, fp, sizeof(flags));
+                    }
+                    writer.put("M\t");
+                    writer.put(m->get_name());
+                    writer.put("\t");
+                    writer.put(m->get_signature());
+                    writer.put("\t");
+                    writer.put(std::to_string(flags));
+                    writer.put("\n");
+                }
+            }
+        }
+
+        // Declared fields: (name, descriptor, access flags).
+        for (const auto& [field_name, field_descriptor, access_flags] : klass->collect_fields())
+        {
+            writer.put("F\t");
+            writer.put(field_name);
+            writer.put("\t");
+            writer.put(field_descriptor);
+            writer.put("\t");
+            writer.put(std::to_string(access_flags));
+            writer.put("\n");
+        }
+    }
+
     void stream_to(HANDLE pipe)
     {
         pipe_writer writer{ pipe };
@@ -282,67 +351,7 @@ namespace
                     return;
                 }
                 ++class_count;
-
-                writer.put("C\t");
-                writer.put(name);
-                writer.put("\t");
-                // Superclass internal name (empty for java/lang/Object / interfaces).
-                if (vmhook::hotspot::klass* const super_klass{ klass->get_super() };
-                    super_klass && vmhook::hotspot::is_valid_pointer(super_klass))
-                {
-                    if (const vmhook::hotspot::symbol* const super_name{ super_klass->get_name() };
-                        super_name && vmhook::hotspot::is_valid_pointer(super_name))
-                    {
-                        writer.put(super_name->to_string());
-                    }
-                }
-                writer.put("\t");
-                // Class-file access flags (interface/enum/abstract/... kind + vis).
-                writer.put(std::to_string(klass->get_class_access_flags()));
-                writer.put("\n");
-
-                // Declared methods: (name, descriptor, access flags).  Array
-                // klasses have no _methods array, so skip them ('[' names).
-                if (name.empty() || name.front() != '[')
-                {
-                    const std::int32_t method_count{ klass->get_methods_count() };
-                    vmhook::hotspot::method** const methods{ klass->get_methods_ptr() };
-                    if (methods && method_count > 0)
-                    {
-                        for (std::int32_t mi = 0; mi < method_count; ++mi)
-                        {
-                            vmhook::hotspot::method* const m{ methods[mi] };
-                            if (!m || !vmhook::hotspot::is_valid_pointer(m))
-                            {
-                                continue;
-                            }
-                            std::uint32_t flags{ 0 };
-                            if (std::uint32_t* const fp{ m->get_access_flags() })
-                            {
-                                vmhook::os::safe_read(&flags, fp, sizeof(flags));
-                            }
-                            writer.put("M\t");
-                            writer.put(m->get_name());
-                            writer.put("\t");
-                            writer.put(m->get_signature());
-                            writer.put("\t");
-                            writer.put(std::to_string(flags));
-                            writer.put("\n");
-                        }
-                    }
-                }
-
-                // Declared fields: (name, descriptor, access flags).
-                for (const auto& [field_name, field_descriptor, access_flags] : klass->collect_fields())
-                {
-                    writer.put("F\t");
-                    writer.put(field_name);
-                    writer.put("\t");
-                    writer.put(field_descriptor);
-                    writer.put("\t");
-                    writer.put(std::to_string(access_flags));
-                    writer.put("\n");
-                }
+                emit_class_surface(writer, name, klass);
             });
 
         writer.put("DONE\t");
@@ -1323,6 +1332,36 @@ namespace
         FlushFileBuffers(pipe);
     }
 
+    // DRAINF request: drain the hook and stream each newly-defined class's FULL
+    // surface (C/M/F), so the viewer can add just those classes to its list
+    // WITHOUT re-enumerating everything.  The class is fully defined by drain time
+    // (defineClass has returned), so its methods/fields resolve.  Deduped per batch;
+    // a name whose klass can't be resolved (unloaded / not yet linked) is skipped.
+    void stream_hook_drain_full(HANDLE pipe)
+    {
+        std::vector<std::string> names;
+        {
+            std::lock_guard<std::mutex> lock{ g_hook_mtx };
+            names.swap(g_hook_log);
+        }
+        pipe_writer writer{ pipe };
+        std::unordered_set<std::string> seen;
+        std::uint64_t count{ 0 };
+        for (const std::string& n : names)
+        {
+            if (n.empty() || !seen.insert(n).second) { continue; }
+            vmhook::hotspot::klass* const k{ vmhook::find_class(n) };
+            if (!k || !vmhook::hotspot::is_valid_pointer(k)) { continue; }
+            emit_class_surface(writer, n, k);
+            ++count;
+        }
+        writer.put("DONE\t");
+        writer.put(std::to_string(count));
+        writer.put("\n");
+        writer.flush();
+        FlushFileBuffers(pipe);
+    }
+
     // Serve every attach: the payload stays loaded and, each time a viewer/CLI
     // creates the pipe server, connects to it and streams whatever the current
     // request asks for (class surface by default, or live instances).  This makes
@@ -1386,6 +1425,10 @@ namespace
             else if (req == "DRAIN")
             {
                 stream_hook_drain(pipe);
+            }
+            else if (req == "DRAINF")
+            {
+                stream_hook_drain_full(pipe);
             }
             else
             {
