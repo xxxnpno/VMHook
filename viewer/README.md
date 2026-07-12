@@ -31,11 +31,29 @@ Claude/other AIs can drive it (see [`mcp/`](mcp/README.md)).
   superclass chain (inherited rows dimmed, hover shows the declaring class); it
   also drives **Copy all**.
 - **Live heap inspection** — pick a class and hit **Live instances** to scan the
-  heap for its live objects. Each instance's **address** and **field values** show
-  in a **sortable, filterable, live-updating grid** — own *and* inherited fields
-  (inherited columns dimmed, toggle to hide), colour-coded by type (strings, refs,
-  booleans, null). Click a row for a vertical Field / Value / From detail popup;
-  ref values and the address are copyable; **Copy table** exports the rows as TSV.
+  heap for its live objects, shown master/detail: a clickable instance list on the
+  left, the selected object's **Field / Value** table on the right — own *and*
+  inherited fields, colour-coded by type (strings, refs, booleans, null), live-
+  updating, sortable and filterable. Ref values are clickable (jump to the class).
+- **Edit & freeze fields** — every instance/static field row has inline actions:
+  ✏ **edit** the value (primitive text, a new `String`, `null`, a `0x` oop, or a
+  saved object), and 🔒 **freeze** it — a payload thread then re-writes it ~50×/s so
+  it holds against the running program until you unlock it. A **frozen: N**
+  indicator in the status bar lists every freeze with one-click / bulk unfreeze.
+- **Object clipboard** — 📌 grab any object (a reference field, an instance, a call
+  result) into a **Saved objects** strip, then **drag a chip onto a field or a
+  method argument** to place it. Repoint references and pass objects around live.
+- **Static fields window** — a class's live static values, editable/freezable like
+  instance fields, plus a **static-method call** panel.
+- **Call methods** — invoke any method on an instance (or a static): fill arguments
+  from primitives, `#text` new Strings, `@null`, or saved objects, and see the
+  result inline (which you can grab too). Works on every JDK — the call runs inside
+  a hook detour on a real Java thread and dispatches through JNI.
+- **Live class-load tracking** — turn on **Auto** and new classes appear the moment
+  `ClassLoader.defineClass` defines them (an event-driven `on_class_loaded` hook,
+  no full re-scan). **Rescan** does a full re-list + diff (also catches unloads).
+- **Sort the class list** by name, package, **age** (when a class first appeared),
+  kind, or member count — ascending or descending.
 - **Ctrl +/−/0** scales the UI font for accessibility / dense listings.
 - One-click **Copy all** (Java-like listing) / **Export .txt**.
 - Re-attach works (the payload serves every attach; no restart needed).
@@ -106,3 +124,6 @@ is self-contained when injected.
 | live instances of a class| `vmhook::for_each_instance_of` (added) + `vmhook::get_field<T>` |
 | a field's value          | `vmhook::get_field<T>` / `read_java_string` / `decode_oop_pointer` |
 | a class's static values  | `klass::get_java_mirror()` + `vmhook::get_field<T>` (mirror-relative offset) |
+| write / freeze a field   | `vmhook::set_field<T>` (freeze = a payload thread re-writing it ~50×/s) |
+| call a method            | JNI `Call*MethodA` run inside a `vmhook::hook` detour on a real JavaThread |
+| new-class notifications  | `vmhook::on_class_loaded` (deopted `ClassLoader.defineClass` detour) |

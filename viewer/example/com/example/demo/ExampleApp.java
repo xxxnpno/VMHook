@@ -69,6 +69,10 @@ public class ExampleApp
     public  double  compute(int a, double b)                   { return a * b + ratio; }
     public  String  describe(int n, String s, boolean flag)    { return label + ":" + n + ":" + s + ":" + flag; }
     public  long[]  snapshot()                                 { return history.clone(); }
+    // Object-argument methods — demo passing a SAVED object from the viewer's
+    // clipboard as a method argument (grab one Worker's `inner`, then call these).
+    public  int     innerValueOf(Inner in)                     { return in == null ? -1 : in.innerValue; }
+    public  void    adopt(Inner other)                         { this.inner = other; }
     public  static  void tick()                                { tickCounter++; }
     public  static  int  scoreOf(String who)                   { return scores.getOrDefault(who, 0); }
 
