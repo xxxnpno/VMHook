@@ -24,7 +24,12 @@ namespace ui
         const ImVec4* c{ ImGui::GetStyle().Colors };
         const ImVec4 accent{ c[ImGuiCol_SliderGrab] };
         const ImVec4 accentHi{ c[ImGuiCol_SliderGrabActive] };
-        int colors{ 0 }, vars{ 0 };
+        // Compact buttons that sit in the page's flat-frame family: narrower
+        // horizontal padding (height kept = frame height so they stay aligned
+        // with combos/inputs on a shared row).
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+            ImVec2(ImGui::GetStyle().FramePadding.x * 0.72f, ImGui::GetStyle().FramePadding.y));
+        int colors{ 0 }, vars{ 1 };
         if (kind == BtnPrimary)
         {
             ImGui::PushStyleColor(ImGuiCol_Button,        accent);
@@ -39,7 +44,7 @@ namespace ui
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.09f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1, 1, 1, 0.15f));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-            colors = 3; vars = 1;
+            colors = 3; vars = 2;
         }
         else if (kind == BtnDanger)
         {
@@ -47,10 +52,17 @@ namespace ui
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.86f, 0.26f, 0.26f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.70f, 0.17f, 0.17f, 1.0f));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-            colors = 3; vars = 1;
+            colors = 3; vars = 2;
+        }
+        else  // BtnNeutral — look like a flat frame cell (matches the combos/inputs)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button,        c[ImGuiCol_FrameBg]);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, c[ImGuiCol_FrameBgHovered]);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  c[ImGuiCol_FrameBgActive]);
+            colors = 3;
         }
         const bool pressed{ ImGui::Button(label, size) };
-        if (vars)   ImGui::PopStyleVar(vars);
+        ImGui::PopStyleVar(vars);
         if (colors) ImGui::PopStyleColor(colors);
         return pressed;
     }

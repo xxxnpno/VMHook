@@ -149,7 +149,7 @@ namespace
         s.WindowRounding = 8.0f; s.ChildRounding = 6.0f; s.FrameRounding = 5.0f;
         s.PopupRounding = 6.0f; s.GrabRounding = 4.0f; s.ScrollbarRounding = 9.0f; s.TabRounding = 6.0f;
         // Spacing / padding.
-        s.WindowPadding = ImVec2(14, 12); s.FramePadding = ImVec2(12, 6);
+        s.WindowPadding = ImVec2(14, 12); s.FramePadding = ImVec2(12, 5);
         s.ItemSpacing = ImVec2(8, 7); s.ItemInnerSpacing = ImVec2(7, 5); s.CellPadding = ImVec2(10, 6);
         s.ScrollbarSize = 12.0f; s.GrabMinSize = 10.0f;
         // Crisp 1px borders on frames — the signature of a clean flat tool UI.
@@ -266,6 +266,7 @@ namespace
     bool         g_focus_search{ false };
     int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
     int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
+    int          g_class_sort{ 0 };    // class list: 0=natural, 1=A→Z, 2=Z→A
     std::wstring g_dll_path{};
     std::vector<int> g_filtered;  // rebuilt each frame from the search box
     // Global member-search results: (class index, member index) pairs.
@@ -746,32 +747,55 @@ namespace
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%d / %zu classes", (int)g_filtered.size(), app.classes.size());
 
-        // One merged column: the class's full path.  The package prefix is drawn
-        // dimmed and the class name in its kind colour, over a full-row selectable.
-        // A touch more cell padding so the "Class" header + rows sit comfortably
-        // inside the pane instead of hugging the left edge.
-        // PadOuterX: without borders ImGui defaults to NoPadOuterX, so the left
-        // column would sit flush against the edge — force the outer padding so the
-        // "Class" header + rows are inset by CellPadding.x.
+        // Custom "Class" header — a rounded frame matching the combo/input cells
+        // (ImGui table headers can't be rounded).  Click to cycle sort: natural →
+        // A→Z → Z→A, shown by a little triangle on the right.
+        {
+            const ImGuiStyle& st{ ImGui::GetStyle() };
+            const float   hpad{ em(0.9f) };
+            const ImVec2  p0{ ImGui::GetCursorScreenPos() };
+            const float   bar_w{ ImGui::GetContentRegionAvail().x };
+            const float   bar_h{ ImGui::GetFrameHeight() };
+            const ImVec2  p1{ p0.x + bar_w, p0.y + bar_h };
+            if (ImGui::InvisibleButton("##classhdr", ImVec2(bar_w, bar_h))) g_class_sort = (g_class_sort + 1) % 3;
+            const bool    hov{ ImGui::IsItemHovered() };
+            if (hov) ImGui::SetTooltip("Sort by name (%s)", g_class_sort == 0 ? "click to A→Z" : g_class_sort == 1 ? "A→Z" : "Z→A");
+            ImDrawList* dl{ ImGui::GetWindowDrawList() };
+            dl->AddRectFilled(p0, p1, ImGui::GetColorU32(hov ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), st.FrameRounding);
+            if (st.FrameBorderSize > 0.0f)
+                dl->AddRect(p0, p1, ImGui::GetColorU32(ImGuiCol_Border), st.FrameRounding, 0, st.FrameBorderSize);
+            dl->AddText(ImVec2(p0.x + hpad, p0.y + (bar_h - ImGui::GetFontSize()) * 0.5f),
+                        ImGui::GetColorU32(ImGuiCol_Text), "Class");
+            if (g_class_sort != 0)
+            {
+                const float  cx{ p1.x - hpad }, cy{ p0.y + bar_h * 0.5f }, tr{ em(0.22f) };
+                const ImU32  ac{ ImGui::GetColorU32(ImGuiCol_Text) };
+                if (g_class_sort == 1)  // A→Z, triangle up
+                    dl->AddTriangleFilled(ImVec2(cx, cy - tr), ImVec2(cx - tr, cy + tr), ImVec2(cx + tr, cy + tr), ac);
+                else                    // Z→A, triangle down
+                    dl->AddTriangleFilled(ImVec2(cx - tr, cy - tr), ImVec2(cx + tr, cy - tr), ImVec2(cx, cy + tr), ac);
+            }
+        }
+        if (g_class_sort != 0)
+        {
+            const bool asc{ g_class_sort == 1 };
+            std::sort(g_filtered.begin(), g_filtered.end(), [&](int a, int b)
+            {
+                const int cmp{ app.classes[(std::size_t)a].internal_name.compare(app.classes[(std::size_t)b].internal_name) };
+                return asc ? cmp < 0 : cmp > 0;
+            });
+        }
+
+        // Headerless table (the rounded header above replaces the built-in one).
+        // PadOuterX: without borders ImGui defaults to NoPadOuterX, so the column
+        // would sit flush against the edge — force the outer padding + a touch more
+        // CellPadding so rows are inset comfortably and align with the header label.
         ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(em(0.9f), ImGui::GetStyle().CellPadding.y));
         const bool table_open{ ImGui::BeginTable("classes", 1,
-                ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_PadOuterX |
-                ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate) };
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_PadOuterX) };
         if (table_open)
         {
             ImGui::TableSetupColumn("Class", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableHeadersRow();
-
-            if (ImGuiTableSortSpecs* sort = ImGui::TableGetSortSpecs(); sort && sort->SpecsCount > 0)
-            {
-                const bool asc{ sort->Specs[0].SortDirection == ImGuiSortDirection_Ascending };
-                std::sort(g_filtered.begin(), g_filtered.end(), [&](int a, int b)
-                {
-                    const int cmp{ app.classes[(std::size_t)a].internal_name.compare(app.classes[(std::size_t)b].internal_name) };
-                    return asc ? cmp < 0 : cmp > 0;
-                });
-            }
 
             ImGuiListClipper clipper;
             clipper.Begin((int)g_filtered.size());
