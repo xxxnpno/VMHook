@@ -1477,18 +1477,20 @@ namespace
     }
     inline bool desc_is_ref(const std::string& d) { return !d.empty() && (d[0] == 'L' || d[0] == '['); }
 
-    // Freeze / unfreeze through the app AND keep the UI's freeze registry in sync
-    // (so the Frozen overview shows every active freeze + its held value).
+    // Freeze / unfreeze through the app AND keep the UI's freeze registry in sync.
+    // Only record the change if the request was ACTUALLY dispatched — otherwise
+    // (a channel was busy so the op was dropped) the registry would claim a freeze
+    // that never reached the VM, and the lock icon / overview would lie.
     void ui_freeze(viewer::App& app, char scope, const std::string& cls, const std::string& addr,
                    const std::string& field, const std::string& value)
     {
-        app.freeze_field(scope, cls, addr, field, value);
-        g_frozen[frozen_key(scope, cls, addr, field)] = FrozenField{ scope, cls, addr, field, value };
+        if (app.freeze_field(scope, cls, addr, field, value))
+            g_frozen[frozen_key(scope, cls, addr, field)] = FrozenField{ scope, cls, addr, field, value };
     }
     void ui_unfreeze(viewer::App& app, char scope, const std::string& cls, const std::string& addr, const std::string& field)
     {
-        app.unfreeze_field(scope, cls, addr, field);
-        g_frozen.erase(frozen_key(scope, cls, addr, field));
+        if (app.unfreeze_field(scope, cls, addr, field))
+            g_frozen.erase(frozen_key(scope, cls, addr, field));
     }
 
     // Turn a displayed field value into a token accepted by the payload's writer:
@@ -1519,7 +1521,10 @@ namespace
     void obj_drag_source(const std::string& addr, const std::string& cls, const std::string& label)
     {
         if (addr.empty() || addr == "null") return;
-        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None))
+        // SourceAllowNullID: a reference VALUE is often rendered with TextWrapped
+        // (item ID 0) when its class isn't a resolvable link, and BeginDragDropSource
+        // refuses a null-ID source without this flag (asserts in a debug build).
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID))
         {
             DragObj d{};
             std::snprintf(d.address, sizeof(d.address), "%s", addr.c_str());
@@ -2544,7 +2549,7 @@ namespace
                 ImGui::TextDisabled("(none)");
             else
             {
-                if (ui::Button("Unfreeze all", ImVec2(0, 0), ui::BtnDanger)) { app.unfreeze_all(); g_frozen.clear(); }
+                if (ui::Button("Unfreeze all", ImVec2(0, 0), ui::BtnDanger)) { if (app.unfreeze_all()) g_frozen.clear(); }
                 ImGui::Spacing();
                 ImGui::BeginChild("frzlist", ImVec2(em(34.0f), (std::min)((float)g_frozen.size() + 0.5f, 14.0f) * em(1.7f)));
                 if (ImGui::BeginTable("frztbl", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH))

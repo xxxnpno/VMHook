@@ -631,54 +631,62 @@ namespace viewer
         // ── one-shot mutating operations (set / freeze / unfreeze / call) ─────
         // Each builds a request line, runs it on the worker, and publishes an
         // OpResult the UI consumes when op_seq changes.  scope = 'I' instance,
-        // 'S' static.  All are no-ops while any channel is busy.
-        void set_field_value(char scope, const std::string& cls, const std::string& addr,
+        // 'S' static.  Return TRUE only if the op was actually dispatched — the UI
+        // relies on this to keep its freeze registry honest (a request dropped
+        // because a channel is busy must NOT be recorded as applied).
+        bool set_field_value(char scope, const std::string& cls, const std::string& addr,
                              const std::string& field, const std::string& value)
         {
             const std::string tag{ scope == 'S' ? "SETS\t" : "SETI\t" };
             const std::string req{ scope == 'S'
                 ? tag + cls + "\t" + field + "\t" + value
                 : tag + cls + "\t" + addr + "\t" + field + "\t" + value };
-            dispatch_op(req, /*want_call=*/false);
+            return dispatch_op(req, /*want_call=*/false);
         }
 
-        void freeze_field(char scope, const std::string& cls, const std::string& addr,
+        bool freeze_field(char scope, const std::string& cls, const std::string& addr,
                           const std::string& field, const std::string& value)
         {
             std::string req{ "FRZ\t" };
             req += (scope == 'S' ? "S" : "I");
             req += "\t" + cls + "\t" + (scope == 'S' ? std::string{} : addr) + "\t" + field + "\t" + value;
-            dispatch_op(req, /*want_call=*/false);
+            return dispatch_op(req, /*want_call=*/false);
         }
 
-        void unfreeze_field(char scope, const std::string& cls, const std::string& addr, const std::string& field)
+        bool unfreeze_field(char scope, const std::string& cls, const std::string& addr, const std::string& field)
         {
             std::string key(1, scope);
             key += '|'; key += cls;
             key += '|'; if (scope == 'I') { key += addr; }
             key += '|'; key += field;
-            dispatch_op("UNF\t" + key, /*want_call=*/false);
+            return dispatch_op("UNF\t" + key, /*want_call=*/false);
         }
 
-        void unfreeze_all() { dispatch_op("UNF\t*", /*want_call=*/false); }
+        bool unfreeze_all() { return dispatch_op("UNF\t*", /*want_call=*/false); }
 
         // args: already-tagged tokens (bare literal / @null / @0x<oop> / #text).
-        void call_method(const std::string& cls, const std::string& addr, const std::string& method,
+        bool call_method(const std::string& cls, const std::string& addr, const std::string& method,
                          const std::string& descriptor, const std::vector<std::string>& args)
         {
             std::string req{ "CALL\t" + cls + "\t" + (addr.empty() ? "-" : addr) + "\t"
                              + method + "\t" + descriptor + "\t" + std::to_string(args.size()) };
-            for (const std::string& a : args) { req += "\t"; req += a; }
-            dispatch_op(req, /*want_call=*/true);
+            for (const std::string& a : args)
+            {
+                std::string t{ a };  // a tab/newline in an arg would split it into extra fields
+                for (char& c : t) if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+                req += "\t"; req += t;
+            }
+            return dispatch_op(req, /*want_call=*/true);
         }
 
     private:
-        void dispatch_op(const std::string& request, bool want_call)
+        bool dispatch_op(const std::string& request, bool want_call)
         {
-            if (any_busy() || attached_pid_ == 0) { return; }
+            if (any_busy() || attached_pid_ == 0) { return false; }
             if (worker.joinable()) { worker.join(); }
             op_status.store(Status::Receiving);
             worker = std::thread([this, request, want_call] { run_op(request, want_call); });
+            return true;
         }
 
         // Run a mutating request over the pipe and parse its V / R / E reply into

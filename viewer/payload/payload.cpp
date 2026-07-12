@@ -211,17 +211,49 @@ namespace
         }
 
         std::unique_lock<std::mutex> lk{ g_task_mtx };
-        g_task_cv.wait_for(lk, std::chrono::seconds(5), [] { return g_task_done; });
-        const bool ran{ g_task_done };
-        if (!ran) { g_task = nullptr; g_task_pending.store(false); }
-        return ran;
+        if (!g_task_cv.wait_for(lk, std::chrono::seconds(5), [] { return g_task_done; }))
+        {
+            // Timed out.  If the job was never dequeued, nobody holds our closure —
+            // abandon it safely.  But if it was ALREADY dequeued (pending cleared),
+            // some JavaThread is running it right now with references into THIS
+            // caller's stack; we must NOT return and let the caller unwind, or the
+            // late write faults.  Wait it out (bounded) so the closure outlives the job.
+            if (g_task_pending.load())
+            {
+                g_task = nullptr;
+                g_task_pending.store(false);
+                return false;
+            }
+            g_task_cv.wait_for(lk, std::chrono::seconds(30), [] { return g_task_done; });
+        }
+        return g_task_done;
     }
 
-    // make_java_string, but on a real JavaThread (via the trigger detour).
+    // Allocate a java.lang.String on a real JavaThread (via the trigger detour)
+    // and return its heap oop.  Uses JNI NewStringUTF (robust on every JDK, unlike
+    // the pure-VM make_java_string which fails to allocate from this context) and
+    // pins it with a global ref so it survives GC after the detour's frame pops
+    // (the value is about to be written into / held by a field).  GC caveat: a
+    // relocating collection moves the pinned object, so the RAW address returned
+    // can go stale — best-effort, like every raw-oop path here.
     auto alloc_java_string(const std::string& text) -> void*
     {
         void* out{ nullptr };
-        run_on_java_thread([&] { out = vmhook::make_java_string(text); });
+        run_on_java_thread([&]
+        {
+            JNIEnv* env{ nullptr };
+            if (!g_jvm || g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env) { return; }
+            jstring js{ env->NewStringUTF(text.c_str()) };
+            if (env->ExceptionCheck()) { env->ExceptionClear(); }
+            if (!js) { return; }
+            // Read the oop from the LOCAL ref (untagged; a raw deref is valid).  A
+            // JNI GLOBAL ref is tag-bit-encoded in HotSpot, so we must NOT deref it
+            // as a raw pointer — we only create one to PIN the object alive past
+            // this frame, and keep using the address read from the local ref.
+            out = *reinterpret_cast<void**>(js);
+            env->NewGlobalRef(js);  // pin (kept alive; intentionally not released)
+            env->DeleteLocalRef(js);
+        });
         return out;
     }
 
@@ -696,16 +728,10 @@ namespace
                 vmhook::set_field<std::uint32_t>(base, k, name, 0u);
                 break;
             }
-            if (desc == "Ljava/lang/String;")
-            {
-                void* const s{ alloc_java_string(value) };  // runs on a real JavaThread
-                if (!s || !vmhook::hotspot::is_valid_pointer(s))
-                {
-                    return "failed to allocate a java.lang.String for the new value";
-                }
-                vmhook::set_field<std::uint32_t>(base, k, name, vmhook::hotspot::encode_oop_pointer(s));
-                break;
-            }
+            // Repoint by raw oop FIRST — this is the pre-resolved form the freeze
+            // thread re-applies, and it needs no JavaThread (a plain compressed-oop
+            // write).  Only a NON-0x value for a String field allocates a new String
+            // (which requires a JavaThread — off the freeze thread's hot path).
             if (value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0)
             {
                 void* const ref{ reinterpret_cast<void*>(
@@ -715,6 +741,16 @@ namespace
                     return "the target oop address is not a readable pointer";
                 }
                 vmhook::set_field<std::uint32_t>(base, k, name, vmhook::hotspot::encode_oop_pointer(ref));
+                break;
+            }
+            if (desc == "Ljava/lang/String;")
+            {
+                void* const s{ alloc_java_string(value) };  // runs on a real JavaThread
+                if (!s || !vmhook::hotspot::is_valid_pointer(s))
+                {
+                    return "failed to allocate a java.lang.String for the new value";
+                }
+                vmhook::set_field<std::uint32_t>(base, k, name, vmhook::hotspot::encode_oop_pointer(s));
                 break;
             }
             return "reference field: pass 'null', a 0x<oop> address, or (for String) the literal text";

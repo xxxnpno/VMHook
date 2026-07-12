@@ -575,7 +575,14 @@ int main(int argc, char** argv)
         const int nargs{ argc - 7 };
         std::string request{ "CALL\t" + cls + "\t" + (addr.empty() ? "-" : addr) + "\t" + method + "\t" + desc
                              + "\t" + std::to_string(nargs) };
-        for (int i = 7; i < argc; ++i) { request += "\t"; request += argv[i]; }
+        // Flatten any control char in an argument so a tab/newline can't split it
+        // into extra tab-separated fields and mis-align the argument list.
+        for (int i = 7; i < argc; ++i)
+        {
+            std::string a{ argv[i] };
+            for (char& c : a) if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+            request += "\t"; request += a;
+        }
         wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
         std::wstring w{ exe }; const std::size_t s{ w.find_last_of(L"\\/") };
         if (s != std::wstring::npos) w.resize(s + 1);
