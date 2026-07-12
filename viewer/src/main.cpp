@@ -259,7 +259,6 @@ namespace
     bool         g_instances_refresh_now{ false };  // force an immediate re-scan
     std::string  g_instances_class;          // internal name shown in the window
     char         g_instance_filter[128]{};   // substring filter over the instance rows
-    bool         g_open_instance_detail{ false };  // request the per-instance detail popup
     std::string  g_detail_addr;              // address of the instance the popup shows
     bool         g_copy_instance_table{ false };   // request a TSV copy of the instance table
     int          g_instance_cap{ 1000 };     // persisted mirror of App::inst_cap
@@ -271,6 +270,10 @@ namespace
     bool         g_auto_rescan{ false };  // periodically re-scan loaded classes
     bool         g_new_only{ false };     // class list: show only runtime-loaded classes
     bool         g_show_removed{ false }; // request the unloaded-classes popup
+    bool         g_show_age{ false };     // class list: show "age" + sort newest-first
+    bool         g_inst_show_age{ false };// instance list: show "age" + sort newest-first
+    int          g_inst_sort{ 1 };     // instance list: 0=natural, 1=addr↑, 2=addr↓
+    float        g_inst_left_width{ 300.0f };  // Live-instances master/detail split
     std::wstring g_dll_path{};
     std::vector<int> g_filtered;  // rebuilt each frame from the search box
     // Global member-search results: (class index, member index) pairs.
@@ -556,6 +559,16 @@ namespace
     // so layout math stays adaptive instead of using magic pixel constants.
     inline float em(float n) { return ImGui::GetFontSize() * n; }
 
+    // Compact "how long ago" label from a seconds delta (e.g. 12s / 3m / 1h).
+    inline std::string fmt_age(double secs)
+    {
+        if (secs < 0.0) return "?";
+        const int s{ static_cast<int>(secs) };
+        if (s < 60)   return std::to_string(s) + "s";
+        if (s < 3600) return std::to_string(s / 60) + "m";
+        return std::to_string(s / 3600) + "h";
+    }
+
     // Text vertically centered against framed widgets on the same row.
     inline void row_label(const char* text)
     {
@@ -784,6 +797,15 @@ namespace
             ImGui::PopStyleColor(2);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Classes loaded since the previous scan — click to filter to them");
         }
+        // "Age" option — show how long ago each class was first observed + sort
+        // newest-first (right-aligned so it doesn't crowd the count/+new chip).
+        {
+            const float aw{ em(3.6f) };
+            ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - aw, ImGui::GetCursorPosX() + em(0.5f)));
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetFrameHeight() * 0.13f);
+            ui::Toggle("Age", &g_show_age);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show how long ago each class was first observed + sort newest-first.\nBaseline classes share the attach time (they were loaded before the viewer attached).");
+        }
 
         // Custom "Class" header — a rounded frame matching the combo/input cells
         // (ImGui table headers can't be rounded).  Click to cycle sort: natural →
@@ -816,7 +838,16 @@ namespace
                     dl->AddTriangleFilled(ImVec2(cx - tr, cy - tr), ImVec2(cx + tr, cy - tr), ImVec2(cx, cy + tr), ac);
             }
         }
-        if (g_class_sort != 0)
+        if (g_show_age)  // newest-loaded first (overrides the name-sort header)
+        {
+            std::stable_sort(g_filtered.begin(), g_filtered.end(), [&](int a, int b)
+            {
+                const double ea{ app.classes[(std::size_t)a].seen_epoch }, eb{ app.classes[(std::size_t)b].seen_epoch };
+                if (ea != eb) return ea > eb;
+                return app.classes[(std::size_t)a].internal_name < app.classes[(std::size_t)b].internal_name;
+            });
+        }
+        else if (g_class_sort != 0)
         {
             const bool asc{ g_class_sort == 1 };
             std::sort(g_filtered.begin(), g_filtered.end(), [&](int a, int b)
@@ -888,6 +919,11 @@ namespace
                     ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : class_kind(c).color);
                     ImGui::TextUnformatted(sname.c_str());
                     ImGui::PopStyleColor();
+                    if (g_show_age)
+                    {
+                        ImGui::SameLine(0.0f, em(0.5f));
+                        ImGui::TextDisabled("· %s", fmt_age(app.now_s() - c.seen_epoch).c_str());
+                    }
                     // runtime-loaded classes get a small green dot in the left gutter
                     if (c.is_new)
                         ImGui::GetWindowDrawList()->AddCircleFilled(
@@ -1301,41 +1337,6 @@ namespace
         return h.find(lower_needle) != std::string::npos;
     }
 
-    // Compare two field-value strings numerically when BOTH parse as a full
-    // number (so ticks 9 < 10, not "10" < "9"), else lexicographically.
-    int cmp_num_or_str(const std::string& x, const std::string& y)
-    {
-        auto as_num = [](const std::string& s, double& out) -> bool
-        {
-            if (s.empty() || s == "null") return false;
-            char* end{ nullptr };
-            out = std::strtod(s.c_str(), &end);
-            return end != nullptr && *end == '\0';
-        };
-        double nx{}, ny{};
-        if (as_num(x, nx) && as_num(y, ny)) return nx < ny ? -1 : nx > ny ? 1 : 0;
-        const int c{ x.compare(y) };
-        return c < 0 ? -1 : c > 0 ? 1 : 0;
-    }
-
-    // Order two instances by table column `col` (0=#, 1=Address, 2+=field).
-    int cmp_instance(const viewer::InstanceInfo& A, const viewer::InstanceInfo& B,
-                     int col, int ia, int ib)
-    {
-        if (col <= 0) return ia < ib ? -1 : ia > ib ? 1 : 0;
-        if (col == 1)
-        {
-            const unsigned long long x{ std::strtoull(A.address.c_str(), nullptr, 16) };
-            const unsigned long long y{ std::strtoull(B.address.c_str(), nullptr, 16) };
-            return x < y ? -1 : x > y ? 1 : 0;
-        }
-        static const std::string empty{};
-        const int fi{ col - 2 };
-        const std::string& xs{ fi < (int)A.fields.size() ? A.fields[(std::size_t)fi].value : empty };
-        const std::string& ys{ fi < (int)B.fields.size() ? B.fields[(std::size_t)fi].value : empty };
-        return cmp_num_or_str(xs, ys);
-    }
-
     // Colour a formatted field value by its kind so the table scans easily:
     // strings, object refs (<...>), booleans, and null each get their own tint.
     ImVec4 value_color(const std::string& v)
@@ -1347,25 +1348,18 @@ namespace
         return ImGui::GetStyleColorVec4(ImGuiCol_Text);                             // number/default
     }
 
-    void render_field_value(const std::string& v)
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, value_color(v));
-        ImGui::TextUnformatted(v.c_str());
-        ImGui::PopStyleColor();
-    }
-
     void draw_instances_window(viewer::App& app)
     {
-        ImGui::SetNextWindowSize(ImVec2(em(58.0f), em(32.0f)), ImGuiCond_FirstUseEver);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em(0.85f), em(0.7f)));
+        ImGui::SetNextWindowSize(ImVec2(em(64.0f), em(34.0f)), ImGuiCond_FirstUseEver);
         const bool open{ ImGui::Begin("Live instances", &g_show_instances, ImGuiWindowFlags_NoCollapse) };
-        ImGui::PopStyleVar();
         if (!open) { ImGui::End(); return; }
 
         std::lock_guard<std::mutex> lock{ app.data_mutex };
         const viewer::Status st{ app.inst_status.load() };
+        const double now{ app.now_s() };
+        const float  toggle_dy{ ImGui::GetFrameHeight() * 0.13f };  // vertical-centre small switches
 
-        // Header: class name (+ tiny spinner while scanning) ... Live | Refresh.
+        // ── header: class name (+ spinner) .............. Live | Refresh | Copy ──
         std::string dotted{ app.inst_class };
         for (char& ch : dotted) if (ch == '/') ch = '.';
         ImGui::AlignTextToFramePadding();
@@ -1378,29 +1372,40 @@ namespace
             const float r{ ImGui::GetFrameHeight() * 0.28f };
             ui::Spinner("##iscan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
         }
-        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(16.5f), ImGui::GetCursorPosX() + em(1.0f)));
+        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(17.0f), ImGui::GetCursorPosX() + em(1.0f)));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + toggle_dy);
         ui::Toggle("Live", &g_instances_live);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Re-scan the heap ~every 1.5s so field values update live");
         ImGui::SameLine(0.0f, em(0.7f));
         if (ui::Button("Refresh")) g_instances_refresh_now = true;
         ImGui::SameLine(0.0f, em(0.4f));
         if (ui::Button("Copy table")) g_copy_instance_table = true;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the filtered + sorted rows to the clipboard as TSV");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy every instance's fields to the clipboard as TSV");
 
-        // Columns = indices into the streamed fields (declared then inherited),
-        // filtered by the "Inherited" toggle.  Carrying the field index (rather
-        // than name/owner) keeps value lookup + sorting correct when inherited
-        // columns are hidden.  Taken from the first instance — every instance of
-        // the same class streams the same fields.
-        std::vector<int> cols;
-        if (!app.instances.empty())
-            for (int fi = 0; fi < (int)app.instances.front().fields.size(); ++fi)
-                if (g_inst_show_inherited || app.instances.front().fields[(std::size_t)fi].owner.empty())
-                    cols.push_back(fi);
+        // ── filter row: filter + Age + Inherited + cap ──
+        ui::InputText("##ifilter", ICON_FA_SEARCH "  Filter instances",
+                      g_instance_filter, sizeof(g_instance_filter),
+                      (std::max)(ImGui::GetContentRegionAvail().x - em(23.0f), em(6.0f)));
+        ImGui::SameLine(0.0f, em(0.6f));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + toggle_dy);
+        ui::Toggle("Age", &g_inst_show_age);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show how long ago each instance was first observed + sort newest-first.\nHotSpot has no per-object creation time and a moving GC can reset this — best-effort.");
+        ImGui::SameLine(0.0f, em(0.6f));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + toggle_dy);
+        ui::Toggle("Inherited", &g_inst_show_inherited);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include inherited fields in the detail pane");
+        ImGui::SameLine(0.0f, em(0.6f));
+        ImGui::SetNextItemWidth(em(7.5f));
+        int cap{ app.inst_cap };
+        if (ImGui::DragInt("##icap", &cap, 10.0f, 20, 200000, "cap %d"))
+        {
+            app.inst_cap = std::clamp(cap, 20, 200000);
+            g_instance_cap = app.inst_cap;
+            g_instances_refresh_now = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Max instances to scan for on the heap");
 
-        // Filter order: keep the rows whose address or any value matches (the
-        // InputText below updates g_instance_filter, so this is last frame's
-        // text — a 1-frame lag that's imperceptible).
+        // filter the rows (address or any field value)
         std::string needle{ g_instance_filter };
         for (char& ch : needle) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         std::vector<int> view;
@@ -1414,14 +1419,10 @@ namespace
             if (hit) view.push_back(i);
         }
 
-        // "Found N" (+ filtered count + cap warning) on one line.
+        // "Found N" (+ shown + cap warning)
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%s", app.inst_message.c_str());
-        if (!needle.empty())
-        {
-            ImGui::SameLine(0.0f, em(0.5f));
-            ImGui::TextDisabled("· %d shown", (int)view.size());
-        }
+        if (!needle.empty()) { ImGui::SameLine(0.0f, em(0.5f)); ImGui::TextDisabled("· %d shown", (int)view.size()); }
         if (app.inst_cap > 0 && (int)app.instances.size() >= app.inst_cap)
         {
             ImGui::SameLine(0.0f, em(0.6f));
@@ -1430,175 +1431,155 @@ namespace
             ImGui::PopStyleColor();
         }
 
-        // Row: substring filter (address or any value) + inherited toggle + cap.
-        ui::InputText("##ifilter", ICON_FA_SEARCH "  Filter instances",
-                      g_instance_filter, sizeof(g_instance_filter),
-                      (std::max)(ImGui::GetContentRegionAvail().x - em(18.5f), em(6.0f)));
-        ImGui::SameLine(0.0f, em(0.6f));
-        ImGui::Checkbox("Inherited", &g_inst_show_inherited);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show columns for fields inherited from a superclass");
-        ImGui::SameLine(0.0f, em(0.6f));
-        ImGui::SetNextItemWidth(em(8.5f));
-        int cap{ app.inst_cap };
-        if (ImGui::DragInt("##icap", &cap, 10.0f, 20, 200000, "cap %d"))
-        {
-            app.inst_cap = std::clamp(cap, 20, 200000);
-            g_instance_cap = app.inst_cap;   // remember for next launch
-            g_instances_refresh_now = true;  // re-scan with the new cap
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Max instances to scan for on the heap (drag or double-click to edit)");
-
         ImGui::Separator();
+
         if (app.instances.empty())
         {
-            // Show guidance once a scan has actually completed with 0 hits (the
-            // worker sets "Found 0…"); it persists across live re-scans, unlike a
-            // status check which a 0-instance class spends re-Receiving.
             if (app.inst_message.rfind("Found 0", 0) == 0)
             {
                 ImGui::TextDisabled("No live instances of this exact class on the heap.");
                 ImGui::TextDisabled("The scan matches this class only — if it is abstract, or just its");
                 ImGui::TextDisabled("subclasses are instantiated, inspect a subclass instead.");
             }
-        }
-        else if (ImGui::BeginTable("instances", 2 + (int)cols.size(),
-                     ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                     ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable |
-                     ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti))
-        {
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort, em(2.8f));
-            ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, em(11.0f));
-            for (const int fi : cols)
-                ImGui::TableSetupColumn(app.instances.front().fields[(std::size_t)fi].name.c_str(), ImGuiTableColumnFlags_WidthFixed, em(11.0f));
-            ImGui::TableSetupScrollFreeze(2, 1);
-
-            // Header row (manual, so inherited columns render dimmed + tooltipped).
-            ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
-            for (int c = 0; c < 2 + (int)cols.size(); ++c)
-            {
-                if (!ImGui::TableSetColumnIndex(c)) continue;
-                const std::string* owner{ c >= 2 ? &app.instances.front().fields[(std::size_t)cols[(std::size_t)(c - 2)]].owner : nullptr };
-                const bool inherited{ owner != nullptr && !owner->empty() };
-                if (inherited) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.60f, 0.72f, 1.0f));
-                ImGui::TableHeader(ImGui::TableGetColumnName(c));
-                if (inherited) ImGui::PopStyleColor();
-                if (inherited && ImGui::IsItemHovered())
-                    ImGui::SetTooltip("inherited from %s", owner->c_str());
-            }
-
-            if (ImGuiTableSortSpecs* ss{ ImGui::TableGetSortSpecs() }; ss && ss->SpecsCount > 0)
-            {
-                std::stable_sort(view.begin(), view.end(), [&](int a, int b)
-                {
-                    for (int s = 0; s < ss->SpecsCount; ++s)
-                    {
-                        const ImGuiTableColumnSortSpecs& sp{ ss->Specs[s] };
-                        // Map the (possibly filtered) table column to the real field
-                        // index, biased by +2 so cmp_instance's (col-2) recovers it.
-                        const int vcol{ (sp.ColumnIndex >= 2 && sp.ColumnIndex - 2 < (int)cols.size())
-                                            ? cols[(std::size_t)(sp.ColumnIndex - 2)] + 2 : (int)sp.ColumnIndex };
-                        const int c{ cmp_instance(app.instances[(std::size_t)a], app.instances[(std::size_t)b],
-                                                  vcol, a, b) };
-                        if (c != 0)
-                            return sp.SortDirection == ImGuiSortDirection_Ascending ? c < 0 : c > 0;
-                    }
-                    return a < b;
-                });
-            }
-
-            ImGuiListClipper clip;
-            clip.Begin((int)view.size());
-            while (clip.Step())
-                for (int vr = clip.DisplayStart; vr < clip.DisplayEnd; ++vr)
-                {
-                    const int r{ view[(std::size_t)vr] };
-                    const viewer::InstanceInfo& inst{ app.instances[(std::size_t)r] };
-                    ImGui::TableNextRow();
-                    ImGui::PushID(r);
-                    ImGui::TableSetColumnIndex(0);
-                    char idxlbl[24];
-                    std::snprintf(idxlbl, sizeof(idxlbl), "%d", r);
-                    if (ImGui::Selectable(idxlbl, g_detail_addr == inst.address,
-                            ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
-                    {
-                        g_detail_addr = inst.address;
-                        g_open_instance_detail = true;
-                    }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click for full detail");
-                    ImGui::TableSetColumnIndex(1);
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.68f, 0.82f, 1.0f));
-                    ImGui::TextUnformatted(inst.address.c_str());
-                    ImGui::PopStyleColor();
-                    copy_menu("addr", inst.address);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (right-click to copy)", inst.address.c_str());
-                    for (int cidx = 0; cidx < (int)cols.size(); ++cidx)
-                    {
-                        ImGui::TableSetColumnIndex(cidx + 2);
-                        const int fi{ cols[(std::size_t)cidx] };
-                        if (fi >= (int)inst.fields.size()) continue;
-                        const std::string& v{ inst.fields[(std::size_t)fi].value };
-                        render_field_value(v);
-                        if (ImGui::IsItemHovered() && v.size() > 18) ImGui::SetTooltip("%s", v.c_str());
-                    }
-                    ImGui::PopID();
-                }
-            ImGui::EndTable();
+            ImGui::End();
+            return;
         }
 
-        // Copy the filtered + sorted table to the clipboard as TSV (view holds
-        // the current display order after the sort above).
-        if (g_copy_instance_table)
-        {
-            g_copy_instance_table = false;
-            std::string tsv{ "#\tAddress" };
-            for (const int fi : cols) { tsv += '\t'; tsv += app.instances.front().fields[(std::size_t)fi].name; }
-            tsv += '\n';
-            for (const int rr : view)
+        // sort the view — Age on → newest first; else the header's address sort.
+        if (g_inst_show_age)
+            std::stable_sort(view.begin(), view.end(), [&](int a, int b)
             {
-                const viewer::InstanceInfo& in{ app.instances[(std::size_t)rr] };
-                tsv += std::to_string(rr);
-                tsv += '\t';
-                tsv += in.address;
-                for (const int fi : cols) { tsv += '\t'; if (fi < (int)in.fields.size()) tsv += in.fields[(std::size_t)fi].value; }
-                tsv += '\n';
-            }
-            ImGui::SetClipboardText(tsv.c_str());
-        }
+                const double ea{ app.instances[(std::size_t)a].seen_epoch }, eb{ app.instances[(std::size_t)b].seen_epoch };
+                if (ea != eb) return ea > eb;
+                return app.instances[(std::size_t)a].address < app.instances[(std::size_t)b].address;
+            });
+        else if (g_inst_sort != 0)
+            std::stable_sort(view.begin(), view.end(), [&](int a, int b)
+            {
+                const unsigned long long x{ std::strtoull(app.instances[(std::size_t)a].address.c_str(), nullptr, 16) };
+                const unsigned long long y{ std::strtoull(app.instances[(std::size_t)b].address.c_str(), nullptr, 16) };
+                return g_inst_sort == 1 ? x < y : x > y;
+            });
 
-        // Per-instance detail popup (click a row): a vertical Field/Value/From
-        // view — readable for objects with many columns, and live (re-looked-up
-        // by address each frame so its values keep updating).
-        if (g_open_instance_detail) { ImGui::OpenPopup("Instance detail"); g_open_instance_detail = false; }
-        if (ImGui::BeginPopup("Instance detail"))
+        // keep a valid selection (default to the first row) so the detail is filled
+        bool sel_present{ false };
+        for (const auto& in : app.instances) if (in.address == g_detail_addr) { sel_present = true; break; }
+        if (!sel_present && !view.empty()) g_detail_addr = app.instances[(std::size_t)view.front()].address;
+
+        // ── master / detail split (mirrors the main window) ──
+        const float avail_y{ ImGui::GetContentRegionAvail().y };
+        ImGui::BeginChild("ileft", ImVec2(g_inst_left_width, avail_y), ImGuiChildFlags_Borders);
         {
-            const viewer::InstanceInfo* sel{ nullptr };
-            for (const auto& in : app.instances) if (in.address == g_detail_addr) { sel = &in; break; }
-            if (!sel)
+            const ImGuiStyle& stl{ ImGui::GetStyle() };
+            // Rounded "Instances (N)" header (matches the combo/input cells); click
+            // cycles the address sort (ignored while Age sort is active).
+            const ImVec2 hp0{ ImGui::GetCursorScreenPos() };
+            const float  hw{ ImGui::GetContentRegionAvail().x }, hh{ ImGui::GetFrameHeight() };
+            const ImVec2 hp1{ hp0.x + hw, hp0.y + hh };
+            if (ImGui::InvisibleButton("##ihdr", ImVec2(hw, hh)) && !g_inst_show_age)
+                g_inst_sort = (g_inst_sort == 1) ? 2 : 1;
+            const bool hhov{ ImGui::IsItemHovered() };
+            ImDrawList* hdl{ ImGui::GetWindowDrawList() };
+            hdl->AddRectFilled(hp0, hp1, ImGui::GetColorU32(hhov ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), stl.FrameRounding);
+            if (stl.FrameBorderSize > 0.0f) hdl->AddRect(hp0, hp1, ImGui::GetColorU32(ImGuiCol_Border), stl.FrameRounding, 0, stl.FrameBorderSize);
+            char hlbl[40]; std::snprintf(hlbl, sizeof(hlbl), "Instances  (%d)", (int)view.size());
+            hdl->AddText(ImVec2(hp0.x + stl.FramePadding.x, hp0.y + (hh - ImGui::GetFontSize()) * 0.5f),
+                         ImGui::GetColorU32(ImGuiCol_Text), hlbl);
             {
-                ImGui::TextDisabled("(instance no longer on the heap)");
+                const float cx{ hp1.x - stl.FramePadding.x }, cy{ hp0.y + hh * 0.5f }, tr{ em(0.22f) };
+                const ImU32 ac{ ImGui::GetColorU32(ImGuiCol_Text) };
+                const bool up{ !g_inst_show_age && g_inst_sort == 1 };  // Age sort = newest-first (down)
+                if (up) hdl->AddTriangleFilled(ImVec2(cx, cy - tr), ImVec2(cx - tr, cy + tr), ImVec2(cx + tr, cy + tr), ac);
+                else    hdl->AddTriangleFilled(ImVec2(cx - tr, cy - tr), ImVec2(cx + tr, cy - tr), ImVec2(cx, cy + tr), ac);
+            }
+
+            ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(stl.FramePadding.x, ImGui::GetStyle().CellPadding.y));
+            if (ImGui::BeginTable("ilist", 1, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_PadOuterX))
+            {
+                ImGui::TableSetupColumn("addr", ImGuiTableColumnFlags_WidthStretch);
+                ImGuiListClipper clip; clip.Begin((int)view.size());
+                while (clip.Step())
+                    for (int vr = clip.DisplayStart; vr < clip.DisplayEnd; ++vr)
+                    {
+                        const int r{ view[(std::size_t)vr] };
+                        const viewer::InstanceInfo& inst{ app.instances[(std::size_t)r] };
+                        const bool sel{ g_detail_addr == inst.address };
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::PushID(r);
+                        const ImVec2 rp{ ImGui::GetCursorScreenPos() };
+                        if (ImGui::Selectable("##irow", sel, ImGuiSelectableFlags_SpanAllColumns))
+                            g_detail_addr = inst.address;
+                        copy_menu("addr", inst.address);
+                        ImGui::SetCursorScreenPos(rp);
+                        ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : ImVec4(0.58f, 0.68f, 0.82f, 1.0f));
+                        ImGui::TextUnformatted(inst.address.c_str());
+                        ImGui::PopStyleColor();
+                        if (g_inst_show_age)
+                        {
+                            ImGui::SameLine(0.0f, em(0.5f));
+                            ImGui::TextDisabled("· %s", fmt_age(now - inst.seen_epoch).c_str());
+                        }
+                        ImGui::PopID();
+                    }
+                ImGui::EndTable();
+            }
+            ImGui::PopStyleVar();
+        }
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+        ImGui::InvisibleButton("isplit", ImVec2(em(0.4f), avail_y));
+        if (ImGui::IsItemActive()) g_inst_left_width += ImGui::GetIO().MouseDelta.x;
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        g_inst_left_width = std::clamp(g_inst_left_width, em(9.0f), (std::max)(ImGui::GetWindowSize().x - em(14.0f), em(10.0f)));
+        {
+            const ImVec2 sp0{ ImGui::GetItemRectMin() }, sp1{ ImGui::GetItemRectMax() };
+            const float  sx{ (sp0.x + sp1.x) * 0.5f };
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(sx, sp0.y + em(0.15f)), ImVec2(sx, sp1.y - em(0.15f)),
+                ImGui::GetColorU32(ImGui::IsItemActive() ? ImGuiCol_ButtonActive : ImGuiCol_Border), (std::max)(em(0.12f), 1.0f));
+        }
+        ImGui::SameLine();
+
+        // ── right: the selected instance's fields (live, re-looked-up by address) ──
+        ImGui::BeginChild("iright", ImVec2(0, avail_y), ImGuiChildFlags_Borders);
+        {
+            const viewer::InstanceInfo* selp{ nullptr };
+            for (const auto& in : app.instances) if (in.address == g_detail_addr) { selp = &in; break; }
+            if (!selp)
+            {
+                ImGui::Dummy(ImVec2(0, em(1.0f)));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.55f, 1.0f));
+                const char* hint{ "Select an instance on the left to see its fields." };
+                const float w{ ImGui::CalcTextSize(hint).x };
+                ImGui::SetCursorPosX((std::max)((ImGui::GetContentRegionAvail().x - w) * 0.5f, 0.0f));
+                ImGui::TextUnformatted(hint);
+                ImGui::PopStyleColor();
             }
             else
             {
-                // class name @ address, so the (movable) popup is self-describing.
                 std::string dcls{ app.inst_class };
                 for (char& ch : dcls) if (ch == '/') ch = '.';
+                ImGui::AlignTextToFramePadding();
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
                 ImGui::TextUnformatted(dcls.c_str());
                 ImGui::PopStyleColor();
-                ImGui::SameLine(0.0f, em(0.35f));
-                ImGui::TextDisabled("@");
-                ImGui::SameLine(0.0f, em(0.35f));
+                ImGui::SameLine(0.0f, em(0.35f)); ImGui::TextDisabled("@"); ImGui::SameLine(0.0f, em(0.35f));
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.68f, 0.82f, 1.0f));
-                ImGui::TextUnformatted(sel->address.c_str());
+                ImGui::TextUnformatted(selp->address.c_str());
                 ImGui::PopStyleColor();
+                if (g_inst_show_age)
+                {
+                    ImGui::SameLine(0.0f, em(0.6f));
+                    ImGui::TextDisabled("· seen %s ago", fmt_age(now - selp->seen_epoch).c_str());
+                }
                 ImGui::SameLine(0.0f, em(0.8f));
-                if (ui::Button("Copy addr")) ImGui::SetClipboardText(sel->address.c_str());
+                if (ui::Button("Copy addr")) ImGui::SetClipboardText(selp->address.c_str());
                 ImGui::SameLine(0.0f, em(0.4f));
                 if (ui::Button("Copy all"))
                 {
-                    std::string tsv{ dcls + " @ " + sel->address + "\nField\tValue\tFrom\n" };
-                    for (const viewer::InstField& f : sel->fields)
+                    std::string tsv{ dcls + " @ " + selp->address + "\nField\tValue\tFrom\n" };
+                    for (const viewer::InstField& f : selp->fields)
                     {
                         tsv += f.name; tsv += '\t'; tsv += f.value; tsv += '\t'; tsv += f.owner; tsv += '\n';
                     }
@@ -1606,21 +1587,22 @@ namespace
                 }
                 ImGui::Separator();
                 if (ImGui::BeginTable("idetail", 3,
-                        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
-                        ImVec2(em(32.0f), em(18.0f))))
+                        ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH))
                 {
                     ImGui::TableSetupColumn("Field", ImGuiTableColumnFlags_WidthFixed, em(9.0f));
                     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
                     ImGui::TableSetupColumn("From",  ImGuiTableColumnFlags_WidthFixed, em(7.0f));
+                    ImGui::TableSetupScrollFreeze(0, 1);
                     ImGui::TableHeadersRow();
-                    for (const viewer::InstField& f : sel->fields)
+                    for (const viewer::InstField& f : selp->fields)
                     {
+                        if (!g_inst_show_inherited && !f.owner.empty()) continue;
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
+                        if (!f.owner.empty()) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
                         ImGui::TextUnformatted(f.name.c_str());
+                        if (!f.owner.empty()) ImGui::PopStyleColor();
                         ImGui::TableSetColumnIndex(1);
-                        // A "<internal/name>" ref value whose class is loaded becomes a
-                        // link that navigates to it (jump from a field to its type).
                         bool linked{ false };
                         if (f.value.size() > 2 && f.value.front() == '<' && f.value.back() == '>')
                         {
@@ -1644,8 +1626,27 @@ namespace
                     ImGui::EndTable();
                 }
             }
-            ImGui::EndPopup();
         }
+        ImGui::EndChild();
+
+        // Copy table → every instance's fields as TSV (current view order).
+        if (g_copy_instance_table)
+        {
+            g_copy_instance_table = false;
+            const std::vector<viewer::InstField>& f0{ app.instances.front().fields };
+            std::string tsv{ "Address" };
+            for (const auto& f : f0) { tsv += '\t'; tsv += f.name; }
+            tsv += '\n';
+            for (const int rr : view)
+            {
+                const viewer::InstanceInfo& in{ app.instances[(std::size_t)rr] };
+                tsv += in.address;
+                for (std::size_t k = 0; k < f0.size(); ++k) { tsv += '\t'; if (k < in.fields.size()) tsv += in.fields[k].value; }
+                tsv += '\n';
+            }
+            ImGui::SetClipboardText(tsv.c_str());
+        }
+
         ImGui::End();
     }
 

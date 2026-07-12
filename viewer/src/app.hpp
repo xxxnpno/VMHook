@@ -13,6 +13,7 @@
 #include <psapi.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
@@ -52,6 +53,7 @@ namespace viewer
         std::vector<MethodInfo> methods;
         std::vector<FieldInfo>  fields;
         bool                    is_new{ false }; // loaded since the previous scan (runtime-added)
+        double                  seen_epoch{ 0.0 }; // secs-since-app-start when first observed (age source)
     };
 
     // One instance field: name, formatted value, and (if inherited) the simple
@@ -70,6 +72,7 @@ namespace viewer
     {
         std::string address;  // "0x..." oop address
         std::vector<InstField> fields;
+        double seen_epoch{ 0.0 };  // secs-since-app-start when this address was first observed
     };
 
     struct JvmProcess
@@ -399,6 +402,13 @@ namespace viewer
         std::atomic<std::uint64_t> hook_total{ 0 };   // cumulative hook-captured loads
         std::vector<std::string>   hook_recent;        // last N names the hook captured (guarded)
 
+        // Monotonic clock shared by the worker (stamping seen_epoch) and the UI
+        // (computing "age" = now_s() - seen_epoch).  Seconds since App creation.
+        auto now_s() const -> double
+        {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+        }
+
         // Live-instance inspection (guarded by data_mutex, driven on `worker`).
         std::atomic<Status>       inst_status{ Status::Idle };
         std::string               inst_message{};
@@ -471,6 +481,7 @@ namespace viewer
                 if (inst_class != internal_class)
                 {
                     instances.clear();
+                    inst_seen_.clear();  // fresh class = fresh age baseline (worker idle here)
                     inst_message = "Scanning heap for live instances...";
                 }
                 inst_class = internal_class;
@@ -552,6 +563,9 @@ namespace viewer
         std::uint32_t attached_pid_{ 0 };   // the JVM a successful attach latched onto
         std::wstring  attached_dll_{};      // payload path used for that attach
         std::unordered_set<std::string> prev_names_;  // class names from the previous scan (diff)
+        std::chrono::steady_clock::time_point start_{ std::chrono::steady_clock::now() };
+        std::unordered_map<std::string, double> class_seen_;  // class name -> first-seen epoch (age)
+        std::unordered_map<std::string, double> inst_seen_;   // instance address -> first-seen epoch
 
         // Send a one-line request to the loaded payload and read its (short)
         // reply.  Reuses the loaded payload's serve loop (no injection) — the
@@ -781,6 +795,24 @@ namespace viewer
 
             std::vector<InstanceInfo> parsed{};
             parse_instances(raw, parsed);
+
+            // Stamp each instance's first-seen time (age source), keyed by heap
+            // address.  NOTE: a moving GC relocates objects, so an address can
+            // vanish + a new one appear for the same object — this is "first
+            // OBSERVED by the viewer", best-effort, not a true creation time.
+            {
+                const double t{ now_s() };
+                std::unordered_map<std::string, double> seen_next;
+                seen_next.reserve(parsed.size());
+                for (InstanceInfo& in : parsed)
+                {
+                    const auto it{ inst_seen_.find(in.address) };
+                    const double e{ it != inst_seen_.end() ? it->second : t };
+                    in.seen_epoch = e;
+                    seen_next.emplace(in.address, e);
+                }
+                inst_seen_ = std::move(seen_next);
+            }
             {
                 std::lock_guard<std::mutex> lock{ data_mutex };
                 instances = std::move(parsed);
@@ -927,6 +959,24 @@ namespace viewer
                     if (!prev_names_.count(c.internal_name)) { c.is_new = true; ++added; }
                 for (const auto& old : prev_names_)
                     if (!new_names.count(old)) removed.push_back(old);
+            }
+
+            // Stamp each class's first-seen time (the age source): keep the prior
+            // time if we've seen the name before, else now.  Baseline classes all
+            // get the attach time (= "age since attach").  class_seen_ is touched
+            // only on this worker thread, so it needs no lock.
+            {
+                const double t{ now_s() };
+                std::unordered_map<std::string, double> seen_next;
+                seen_next.reserve(parsed.size());
+                for (ClassInfo& c : parsed)
+                {
+                    const auto it{ class_seen_.find(c.internal_name) };
+                    const double e{ it != class_seen_.end() ? it->second : t };
+                    c.seen_epoch = e;
+                    seen_next.emplace(c.internal_name, e);
+                }
+                class_seen_ = std::move(seen_next);
             }
 
             {
