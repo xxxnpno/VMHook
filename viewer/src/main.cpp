@@ -272,7 +272,9 @@ namespace
     bool         g_focus_search{ false };
     int          g_kind_filter{ 0 };   // 0=all; else index into k_kind_names
     int          g_search_scope{ 0 };  // 0=Classes, 1=Methods, 2=Fields
-    int          g_class_sort{ 0 };    // class list: 0=natural, 1=A→Z, 2=Z→A
+    // class list sort: key (0=Natural 1=Name 2=Package 3=Age 4=Kind 5=Members) + direction.
+    int          g_class_sort_key{ 0 };
+    bool         g_class_sort_desc{ false };
     bool         g_auto_rescan{ false };  // periodically re-scan loaded classes
     bool         g_new_only{ false };     // class list: show only runtime-loaded classes
     bool         g_show_removed{ false }; // request the unloaded-classes popup
@@ -846,19 +848,30 @@ namespace
             ImGui::PopStyleColor(2);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Classes loaded since the previous scan — click to filter to them");
         }
-        // "Age" option — show how long ago each class was first observed + sort
-        // newest-first (right-aligned so it doesn't crowd the count/+new chip).
+        // Sort key + Age display, right-aligned on the count row.  The combo picks
+        // WHAT to sort by; clicking the "Class" header below reverses the direction.
         {
-            const float aw{ em(3.6f) };
-            ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - aw, ImGui::GetCursorPosX() + em(0.5f)));
+            const float sort_w{ em(8.4f) }, age_w{ em(3.4f) };
+            ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - sort_w - age_w - em(0.6f), ImGui::GetCursorPosX() + em(0.5f)));
+            const int prev_key{ g_class_sort_key };
+            ui::Combo("##classsort", &g_class_sort_key,
+                      "Sort: Natural\0Sort: Name\0Sort: Package\0Sort: Age\0Sort: Kind\0Sort: Members\0", sort_w);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sort the class list. Natural = load order.\nClick the \"Class\" header to reverse the direction.");
+            if (g_class_sort_key != prev_key)  // sensible default direction per key
+                g_class_sort_desc = (g_class_sort_key == 3 || g_class_sort_key == 5);  // Age / Members -> most first
+            ImGui::SameLine(0.0f, em(0.5f));
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetFrameHeight() * 0.13f);
             ui::Toggle("Age", &g_show_age);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show how long ago each class was first observed + sort newest-first.\nBaseline classes share the attach time (they were loaded before the viewer attached).");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show how long ago each class was first observed (\"· 12s\").\nBaseline classes share the attach time (loaded before the viewer attached).");
         }
+        // Show the age suffix whenever it's toggled on OR we're sorting by age.
+        const bool show_age_col{ g_show_age || g_class_sort_key == 3 };
 
         // Custom "Class" header — a rounded frame matching the combo/input cells
-        // (ImGui table headers can't be rounded).  Click to cycle sort: natural →
-        // A→Z → Z→A, shown by a little triangle on the right.
+        // (ImGui table headers can't be rounded).  Shows a direction triangle for
+        // the active sort; clicking it reverses the direction (or starts a Name
+        // sort when the list is in Natural order).
+        static const char* const k_sort_names[]{ "Natural", "Name", "Package", "Age", "Kind", "Members" };
         {
             const ImGuiStyle& st{ ImGui::GetStyle() };
             // Match the combo/input text inset (FramePadding.x) so "Class" lines
@@ -868,41 +881,54 @@ namespace
             const float   bar_w{ ImGui::GetContentRegionAvail().x };
             const float   bar_h{ ImGui::GetFrameHeight() };
             const ImVec2  p1{ p0.x + bar_w, p0.y + bar_h };
-            if (ImGui::InvisibleButton("##classhdr", ImVec2(bar_w, bar_h))) g_class_sort = (g_class_sort + 1) % 3;
+            if (ImGui::InvisibleButton("##classhdr", ImVec2(bar_w, bar_h)))
+            {
+                if (g_class_sort_key == 0) g_class_sort_key = 1;   // Natural -> sort by Name on first click
+                else                       g_class_sort_desc = !g_class_sort_desc;  // otherwise reverse
+            }
             const bool    hov{ ImGui::IsItemHovered() };
-            if (hov) ImGui::SetTooltip("Sort by name (%s)", g_class_sort == 0 ? "click to A→Z" : g_class_sort == 1 ? "A→Z" : "Z→A");
+            if (hov) ImGui::SetTooltip("Sorted by %s (%s) — click to %s", k_sort_names[g_class_sort_key],
+                g_class_sort_key == 0 ? "load order" : (g_class_sort_desc ? "descending" : "ascending"),
+                g_class_sort_key == 0 ? "sort by name" : "reverse");
             ImDrawList* dl{ ImGui::GetWindowDrawList() };
             dl->AddRectFilled(p0, p1, ImGui::GetColorU32(hov ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), st.FrameRounding);
             if (st.FrameBorderSize > 0.0f)
                 dl->AddRect(p0, p1, ImGui::GetColorU32(ImGuiCol_Border), st.FrameRounding, 0, st.FrameBorderSize);
             dl->AddText(ImVec2(p0.x + hpad, p0.y + (bar_h - ImGui::GetFontSize()) * 0.5f),
                         ImGui::GetColorU32(ImGuiCol_Text), "Class");
-            if (g_class_sort != 0)
+            if (g_class_sort_key != 0)  // direction triangle (up = ascending, down = descending)
             {
                 const float  cx{ p1.x - hpad }, cy{ p0.y + bar_h * 0.5f }, tr{ em(0.22f) };
                 const ImU32  ac{ ImGui::GetColorU32(ImGuiCol_Text) };
-                if (g_class_sort == 1)  // A→Z, triangle up
+                if (!g_class_sort_desc)
                     dl->AddTriangleFilled(ImVec2(cx, cy - tr), ImVec2(cx - tr, cy + tr), ImVec2(cx + tr, cy + tr), ac);
-                else                    // Z→A, triangle down
+                else
                     dl->AddTriangleFilled(ImVec2(cx - tr, cy - tr), ImVec2(cx + tr, cy - tr), ImVec2(cx, cy + tr), ac);
             }
         }
-        if (g_show_age)  // newest-loaded first (overrides the name-sort header)
+        // Apply the chosen sort (Natural keeps the enumeration/filter order).  Every
+        // key breaks ties on the full name so the order is stable + deterministic.
+        if (g_class_sort_key != 0)
         {
+            const auto key_cmp{ [&](int a, int b) -> int
+            {
+                const viewer::ClassInfo& ca{ app.classes[(std::size_t)a] };
+                const viewer::ClassInfo& cb{ app.classes[(std::size_t)b] };
+                switch (g_class_sort_key)
+                {
+                case 1: return ca.internal_name.compare(cb.internal_name);                                   // Name (full path)
+                case 2: { const int c{ ca.package.compare(cb.package) }; return c ? c : ca.simple_name.compare(cb.simple_name); }  // Package, then simple name
+                case 3: { if (ca.seen_epoch != cb.seen_epoch) return ca.seen_epoch < cb.seen_epoch ? -1 : 1; return ca.internal_name.compare(cb.internal_name); }  // Age (first-observed)
+                case 4: { const int c{ std::strcmp(class_kind(ca).label, class_kind(cb).label) }; return c ? c : ca.internal_name.compare(cb.internal_name); }  // Kind
+                case 5: { const std::size_t ma{ ca.methods.size() + ca.fields.size() }, mb{ cb.methods.size() + cb.fields.size() };
+                          if (ma != mb) return ma < mb ? -1 : 1; return ca.internal_name.compare(cb.internal_name); }  // Members (methods+fields)
+                default: return 0;
+                }
+            } };
             std::stable_sort(g_filtered.begin(), g_filtered.end(), [&](int a, int b)
             {
-                const double ea{ app.classes[(std::size_t)a].seen_epoch }, eb{ app.classes[(std::size_t)b].seen_epoch };
-                if (ea != eb) return ea > eb;
-                return app.classes[(std::size_t)a].internal_name < app.classes[(std::size_t)b].internal_name;
-            });
-        }
-        else if (g_class_sort != 0)
-        {
-            const bool asc{ g_class_sort == 1 };
-            std::sort(g_filtered.begin(), g_filtered.end(), [&](int a, int b)
-            {
-                const int cmp{ app.classes[(std::size_t)a].internal_name.compare(app.classes[(std::size_t)b].internal_name) };
-                return asc ? cmp < 0 : cmp > 0;
+                const int c{ key_cmp(a, b) };
+                return g_class_sort_desc ? c > 0 : c < 0;
             });
         }
 
@@ -968,7 +994,7 @@ namespace
                     ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : class_kind(c).color);
                     ImGui::TextUnformatted(sname.c_str());
                     ImGui::PopStyleColor();
-                    if (g_show_age)
+                    if (show_age_col)
                     {
                         ImGui::SameLine(0.0f, em(0.5f));
                         ImGui::TextDisabled("· %s", fmt_age(app.now_s() - c.seen_epoch).c_str());
