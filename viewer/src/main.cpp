@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -287,7 +288,11 @@ namespace
     // ── object clipboard + field editing + method-call UI state ──
     std::vector<viewer::SavedObject> g_clipboard;          // stashed objects (grab / drag-drop)
     bool          g_show_clipboard{ false };               // the clipboard strip is visible
-    std::unordered_set<std::string>  g_frozen;             // "scope|cls|addr|field" -> frozen
+    // Frozen fields: key "scope|cls|addr|field" -> its details (so we can list +
+    // manage every freeze from one place, not just per-instance).
+    struct FrozenField { char scope{ 'I' }; std::string cls, addr, field, value; };
+    std::map<std::string, FrozenField> g_frozen;
+    bool         g_show_frozen{ false };                   // open the frozen-fields popup
     char          g_edit_buf[512]{};                       // shared edit-popup input buffer
     // Static-fields window (per class, async STAT channel).
     bool          g_show_statics{ false };
@@ -372,7 +377,12 @@ namespace
             << "font_scale="     << ImGui::GetIO().FontGlobalScale << "\n"
             << "inst_cap="       << g_instance_cap            << "\n"
             << "inst_live="      << (g_instances_live ? 1 : 0)<< "\n"
-            << "inst_inherited=" << (g_inst_show_inherited ? 1 : 0) << "\n";
+            << "inst_inherited=" << (g_inst_show_inherited ? 1 : 0) << "\n"
+            << "sort_key="       << g_class_sort_key          << "\n"
+            << "sort_desc="      << (g_class_sort_desc ? 1 : 0) << "\n"
+            << "show_age="       << (g_show_age ? 1 : 0)      << "\n"
+            << "clipboard="      << (g_show_clipboard ? 1 : 0)<< "\n"
+            << "statics_live="   << (g_statics_live ? 1 : 0)  << "\n";
     }
 
     void load_settings()
@@ -397,6 +407,11 @@ namespace
                 else if (key == "inst_cap")   g_instance_cap  = std::clamp(std::stoi(val), 20, 200000);
                 else if (key == "inst_live")  g_instances_live = (std::stoi(val) != 0);
                 else if (key == "inst_inherited") g_inst_show_inherited = (std::stoi(val) != 0);
+                else if (key == "sort_key")   { int k{ std::stoi(val) }; if (k >= 0 && k <= 5) g_class_sort_key = k; }
+                else if (key == "sort_desc")  g_class_sort_desc = (std::stoi(val) != 0);
+                else if (key == "show_age")   g_show_age       = (std::stoi(val) != 0);
+                else if (key == "clipboard")  g_show_clipboard = (std::stoi(val) != 0);
+                else if (key == "statics_live") g_statics_live = (std::stoi(val) != 0);
             }
             catch (...) { /* ignore a malformed value, keep the default */ }
         }
@@ -1462,6 +1477,20 @@ namespace
     }
     inline bool desc_is_ref(const std::string& d) { return !d.empty() && (d[0] == 'L' || d[0] == '['); }
 
+    // Freeze / unfreeze through the app AND keep the UI's freeze registry in sync
+    // (so the Frozen overview shows every active freeze + its held value).
+    void ui_freeze(viewer::App& app, char scope, const std::string& cls, const std::string& addr,
+                   const std::string& field, const std::string& value)
+    {
+        app.freeze_field(scope, cls, addr, field, value);
+        g_frozen[frozen_key(scope, cls, addr, field)] = FrozenField{ scope, cls, addr, field, value };
+    }
+    void ui_unfreeze(viewer::App& app, char scope, const std::string& cls, const std::string& addr, const std::string& field)
+    {
+        app.unfreeze_field(scope, cls, addr, field);
+        g_frozen.erase(frozen_key(scope, cls, addr, field));
+    }
+
     // Turn a displayed field value into a token accepted by the payload's writer:
     // strings lose their quotes (payload re-allocates), non-string refs use their
     // pointee address (or null), chars lose their quotes, everything else is verbatim.
@@ -1548,7 +1577,7 @@ namespace
         const bool frozen{ g_frozen.count(fkey) != 0 };
         const bool is_ref{ desc_is_ref(desc) };
         const bool is_string{ desc == "Ljava/lang/String;" };
-        const auto refreeze_if{ [&](const std::string& v) { if (frozen) app.freeze_field(scope, cls, addr, field, v); } };
+        const auto refreeze_if{ [&](const std::string& v) { if (frozen) ui_freeze(app, scope, cls, addr, field, v); } };
 
         // Freeze lock
         ImGui::PushStyleColor(ImGuiCol_Text, frozen ? ImVec4(0.36f, 0.63f, 1.0f, 1.0f) : ImVec4(0.52f, 0.54f, 0.60f, 1.0f));
@@ -1557,8 +1586,8 @@ namespace
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(frozen ? "Frozen — click to unlock" : "Freeze at the current value");
         if (lk)
         {
-            if (frozen) { app.unfreeze_field(scope, cls, addr, field); g_frozen.erase(fkey); }
-            else        { app.freeze_field(scope, cls, addr, field, writeable_value(desc, value, ref_addr)); g_frozen.insert(fkey); }
+            if (frozen) ui_unfreeze(app, scope, cls, addr, field);
+            else        ui_freeze(app, scope, cls, addr, field, writeable_value(desc, value, ref_addr));
         }
 
         // Edit
@@ -2154,7 +2183,7 @@ namespace
                             if (obj_drop_target(d))
                             {
                                 app.set_field_value('I', app.inst_class, selp->address, f.name, d.address);
-                                if (g_frozen.count(frozen_key('I', app.inst_class, selp->address, f.name))) app.freeze_field('I', app.inst_class, selp->address, f.name, d.address);
+                                if (g_frozen.count(frozen_key('I', app.inst_class, selp->address, f.name))) ui_freeze(app, 'I', app.inst_class, selp->address, f.name, d.address);
                             }
                         }
 
@@ -2287,7 +2316,7 @@ namespace
                     if (obj_drop_target(d))
                     {
                         app.set_field_value('S', app.stat_class, {}, f.name, d.address);
-                        if (g_frozen.count(frozen_key('S', app.stat_class, {}, f.name))) app.freeze_field('S', app.stat_class, {}, f.name, d.address);
+                        if (g_frozen.count(frozen_key('S', app.stat_class, {}, f.name))) ui_freeze(app, 'S', app.stat_class, {}, f.name, d.address);
                     }
                 }
                 ImGui::TableSetColumnIndex(2);
@@ -2432,6 +2461,19 @@ namespace
                     ImGui::SetTooltip("on_class_loaded hook armed — %llu class(es) defined via ClassLoader.defineClass so far",
                                       (unsigned long long)app.hook_total.load());
             }
+            // Frozen-fields indicator: click to review + unfreeze every active freeze.
+            if (!g_frozen.empty())
+            {
+                ImGui::SameLine(0.0f, em(0.6f));
+                const ImVec4 ice{ 0.40f, 0.66f, 1.0f, 1.0f };
+                ImGui::PushStyleColor(ImGuiCol_Text, ice);
+                ImGui::PushStyleColor(ImGuiCol_TextLink, ice);
+                char lbl[48];
+                std::snprintf(lbl, sizeof(lbl), ICON_FA_LOCK " frozen: %d", (int)g_frozen.size());
+                if (ImGui::TextLink(lbl)) g_show_frozen = true;
+                ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fields held at a fixed value — click to review / unfreeze");
+            }
             ImGui::SameLine(0.0f, em(0.8f));
 
             // Status message — coloured by severity and ellipsized so a long error
@@ -2487,6 +2529,55 @@ namespace
                     std::string d{ nm };
                     for (char& ch : d) if (ch == '/') ch = '.';
                     ImGui::TextUnformatted(d.c_str());
+                }
+                ImGui::EndChild();
+            }
+            ImGui::EndPopup();
+        }
+
+        // Frozen-fields overview: every active freeze, with per-row + bulk unfreeze.
+        if (g_show_frozen) { ImGui::OpenPopup("Frozen fields"); g_show_frozen = false; }
+        if (ImGui::BeginPopup("Frozen fields"))
+        {
+            ImGui::SeparatorText("Frozen fields");
+            if (g_frozen.empty())
+                ImGui::TextDisabled("(none)");
+            else
+            {
+                if (ui::Button("Unfreeze all", ImVec2(0, 0), ui::BtnDanger)) { app.unfreeze_all(); g_frozen.clear(); }
+                ImGui::Spacing();
+                ImGui::BeginChild("frzlist", ImVec2(em(34.0f), (std::min)((float)g_frozen.size() + 0.5f, 14.0f) * em(1.7f)));
+                if (ImGui::BeginTable("frztbl", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH))
+                {
+                    ImGui::TableSetupColumn("Field", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, em(9.0f));
+                    ImGui::TableSetupColumn("",      ImGuiTableColumnFlags_WidthFixed, em(2.4f));
+                    std::string remove_key;
+                    int uid{ 0 };
+                    for (const auto& [key, fz] : g_frozen)
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        std::string label{ dotted_name(cls_short(fz.cls)) + "." + fz.field };
+                        if (fz.scope == 'S') label += "  (static)";
+                        ImGui::TextUnformatted(label.c_str());
+                        if (fz.scope == 'I' && ImGui::IsItemHovered()) ImGui::SetTooltip("%s @ %s", dotted_name(fz.cls).c_str(), fz.addr.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::PushStyleColor(ImGuiCol_Text, value_color(fz.value));
+                        ImGui::TextUnformatted(fz.value.c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::PushID(uid++);
+                        if (ui::IconButton(ICON_FA_UNLOCK, "unf")) remove_key = key;
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Unfreeze");
+                        ImGui::PopID();
+                    }
+                    if (!remove_key.empty())
+                    {
+                        if (const auto it{ g_frozen.find(remove_key) }; it != g_frozen.end())
+                        { const FrozenField fz{ it->second }; ui_unfreeze(app, fz.scope, fz.cls, fz.addr, fz.field); }
+                    }
+                    ImGui::EndTable();
                 }
                 ImGui::EndChild();
             }

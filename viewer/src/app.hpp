@@ -660,6 +660,8 @@ namespace viewer
             dispatch_op("UNF\t" + key, /*want_call=*/false);
         }
 
+        void unfreeze_all() { dispatch_op("UNF\t*", /*want_call=*/false); }
+
         // args: already-tagged tokens (bare literal / @null / @0x<oop> / #text).
         void call_method(const std::string& cls, const std::string& addr, const std::string& method,
                          const std::string& descriptor, const std::vector<std::string>& args)
