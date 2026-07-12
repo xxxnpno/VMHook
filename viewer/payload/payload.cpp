@@ -12,12 +12,17 @@
 //   F <TAB> fieldName  <TAB> descriptor <TAB> <fieldAccessFlags>
 //   O <TAB> 0x<addr>                      (start of a live instance, its oop address)
 //   V <TAB> fieldName <TAB> value        (a field value of the current instance)
+//   E <TAB> message                      (an error, for the SET requests)
 //   DONE <TAB> <count>
 // Methods/fields belong to the most recently emitted C record; V records to the
 // most recent O.  Which stream is produced depends on the request the viewer
 // leaves in %TEMP%\vmhook_viewer_req.txt before it opens the pipe:
 //   "ENUM"          (or missing)  -> the full class surface (C/M/F).
-//   "INST" <TAB> internal/Class/Name  -> live instances of that class (O/V).
+//   "INST" <TAB> internal/Class/Name [<TAB> max]  -> live instances (O/V).
+//   "STAT" <TAB> internal/Class/Name              -> static fields (one O + V's).
+//   "SETI" <TAB> Class <TAB> 0xADDR <TAB> field <TAB> value -> write an instance
+//                                                   field, then stream back V (re-read).
+//   "SETS" <TAB> Class <TAB> field <TAB> value    -> write a static field, then V.
 // Access-flag fields are decimal JVM class-file flag words.
 
 #include <vmhook/vmhook.hpp>
@@ -417,6 +422,166 @@ namespace
         FlushFileBuffers(pipe);
     }
 
+    // Find a declared or inherited field's descriptor + static flag by name,
+    // walking k and its superchain (like stream_instances).  Returns true and
+    // fills desc/is_static when found.
+    auto find_field_desc(vmhook::hotspot::klass* const k, const std::string& name,
+                         std::string& desc, bool& is_static) -> bool
+    {
+        int hops{ 0 };
+        for (vmhook::hotspot::klass* kk{ k };
+             kk && vmhook::hotspot::is_valid_pointer(kk) && hops < 64;
+             kk = kk->get_super(), ++hops)
+        {
+            for (const auto& [fname, fdesc, facc] : kk->collect_fields())
+            {
+                if (fname == name)
+                {
+                    desc      = fdesc;
+                    is_static = (facc & 0x0008u) != 0u;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Parse `value` per the field descriptor and write it through vmhook's
+    // fault-safe set_field (which resolves static-vs-instance + offset itself, so
+    // `base` is the instance oop for instance fields and is ignored for statics).
+    // Returns "" on success, else a human error message.
+    auto apply_set(vmhook::hotspot::klass* const k, void* const base,
+                   const std::string& name, const std::string& desc, const std::string& value) -> std::string
+    {
+        if (desc.empty())
+        {
+            return "unknown field descriptor";
+        }
+        const auto to_ll{ [](const std::string& v) { return std::strtoll(v.c_str(), nullptr, 0); } };
+        switch (desc[0])
+        {
+        case 'Z':
+        {
+            const bool b{ value == "true" || value == "TRUE" || value == "1" };
+            vmhook::set_field<std::uint8_t>(base, k, name, static_cast<std::uint8_t>(b ? 1 : 0));
+            break;
+        }
+        case 'B': vmhook::set_field<std::int8_t>(base, k, name, static_cast<std::int8_t>(to_ll(value))); break;
+        case 'C':
+        {
+            const std::uint16_t ch{ value.size() == 1
+                ? static_cast<std::uint16_t>(static_cast<unsigned char>(value[0]))
+                : static_cast<std::uint16_t>(std::strtoul(value.c_str(), nullptr, 0)) };
+            vmhook::set_field<std::uint16_t>(base, k, name, ch);
+            break;
+        }
+        case 'S': vmhook::set_field<std::int16_t>(base, k, name, static_cast<std::int16_t>(to_ll(value))); break;
+        case 'I': vmhook::set_field<std::int32_t>(base, k, name, static_cast<std::int32_t>(to_ll(value))); break;
+        case 'J': vmhook::set_field<std::int64_t>(base, k, name, static_cast<std::int64_t>(to_ll(value))); break;
+        case 'F': vmhook::set_field<float>(base, k, name, std::strtof(value.c_str(), nullptr)); break;
+        case 'D': vmhook::set_field<double>(base, k, name, std::strtod(value.c_str(), nullptr)); break;
+        case 'L':
+        case '[':
+        {
+            if (value == "null")
+            {
+                vmhook::set_field<std::uint32_t>(base, k, name, 0u);
+                break;
+            }
+            if (desc == "Ljava/lang/String;")
+            {
+                void* const s{ vmhook::make_java_string(value) };
+                if (!s || !vmhook::hotspot::is_valid_pointer(s))
+                {
+                    return "failed to allocate a java.lang.String for the new value";
+                }
+                vmhook::set_field<std::uint32_t>(base, k, name, vmhook::hotspot::encode_oop_pointer(s));
+                break;
+            }
+            if (value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0)
+            {
+                void* const ref{ reinterpret_cast<void*>(
+                    static_cast<std::uintptr_t>(std::strtoull(value.c_str(), nullptr, 16))) };
+                if (ref && !vmhook::hotspot::is_valid_pointer(ref))
+                {
+                    return "the target oop address is not a readable pointer";
+                }
+                vmhook::set_field<std::uint32_t>(base, k, name, vmhook::hotspot::encode_oop_pointer(ref));
+                break;
+            }
+            return "reference field: pass 'null', a 0x<oop> address, or (for String) the literal text";
+        }
+        default: return "unsupported field type";
+        }
+        return "";
+    }
+
+    // Write one field on a live instance (SETI) or a class's statics (SETS), then
+    // stream the re-read value back so the caller sees the applied result.
+    //   SETI  arg = "<class>\t<0xADDR>\t<field>\t<value>"
+    //   SETS  arg = "<class>\t<field>\t<value>"
+    void stream_set(HANDLE pipe, const std::string& arg, const bool is_instance)
+    {
+        pipe_writer writer{ pipe };
+        const auto bail{ [&](const std::string& msg)
+        {
+            writer.put("E\t"); writer.put(sanitize(msg)); writer.put("\n");
+            writer.put("DONE\t0\n"); writer.flush(); FlushFileBuffers(pipe);
+        } };
+
+        // Split into fields; the value is everything after the last structural tab
+        // so it may itself contain tabs.
+        std::vector<std::string> parts;
+        const std::size_t need{ is_instance ? 3u : 2u };  // structural tabs before the value
+        std::size_t pos{ 0 };
+        for (std::size_t i = 0; i < need; ++i)
+        {
+            const std::size_t tab{ arg.find('\t', pos) };
+            if (tab == std::string::npos) { bail("malformed set request"); return; }
+            parts.push_back(arg.substr(pos, tab - pos));
+            pos = tab + 1;
+        }
+        parts.push_back(arg.substr(pos));  // the value (remainder)
+
+        const std::string& classname{ parts[0] };
+        const std::string& field{ is_instance ? parts[2] : parts[1] };
+        const std::string& value{ is_instance ? parts[3] : parts[2] };
+
+        vmhook::hotspot::klass* const k{ vmhook::find_class(classname) };
+        if (!k || !vmhook::hotspot::is_valid_pointer(k)) { bail("class not found: " + classname); return; }
+
+        std::string desc; bool is_static{ false };
+        if (!find_field_desc(k, field, desc, is_static)) { bail("field not found: " + field); return; }
+
+        void* base{ nullptr };
+        if (is_instance)
+        {
+            if (is_static) { bail("'" + field + "' is a static field — use set-static"); return; }
+            base = reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(std::strtoull(parts[1].c_str(), nullptr, 16)));
+            if (!base || !vmhook::hotspot::is_valid_pointer(base)) { bail("invalid instance address: " + parts[1]); return; }
+        }
+        else
+        {
+            if (!is_static) { bail("'" + field + "' is an instance field — use set-instance"); return; }
+            base = k->get_java_mirror();
+            if (!base || !vmhook::hotspot::is_valid_pointer(base)) { bail("could not resolve the class mirror"); return; }
+        }
+
+        const std::string err{ apply_set(k, base, field, desc, value) };
+        if (!err.empty()) { bail(err); return; }
+
+        // Re-read so the response reflects what actually landed.
+        writer.put("V\t");
+        writer.put(sanitize(field));
+        writer.put("\t");
+        writer.put(sanitize(read_field_value(base, k, field, desc)));
+        writer.put("\n");
+        writer.put("DONE\t1\n");
+        writer.flush();
+        FlushFileBuffers(pipe);
+    }
+
     // Serve every attach: the payload stays loaded and, each time a viewer/CLI
     // creates the pipe server, connects to it and streams whatever the current
     // request asks for (class surface by default, or live instances).  This makes
@@ -448,6 +613,14 @@ namespace
             else if (req.rfind("STAT\t", 0) == 0)
             {
                 stream_statics(pipe, req.substr(5));
+            }
+            else if (req.rfind("SETI\t", 0) == 0)
+            {
+                stream_set(pipe, req.substr(5), /*is_instance=*/true);
+            }
+            else if (req.rfind("SETS\t", 0) == 0)
+            {
+                stream_set(pipe, req.substr(5), /*is_instance=*/false);
             }
             else
             {

@@ -16,5 +16,4 @@
 #define ICON_FA_COMPRESS "\xef\x81\xa6"  // U+F066 compress (restore)
 #define ICON_FA_MINUS    "\xef\x81\xa8"  // U+F068
 #define ICON_FA_PLUG     "\xef\x87\xa6"  // U+F1E6
-#define ICON_FA_MUG_HOT  "\xef\x9e\xb6"  // U+F7B6
 #define ICON_FA_CIRCLE_Q "\xef\x81\x99"  // U+F059 circle-question

@@ -140,6 +140,68 @@ TOOLS = [
             "required": ["pid", "class_name"],
         },
     },
+    {
+        "name": "search_members",
+        "description": (
+            "Search a JVM's cached enumeration for methods and/or fields whose name contains a "
+            "case-insensitive substring, across every loaded class. Returns a list of "
+            "{class, kind, name, descriptor, signature|type, static?}. Run enumerate_jvm first. "
+            "Use this to locate a member (e.g. every 'update' method or 'health' field) without "
+            "scanning class by class. Capped at 5000 hits."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "query": {"type": "string", "description": "case-insensitive substring of the member name"},
+                "scope": {"type": "string", "enum": ["all", "methods", "fields"], "description": "what to search (default 'all')"},
+            },
+            "required": ["pid", "query"],
+        },
+    },
+    {
+        "name": "set_instance_field",
+        "description": (
+            "WRITE a field on ONE live heap instance (mutates the running JVM). Identify the object by "
+            "the heap 'address' from get_instances, then give the field name and new value. Primitives "
+            "(int/long/float/double/boolean/char/byte/short) are parsed from the string and always work; "
+            "reference fields take 'null' or a 0x<oop> address; a String field also accepts literal text, "
+            "though building a NEW String is best-effort (the VM may refuse the allocation — you get "
+            "{error}; 'null' always works). Returns {pid, class, field, value, ok:true} with the re-read "
+            "value, or {error}. Injects the payload if needed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "class_name": {"type": "string", "description": "internal name of the instance's class, e.g. 'com/example/demo/ExampleApp$Worker'"},
+                "address": {"type": "string", "description": "heap address of the instance (the 'address' from get_instances, e.g. '0x60F44D7F8')"},
+                "field": {"type": "string", "description": "declared or inherited instance field name"},
+                "value": {"type": "string", "description": "new value (primitive literal, String text, 'null', or 0x<oop>)"},
+            },
+            "required": ["pid", "class_name", "address", "field", "value"],
+        },
+    },
+    {
+        "name": "set_static_field",
+        "description": (
+            "WRITE a STATIC field on a class (mutates the running JVM's class-level state, on the "
+            "java.lang.Class mirror). Value parsing matches set_instance_field: primitives always work, "
+            "reference fields take 'null' or a 0x<oop> address, and a new String is best-effort. Returns "
+            "{pid, class, field, value, ok:true} with the re-read value, or {error}. Injects the payload "
+            "if needed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "class_name": {"type": "string", "description": "internal name, e.g. 'com/example/demo/ExampleApp'"},
+                "field": {"type": "string", "description": "static field name"},
+                "value": {"type": "string", "description": "new value (primitive literal, String text, 'null', or 0x<oop>)"},
+            },
+            "required": ["pid", "class_name", "field", "value"],
+        },
+    },
 ]
 
 
@@ -162,6 +224,17 @@ def call_tool(name: str, args: dict) -> str:
         return run_cli(cli_args)
     if name == "get_statics":
         return run_cli(["statics", str(args["pid"]), str(args["class_name"])])
+    if name == "search_members":
+        cli_args = ["search", str(args["pid"]), str(args["query"])]
+        if args.get("scope"):
+            cli_args.append(str(args["scope"]))
+        return run_cli(cli_args)
+    if name == "set_instance_field":
+        return run_cli(["set-instance", str(args["pid"]), str(args["class_name"]),
+                        str(args["address"]), str(args["field"]), str(args["value"])])
+    if name == "set_static_field":
+        return run_cli(["set-static", str(args["pid"]), str(args["class_name"]),
+                        str(args["field"]), str(args["value"])])
     return json.dumps({"error": f"unknown tool: {name}"})
 
 

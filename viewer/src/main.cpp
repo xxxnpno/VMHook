@@ -138,66 +138,76 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
 // ── style + fonts ─────────────────────────────────────────────────────────────
 namespace
 {
-    // Reworked theme: a deep, cohesive dark palette (inspired by the community
-    // "Moonlight" theme, github.com/Madam-Herta/Moonlight) with a modern blue
-    // accent and softer rounding.
+    // Theme: the community "Moonlight" palette (github.com/Madam-Herta/Moonlight)
+    // — a deep blue-black night palette with pill-rounded frames — adapted to a
+    // data-dense tool: a legible periwinkle accent for interactive controls, and
+    // the two self-defeating Moonlight values fixed (near-white TextSelectedBg,
+    // pure-black table lines) so selected text and table gridlines stay visible.
     void apply_modern_style()
     {
         ImGuiStyle& s{ ImGui::GetStyle() };
-        // Rounding — softer, more modern.
-        s.WindowRounding = 10.0f; s.ChildRounding = 8.0f; s.FrameRounding = 8.0f;
-        s.PopupRounding = 8.0f; s.GrabRounding = 8.0f; s.ScrollbarRounding = 12.0f; s.TabRounding = 8.0f;
-        // Spacing / padding.
-        s.WindowPadding = ImVec2(14, 12); s.FramePadding = ImVec2(12, 7);
-        s.ItemSpacing = ImVec2(9, 8); s.ItemInnerSpacing = ImVec2(8, 6); s.CellPadding = ImVec2(10, 6);
-        s.ScrollbarSize = 13.0f; s.GrabMinSize = 11.0f;
+        // Rounding — Moonlight's signature soft, pill-shaped frames.
+        s.WindowRounding = 11.5f; s.ChildRounding = 8.0f; s.FrameRounding = 9.0f;
+        s.PopupRounding = 7.0f; s.GrabRounding = 9.0f; s.ScrollbarRounding = 12.0f; s.TabRounding = 8.0f;
+        // Spacing / padding (Moonlight's 20px frame padding is far too wide for a
+        // dense listing — moderated, its rounded character kept).
+        s.WindowPadding = ImVec2(14, 12); s.FramePadding = ImVec2(12, 6);
+        s.ItemSpacing = ImVec2(8, 7); s.ItemInnerSpacing = ImVec2(7, 5); s.CellPadding = ImVec2(10, 6);
+        s.ScrollbarSize = 12.0f; s.GrabMinSize = 10.0f;
         s.WindowBorderSize = 0.0f; s.FrameBorderSize = 0.0f; s.ChildBorderSize = 1.0f; s.PopupBorderSize = 1.0f;
         s.SeparatorTextBorderSize = 2.0f; s.SeparatorTextPadding = ImVec2(20, 6);
         s.WindowTitleAlign = ImVec2(0.0f, 0.5f);
-        s.FrameBorderSize = 0.0f;
+        s.ButtonTextAlign = ImVec2(0.5f, 0.5f);
 
         ImVec4* c{ s.Colors };
-        const ImVec4 accent  { 0.26f, 0.55f, 0.98f, 1.00f };
-        const ImVec4 accentHi{ 0.42f, 0.66f, 1.00f, 1.00f };
-        c[ImGuiCol_Text]                 = ImVec4(0.93f, 0.94f, 0.97f, 1.00f);
-        c[ImGuiCol_TextDisabled]         = ImVec4(0.43f, 0.47f, 0.56f, 1.00f);
-        c[ImGuiCol_WindowBg]             = ImVec4(0.066f, 0.072f, 0.088f, 1.00f);
-        c[ImGuiCol_ChildBg]              = ImVec4(0.091f, 0.099f, 0.118f, 1.00f);
-        c[ImGuiCol_PopupBg]              = ImVec4(0.074f, 0.081f, 0.099f, 0.99f);
-        c[ImGuiCol_Border]               = ImVec4(0.145f, 0.158f, 0.190f, 1.00f);
+        // Periwinkle-indigo accent (Moonlight's night-blue family) for anything
+        // interactive; a muted variant for primary buttons so they read as
+        // "primary" without neon glare.
+        const ImVec4 accent   { 0.33f, 0.48f, 0.94f, 1.00f };
+        const ImVec4 accentHi { 0.47f, 0.60f, 1.00f, 1.00f };
+        const ImVec4 btn      { 0.19f, 0.28f, 0.56f, 1.00f };
+        const ImVec4 btnHi    { 0.27f, 0.40f, 0.80f, 1.00f };
+        const ImVec4 btnDn    { 0.15f, 0.23f, 0.47f, 1.00f };
+        c[ImGuiCol_Text]                 = ImVec4(0.95f, 0.96f, 0.98f, 1.00f);
+        c[ImGuiCol_TextDisabled]         = ImVec4(0.40f, 0.44f, 0.55f, 1.00f);
+        c[ImGuiCol_WindowBg]             = ImVec4(0.078f, 0.086f, 0.102f, 1.00f);
+        c[ImGuiCol_ChildBg]              = ImVec4(0.093f, 0.100f, 0.116f, 1.00f);
+        c[ImGuiCol_PopupBg]              = ImVec4(0.070f, 0.078f, 0.094f, 0.98f);
+        c[ImGuiCol_Border]               = ImVec4(0.157f, 0.169f, 0.192f, 1.00f);
         c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_FrameBg]              = ImVec4(0.120f, 0.132f, 0.162f, 1.00f);
-        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.160f, 0.176f, 0.216f, 1.00f);
-        c[ImGuiCol_FrameBgActive]        = ImVec4(0.190f, 0.210f, 0.256f, 1.00f);
-        c[ImGuiCol_TitleBg]              = ImVec4(0.055f, 0.061f, 0.075f, 1.00f);
-        c[ImGuiCol_TitleBgActive]        = ImVec4(0.10f, 0.14f, 0.24f, 1.00f);
-        c[ImGuiCol_MenuBarBg]            = ImVec4(0.10f, 0.11f, 0.13f, 1.00f);
+        c[ImGuiCol_FrameBg]              = ImVec4(0.112f, 0.126f, 0.155f, 1.00f);
+        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.157f, 0.169f, 0.192f, 1.00f);
+        c[ImGuiCol_FrameBgActive]        = ImVec4(0.185f, 0.205f, 0.245f, 1.00f);
+        c[ImGuiCol_TitleBg]              = ImVec4(0.047f, 0.055f, 0.071f, 1.00f);
+        c[ImGuiCol_TitleBgActive]        = ImVec4(0.047f, 0.055f, 0.071f, 1.00f);
+        c[ImGuiCol_MenuBarBg]            = ImVec4(0.098f, 0.106f, 0.122f, 1.00f);
         c[ImGuiCol_ScrollbarBg]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.24f, 0.27f, 0.33f, 1.00f);
-        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.33f, 0.37f, 0.45f, 1.00f);
+        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.20f, 0.22f, 0.26f, 1.00f);
+        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.28f, 0.31f, 0.37f, 1.00f);
         c[ImGuiCol_ScrollbarGrabActive]  = accent;
         c[ImGuiCol_CheckMark]            = accentHi;
         c[ImGuiCol_SliderGrab]           = accent;
         c[ImGuiCol_SliderGrabActive]     = accentHi;
-        c[ImGuiCol_Button]               = ImVec4(0.20f, 0.42f, 0.86f, 1.00f);
-        c[ImGuiCol_ButtonHovered]        = ImVec4(0.26f, 0.52f, 0.98f, 1.00f);
-        c[ImGuiCol_ButtonActive]         = ImVec4(0.17f, 0.35f, 0.72f, 1.00f);
-        c[ImGuiCol_Header]               = ImVec4(0.20f, 0.40f, 0.78f, 0.55f);
-        c[ImGuiCol_HeaderHovered]        = ImVec4(0.23f, 0.46f, 0.86f, 0.72f);
-        c[ImGuiCol_HeaderActive]         = ImVec4(0.25f, 0.50f, 0.92f, 0.90f);
-        c[ImGuiCol_Separator]            = ImVec4(0.145f, 0.158f, 0.190f, 1.00f);
+        c[ImGuiCol_Button]               = btn;
+        c[ImGuiCol_ButtonHovered]        = btnHi;
+        c[ImGuiCol_ButtonActive]         = btnDn;
+        c[ImGuiCol_Header]               = ImVec4(accent.x, accent.y, accent.z, 0.50f);
+        c[ImGuiCol_HeaderHovered]        = ImVec4(accent.x, accent.y, accent.z, 0.70f);
+        c[ImGuiCol_HeaderActive]         = ImVec4(accent.x, accent.y, accent.z, 0.90f);
+        c[ImGuiCol_Separator]            = ImVec4(0.157f, 0.169f, 0.192f, 1.00f);
         c[ImGuiCol_SeparatorHovered]     = accent;
         c[ImGuiCol_SeparatorActive]      = accentHi;
         c[ImGuiCol_ResizeGrip]           = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
         c[ImGuiCol_ResizeGripHovered]    = accent;
         c[ImGuiCol_ResizeGripActive]     = accentHi;
-        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.100f, 0.110f, 0.135f, 1.00f);
-        c[ImGuiCol_TableBorderStrong]    = ImVec4(1.00f, 1.00f, 1.00f, 0.080f);
-        c[ImGuiCol_TableBorderLight]     = ImVec4(1.00f, 1.00f, 1.00f, 0.040f);
+        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.047f, 0.055f, 0.071f, 1.00f);
+        c[ImGuiCol_TableBorderStrong]    = ImVec4(1.00f, 1.00f, 1.00f, 0.060f);
+        c[ImGuiCol_TableBorderLight]     = ImVec4(1.00f, 1.00f, 1.00f, 0.028f);
         c[ImGuiCol_TableRowBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
         c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.00f, 1.00f, 1.00f, 0.020f);
         c[ImGuiCol_TextSelectedBg]       = ImVec4(accent.x, accent.y, accent.z, 0.35f);
         c[ImGuiCol_TextLink]             = accentHi;  // the extends / field-type jump links
+        c[ImGuiCol_DragDropTarget]       = accentHi;
         c[ImGuiCol_NavHighlight]         = accent;
     }
 
@@ -225,7 +235,6 @@ namespace
                 0xF065, 0xF066,  // expand / compress
                 0xF068, 0xF068,  // minus
                 0xF1E6, 0xF1E6,  // plug
-                0xF7B6, 0xF7B6,  // mug-hot
                 0 };
             ImFontConfig cfg{};
             cfg.MergeMode        = true;
@@ -558,17 +567,6 @@ namespace
         ImGui::TextDisabled("%s", text);
     }
 
-    // Make a combo's dropdown-arrow box blend into its frame instead of showing
-    // as a bright accent button — cleaner, more integrated look.
-    inline void push_combo_style()
-    {
-        const ImVec4* col{ ImGui::GetStyle().Colors };
-        ImGui::PushStyleColor(ImGuiCol_Button,        col[ImGuiCol_FrameBg]);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col[ImGuiCol_FrameBgHovered]);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  col[ImGuiCol_FrameBgActive]);
-    }
-    inline void pop_combo_style() { ImGui::PopStyleColor(3); }
-
     // A thin vertical divider that lines up with the row's framed widgets.
     inline void row_divider()
     {
@@ -583,20 +581,17 @@ namespace
 
     void draw_toolbar(viewer::App& app)
     {
-        // JVM label + adaptive combo (list auto-refreshes every 2s; no Refresh btn)
-        row_label(ICON_FA_MUG_HOT "  JVM");
-        ImGui::SameLine();
-        const float combo_w{ std::clamp(ImGui::GetContentRegionMax().x - em(34.0f), em(16.0f), em(64.0f)) };
-        ImGui::SetNextItemWidth(combo_w);
+        // Adaptive JVM picker combo (list auto-refreshes every 2s; no Refresh btn).
+        // No leading label/icon — the "Select a running JVM..." preview is self-explanatory.
+        const float combo_w{ std::clamp(ImGui::GetContentRegionMax().x - em(30.0f), em(16.0f), em(64.0f)) };
         std::string preview{ "Select a running JVM..." };
         if (app.selected_jvm >= 0 && app.selected_jvm < (int)app.jvms.size())
         {
             const auto& p{ app.jvms[(std::size_t)app.selected_jvm] };
             preview = p.display_name + "  -  " + std::to_string(p.pid);
         }
-        push_combo_style();
         ImGui::BeginDisabled(app.busy());  // don't swap JVM mid-attach
-        const bool combo_open{ ImGui::BeginCombo("##jvm", preview.c_str()) };
+        const bool combo_open{ ui::BeginCombo("##jvm", preview.c_str(), combo_w) };
         // Full command line on hover (the name/pid preview hides it).
         if (!combo_open && app.selected_jvm >= 0 && app.selected_jvm < (int)app.jvms.size() && ImGui::IsItemHovered())
         {
@@ -613,13 +608,12 @@ namespace
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("%s", p.command_line.empty() ? p.image_name.c_str() : p.command_line.c_str());
             }
-            ImGui::EndCombo();
+            ui::EndCombo();
         }
         ImGui::EndDisabled();
-        pop_combo_style();
-        ImGui::SameLine(0.0f, em(0.5f));
+        ImGui::SameLine(0.0f, em(0.6f));
         ImGui::BeginDisabled(app.busy() || app.selected_jvm < 0);
-        if (ImGui::Button(ICON_FA_PLUG "  Attach")) { app.attach_selected(g_dll_path); g_selected_class = -1; g_nav_back.clear(); g_nav_fwd.clear(); }
+        if (ui::Button(ICON_FA_PLUG "  Attach", ImVec2(0, 0), ui::BtnPrimary)) { app.attach_selected(g_dll_path); g_selected_class = -1; g_nav_back.clear(); g_nav_fwd.clear(); }
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !ImGui::IsItemActive())
             ImGui::SetTooltip("Inject vmhook and enumerate every class, method and field");
@@ -651,29 +645,21 @@ namespace
         ImGui::SameLine(ImGui::GetContentRegionMax().x - (bw * 4.0f + gap * 3.0f));
         // Ghost (transparent) window controls that only tint on hover — subtle
         // chrome rather than loud primary buttons.
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.10f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1.0f, 1.0f, 1.0f, 0.16f));
-        if (ImGui::Button(ICON_FA_CIRCLE_Q "##help", ImVec2(bw, bw))) ImGui::OpenPopup("shortcuts");
+        if (ui::Button(ICON_FA_CIRCLE_Q "##help", ImVec2(bw, bw), ui::BtnGhost)) ImGui::OpenPopup("shortcuts");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyboard shortcuts (F1)");
         if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) ImGui::OpenPopup("shortcuts");
         ImGui::SameLine(0.0f, gap);
-        if (ImGui::Button(ICON_FA_MINUS "##min", ImVec2(bw, bw)) && g_hwnd) ShowWindow(g_hwnd, SW_MINIMIZE);
+        if (ui::Button(ICON_FA_MINUS "##min", ImVec2(bw, bw), ui::BtnGhost) && g_hwnd) ShowWindow(g_hwnd, SW_MINIMIZE);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimize");
         ImGui::SameLine(0.0f, gap);
         const bool maximized{ g_hwnd && IsZoomed(g_hwnd) };
         char maxlbl[24];
         std::snprintf(maxlbl, sizeof(maxlbl), "%s##maxrestore", maximized ? ICON_FA_COMPRESS : ICON_FA_EXPAND);
-        if (ImGui::Button(maxlbl, ImVec2(bw, bw)) && g_hwnd)
+        if (ui::Button(maxlbl, ImVec2(bw, bw), ui::BtnGhost) && g_hwnd)
             ShowWindow(g_hwnd, maximized ? SW_RESTORE : SW_MAXIMIZE);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(maximized ? "Restore" : "Maximize");
-        ImGui::PopStyleColor(3);
         ImGui::SameLine(0.0f, gap);
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.86f, 0.26f, 0.26f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.70f, 0.17f, 0.17f, 1.0f));
-        if (ImGui::Button(ICON_FA_XMARK "##close", ImVec2(bw, bw)) && g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
-        ImGui::PopStyleColor(3);
+        if (ui::Button(ICON_FA_XMARK "##close", ImVec2(bw, bw), ui::BtnDanger) && g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close");
         if (ImGui::BeginPopup("shortcuts"))
         {
@@ -719,26 +705,26 @@ namespace
         ImGui::SameLine(0.0f, em(0.4f));
         if (g_focus_search) { ImGui::SetKeyboardFocusHere(); g_focus_search = false; }
         const bool has_query{ g_search[0] != '\0' };
-        ImGui::SetNextItemWidth(has_query ? -em(1.9f) : -1.0f);
         const char* hint{ g_search_scope == 1 ? "Search methods across all classes" : g_search_scope == 2 ? "Search fields across all classes" : "Search classes  (Ctrl+F)" };
-        ImGui::InputTextWithHint("##search", hint, g_search, sizeof(g_search));
+        ui::InputText("##search", hint, g_search, sizeof(g_search), has_query ? -em(1.9f) : -1.0f);
         if (has_query)
         {
             ImGui::SameLine(0.0f, em(0.3f));
-            if (ImGui::Button(ICON_FA_XMARK "##clear", ImVec2(em(1.6f), 0.0f))) g_search[0] = '\0';
+            if (ui::Button(ICON_FA_XMARK "##clear", ImVec2(em(1.6f), 0.0f))) g_search[0] = '\0';
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear (Esc)");
         }
 
         std::lock_guard<std::mutex> lock{ app.data_mutex };
 
-        // ── scope selector — search Classes / Methods / Fields ──────────────
-        ImGui::AlignTextToFramePadding();
-        ImGui::SetNextItemWidth(em(7.5f));
-        push_combo_style();
-        ImGui::Combo("##scope", &g_search_scope, "Classes\0Methods\0Fields\0");
-        pop_combo_style();
+        // ── scope selector (+ kind filter for Classes) on one compact row ───
+        static const char* k_kind_names[]{ "All kinds", "class", "interface", "enum", "abstract", "annotation", "record" };
+        ui::Combo("##scope", &g_search_scope, "Classes\0Methods\0Fields\0", em(7.5f));
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Search across every class's methods or fields");
-        ImGui::SameLine(0.0f, em(0.7f));
+        if (g_search_scope == 0)
+        {
+            ImGui::SameLine(0.0f, em(0.5f));
+            ui::Combo("##kind", &g_kind_filter, k_kind_names, IM_ARRAYSIZE(k_kind_names), -1.0f);
+        }
 
         if (g_search_scope != 0)
         {
@@ -750,7 +736,6 @@ namespace
         std::string needle{ g_search };
         for (char& ch : needle) if (ch == '.') ch = '/';
 
-        static const char* k_kind_names[]{ "All kinds", "class", "interface", "enum", "abstract", "annotation", "record" };
         const char* want_kind{ g_kind_filter > 0 ? k_kind_names[g_kind_filter] : nullptr };
 
         g_filtered.clear();
@@ -765,35 +750,22 @@ namespace
 
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%d / %zu classes", (int)g_filtered.size(), app.classes.size());
-        const float kind_w{ em(8.5f) };
-        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - kind_w, ImGui::GetCursorPosX() + em(0.5f)));
-        ImGui::SetNextItemWidth(kind_w);
-        push_combo_style();
-        ImGui::Combo("##kind", &g_kind_filter, k_kind_names, IM_ARRAYSIZE(k_kind_names));
-        pop_combo_style();
 
-        if (ImGui::BeginTable("classes", 3,
-                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate))
+        // One merged column: the class's full path.  The package prefix is drawn
+        // dimmed and the class name in its kind colour, over a full-row selectable.
+        if (ImGui::BeginTable("classes", 1,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate))
         {
-            ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-            ImGui::TableSetupColumn("Class",   ImGuiTableColumnFlags_WidthStretch, 1.15f);
-            ImGui::TableSetupColumn("m/f",     ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, em(4.2f));
+            ImGui::TableSetupColumn("Class", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();
 
             if (ImGuiTableSortSpecs* sort = ImGui::TableGetSortSpecs(); sort && sort->SpecsCount > 0)
             {
-                const bool by_pkg{ sort->Specs[0].ColumnIndex == 0 };
                 const bool asc{ sort->Specs[0].SortDirection == ImGuiSortDirection_Ascending };
                 std::sort(g_filtered.begin(), g_filtered.end(), [&](int a, int b)
                 {
-                    const auto& ca{ app.classes[(std::size_t)a] };
-                    const auto& cb{ app.classes[(std::size_t)b] };
-                    const std::string& ka{ by_pkg ? ca.package : ca.simple_name };
-                    const std::string& kb{ by_pkg ? cb.package : cb.simple_name };
-                    int cmp{ ka.compare(kb) };
-                    if (cmp == 0) cmp = ca.simple_name.compare(cb.simple_name);
+                    const int cmp{ app.classes[(std::size_t)a].internal_name.compare(app.classes[(std::size_t)b].internal_name) };
                     return asc ? cmp < 0 : cmp > 0;
                 });
             }
@@ -816,29 +788,39 @@ namespace
                 {
                     const int idx{ g_filtered[(std::size_t)row] };
                     const viewer::ClassInfo& c{ app.classes[(std::size_t)idx] };
+                    const bool sel{ g_selected_class == idx };
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
                     ImGui::PushID(idx);
-                    if (ImGui::Selectable(c.package.empty() ? "(default)" : c.package.c_str(),
-                            g_selected_class == idx, ImGuiSelectableFlags_SpanAllColumns))
-                    {
+                    // Full-row selectable (empty label); the two-tone path is
+                    // drawn over it via SetCursorScreenPos so package + name can
+                    // carry distinct colours without losing click/selection.
+                    const ImVec2 rp{ ImGui::GetCursorScreenPos() };
+                    if (ImGui::Selectable("##row", sel, ImGuiSelectableFlags_SpanAllColumns))
                         navigate_to(idx, false);  // clicked row already visible
-                    }
                     copy_menu("cls", c.internal_name);
-                    ImGui::TableSetColumnIndex(1);
-                    // On the selected (blue) row, use plain text so the kind colour
-                    // doesn't lose contrast against the highlight — the details
-                    // pane restates the kind badge anyway.
-                    const bool sel{ g_selected_class == idx };
-                    ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : class_kind(c).color);
-                    ImGui::TextUnformatted(c.simple_name.c_str());
-                    ImGui::PopStyleColor();
+                    std::string dotted{ c.internal_name };
+                    for (char& ch : dotted) if (ch == '/') ch = '.';
                     if (ImGui::IsItemHovered() && (c.access || !c.super_name.empty()))
-                        ImGui::SetTooltip("%s", class_kind(c).label);
-                    ImGui::TableSetColumnIndex(2);
-                    ImGui::TextDisabled("%zu/%zu", c.methods.size(), c.fields.size());
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("%zu methods / %zu fields", c.methods.size(), c.fields.size());
+                        ImGui::SetTooltip("%s\n%s  ·  %zu methods / %zu fields",
+                            dotted.c_str(), class_kind(c).label, c.methods.size(), c.fields.size());
+
+                    ImGui::SetCursorScreenPos(rp);
+                    std::string pkg{ c.package };
+                    for (char& ch : pkg) if (ch == '/') ch = '.';
+                    if (!pkg.empty())
+                    {
+                        ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImVec4(0.80f, 0.85f, 0.95f, 1.0f)
+                                                                 : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                        ImGui::TextUnformatted((pkg + ".").c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::SameLine(0.0f, 0.0f);
+                    }
+                    std::string sname{ c.simple_name };
+                    for (char& ch : sname) if (ch == '$') ch = '.';  // nested → dotted for display
+                    ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : class_kind(c).color);
+                    ImGui::TextUnformatted(sname.c_str());
+                    ImGui::PopStyleColor();
                     ImGui::PopID();
                     if (row == scroll_row && g_scroll_to_selected)
                     {
@@ -966,17 +948,15 @@ namespace
         // back / forward navigation (browser-style, pairs with `extends` jumps).
         // Subtle frame-coloured square buttons with Font Awesome arrows.
         const float navw{ ImGui::GetFrameHeight() };
-        push_combo_style();
         ImGui::BeginDisabled(g_nav_back.empty());
-        if (ImGui::Button(ICON_FA_ARROW_L "##nav_back", ImVec2(navw, navw))) nav_back();
+        if (ui::Button(ICON_FA_ARROW_L "##nav_back", ImVec2(navw, navw))) nav_back();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !g_nav_back.empty()) ImGui::SetTooltip("Back (Alt+Left)");
-        ImGui::SameLine(0.0f, em(0.25f));
+        ImGui::SameLine(0.0f, em(0.3f));
         ImGui::BeginDisabled(g_nav_fwd.empty());
-        if (ImGui::Button(ICON_FA_ARROW_R "##nav_fwd", ImVec2(navw, navw))) nav_forward();
+        if (ui::Button(ICON_FA_ARROW_R "##nav_fwd", ImVec2(navw, navw))) nav_forward();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !g_nav_fwd.empty()) ImGui::SetTooltip("Forward (Alt+Right)");
-        pop_combo_style();
         ImGui::SameLine(0.0f, em(0.6f));
 
         // header — one frame-align sets the baseline for the whole line (name + badges)
@@ -1026,13 +1006,13 @@ namespace
         ImGui::Spacing();
         // These run while draw_details holds data_mutex, so status_message
         // (also guarded by it) can be written directly for lightweight feedback.
-        if (ImGui::SmallButton("Copy name"))
+        if (ui::Button("Copy name"))
         {
             ImGui::SetClipboardText(c.internal_name.c_str());
             app.status_message = "Copied class name to clipboard.";
         }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Copy all"))
+        ImGui::SameLine(0.0f, em(0.4f));
+        if (ui::Button("Copy all"))
         {
             // WYSIWYG with the tables: include inherited members (grouped under a
             // "// inherited from X" comment) when the Show-inherited toggle is on.
@@ -1069,21 +1049,19 @@ namespace
             app.status_message = g_show_inherited ? "Copied class listing (with inherited members) to clipboard."
                                                   : "Copied class listing to clipboard.";
         }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Export .txt"))
+        ImGui::SameLine(0.0f, em(0.4f));
+        if (ui::Button("Export .txt"))
             app.status_message = export_class(c) ? "Exported to vmhook_export.txt (next to the viewer)."
                                                  : "Export failed — is the viewer's folder writable?";
-        ImGui::SameLine();
+        ImGui::SameLine(0.0f, em(0.4f));
         // Live heap instances — deferred (request_instances re-locks data_mutex
         // which this function already holds).
-        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_Header));
-        if (ImGui::SmallButton(ICON_FA_SEARCH " Live instances"))
+        if (ui::Button(ICON_FA_SEARCH " Live instances", ImVec2(0, 0), ui::BtnPrimary))
         {
             g_instances_class = c.internal_name;
             g_instances_refresh_now = true;  // immediate first scan
             g_show_instances = true;
         }
-        ImGui::PopStyleColor();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Scan the heap for live objects of this class and show their field values");
         ImGui::Spacing();
@@ -1131,8 +1109,7 @@ namespace
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(ICON_FA_SEARCH);
         ImGui::SameLine(0.0f, em(0.4f));
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputTextWithHint("##mf", "Filter methods", g_method_filter, sizeof(g_method_filter));
+        ui::InputText("##mf", "Filter methods", g_method_filter, sizeof(g_method_filter), -1.0f);
         {
             const std::string mf{ g_method_filter };
             static std::vector<int> mrows;
@@ -1182,8 +1159,7 @@ namespace
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(ICON_FA_SEARCH);
         ImGui::SameLine(0.0f, em(0.4f));
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputTextWithHint("##ff", "Filter fields", g_field_filter, sizeof(g_field_filter));
+        ui::InputText("##ff", "Filter fields", g_field_filter, sizeof(g_field_filter), -1.0f);
         {
             const std::string ff{ g_field_filter };
             static std::vector<int> frows;
@@ -1334,9 +1310,9 @@ namespace
         ui::Toggle("Live", &g_instances_live);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Re-scan the heap ~every 1.5s so field values update live");
         ImGui::SameLine(0.0f, em(0.7f));
-        if (ImGui::SmallButton("Refresh")) g_instances_refresh_now = true;
+        if (ui::Button("Refresh")) g_instances_refresh_now = true;
         ImGui::SameLine(0.0f, em(0.4f));
-        if (ImGui::SmallButton("Copy table")) g_copy_instance_table = true;
+        if (ui::Button("Copy table")) g_copy_instance_table = true;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the filtered + sorted rows to the clipboard as TSV");
 
         // Columns = indices into the streamed fields (declared then inherited),
@@ -1383,9 +1359,9 @@ namespace
         }
 
         // Row: substring filter (address or any value) + inherited toggle + cap.
-        ImGui::SetNextItemWidth((std::max)(ImGui::GetContentRegionAvail().x - em(18.5f), em(6.0f)));
-        ImGui::InputTextWithHint("##ifilter", ICON_FA_SEARCH "  Filter instances",
-                                 g_instance_filter, sizeof(g_instance_filter));
+        ui::InputText("##ifilter", ICON_FA_SEARCH "  Filter instances",
+                      g_instance_filter, sizeof(g_instance_filter),
+                      (std::max)(ImGui::GetContentRegionAvail().x - em(18.5f), em(6.0f)));
         ImGui::SameLine(0.0f, em(0.6f));
         ImGui::Checkbox("Inherited", &g_inst_show_inherited);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show columns for fields inherited from a superclass");
@@ -1545,9 +1521,9 @@ namespace
                 ImGui::TextUnformatted(sel->address.c_str());
                 ImGui::PopStyleColor();
                 ImGui::SameLine(0.0f, em(0.8f));
-                if (ImGui::SmallButton("Copy addr")) ImGui::SetClipboardText(sel->address.c_str());
+                if (ui::Button("Copy addr")) ImGui::SetClipboardText(sel->address.c_str());
                 ImGui::SameLine(0.0f, em(0.4f));
-                if (ImGui::SmallButton("Copy all"))
+                if (ui::Button("Copy all"))
                 {
                     std::string tsv{ dcls + " @ " + sel->address + "\nField\tValue\tFrom\n" };
                     for (const viewer::InstField& f : sel->fields)
@@ -1797,7 +1773,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
             if (dpi >= 48u) g_dpi_scale = static_cast<float>(dpi) / 96.0f;
         }
     }
-    g_left_width *= g_dpi_scale;  // scale the default split (load_settings may override)
+    // Default the class list to a quarter of the screen (load_settings may
+    // override with a previously dragged width).
+    {
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+            g_left_width = static_cast<float>(mi.rcWork.right - mi.rcWork.left) * 0.25f;
+        else
+            g_left_width *= g_dpi_scale;
+    }
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();

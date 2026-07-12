@@ -21,15 +21,45 @@ JVM's classes / methods / fields — all discovered live, no mappings.
 | `get_class`     | `pid`, `class_name`      | `{name, super, kind, access, methods:[{name,descriptor,signature,modifiers,access}], fields:[{name,descriptor,type,modifiers,access,static}]}` |
 | `get_instances` | `pid`, `class_name`, `cap?` | `{pid, class, instances:[{address, fields:{name:value, …}}]}` — live heap objects of the class + their field values (own + inherited); injects if needed, so no prior `enumerate_jvm` required |
 | `get_statics`   | `pid`, `class_name`      | `{pid, class, statics:{name:value, …}}` — the class's STATIC field values, read live from its `java.lang.Class` mirror (class-level state the instance tools don't show) |
+| `search_members`| `pid`, `query`, `scope?` | `[{class, kind, name, descriptor, signature\|type, static?}, …]` — every method/field whose name matches, across all classes (from cache); `scope` ∈ `all`/`methods`/`fields`. Capped at 5000 hits |
+| `set_instance_field` | `pid`, `class_name`, `address`, `field`, `value` | **writes** one field on the live instance at `address` (from `get_instances`); `{pid, class, field, value, ok:true}` with the re-read value, or `{error}` |
+| `set_static_field`   | `pid`, `class_name`, `field`, `value` | **writes** a static field on the class mirror; same result shape |
 
 `kind` is one of `class` / `interface` / `enum` / `abstract` / `annotation` /
 `record` (from the class-file access flags); `access` is the raw flag word.
 
 Typical flow: `list_jvms` → pick a pid → `enumerate_jvm(pid)` → then
-`list_classes` / `get_class` as much as you like (they read the cache; re-run
-`enumerate_jvm` to refresh — re-attach is supported). `get_instances` reads the
-**live heap** directly (not the cache), so it reflects the current object state
-on every call.
+`list_classes` / `get_class` / `search_members` as much as you like (they read
+the cache; re-run `enumerate_jvm` to refresh — re-attach is supported).
+`get_instances` / `get_statics` read the **live heap / class mirror** directly
+(not the cache), so they reflect the current object state on every call.
+
+### Reading *and* writing
+
+The `set_*` tools **mutate the running JVM** — the same pure-VM path the reader
+uses, in reverse. Values are parsed by the field's declared type:
+
+- **primitives** — `int`/`long`/`short`/`byte`/`char`/`float`/`double`/`boolean`
+  are parsed from the string (`"42"`, `"3.14"`, `"true"`, `"0x1F"`) — fully reliable;
+- **reference** fields — take `null`, or a raw `0x<oop>` heap address to repoint them;
+- **String** fields — also accept the literal text, but building a *new* String is
+  best-effort: it needs a VM allocation from the helper thread and may be refused
+  (you get a clear `{"error": …}`); `null` and repointing always work.
+
+The write is re-read and echoed back, so `value` in the result is what actually
+landed. Example — freeze a worker's byte field and bump a static counter:
+
+```
+$ vmhook_cli set-instance 15352 com/example/demo/ExampleApp$Worker 0x60F44C718 b8 7
+{"pid":15352,"class":"…$Worker","field":"b8","value":"7","ok":true}
+
+$ vmhook_cli set-static 15352 com/example/demo/ExampleApp tickCounter 999
+{"pid":15352,"class":"…","field":"tickCounter","value":"999","ok":true}
+```
+
+(Fields the target program keeps rewriting each loop — like a live tick counter —
+will show your value on the echo, then be overwritten by the app on its next tick;
+that's the program, not the write, at work.)
 
 ### Example — live heap + statics
 

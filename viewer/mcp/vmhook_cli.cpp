@@ -328,6 +328,100 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if ((cmd == "set-instance" || cmd == "set-static") && argc >= 5)
+    {
+        const bool is_instance{ cmd == "set-instance" };
+        // set-instance <pid> <class> <address> <field> <value>
+        // set-static   <pid> <class> <field> <value>
+        if (is_instance && argc < 7) { std::printf("{\"error\":\"usage: set-instance <pid> <class> <address> <field> <value>\"}\n"); return 2; }
+        if (!is_instance && argc < 6) { std::printf("{\"error\":\"usage: set-static <pid> <class> <field> <value>\"}\n"); return 2; }
+        const std::uint32_t pid{ (std::uint32_t)std::strtoul(argv[2], nullptr, 10) };
+        const std::string cls{ argv[3] };
+        std::string request, field, value;
+        if (is_instance)
+        {
+            const std::string addr{ argv[4] };
+            field = argv[5]; value = argv[6];
+            request = "SETI\t" + cls + "\t" + addr + "\t" + field + "\t" + value;
+        }
+        else
+        {
+            field = argv[4]; value = argv[5];
+            request = "SETS\t" + cls + "\t" + field + "\t" + value;
+        }
+        wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring w{ exe }; const std::size_t s{ w.find_last_of(L"\\/") };
+        if (s != std::wstring::npos) w.resize(s + 1);
+        const std::wstring dll{ w + L"vmhook_payload.dll" };
+        std::string raw, err;
+        if (!enumerate_raw(pid, dll, raw, err, request))
+        { std::printf("{\"error\":\"%s\"}\n", json_escape(err).c_str()); return 1; }
+
+        // Response: "E<TAB>message" on failure, "V<TAB>name<TAB>value" on success.
+        std::string emsg, newval; bool ok{ false };
+        std::size_t p{ 0 };
+        while (p < raw.size())
+        {
+            std::size_t nl{ raw.find('\n', p) };
+            if (nl == std::string::npos) nl = raw.size();
+            const std::string_view line{ raw.data() + p, nl - p };
+            p = nl + 1;
+            if (line.size() >= 2 && line[0] == 'E' && line[1] == '\t') emsg.assign(line.substr(2));
+            else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t')
+            {
+                const std::size_t t2{ line.find('\t', 2) };
+                if (t2 != std::string_view::npos) { newval.assign(line.substr(t2 + 1)); ok = true; }
+            }
+        }
+        if (!ok)
+        { std::printf("{\"error\":\"%s\"}\n", json_escape(emsg.empty() ? "set failed (no response)" : emsg).c_str()); return 1; }
+        std::printf("{\"pid\":%u,\"class\":\"%s\",\"field\":\"%s\",\"value\":\"%s\",\"ok\":true}\n",
+            pid, json_escape(cls).c_str(), json_escape(field).c_str(), json_escape(newval).c_str());
+        return 0;
+    }
+
+    if (cmd == "search" && argc >= 4)
+    {
+        const std::uint32_t pid{ (std::uint32_t)std::strtoul(argv[2], nullptr, 10) };
+        const std::string query{ argv[3] };
+        const std::string scope{ argc >= 5 ? argv[4] : "all" };
+        const bool wantM{ scope == "all" || scope == "methods" };
+        const bool wantF{ scope == "all" || scope == "fields" };
+        const std::string raw{ load_cache(pid) };
+        if (raw.empty()) { std::printf("{\"error\":\"no cache for pid %u; run enumerate first\"}\n", pid); return 1; }
+        auto classes{ parse(raw) };
+        constexpr int k_cap{ 5000 };
+        std::printf("[");
+        bool first{ true }; int emitted{ 0 };
+        for (const auto& c : classes)
+        {
+            if (emitted >= k_cap) break;
+            if (wantM)
+                for (const auto& m : c.methods)
+                {
+                    if (emitted >= k_cap) break;
+                    if (!icontains(m.name, query)) continue;
+                    std::printf("%s{\"class\":\"%s\",\"kind\":\"method\",\"name\":\"%s\",\"descriptor\":\"%s\",\"signature\":\"%s\"}",
+                        first ? "" : ",", json_escape(c.internal_name).c_str(), json_escape(m.name).c_str(),
+                        json_escape(m.descriptor).c_str(), json_escape(viewer::pretty_method(m.descriptor)).c_str());
+                    first = false; ++emitted;
+                }
+            if (wantF)
+                for (const auto& f : c.fields)
+                {
+                    if (emitted >= k_cap) break;
+                    if (!icontains(f.name, query)) continue;
+                    std::printf("%s{\"class\":\"%s\",\"kind\":\"field\",\"name\":\"%s\",\"descriptor\":\"%s\",\"type\":\"%s\",\"static\":%s}",
+                        first ? "" : ",", json_escape(c.internal_name).c_str(), json_escape(f.name).c_str(),
+                        json_escape(f.descriptor).c_str(), json_escape(viewer::pretty_field(f.descriptor)).c_str(),
+                        f.is_static ? "true" : "false");
+                    first = false; ++emitted;
+                }
+        }
+        std::printf("]\n");
+        return 0;
+    }
+
     if (cmd == "classes" && argc >= 3)
     {
         const std::uint32_t pid{ (std::uint32_t)std::strtoul(argv[2], nullptr, 10) };
@@ -390,6 +484,8 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::printf("{\"error\":\"usage: vmhook_cli list | enumerate <pid> | classes <pid> [substr] | class <pid> <name> | instances <pid> <class> [cap] | statics <pid> <class>\"}\n");
+    std::printf("{\"error\":\"usage: vmhook_cli list | enumerate <pid> | classes <pid> [substr] | class <pid> <name> | "
+                "search <pid> <query> [methods|fields|all] | instances <pid> <class> [cap] | statics <pid> <class> | "
+                "set-instance <pid> <class> <address> <field> <value> | set-static <pid> <class> <field> <value>\"}\n");
     return 2;
 }
