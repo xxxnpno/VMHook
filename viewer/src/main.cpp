@@ -635,27 +635,26 @@ namespace
 
         // Right-aligned window controls: help (?), minimize, close — the app is
         // borderless (no native title bar), so these replace the caption buttons.
-        // Square buttons (width = row height) sized/spaced in font-relative units.
-        const float bw{ ImGui::GetFrameHeight() };
+        // Compact square icon buttons (glyph pixel-centred by ui::IconButton),
+        // spaced in font-relative units.
+        const float bw{ ImGui::GetFrameHeight() * 0.78f };
         const float gap{ em(0.35f) };
         ImGui::SameLine(ImGui::GetContentRegionMax().x - (bw * 4.0f + gap * 3.0f));
         // Ghost (transparent) window controls that only tint on hover — subtle
         // chrome rather than loud primary buttons.
-        if (ui::Button(ICON_FA_CIRCLE_Q "##help", ImVec2(bw, bw), ui::BtnGhost)) ImGui::OpenPopup("shortcuts");
+        if (ui::IconButton(ICON_FA_CIRCLE_Q, "help", bw, ui::BtnGhost)) ImGui::OpenPopup("shortcuts");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyboard shortcuts (F1)");
         if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) ImGui::OpenPopup("shortcuts");
         ImGui::SameLine(0.0f, gap);
-        if (ui::Button(ICON_FA_MINUS "##min", ImVec2(bw, bw), ui::BtnGhost) && g_hwnd) ShowWindow(g_hwnd, SW_MINIMIZE);
+        if (ui::IconButton(ICON_FA_MINUS, "min", bw, ui::BtnGhost) && g_hwnd) ShowWindow(g_hwnd, SW_MINIMIZE);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimize");
         ImGui::SameLine(0.0f, gap);
         const bool maximized{ g_hwnd && IsZoomed(g_hwnd) };
-        char maxlbl[24];
-        std::snprintf(maxlbl, sizeof(maxlbl), "%s##maxrestore", maximized ? ICON_FA_COMPRESS : ICON_FA_EXPAND);
-        if (ui::Button(maxlbl, ImVec2(bw, bw), ui::BtnGhost) && g_hwnd)
+        if (ui::IconButton(maximized ? ICON_FA_COMPRESS : ICON_FA_EXPAND, "maxrestore", bw, ui::BtnGhost) && g_hwnd)
             ShowWindow(g_hwnd, maximized ? SW_RESTORE : SW_MAXIMIZE);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(maximized ? "Restore" : "Maximize");
         ImGui::SameLine(0.0f, gap);
-        if (ui::Button(ICON_FA_XMARK "##close", ImVec2(bw, bw), ui::BtnDanger) && g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        if (ui::IconButton(ICON_FA_XMARK, "close", bw, ui::BtnDanger) && g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close");
         if (ImGui::BeginPopup("shortcuts"))
         {
@@ -706,7 +705,7 @@ namespace
         if (has_query)
         {
             ImGui::SameLine(0.0f, em(0.3f));
-            if (ui::Button(ICON_FA_XMARK "##clear", ImVec2(em(1.6f), 0.0f))) g_search[0] = '\0';
+            if (ui::IconButton(ICON_FA_XMARK, "clear")) g_search[0] = '\0';
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear (Esc)");
         }
 
@@ -943,14 +942,13 @@ namespace
 
         // back / forward navigation (browser-style, pairs with `extends` jumps).
         // Subtle frame-coloured square buttons with Font Awesome arrows.
-        const float navw{ ImGui::GetFrameHeight() };
         ImGui::BeginDisabled(g_nav_back.empty());
-        if (ui::Button(ICON_FA_ARROW_L "##nav_back", ImVec2(navw, navw))) nav_back();
+        if (ui::IconButton(ICON_FA_ARROW_L, "nav_back")) nav_back();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !g_nav_back.empty()) ImGui::SetTooltip("Back (Alt+Left)");
         ImGui::SameLine(0.0f, em(0.3f));
         ImGui::BeginDisabled(g_nav_fwd.empty());
-        if (ui::Button(ICON_FA_ARROW_R "##nav_fwd", ImVec2(navw, navw))) nav_forward();
+        if (ui::IconButton(ICON_FA_ARROW_R, "nav_fwd")) nav_forward();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !g_nav_fwd.empty()) ImGui::SetTooltip("Forward (Alt+Right)");
         ImGui::SameLine(0.0f, em(0.6f));

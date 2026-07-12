@@ -55,6 +55,85 @@ namespace ui
         return pressed;
     }
 
+    namespace detail
+    {
+        // First Unicode codepoint of a UTF-8 string (FA glyphs are 3-byte).
+        inline unsigned first_cp(const char* s)
+        {
+            const unsigned char* u{ reinterpret_cast<const unsigned char*>(s) };
+            const unsigned c{ u[0] };
+            if (c < 0x80)          return c;
+            if ((c >> 5) == 0x6)   return ((c & 0x1Fu) << 6) | (u[1] & 0x3Fu);
+            if ((c >> 4) == 0xE)   return ((c & 0x0Fu) << 12) | ((u[1] & 0x3Fu) << 6) | (u[2] & 0x3Fu);
+            if ((c >> 3) == 0x1E)  return ((c & 0x07u) << 18) | ((u[1] & 0x3Fu) << 12) | ((u[2] & 0x3Fu) << 6) | (u[3] & 0x3Fu);
+            return c;
+        }
+    }
+
+    // A compact square icon-only button.  The hit box reserves the full frame
+    // height (so it aligns with combos/inputs on the same row), but the visible
+    // square is `size` (default 0.78*frame-height — noticeably lighter than a
+    // full-height square) and vertically centred in that cell.  The glyph is
+    // placed by its ACTUAL visual bounds (ImFont::FindGlyph), so Font Awesome's
+    // inline baseline offset can't push it off-centre — it's pixel-centred.
+    inline bool IconButton(const char* icon, const char* str_id, float size = 0.0f, int kind = BtnNeutral)
+    {
+        ImGuiStyle& st{ ImGui::GetStyle() };
+        const ImVec4* col{ st.Colors };
+        const float fh{ ImGui::GetFrameHeight() };
+        if (size <= 0.0f) size = fh * 0.78f;
+
+        const ImVec2 p0{ ImGui::GetCursorScreenPos() };
+        ImGui::PushID(str_id);
+        const bool pressed{ ImGui::InvisibleButton("##ib", ImVec2(size, fh)) };
+        const bool hov{ ImGui::IsItemHovered() };
+        const bool act{ ImGui::IsItemActive() };
+        ImGui::PopID();
+
+        // Visible square, vertically centred in the frame-height cell.
+        const float  vy{ p0.y + (fh - size) * 0.5f };
+        const ImVec2 q0{ p0.x, vy }, q1{ p0.x + size, vy + size };
+
+        ImVec4 fill{ 0, 0, 0, 0 }, border{ 0, 0, 0, 0 }, text{ col[ImGuiCol_Text] };
+        bool drawBorder{ false };
+        if (kind == BtnGhost)
+            fill = act ? ImVec4(1, 1, 1, 0.15f) : hov ? ImVec4(1, 1, 1, 0.09f) : ImVec4(0, 0, 0, 0);
+        else if (kind == BtnDanger)
+            fill = act ? ImVec4(0.70f, 0.17f, 0.17f, 1) : hov ? ImVec4(0.86f, 0.26f, 0.26f, 1) : ImVec4(0, 0, 0, 0);
+        else if (kind == BtnPrimary)
+        {
+            fill = act ? ImVec4(col[ImGuiCol_SliderGrab].x * 0.86f, col[ImGuiCol_SliderGrab].y * 0.86f, col[ImGuiCol_SliderGrab].z * 0.86f, 1.0f)
+                 : hov ? col[ImGuiCol_SliderGrabActive] : col[ImGuiCol_SliderGrab];
+            text = ImVec4(1, 1, 1, 1);
+        }
+        else  // Neutral
+        {
+            fill = act ? col[ImGuiCol_ButtonActive] : hov ? col[ImGuiCol_ButtonHovered] : col[ImGuiCol_Button];
+            border = col[ImGuiCol_Border]; drawBorder = true;
+        }
+
+        ImDrawList* dl{ ImGui::GetWindowDrawList() };
+        const float r{ st.FrameRounding };
+        if (fill.w > 0.0f) dl->AddRectFilled(q0, q1, ImGui::GetColorU32(fill), r);
+        if (drawBorder && st.FrameBorderSize > 0.0f)
+            dl->AddRect(q0, q1, ImGui::GetColorU32(border), r, 0, st.FrameBorderSize);
+
+        const ImVec2 ctr{ p0.x + size * 0.5f, vy + size * 0.5f };
+        const ImU32  tcol{ ImGui::GetColorU32(text) };
+        // ImGui 1.92+ moved FindGlyph onto the size-baked font.  Centre by the
+        // glyph's actual visual quad so the FA baseline offset can't shift it.
+        ImFontBaked* baked{ ImGui::GetFontBaked() };
+        const ImFontGlyph* g{ baked ? baked->FindGlyphNoFallback(static_cast<ImWchar>(detail::first_cp(icon))) : nullptr };
+        if (g)
+            dl->AddText(ImVec2(ctr.x - (g->X0 + g->X1) * 0.5f, ctr.y - (g->Y0 + g->Y1) * 0.5f), tcol, icon);
+        else
+        {
+            const ImVec2 ts{ ImGui::CalcTextSize(icon) };
+            dl->AddText(ImVec2(ctr.x - ts.x * 0.5f, ctr.y - ts.y * 0.5f), tcol, icon);
+        }
+        return pressed;
+    }
+
     // Dropdowns — stock ImGui, width set for the caller (negative widths follow
     // ImGui's "fill from the right" convention, same as before).
     inline bool BeginCombo(const char* id, const char* preview, float width)
