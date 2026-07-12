@@ -222,6 +222,27 @@ TOOLS = [
         },
     },
     {
+        "name": "get_array",
+        "description": (
+            "Read the ELEMENTS of a Java array at a heap address. Give the array's '0x' address (from a "
+            "call_method result whose 'refClass' is an array type like '[J', or a reference field's oop) and "
+            "its element descriptor: a primitive ('I','J','F','D','Z','B','C','S') or 'Ljava/lang/String;' / "
+            "'L<class>;' for an object array (the array's own descriptor with one leading '[' removed). "
+            "Returns {address, length, elements:[...]} — the first `max` (default 4096) elements formatted "
+            "like field values (a '<class>' element is an object, '\"...\"' a String). Injects if needed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer"},
+                "address": {"type": "string", "description": "the array's heap address, e.g. '0x60F4DE5A8'"},
+                "element_type": {"type": "string", "description": "element descriptor, e.g. 'J', 'I', 'Ljava/lang/String;'"},
+                "max": {"type": "integer", "description": "max elements to read (default 4096)"},
+            },
+            "required": ["pid", "address", "element_type"],
+        },
+    },
+    {
         "name": "call_method",
         "description": (
             "INVOKE a Java method in the running JVM and return its result. For an instance method, give "
@@ -327,6 +348,11 @@ def call_tool(name: str, args: dict) -> str:
     if name == "set_static_field":
         return run_cli(["set-static", str(args["pid"]), str(args["class_name"]),
                         str(args["field"]), str(args["value"])])
+    if name == "get_array":
+        cli_args = ["array", str(args["pid"]), str(args["address"]), str(args["element_type"])]
+        if args.get("max"):
+            cli_args.append(str(args["max"]))
+        return run_cli(cli_args)
     if name == "call_method":
         cli_args = ["call", str(args["pid"]), str(args["class_name"]), str(args["address"]),
                     str(args["method"]), str(args["descriptor"])]

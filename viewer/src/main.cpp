@@ -293,6 +293,10 @@ namespace
     struct FrozenField { char scope{ 'I' }; std::string cls, addr, field, value; };
     std::map<std::string, FrozenField> g_frozen;
     bool         g_show_frozen{ false };                   // open the frozen-fields popup
+    // Array inspector (click an array-typed value to open it).
+    bool         g_show_array{ false };
+    std::string  g_array_addr, g_array_elemdesc, g_array_label;
+    bool         g_array_refresh{ false };
     char          g_edit_buf[512]{};                       // shared edit-popup input buffer
     // Static-fields window (per class, async STAT channel).
     bool          g_show_statics{ false };
@@ -1476,6 +1480,19 @@ namespace
         return k;
     }
     inline bool desc_is_ref(const std::string& d) { return !d.empty() && (d[0] == 'L' || d[0] == '['); }
+    inline bool desc_is_array(const std::string& d) { return !d.empty() && d[0] == '['; }
+
+    // Open the array inspector on the array at `addr` (elements typed by the field
+    // descriptor with one leading '[' stripped).
+    void open_array(const std::string& addr, const std::string& field_desc, const std::string& label)
+    {
+        if (addr.empty()) return;
+        g_array_addr     = addr;
+        g_array_elemdesc = field_desc.size() > 1 ? field_desc.substr(1) : std::string{};
+        g_array_label    = label;
+        g_show_array     = true;
+        g_array_refresh  = true;
+    }
 
     // Freeze / unfreeze through the app AND keep the UI's freeze registry in sync.
     // Only record the change if the request was ACTUALLY dispatched — otherwise
@@ -2164,7 +2181,14 @@ namespace
 
                         ImGui::TableSetColumnIndex(1);
                         bool linked{ false };
-                        if (f.value.size() > 2 && f.value.front() == '<' && f.value.back() == '>')
+                        if (desc_is_array(desc) && !f.ref_addr.empty() && f.value != "null")
+                        {
+                            if (ImGui::TextLink(f.value.c_str()))
+                                open_array(f.ref_addr, desc, dotted_name(cls_short(app.inst_class)) + "." + f.name);
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to view the array's elements)", f.ref_addr.c_str());
+                            linked = true;
+                        }
+                        else if (f.value.size() > 2 && f.value.front() == '<' && f.value.back() == '>')
                         {
                             const std::string internal{ f.value.substr(1, f.value.size() - 2) };
                             if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
@@ -2298,7 +2322,14 @@ namespace
                 ImGui::TextUnformatted(f.name.c_str());
                 ImGui::TableSetColumnIndex(1);
                 bool linked{ false };
-                if (f.value.size() > 2 && f.value.front() == '<' && f.value.back() == '>')
+                if (desc_is_array(desc) && !f.ref_addr.empty() && f.value != "null")
+                {
+                    if (ImGui::TextLink(f.value.c_str()))
+                        open_array(f.ref_addr, desc, dotted_name(cls_short(app.stat_class)) + "." + f.name);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to view the array's elements)", f.ref_addr.c_str());
+                    linked = true;
+                }
+                else if (f.value.size() > 2 && f.value.front() == '<' && f.value.back() == '>')
                 {
                     const std::string internal{ f.value.substr(1, f.value.size() - 2) };
                     if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
@@ -2334,6 +2365,86 @@ namespace
         ImGui::Separator();
         draw_call_panel(app, app.stat_class, {}, g_call_stat);
 
+        ImGui::End();
+    }
+
+    // The array inspector: the elements of the array a user clicked.  Read-only
+    // element list; reference elements can be grabbed / dragged into the clipboard.
+    void draw_array_window(viewer::App& app)
+    {
+        ImGui::SetNextWindowSize(ImVec2(em(30.0f), em(28.0f)), ImGuiCond_FirstUseEver);
+        const bool open{ ImGui::Begin("Array", &g_show_array, ImGuiWindowFlags_NoCollapse) };
+        if (!open) { ImGui::End(); return; }
+
+        std::lock_guard<std::mutex> lock{ app.data_mutex };
+        const viewer::Status st{ app.arr_status.load() };
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
+        ImGui::TextUnformatted(g_array_label.empty() ? "array" : g_array_label.c_str());
+        ImGui::PopStyleColor();
+        if (st == viewer::Status::Receiving)
+        {
+            ImGui::SameLine(0.0f, em(0.5f));
+            const float r{ ImGui::GetFrameHeight() * 0.28f };
+            ui::Spinner("##ascan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+        }
+        ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(5.0f), ImGui::GetCursorPosX() + em(1.0f)));
+        if (ui::Button("Refresh")) g_array_refresh = true;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", g_array_addr.c_str());
+        ImGui::SameLine(0.0f, em(0.6f));
+        ImGui::TextDisabled("%s", app.arr_message.c_str());
+        ImGui::Separator();
+
+        if (app.array_elems.empty())
+        {
+            ImGui::TextDisabled(app.arr_length == 0 ? "(empty array)" : "Reading...");
+            ImGui::End();
+            return;
+        }
+
+        if (ImGui::BeginTable("arrt", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH))
+        {
+            ImGui::TableSetupColumn("#",     ImGuiTableColumnFlags_WidthFixed, em(4.0f));
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("",      ImGuiTableColumnFlags_WidthFixed, em(2.4f));
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableHeadersRow();
+            int uid{ 0 };
+            for (const viewer::InstField& e : app.array_elems)
+            {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextDisabled("%s", e.name.c_str());
+                ImGui::TableSetColumnIndex(1);
+                bool linked{ false };
+                if (e.value.size() > 2 && e.value.front() == '<' && e.value.back() == '>')
+                {
+                    const std::string internal{ e.value.substr(1, e.value.size() - 2) };
+                    if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
+                    { if (ImGui::TextLink(e.value.c_str())) navigate_to(it->second); linked = true; }
+                }
+                if (!linked)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, value_color(e.value));
+                    ImGui::TextUnformatted(e.value.c_str());
+                    ImGui::PopStyleColor();
+                }
+                if (!e.ref_addr.empty())
+                    obj_drag_source(e.ref_addr, class_of_ref_value(e.value), "elem[" + e.name + "]");
+                ImGui::TableSetColumnIndex(2);
+                if (!e.ref_addr.empty())
+                {
+                    ImGui::PushID(uid++);
+                    if (ui::IconButton(ICON_FA_THUMBTACK, "grab"))
+                        add_saved_object(app, "elem[" + e.name + "]", class_of_ref_value(e.value), e.ref_addr);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Grab this element into the clipboard");
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndTable();
+        }
         ImGui::End();
     }
 
@@ -2638,6 +2749,17 @@ namespace
         if (g_show_statics)
         {
             draw_statics_window(app);
+        }
+
+        // Array inspector — fetch on open / Refresh (one-shot; arrays don't auto-poll).
+        if (g_show_array && !g_array_addr.empty() && g_array_refresh && !app.any_busy())
+        {
+            app.request_array(g_array_addr, g_array_elemdesc);
+            g_array_refresh = false;
+        }
+        if (g_show_array)
+        {
+            draw_array_window(app);
         }
 
         // Consume a completed mutating op (set / freeze / call) exactly once:

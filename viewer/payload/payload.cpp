@@ -25,6 +25,8 @@
 //   "ENUM"          (or missing)  -> the full class surface (C/M/F).
 //   "INST" <TAB> internal/Class/Name [<TAB> max]  -> live instances (O/V).
 //   "STAT" <TAB> internal/Class/Name              -> static fields (one O + V's).
+//   "ARR"  <TAB> 0xADDR <TAB> elemDescriptor <TAB> max -> a Java array's elements:
+//                    A <TAB> length ; then V <TAB> index <TAB> value <TAB> <TAB> refAddr.
 //   "SETI" <TAB> Class <TAB> 0xADDR <TAB> field <TAB> value -> write an instance
 //                                                   field, then stream back V (re-read).
 //   "SETS" <TAB> Class <TAB> field <TAB> value    -> write a static field, then V.
@@ -660,6 +662,88 @@ namespace
         writer.put("\n");
         writer.flush();
         FlushFileBuffers(pipe);
+    }
+
+    // Read one array element and format it for display (mirrors read_field_value
+    // but through the bounds-checked vmhook::get_array_element<T>).  ref_out gets a
+    // non-null reference element's pointee address (for grab), else empty.
+    auto read_array_element(void* const arr, const std::string& elem_desc, std::int32_t i,
+                            std::string* const ref_out) -> std::string
+    {
+        if (ref_out) { ref_out->clear(); }
+        if (elem_desc.empty()) { return "?"; }
+        switch (elem_desc[0])
+        {
+        case 'Z': return vmhook::get_array_element<std::uint8_t>(arr, i) != 0 ? "true" : "false";
+        case 'B': return std::to_string(static_cast<int>(vmhook::get_array_element<std::int8_t>(arr, i)));
+        case 'C':
+        {
+            const std::uint16_t ch{ vmhook::get_array_element<std::uint16_t>(arr, i) };
+            if (ch >= 32u && ch < 127u) { return std::string{ "'" } + static_cast<char>(ch) + "'"; }
+            return std::to_string(static_cast<unsigned>(ch));
+        }
+        case 'S': return std::to_string(static_cast<int>(vmhook::get_array_element<std::int16_t>(arr, i)));
+        case 'I': return std::to_string(vmhook::get_array_element<std::int32_t>(arr, i));
+        case 'F': return std::to_string(vmhook::get_array_element<float>(arr, i));
+        case 'J': return std::to_string(vmhook::get_array_element<std::int64_t>(arr, i));
+        case 'D': return std::to_string(vmhook::get_array_element<double>(arr, i));
+        case 'L':
+        case '[':
+        {
+            const std::uint32_t compressed{ vmhook::get_array_element<std::uint32_t>(arr, i) };
+            if (compressed == 0u) { return "null"; }
+            void* const ref{ vmhook::hotspot::decode_oop_pointer(compressed) };
+            if (!ref || !vmhook::hotspot::is_valid_pointer(ref)) { return "null"; }
+            if (ref_out)
+            {
+                char rb[32];
+                std::snprintf(rb, sizeof(rb), "0x%llX", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(ref)));
+                *ref_out = rb;
+            }
+            if (elem_desc == "Ljava/lang/String;") { return std::string{ "\"" } + vmhook::read_java_string(ref) + "\""; }
+            if (vmhook::hotspot::klass* const rk{ vmhook::klass_from_oop(ref) }; rk && vmhook::hotspot::is_valid_pointer(rk))
+                if (const vmhook::hotspot::symbol* const rn{ rk->get_name() }; rn && vmhook::hotspot::is_valid_pointer(rn))
+                    return std::string{ "<" } + rn->to_string() + ">";
+            return "<object>";
+        }
+        default: return "?";
+        }
+    }
+
+    // Stream a Java array's elements.  arg = "<0xADDR>\t<elemDescriptor>\t<max>".
+    // Reply: A <TAB> length ; then per element  V <TAB> index <TAB> value <TAB> <TAB> refAddr ; DONE.
+    void stream_array(HANDLE pipe, const std::string& arg)
+    {
+        pipe_writer writer{ pipe };
+        std::vector<std::string> parts;
+        std::size_t pos{ 0 };
+        for (int i = 0; i < 2; ++i)
+        {
+            const std::size_t tab{ arg.find('\t', pos) };
+            if (tab == std::string::npos) { writer.put("DONE\t0\n"); writer.flush(); FlushFileBuffers(pipe); return; }
+            parts.push_back(arg.substr(pos, tab - pos));
+            pos = tab + 1;
+        }
+        parts.push_back(arg.substr(pos));  // max
+
+        void* const arr{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(std::strtoull(parts[0].c_str(), nullptr, 16))) };
+        const std::string elem_desc{ parts[1] };
+        std::int32_t max{ static_cast<std::int32_t>(std::strtol(parts[2].c_str(), nullptr, 10)) };
+        if (max <= 0) { max = 4096; }
+        if (!arr || !vmhook::hotspot::is_valid_pointer(arr)) { writer.put("DONE\t0\n"); writer.flush(); FlushFileBuffers(pipe); return; }
+
+        const std::int32_t length{ vmhook::array_length(arr) };
+        writer.put("A\t"); writer.put(std::to_string(length)); writer.put("\n");
+        const std::int32_t n{ length < max ? length : max };
+        for (std::int32_t i = 0; i < n; ++i)
+        {
+            std::string ref_addr;
+            const std::string value{ read_array_element(arr, elem_desc, i, &ref_addr) };
+            writer.put("V\t"); writer.put(std::to_string(i)); writer.put("\t");
+            writer.put(sanitize(value)); writer.put("\t\t"); writer.put(ref_addr); writer.put("\n");
+        }
+        writer.put("DONE\t"); writer.put(std::to_string(n)); writer.put("\n");
+        writer.flush(); FlushFileBuffers(pipe);
     }
 
     // Find a declared or inherited field's descriptor + static flag by name,
@@ -1429,6 +1513,10 @@ namespace
             else if (req.rfind("STAT\t", 0) == 0)
             {
                 stream_statics(pipe, req.substr(5));
+            }
+            else if (req.rfind("ARR\t", 0) == 0)
+            {
+                stream_array(pipe, req.substr(4));
             }
             else if (req.rfind("SETI\t", 0) == 0)
             {

@@ -43,6 +43,8 @@ Claude/other AIs can drive it (see [`mcp/`](mcp/README.md)).
 - **Object clipboard** — 📌 grab any object (a reference field, an instance, a call
   result) into a **Saved objects** strip, then **drag a chip onto a field or a
   method argument** to place it. Repoint references and pass objects around live.
+- **Array inspector** — click any array-typed value (`int[]`, `String[]`, …) to open
+  its elements in a table; object elements are clickable / grabbable into the clipboard.
 - **Static fields window** — a class's live static values, editable/freezable like
   instance fields, plus a **static-method call** panel.
 - **Call methods** — invoke any method on an instance (or a static): fill arguments

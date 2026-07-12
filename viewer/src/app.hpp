@@ -450,6 +450,15 @@ namespace viewer
         std::string               stat_class{};    // internal name whose statics are shown
         InstanceInfo              statics_obj;      // mirror + its static field values
 
+        // Array inspection (ARR): the elements of one Java array, fetched on demand
+        // when the user opens an array-typed value.  array_elems reuses InstField
+        // (name = index, value = formatted element, ref_addr = pointee for refs).
+        std::atomic<Status>       arr_status{ Status::Idle };
+        std::string               arr_message{};
+        std::string               arr_addr{};       // 0x<oop> of the array being shown
+        std::int32_t              arr_length{ 0 };  // true length (may exceed what we fetched)
+        std::vector<InstField>    array_elems;
+
         // One-shot mutating op (set / freeze / unfreeze / call): result published
         // for the UI to consume when op_seq changes.  Serialised with the other
         // channels through the single `worker` thread.
@@ -502,11 +511,12 @@ namespace viewer
 
         bool stat_busy() const { return stat_status.load() == Status::Receiving; }
         bool op_busy()   const { return op_status.load()   == Status::Receiving; }
+        bool arr_busy()  const { return arr_status.load()  == Status::Receiving; }
 
-        // Any pipe operation in flight — every dispatcher checks this so the four
-        // channels (enumerate / instances / statics / op) never overlap on the
-        // single-instance named pipe or the shared worker thread.
-        bool any_busy() const { return busy() || inst_busy() || stat_busy() || op_busy(); }
+        // Any pipe operation in flight — every dispatcher checks this so the
+        // channels (enumerate / instances / statics / array / op) never overlap on
+        // the single-instance named pipe or the shared worker thread.
+        bool any_busy() const { return busy() || inst_busy() || stat_busy() || arr_busy() || op_busy(); }
 
         // Scan the attached JVM's heap for live instances of `internal_class` and
         // read their instance-field values.  The payload must already be loaded
@@ -626,6 +636,22 @@ namespace viewer
                 stat_class = internal_class;
             }
             worker = std::thread([this, internal_class] { run_statics(internal_class); });
+        }
+
+        // Fetch a Java array's elements (ARR) for on-demand viewing.  addr = the
+        // array's 0x<oop>; elem_desc = its element type (a field's descriptor with
+        // one leading '[' stripped, e.g. "I", "J", "Ljava/lang/String;").
+        void request_array(const std::string& addr, const std::string& elem_desc)
+        {
+            if (any_busy() || attached_pid_ == 0) { return; }
+            if (worker.joinable()) { worker.join(); }
+            arr_status.store(Status::Receiving);
+            {
+                std::lock_guard<std::mutex> lock{ data_mutex };
+                if (arr_addr != addr) { array_elems.clear(); arr_length = 0; arr_message = "Reading array..."; }
+                arr_addr = addr;
+            }
+            worker = std::thread([this, addr, elem_desc] { run_array(addr, elem_desc); });
         }
 
         // ── one-shot mutating operations (set / freeze / unfreeze / call) ─────
@@ -766,6 +792,53 @@ namespace viewer
                     : "Could not read statics — is the JVM still attached?";
             }
             stat_status.store(ok ? Status::Done : Status::Error);
+        }
+
+        void run_array(const std::string& addr, const std::string& elem_desc)
+        {
+            std::string raw;
+            const bool ok{ pipe_exchange("ARR\t" + addr + "\t" + elem_desc + "\t4096", raw) };
+            std::vector<InstField> elems;
+            std::int32_t length{ 0 };
+            if (ok)
+            {
+                std::size_t p{ 0 };
+                while (p < raw.size())
+                {
+                    const std::size_t nl{ raw.find('\n', p) };
+                    const std::size_t end{ nl == std::string::npos ? raw.size() : nl };
+                    const std::string_view line{ raw.data() + p, end - p };
+                    p = (nl == std::string::npos ? raw.size() : nl + 1);
+                    if (line.size() >= 2 && line[0] == 'A' && line[1] == '\t')
+                        length = static_cast<std::int32_t>(std::strtol(std::string{ line.substr(2) }.c_str(), nullptr, 10));
+                    else if (line.size() >= 2 && line[0] == 'V' && line[1] == '\t')
+                    {
+                        const std::size_t t2{ line.find('\t', 2) };
+                        if (t2 != std::string_view::npos)
+                        {
+                            InstField f;
+                            f.name = std::string{ line.substr(2, t2 - 2) };  // the index
+                            const std::size_t t3{ line.find('\t', t2 + 1) };
+                            f.value = std::string{ line.substr(t2 + 1, (t3 == std::string_view::npos ? line.size() : t3) - (t2 + 1)) };
+                            if (t3 != std::string_view::npos)
+                            {
+                                const std::size_t t4{ line.find('\t', t3 + 1) };
+                                if (t4 != std::string_view::npos) f.ref_addr = std::string{ line.substr(t4 + 1) };
+                            }
+                            elems.push_back(std::move(f));
+                        }
+                    }
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock{ data_mutex };
+                array_elems = std::move(elems);
+                arr_length = length;
+                arr_message = ok ? ("Length " + std::to_string(length) + (length > (std::int32_t)array_elems.size()
+                                    ? "  (showing first " + std::to_string(array_elems.size()) + ")" : ""))
+                                 : "Could not read the array.";
+            }
+            arr_status.store(ok ? Status::Done : Status::Error);
         }
 
         std::thread   worker;
