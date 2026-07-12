@@ -56,8 +56,8 @@ rest are primitives.
 
 1. Build the viewer (which also builds `vmhook_cli.exe` + `vmhook_payload.dll`):
    ```bat
-   cmake -S viewer -B build-viewer -G "Visual Studio 17 2022" -A x64
-   cmake --build build-viewer --config Release
+   cmake -S viewer -B build/viewer -G "Visual Studio 17 2022" -A x64
+   cmake --build build/viewer --config Release
    ```
 2. Register the server with your MCP client, pointing `VMHOOK_CLI` at the built
    exe (the payload DLL must sit next to it — it does after the build):
@@ -67,12 +67,12 @@ rest are primitives.
        "vmhook": {
          "command": "python",
          "args": ["C:\\repos\\cpp\\vmhook\\viewer\\mcp\\vmhook_mcp.py"],
-         "env": { "VMHOOK_CLI": "C:\\repos\\cpp\\vmhook\\build-viewer\\bin\\Release\\vmhook_cli.exe" }
+         "env": { "VMHOOK_CLI": "C:\\repos\\cpp\\vmhook\\build\\viewer\\bin\\Release\\vmhook_cli.exe" }
        }
      }
    }
    ```
-   (If `VMHOOK_CLI` is unset, the server looks for `build-viewer/bin/Release/vmhook_cli.exe`
+   (If `VMHOOK_CLI` is unset, the server looks for `build/viewer/bin/Release/vmhook_cli.exe`
    relative to the repo.)
 
 ## Notes

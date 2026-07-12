@@ -78,12 +78,12 @@ Windows SDK. ImGui is fetched into `third_party/imgui` (git-ignored):
 ```bat
 :: from the repo root
 git clone --depth 1 https://github.com/ocornut/imgui viewer/third_party/imgui
-cmake -S viewer -B build-viewer -G "Visual Studio 17 2022" -A x64
-cmake --build build-viewer --config Release
+cmake -S viewer -B build/viewer -G "Visual Studio 17 2022" -A x64
+cmake --build build/viewer --config Release
 ```
 
 Outputs `vmhook_viewer.exe` and `vmhook_payload.dll` side by side in
-`build-viewer/bin/Release/`. Run the exe from that directory (it loads the
+`build/viewer/bin/Release/`. Run the exe from that directory (it loads the
 payload DLL next to itself). The MSVC runtime is static-linked, so the payload
 is self-contained when injected.
 

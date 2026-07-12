@@ -346,9 +346,9 @@ Status: `green` (in CI, passing) · `thin` (exists, needs exhaustive expansion) 
 ## Local compile-only validation (NEVER runs tests)
 
 - C++ (`-Werror`, compiles header + ALL modules + pure-logic tests):
-  `cmake --build build-mingw -j`  (build-mingw configured: MinGW g++, WARNINGS_AS_ERRORS=ON)
+  `cmake --build build/mingw -j`  (build/mingw configured: MinGW g++, WARNINGS_AS_ERRORS=ON)
 - Java fixtures (compile, no run): `javac -d /tmp/fixcheck example/vmhook/*.java example/vmhook/fixtures/*.java`
-- DO NOT run `etc/run_local_mingw.sh` (it launches the JVM + injects + RUNS tests = violates rule).
+- DO NOT run `build/etc/run_local_mingw.sh` (it launches the JVM + injects + RUNS tests = violates rule).
 - DO NOT run `ctest`. GHA is the only test oracle.
 
 ## Phase 1 (Rework D) prep — legacy inline `test_*()` → module parity map
@@ -621,7 +621,7 @@ root each witness into recv* FIRST (before the length sweep) to eliminate the un
   field_primitives_set, method_call_wide_args, field_null_safety, find_methods_by_signature,
   make_java_array. Each authors fixture + module + agent-def.
 - **2026-06-06** — Wave 1 INTEGRATED + PUSHED (commit 18ed5b5). ~520 ctx.check assertions
-  across 5 modules. Validated: C++ compile clean (build-mingw exit 0), javac fixtures clean,
+  across 5 modules. Validated: C++ compile clean (build/mingw exit 0), javac fixtures clean,
   3/5 modules deep-reviewed (excellent), 2/5 quality-scanned (high density, no vacuous checks).
   CI running (watch bv3bq44q2). Roster now 41 agent-defs (method_call_wide_args def pending
   workflow finalize → follow-up commit).

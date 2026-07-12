@@ -1,7 +1,5 @@
 build/
-build-*/
 cmake-build*/
-etc/
 out/
 x64/
 
@@ -58,7 +56,6 @@ process_whitelist.json
 
 # vmhook viewer: vendored ImGui (cloned, not tracked)
 viewer/third_party/imgui/
-build-viewer/
 
 # viewer e2e test artifacts
 viewer/test/*.class

@@ -14,7 +14,7 @@ Register it, e.g. in an MCP client config:
         "vmhook": {
           "command": "python",
           "args": ["C:\\\\repos\\\\cpp\\\\vmhook\\\\viewer\\\\mcp\\\\vmhook_mcp.py"],
-          "env": { "VMHOOK_CLI": "C:\\\\repos\\\\cpp\\\\vmhook\\\\build-viewer\\\\bin\\\\Release\\\\vmhook_cli.exe" }
+          "env": { "VMHOOK_CLI": "C:\\\\repos\\\\cpp\\\\vmhook\\\\build\\\\viewer\\\\bin\\\\Release\\\\vmhook_cli.exe" }
         }
       }
     }
@@ -33,8 +33,8 @@ def find_cli() -> str:
         return env
     here = os.path.dirname(os.path.abspath(__file__))
     for rel in (
-        os.path.join(here, "..", "..", "build-viewer", "bin", "Release", "vmhook_cli.exe"),
-        os.path.join(here, "..", "..", "build-viewer", "bin", "vmhook_cli.exe"),
+        os.path.join(here, "..", "..", "build", "viewer", "bin", "Release", "vmhook_cli.exe"),
+        os.path.join(here, "..", "..", "build", "viewer", "bin", "vmhook_cli.exe"),
         os.path.join(here, "vmhook_cli.exe"),
     ):
         if os.path.exists(rel):

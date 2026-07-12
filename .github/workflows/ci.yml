@@ -508,20 +508,20 @@ jobs:
         run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
       - name: Configure + build (Android ${{ matrix.abi }})
         run: |
-          cmake -S . -B build-android-${{ matrix.abi }} -G Ninja \
+          cmake -S . -B build/android-${{ matrix.abi }} -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=${{ matrix.abi }} \
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
             -DVMHOOK_BUILD_EXAMPLE=OFF \
             -DVMHOOK_BUILD_INJECTOR=OFF
-          cmake --build build-android-${{ matrix.abi }} --parallel
+          cmake --build build/android-${{ matrix.abi }} --parallel
       - name: Run host-runnable unit tests (only when ABI matches host)
         if: matrix.abi == 'x86_64'
         run: |
           # The Android NDK builds for an emulated target by default; we
           # can't execute on the runner.  Just confirm the binaries exist.
-          ls -la build-android-${{ matrix.abi }}/tests/
+          ls -la build/android-${{ matrix.abi }}/tests/
 
   ios-build:
     name: ios cross-compile (xcode · ${{ matrix.sdk }})
@@ -539,7 +539,7 @@ jobs:
             iphonesimulator)  PLATFORM=SIMULATOR64 ;;
           esac
           # Use CMake's built-in iOS toolchain handling.
-          cmake -S . -B build-ios-${{ matrix.sdk }} -G Xcode \
+          cmake -S . -B build/ios-${{ matrix.sdk }} -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=${{ matrix.sdk }} \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -548,7 +548,7 @@ jobs:
             -DVMHOOK_BUILD_EXAMPLE=OFF \
             -DVMHOOK_BUILD_INJECTOR=OFF \
             -DVMHOOK_BUILD_TESTS=ON
-          cmake --build build-ios-${{ matrix.sdk }} --config Release
+          cmake --build build/ios-${{ matrix.sdk }} --config Release
 
   # ─────────────────────────────────────────────────────────────────────────
   # 4. Strict warnings-as-errors build on the primary Linux compilers.
