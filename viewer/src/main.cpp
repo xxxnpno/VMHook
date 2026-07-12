@@ -194,7 +194,9 @@ namespace
         c[ImGuiCol_ResizeGrip]           = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
         c[ImGuiCol_ResizeGripHovered]    = accent;
         c[ImGuiCol_ResizeGripActive]     = accentHi;
-        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.066f, 0.072f, 0.084f, 1.00f);
+        // Header sits in the same flat frame family as the combos/inputs (not a
+        // dark block) so it reads as part of the UI chrome.
+        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.135f, 0.145f, 0.168f, 1.00f);
         c[ImGuiCol_TableBorderStrong]    = ImVec4(1.00f, 1.00f, 1.00f, 0.060f);
         c[ImGuiCol_TableBorderLight]     = ImVec4(1.00f, 1.00f, 1.00f, 0.028f);
         c[ImGuiCol_TableRowBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
