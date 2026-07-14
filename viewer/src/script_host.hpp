@@ -190,12 +190,11 @@ namespace script_host
 
         CreateDirectoryA(work_dir.c_str(), nullptr);
         const std::string src{ work_dir + "\\script_tu.cpp" };
-        const std::string dll{ work_dir + "\\vmhook_script.dll" };
+        // Unique DLL name per build: an already-injected script holds a lock on its
+        // module, so a fixed name would make the next rebuild's link fail.
+        const std::string dll{ work_dir + "\\vmhook_script_" + std::to_string(GetTickCount64()) + ".dll" };
         const std::string bat{ work_dir + "\\build.bat" };
         const std::string blog{ work_dir + "\\build.log" };
-
-        // Remove a stale DLL so a failed rebuild can't be mistaken for success.
-        DeleteFileA(dll.c_str());
 
         { std::ofstream f{ src, std::ios::trunc }; f << compose_source(user_body); }
 
