@@ -293,6 +293,11 @@ namespace
     char         g_method_filter[128]{};
     char         g_field_filter[128]{};
     int          g_selected_class{ -1 };
+    // The selected class's internal name, tracked alongside the index so the
+    // selection can self-heal when a full Rescan replaces the class vector and
+    // shifts indices (HotSpot prepends newly-loaded klasses) — without it, the
+    // details pane would silently show a different class.
+    std::string  g_selected_name;
     float        g_left_width{ 500.0f };  // default; DPI-scaled + persisted
     bool         g_pretty{ true };
     bool         g_full_names{ false };
@@ -407,20 +412,24 @@ namespace
 
     // Back/forward navigation history (paired with the clickable `extends` jump
     // and class-list clicks) so browsing the class graph feels like a browser.
-    std::vector<int> g_nav_back;
-    std::vector<int> g_nav_fwd;
+    // Each entry carries the class's internal name too, so history survives a
+    // Rescan that reorders the class vector (the index is re-resolved by name).
+    std::vector<std::pair<int, std::string>> g_nav_back;
+    std::vector<std::pair<int, std::string>> g_nav_fwd;
     bool             g_scroll_to_selected{ false };  // sync the list to a jump
 
-    // Select a class, recording the previous selection for Back.  Clears the
-    // per-pane member filters (a fresh class shouldn't inherit stale filters).
-    // scroll_into_view syncs the class list to the target — set for link/history
-    // jumps, cleared for list clicks (the clicked row is already visible).
-    void navigate_to(int idx, bool scroll_into_view = true)
+    // Select a class (by index + its internal name), recording the previous
+    // selection for Back.  Clears the per-pane member filters (a fresh class
+    // shouldn't inherit stale filters).  scroll_into_view syncs the class list to
+    // the target — set for link/history jumps, cleared for list clicks (the
+    // clicked row is already visible).
+    void navigate_to(int idx, std::string name, bool scroll_into_view = true)
     {
         if (idx == g_selected_class) return;
-        if (g_selected_class >= 0) g_nav_back.push_back(g_selected_class);
+        if (g_selected_class >= 0) g_nav_back.push_back({ g_selected_class, g_selected_name });
         g_nav_fwd.clear();
         g_selected_class = idx;
+        g_selected_name = std::move(name);
         g_method_filter[0] = 0; g_field_filter[0] = 0;
         if (scroll_into_view) g_scroll_to_selected = true;
     }
@@ -428,8 +437,10 @@ namespace
     void nav_back()
     {
         if (g_nav_back.empty()) return;
-        if (g_selected_class >= 0) g_nav_fwd.push_back(g_selected_class);
-        g_selected_class = g_nav_back.back(); g_nav_back.pop_back();
+        if (g_selected_class >= 0) g_nav_fwd.push_back({ g_selected_class, g_selected_name });
+        g_selected_class = g_nav_back.back().first;
+        g_selected_name  = std::move(g_nav_back.back().second);
+        g_nav_back.pop_back();
         g_method_filter[0] = 0; g_field_filter[0] = 0;
         g_scroll_to_selected = true;
     }
@@ -437,8 +448,10 @@ namespace
     void nav_forward()
     {
         if (g_nav_fwd.empty()) return;
-        if (g_selected_class >= 0) g_nav_back.push_back(g_selected_class);
-        g_selected_class = g_nav_fwd.back(); g_nav_fwd.pop_back();
+        if (g_selected_class >= 0) g_nav_back.push_back({ g_selected_class, g_selected_name });
+        g_selected_class = g_nav_fwd.back().first;
+        g_selected_name  = std::move(g_nav_fwd.back().second);
+        g_nav_fwd.pop_back();
         g_method_filter[0] = 0; g_field_filter[0] = 0;
         g_scroll_to_selected = true;
     }
@@ -627,7 +640,7 @@ namespace
             const auto it{ internal.empty() ? app.name_to_index.end() : app.name_to_index.find(internal) };
             if (it != app.name_to_index.end())
             {
-                if (ImGui::TextLink(base.c_str())) navigate_to(it->second);
+                if (ImGui::TextLink(base.c_str())) navigate_to(it->second, it->first);
                 ImGui::SetItemTooltip("%s  (click to open)", internal.c_str());
             }
             else
@@ -757,7 +770,7 @@ namespace
         ImGui::EndDisabled();
         ImGui::SameLine(0.0f, em(0.6f));
         ImGui::BeginDisabled(app.busy() || app.selected_jvm < 0);
-        if (ui::Button(ICON_FA_PLUG "  Attach", ImVec2(0, 0), ui::BtnPrimary)) { app.attach_selected(g_dll_path); g_selected_class = -1; g_nav_back.clear(); g_nav_fwd.clear(); }
+        if (ui::Button(ICON_FA_PLUG "  Attach", ImVec2(0, 0), ui::BtnPrimary)) { app.attach_selected(g_dll_path); g_selected_class = -1; g_selected_name.clear(); g_nav_back.clear(); g_nav_fwd.clear(); }
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !ImGui::IsItemActive())
             ImGui::SetTooltip("Inject vmhook and enumerate every class, method and field");
@@ -1073,7 +1086,7 @@ namespace
                     // carry distinct colours without losing click/selection.
                     const ImVec2 rp{ ImGui::GetCursorScreenPos() };
                     if (ImGui::Selectable("##row", sel, ImGuiSelectableFlags_SpanAllColumns))
-                        navigate_to(idx, false);  // clicked row already visible
+                        navigate_to(idx, c.internal_name, false);  // clicked row already visible
                     // Left accent bar on the selected row (VS Code-style active marker).
                     if (sel)
                     {
@@ -1193,13 +1206,13 @@ namespace
                         ImGui::PushStyleColor(ImGuiCol_Text, vis_color(f.access));
                         const bool clicked{ ImGui::Selectable(f.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap) };
                         ImGui::PopStyleColor();
-                        if (clicked) { navigate_to(ci); std::snprintf(g_field_filter, sizeof(g_field_filter), "%s", g_search); }
+                        if (clicked) { navigate_to(ci, c.internal_name); std::snprintf(g_field_filter, sizeof(g_field_filter), "%s", g_search); }
                         ImGui::TableSetColumnIndex(1);
                         {
                             const std::string ty{ g_pretty ? viewer::pretty_field(f.descriptor, g_full_names) : f.descriptor };
                             const std::string refn{ ref_internal_name(f.descriptor) };
                             const auto rit{ refn.empty() ? app.name_to_index.end() : app.name_to_index.find(refn) };
-                            if (rit != app.name_to_index.end()) { if (ImGui::TextLink(ty.c_str())) navigate_to(rit->second); }
+                            if (rit != app.name_to_index.end()) { if (ImGui::TextLink(ty.c_str())) navigate_to(rit->second, rit->first); }
                             else ImGui::TextUnformatted(ty.c_str());
                         }
                     }
@@ -1209,7 +1222,7 @@ namespace
                         ImGui::PushStyleColor(ImGuiCol_Text, vis_color(m.access));
                         const bool clicked{ ImGui::Selectable(m.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap) };
                         ImGui::PopStyleColor();
-                        if (clicked) { navigate_to(ci); std::snprintf(g_method_filter, sizeof(g_method_filter), "%s", g_search); }
+                        if (clicked) { navigate_to(ci, c.internal_name); std::snprintf(g_method_filter, sizeof(g_method_filter), "%s", g_search); }
                         ImGui::TableSetColumnIndex(1);
                         render_method_signature(app, m.descriptor);
                     }
@@ -1226,6 +1239,16 @@ namespace
     void draw_details(viewer::App& app)
     {
         std::lock_guard<std::mutex> lock{ app.data_mutex };
+        // Self-heal the selection: a Rescan can replace the class vector and shift
+        // indices, so if the tracked index no longer names the selected class,
+        // re-resolve it by name (dropping to "none" if it was unloaded).
+        if (g_selected_class >= 0 &&
+            (g_selected_class >= (int)app.classes.size() ||
+             app.classes[(std::size_t)g_selected_class].internal_name != g_selected_name))
+        {
+            const auto it{ app.name_to_index.find(g_selected_name) };
+            g_selected_class = (it != app.name_to_index.end()) ? it->second : -1;
+        }
         if (g_selected_class < 0 || g_selected_class >= (int)app.classes.size())
         {
             ImGui::Dummy(ImVec2(0, em(2.2f)));
@@ -1289,7 +1312,7 @@ namespace
             const auto it{ app.name_to_index.find(c.super_name) };
             if (it != app.name_to_index.end())
             {
-                if (ImGui::TextLink(sd.c_str())) { navigate_to(it->second); }
+                if (ImGui::TextLink(sd.c_str())) { navigate_to(it->second, it->first); }
             }
             else
             {
@@ -1502,7 +1525,7 @@ namespace
                         const auto rit{ ref.empty() ? app.name_to_index.end() : app.name_to_index.find(ref) };
                         if (rit != app.name_to_index.end())
                         {
-                            if (ImGui::TextLink(ty.c_str())) navigate_to(rit->second);
+                            if (ImGui::TextLink(ty.c_str())) navigate_to(rit->second, rit->first);
                         }
                         else
                         {
@@ -2284,7 +2307,7 @@ namespace
                             const std::string internal{ f.value.substr(1, f.value.size() - 2) };
                             if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
                             {
-                                if (ImGui::TextLink(f.value.c_str())) navigate_to(it->second);
+                                if (ImGui::TextLink(f.value.c_str())) navigate_to(it->second, it->first);
                                 ImGui::SetItemTooltip("%s  (click to open · drag to grab)", internal.c_str());
                                 linked = true;
                             }
@@ -2425,7 +2448,7 @@ namespace
                     const std::string internal{ f.value.substr(1, f.value.size() - 2) };
                     if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
                     {
-                        if (ImGui::TextLink(f.value.c_str())) navigate_to(it->second);
+                        if (ImGui::TextLink(f.value.c_str())) navigate_to(it->second, it->first);
                         ImGui::SetItemTooltip("%s  (click to open · drag to grab)", internal.c_str());
                         linked = true;
                     }
@@ -2514,7 +2537,7 @@ namespace
                 {
                     const std::string internal{ e.value.substr(1, e.value.size() - 2) };
                     if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
-                    { if (ImGui::TextLink(e.value.c_str())) navigate_to(it->second); linked = true; }
+                    { if (ImGui::TextLink(e.value.c_str())) navigate_to(it->second, it->first); linked = true; }
                 }
                 if (!linked)
                 {
@@ -3163,11 +3186,15 @@ namespace
         }
 
         // Auto-refresh the JVM list every 2s so new/closed JVMs appear without a
-        // manual Refresh (selection is preserved by pid).
+        // manual Refresh (selection is preserved by pid).  The enumeration runs on
+        // a background thread — it's too heavy (a module snapshot per process +
+        // EnumWindows per JVM) to block the render thread with — and its result is
+        // swapped in here when ready.
+        app.apply_refreshed_jvms();
         static double last_refresh{ 0.0 };
-        if (!app.busy() && (ImGui::GetTime() - last_refresh) > 2.0)
+        if ((ImGui::GetTime() - last_refresh) > 2.0)
         {
-            app.refresh_jvms();
+            app.refresh_jvms_async();
             last_refresh = ImGui::GetTime();
         }
 

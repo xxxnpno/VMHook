@@ -477,24 +477,63 @@ namespace viewer
             {
                 worker.join();
             }
+            if (jvm_refresh_thread_.joinable())
+            {
+                jvm_refresh_thread_.join();
+            }
         }
 
         void refresh_jvms()
         {
-            // Preserve the current selection across refreshes by pid (the list
-            // order/size can change as JVMs come and go).
-            const std::uint32_t previous{ (selected_jvm >= 0 && selected_jvm < (int)jvms.size())
-                                              ? jvms[(std::size_t)selected_jvm].pid : 0 };
-            jvms = enumerate_jvms();
-            selected_jvm = -1;
-            for (int i = 0; i < (int)jvms.size(); ++i)
+            adopt_jvm_list(enumerate_jvms());
+        }
+
+        // Kick off a JVM re-enumeration on a background thread and return
+        // immediately.  enumerate_jvms() opens a module snapshot for every process
+        // on the system, reads each candidate's PEB, and runs EnumWindows per JVM —
+        // tens of milliseconds of blocking work.  Running it on the render thread
+        // every couple of seconds dropped frames; this keeps the UI smooth.  No-op
+        // if a refresh is already in flight.  Pair with apply_refreshed_jvms() on
+        // the UI thread to swap the result in.
+        void refresh_jvms_async()
+        {
+            bool expected{ false };
+            if (!jvm_refreshing_.compare_exchange_strong(expected, true))
             {
-                if (jvms[(std::size_t)i].pid == previous) { selected_jvm = i; break; }
+                return;
             }
-            if (selected_jvm < 0 && !jvms.empty())
+            // The previous refresh has published + cleared jvm_refreshing_ before
+            // returning, so this join is on an already-finished thread (near-instant).
+            if (jvm_refresh_thread_.joinable())
             {
-                selected_jvm = 0;
+                jvm_refresh_thread_.join();
             }
+            jvm_refresh_thread_ = std::thread([this]
+            {
+                std::vector<JvmProcess> fresh{ enumerate_jvms() };
+                {
+                    std::lock_guard<std::mutex> lock{ jvm_stage_mtx_ };
+                    jvm_staging_ = std::move(fresh);
+                }
+                jvm_stage_ready_.store(true);
+                jvm_refreshing_.store(false);
+            });
+        }
+
+        // UI thread: if a background refresh finished, swap its result in (keeping
+        // the current selection by pid).  Cheap no-op otherwise.
+        void apply_refreshed_jvms()
+        {
+            if (!jvm_stage_ready_.exchange(false))
+            {
+                return;
+            }
+            std::vector<JvmProcess> fresh;
+            {
+                std::lock_guard<std::mutex> lock{ jvm_stage_mtx_ };
+                fresh = std::move(jvm_staging_);
+            }
+            adopt_jvm_list(std::move(fresh));
         }
 
         bool busy() const
@@ -712,6 +751,24 @@ namespace viewer
         }
 
     private:
+        // Replace the JVM list, preserving the current selection by pid (the list
+        // order/size changes as JVMs come and go).  UI-thread only.
+        void adopt_jvm_list(std::vector<JvmProcess> fresh)
+        {
+            const std::uint32_t previous{ (selected_jvm >= 0 && selected_jvm < (int)jvms.size())
+                                              ? jvms[(std::size_t)selected_jvm].pid : 0 };
+            jvms = std::move(fresh);
+            selected_jvm = -1;
+            for (int i = 0; i < (int)jvms.size(); ++i)
+            {
+                if (jvms[(std::size_t)i].pid == previous) { selected_jvm = i; break; }
+            }
+            if (selected_jvm < 0 && !jvms.empty())
+            {
+                selected_jvm = 0;
+            }
+        }
+
         bool dispatch_op(const std::string& request, bool want_call)
         {
             if (any_busy() || attached_pid_ == 0) { return false; }
@@ -848,6 +905,14 @@ namespace viewer
         }
 
         std::thread   worker;
+
+        // Background JVM re-enumeration (off the render thread — see refresh_jvms_async).
+        std::thread             jvm_refresh_thread_;
+        std::mutex              jvm_stage_mtx_;      // guards jvm_staging_
+        std::vector<JvmProcess> jvm_staging_;        // published by the refresh thread
+        std::atomic<bool>       jvm_stage_ready_{ false };
+        std::atomic<bool>       jvm_refreshing_{ false };
+
         std::uint32_t attached_pid_{ 0 };   // the JVM a successful attach latched onto
         std::wstring  attached_dll_{};      // payload path used for that attach
         std::unordered_set<std::string> prev_names_;  // class names from the previous scan (diff)

@@ -17,7 +17,13 @@ cmake_policy(SET CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # vmhook.hpp needs async exception unwinding (/EHa) on MSVC; CMake injects the
-# default /EHsc, which conflicts.  Scrub it so /EHa is the single EH model.
+# default /EHsc, which conflicts.  Scrub it so the payload can use /EHa as its
+# single EH model.  Every OTHER target (the viewer + CLI tools, which do NOT
+# include vmhook.hpp) still needs a C++ exception model — they use the standard
+# library, try/catch and RAII — so they get the conventional /EHsc added back
+# per-target below.  Without any model, MSVC warns C4530 and, worse, exceptions
+# thrown through those frames would not run destructors (a leaked lock_guard
+# could deadlock).
 if(MSVC)
     string(REGEX REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
     string(REGEX REPLACE "/EHs"  "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
@@ -72,6 +78,9 @@ add_library(imgui STATIC
     "${IMGUI_DIR}/backends/imgui_impl_dx11.cpp")
 target_include_directories(imgui PUBLIC "${IMGUI_DIR}" "${IMGUI_DIR}/backends")
 target_compile_features(imgui PRIVATE cxx_std_17)
+if(MSVC)
+    target_compile_options(imgui PRIVATE /EHsc)  # restore the scrubbed C++ EH model
+endif()
 
 # ── viewer GUI exe ────────────────────────────────────────────────────────────
 # Vendored professional widgets: cmdwtf/imgui_toggle (0BSD) for animated toggle
@@ -90,7 +99,9 @@ target_compile_features(vmhook_viewer PRIVATE cxx_std_23)
 target_compile_definitions(vmhook_viewer PRIVATE IMGUI_DEFINE_MATH_OPERATORS)
 target_link_libraries(vmhook_viewer PRIVATE imgui d3d11 dxgi dwmapi)
 if(MSVC)
-    target_compile_options(vmhook_viewer PRIVATE /Zc:preprocessor /Zc:__cplusplus)
+    # /EHsc: this exe does not include vmhook.hpp, so it wants the standard C++
+    # (synchronous) EH model, not the payload's /EHa — see the scrub note above.
+    target_compile_options(vmhook_viewer PRIVATE /EHsc /Zc:preprocessor /Zc:__cplusplus)
 endif()
 
 # Build the payload alongside the viewer.
@@ -116,10 +127,16 @@ add_custom_command(TARGET vmhook_viewer POST_BUILD
 add_executable(vmhook_cli_probe test/cli_probe.cpp)
 target_include_directories(vmhook_cli_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(vmhook_cli_probe PRIVATE cxx_std_23)
+if(MSVC)
+    target_compile_options(vmhook_cli_probe PRIVATE /EHsc)  # standard C++ EH (no vmhook.hpp here)
+endif()
 add_dependencies(vmhook_cli_probe vmhook_payload)
 
 # ── vmhook_cli — JSON front-end used by the MCP server ───────────────────────
 add_executable(vmhook_cli mcp/vmhook_cli.cpp)
 target_include_directories(vmhook_cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(vmhook_cli PRIVATE cxx_std_23)
+if(MSVC)
+    target_compile_options(vmhook_cli PRIVATE /EHsc)  # standard C++ EH (no vmhook.hpp here)
+endif()
 add_dependencies(vmhook_cli vmhook_payload)
