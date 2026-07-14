@@ -12,8 +12,47 @@
 #include "imgui_toggle.h"
 #include "imgui_toggle_palette.h"
 
+#include <cmath>
+
 namespace ui
 {
+    // ── motion: one frame-rate-independent exponential smoother, keyed by widget
+    // ID, so every hover / selection / focus / toast animation settles with the
+    // SAME timing.  cur = lerp(cur, target, 1 - e^(-rate*dt)) — NOT cur += (t-cur)*k
+    // (which is FPS-dependent).  State lives in ImGui's per-window storage (no
+    // allocation, no external lib).  One motion constant everywhere = perceived
+    // quality; matches the toggle's 0.12s.
+    namespace anim
+    {
+        inline constexpr float kRate     = 14.0f;  // ~120ms settle (hover/focus/fill)
+        inline constexpr float kRateSnap = 22.0f;  // selection / keyboard-nav: near-instant
+        inline constexpr float kRateSoft = 10.0f;  // toast fade
+
+        inline float Approach(ImGuiID id, ImU32 key, float target, float rate = kRate)
+        {
+            ImGuiStorage* st{ ImGui::GetStateStorage() };
+            const ImGuiID k{ id ^ (key * 2654435761u) };
+            float cur{ st->GetFloat(k, target) };  // seed = target on first frame (no pop-in)
+            cur = ImLerp(cur, target, 1.0f - std::exp(-rate * ImGui::GetIO().DeltaTime));
+            if (ImFabs(cur - target) < 0.001f) cur = target;
+            st->SetFloat(k, cur);
+            return cur;
+        }
+    }
+
+    // Delayed, flicker-free tooltip (ImGui 1.92 stationary + short-delay for free).
+    // Replaces the raw `if (IsItemHovered()) SetTooltip(...)` pattern.
+    inline void Tooltip(const char* text)
+    {
+        if (ImGui::BeginItemTooltip())
+        {
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+            ImGui::TextUnformatted(text);
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+    }
+
     enum ButtonKind { BtnNeutral = 0, BtnPrimary = 1, BtnGhost = 2, BtnDanger = 3 };
 
     // A themed button.  Neutral = the frame-coloured default; Primary = solid
@@ -98,6 +137,7 @@ namespace ui
         const ImVec2 p0{ ImGui::GetCursorScreenPos() };
         ImGui::PushID(str_id);
         const bool pressed{ ImGui::InvisibleButton("##ib", ImVec2(size, fh)) };
+        const ImGuiID aid{ ImGui::GetItemID() };
         const bool hov{ ImGui::IsItemHovered() };
         const bool act{ ImGui::IsItemActive() };
         ImGui::PopID();
@@ -106,23 +146,34 @@ namespace ui
         const float  vy{ p0.y + (fh - size) * 0.5f };
         const ImVec2 q0{ p0.x, vy }, q1{ p0.x + size, vy + size };
 
-        ImVec4 fill{ 0, 0, 0, 0 }, border{ 0, 0, 0, 0 }, text{ col[ImGuiCol_Text] };
+        // Idle / hover / active fills — the state fill is LERPED between them so
+        // hover/press fade in smoothly instead of snapping.
+        ImVec4 idleFill{ 0, 0, 0, 0 }, hovFill{ 0, 0, 0, 0 }, actFill{ 0, 0, 0, 0 };
+        ImVec4 border{ 0, 0, 0, 0 }, text{ col[ImGuiCol_Text] };
         bool drawBorder{ false };
         if (kind == BtnGhost)
-            fill = act ? ImVec4(1, 1, 1, 0.15f) : hov ? ImVec4(1, 1, 1, 0.09f) : ImVec4(0, 0, 0, 0);
+        {
+            hovFill = ImVec4(1, 1, 1, 0.09f); actFill = ImVec4(1, 1, 1, 0.15f);
+        }
         else if (kind == BtnDanger)
-            fill = act ? ImVec4(0.70f, 0.17f, 0.17f, 1) : hov ? ImVec4(0.86f, 0.26f, 0.26f, 1) : ImVec4(0, 0, 0, 0);
+        {
+            hovFill = ImVec4(0.86f, 0.26f, 0.26f, 1); actFill = ImVec4(0.70f, 0.17f, 0.17f, 1);
+        }
         else if (kind == BtnPrimary)
         {
-            fill = act ? ImVec4(col[ImGuiCol_SliderGrab].x * 0.86f, col[ImGuiCol_SliderGrab].y * 0.86f, col[ImGuiCol_SliderGrab].z * 0.86f, 1.0f)
-                 : hov ? col[ImGuiCol_SliderGrabActive] : col[ImGuiCol_SliderGrab];
+            idleFill = col[ImGuiCol_SliderGrab];
+            hovFill  = col[ImGuiCol_SliderGrabActive];
+            actFill  = ImVec4(col[ImGuiCol_SliderGrab].x * 0.86f, col[ImGuiCol_SliderGrab].y * 0.86f, col[ImGuiCol_SliderGrab].z * 0.86f, 1.0f);
             text = ImVec4(1, 1, 1, 1);
         }
         else  // Neutral
         {
-            fill = act ? col[ImGuiCol_ButtonActive] : hov ? col[ImGuiCol_ButtonHovered] : col[ImGuiCol_Button];
+            idleFill = col[ImGuiCol_Button]; hovFill = col[ImGuiCol_ButtonHovered]; actFill = col[ImGuiCol_ButtonActive];
             border = col[ImGuiCol_Border]; drawBorder = true;
         }
+        const float th{ anim::Approach(aid, ImHashStr("hov"), hov ? 1.0f : 0.0f) };
+        const float ta{ anim::Approach(aid, ImHashStr("act"), act ? 1.0f : 0.0f, anim::kRateSnap) };
+        const ImVec4 fill{ ImLerp(ImLerp(idleFill, hovFill, th), actFill, ta) };
 
         ImDrawList* dl{ ImGui::GetWindowDrawList() };
         const float r{ st.FrameRounding };

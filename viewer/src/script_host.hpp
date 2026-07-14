@@ -148,8 +148,13 @@ namespace script_host
         s += "            std::this_thread::sleep_for(std::chrono::milliseconds(100));\n        }\n    }\n";
         s += "}\n\n";
         s += "// ─────────────────────────────── user script ───────────────────────────────\n";
+        // Re-base __LINE__/__FILE__ so cl.exe diagnostics for the user body report
+        // as vmhook_script(N) with N = the editor line (1-based).  The viewer maps
+        // those straight to editor error markers.
+        s += "#line 1 \"vmhook_script\"\n";
         s += user_body;
-        s += "\n// ─────────────────────────────── harness epilogue ──────────────────────────\n";
+        s += "\n#line 100000 \"vmhook_harness\"\n";
+        s += "// ─────────────────────────────── harness epilogue ──────────────────────────\n";
         s += "void script_setup();\n";
         s += "static void script_boot()\n{\n";
         s += "    if (!script::wait_for_vm()) { script::log(\"[harness] JVM not ready — aborting.\"); return; }\n";

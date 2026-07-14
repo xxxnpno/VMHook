@@ -26,9 +26,12 @@
 #include "app.hpp"
 #include "descriptor.hpp"
 #include "icons.hpp"
+#include "theme.hpp"
 #include "widgets.hpp"
 #include "wrapper_gen.hpp"
 #include "script_host.hpp"
+#include "complete.hpp"
+#include "TextEditor.h"
 
 #pragma comment(lib, "d3d11.lib")
 
@@ -41,6 +44,7 @@ namespace
     ID3D11RenderTargetView* g_rtv{ nullptr };
     HWND                    g_hwnd{ nullptr };  // for the custom min/close controls
     float                   g_dpi_scale{ 1.0f };  // physical DPI / 96 (set at startup)
+    ImFont*                 g_font_mono{ nullptr };  // monospace font for the code editor
 
     void create_rtv()
     {
@@ -142,73 +146,93 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
 // ── style + fonts ─────────────────────────────────────────────────────────────
 namespace
 {
-    // Theme: a clean, flat, modern-IDE dark palette (VS Code / Linear family) —
-    // moderate rounding, crisp 1px frame borders, a single blue accent for
-    // interactive state.  No gloss/gradients/halos; the widgets are stock ImGui,
-    // so the polish comes entirely from restraint here.
+    // Theme: Tokyo Night (Night) — a deep, desaturated navy-black dark palette
+    // (Linear / Vercel / VS Code family) with a single blue accent for every
+    // interactive state.  Flat frames (no frame borders); panels are separated by
+    // navy-tinted background steps + a hairline Border, not by luminance jumps or
+    // shadows.  Semantic hues (green/amber/red/cyan/...) live in theme.hpp and are
+    // reserved for MEANING.  See [[theme.hpp]].
     void apply_modern_style()
     {
         ImGuiStyle& s{ ImGui::GetStyle() };
-        // Rounding — modern-but-restrained (not pill-shaped).
+        // Concentric, restrained rounding (inner <= outer - padding).
         s.WindowRounding = 8.0f; s.ChildRounding = 6.0f; s.FrameRounding = 5.0f;
-        s.PopupRounding = 6.0f; s.GrabRounding = 4.0f; s.ScrollbarRounding = 9.0f; s.TabRounding = 6.0f;
-        // Spacing / padding.
-        s.WindowPadding = ImVec2(14, 12); s.FramePadding = ImVec2(12, 5);
-        s.ItemSpacing = ImVec2(8, 7); s.ItemInnerSpacing = ImVec2(7, 5); s.CellPadding = ImVec2(10, 6);
-        s.ScrollbarSize = 12.0f; s.GrabMinSize = 10.0f;
-        // Crisp 1px borders on frames — the signature of a clean flat tool UI.
-        s.WindowBorderSize = 0.0f; s.FrameBorderSize = 1.0f; s.ChildBorderSize = 1.0f; s.PopupBorderSize = 1.0f;
-        s.SeparatorTextBorderSize = 2.0f; s.SeparatorTextPadding = ImVec2(20, 6);
+        s.PopupRounding = 6.0f; s.GrabRounding = 4.0f; s.ScrollbarRounding = 5.5f; s.TabRounding = 5.0f;
+        // Spacing / padding — breathable, uniform.
+        s.WindowPadding = ImVec2(14, 12); s.FramePadding = ImVec2(12, 7);
+        s.ItemSpacing = ImVec2(10, 8); s.ItemInnerSpacing = ImVec2(8, 6); s.CellPadding = ImVec2(10, 7);
+        s.IndentSpacing = 22.0f; s.ScrollbarSize = 11.0f; s.GrabMinSize = 12.0f;
+        // Crisp 1px frame borders; hairline chrome on children/popups; the
+        // borderless host keeps WindowBorderSize 0 (no seam against the custom titlebar).
+        s.WindowBorderSize = 0.0f; s.FrameBorderSize = 1.0f; s.ChildBorderSize = 1.0f;
+        s.PopupBorderSize = 1.0f; s.TabBorderSize = 0.0f;
+        s.SeparatorTextBorderSize = 1.0f; s.SeparatorTextPadding = ImVec2(20, 8);
         s.WindowTitleAlign = ImVec2(0.0f, 0.5f);
         s.ButtonTextAlign = ImVec2(0.5f, 0.5f);
+        s.SelectableTextAlign = ImVec2(0.0f, 0.5f);
+        s.WindowMenuButtonPosition = ImGuiDir_None;  // no collapse arrow — cleaner titlebars
+        s.DisabledAlpha = 0.45f;
+        // Snappy-but-flicker-free tooltips (uses ImGui's stationary + short-delay).
+        s.HoverStationaryDelay = 0.12f;
+        s.AntiAliasedLines = true; s.AntiAliasedLinesUseTex = true; s.AntiAliasedFill = true;
+        s.CurveTessellationTol = 1.10f; s.CircleTessellationMaxError = 0.20f;
 
         ImVec4* c{ s.Colors };
-        const ImVec4 accent   { 0.29f, 0.56f, 0.96f, 1.00f };  // clean modern blue
-        const ImVec4 accentHi { 0.40f, 0.66f, 1.00f, 1.00f };
-        c[ImGuiCol_Text]                 = ImVec4(0.90f, 0.91f, 0.94f, 1.00f);
-        c[ImGuiCol_TextDisabled]         = ImVec4(0.44f, 0.47f, 0.54f, 1.00f);
-        c[ImGuiCol_WindowBg]             = ImVec4(0.086f, 0.092f, 0.106f, 1.00f);
-        c[ImGuiCol_ChildBg]              = ImVec4(0.104f, 0.111f, 0.128f, 1.00f);
-        c[ImGuiCol_PopupBg]              = ImVec4(0.094f, 0.100f, 0.116f, 0.98f);
-        c[ImGuiCol_Border]               = ImVec4(0.196f, 0.208f, 0.235f, 1.00f);
+        const ImVec4 accent   { theme::accent() };     // #7aa2f7
+        const ImVec4 accentHi { theme::accent_hi() };  // #98b8ff
+        c[ImGuiCol_Text]                 = theme::text();                          // #c0caf5
+        c[ImGuiCol_TextDisabled]         = theme::muted_dim();                     // #565f89
+        c[ImGuiCol_WindowBg]             = ImVec4(0.102f, 0.106f, 0.149f, 1.00f);  // #1a1b26
+        c[ImGuiCol_ChildBg]              = ImVec4(0.118f, 0.122f, 0.169f, 1.00f);  // #1e1f2b
+        c[ImGuiCol_PopupBg]              = ImVec4(0.086f, 0.086f, 0.118f, 0.98f);  // #16161e
+        c[ImGuiCol_Border]               = ImVec4(0.180f, 0.200f, 0.314f, 1.00f);  // #2e3350 hairline
         c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_FrameBg]              = ImVec4(0.140f, 0.150f, 0.172f, 1.00f);
-        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.176f, 0.190f, 0.220f, 1.00f);
-        c[ImGuiCol_FrameBgActive]        = ImVec4(0.205f, 0.222f, 0.256f, 1.00f);
-        c[ImGuiCol_TitleBg]              = ImVec4(0.066f, 0.072f, 0.084f, 1.00f);
-        c[ImGuiCol_TitleBgActive]        = ImVec4(0.066f, 0.072f, 0.084f, 1.00f);
-        c[ImGuiCol_MenuBarBg]            = ImVec4(0.104f, 0.111f, 0.128f, 1.00f);
+        c[ImGuiCol_FrameBg]              = ImVec4(0.137f, 0.149f, 0.227f, 1.00f);  // #23263a
+        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.173f, 0.188f, 0.278f, 1.00f);  // #2c3047
+        c[ImGuiCol_FrameBgActive]        = ImVec4(0.208f, 0.231f, 0.341f, 1.00f);  // #353b57
+        c[ImGuiCol_TitleBg]              = ImVec4(0.086f, 0.086f, 0.118f, 1.00f);  // #16161e
+        c[ImGuiCol_TitleBgActive]        = ImVec4(0.102f, 0.106f, 0.149f, 1.00f);  // #1a1b26
+        c[ImGuiCol_TitleBgCollapsed]     = ImVec4(0.086f, 0.086f, 0.118f, 1.00f);
+        c[ImGuiCol_MenuBarBg]            = ImVec4(0.118f, 0.122f, 0.169f, 1.00f);  // #1e1f2b
         c[ImGuiCol_ScrollbarBg]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.22f, 0.24f, 0.28f, 1.00f);
-        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.30f, 0.33f, 0.38f, 1.00f);
+        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.180f, 0.200f, 0.314f, 1.00f);  // #2e3350
+        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.239f, 0.267f, 0.408f, 1.00f);  // #3d4468
         c[ImGuiCol_ScrollbarGrabActive]  = accent;
         c[ImGuiCol_CheckMark]            = accentHi;
         c[ImGuiCol_SliderGrab]           = accent;
         c[ImGuiCol_SliderGrabActive]     = accentHi;
         // Neutral secondary button (Primary/Ghost/Danger are set per-call in ui::Button).
-        c[ImGuiCol_Button]               = ImVec4(0.170f, 0.182f, 0.210f, 1.00f);
-        c[ImGuiCol_ButtonHovered]        = ImVec4(0.215f, 0.232f, 0.268f, 1.00f);
-        c[ImGuiCol_ButtonActive]         = ImVec4(0.135f, 0.145f, 0.168f, 1.00f);
-        c[ImGuiCol_Header]               = ImVec4(accent.x, accent.y, accent.z, 0.32f);
-        c[ImGuiCol_HeaderHovered]        = ImVec4(accent.x, accent.y, accent.z, 0.48f);
-        c[ImGuiCol_HeaderActive]         = ImVec4(accent.x, accent.y, accent.z, 0.64f);
-        c[ImGuiCol_Separator]            = ImVec4(0.196f, 0.208f, 0.235f, 1.00f);
+        c[ImGuiCol_Button]               = ImVec4(0.149f, 0.165f, 0.251f, 1.00f);  // #262a40
+        c[ImGuiCol_ButtonHovered]        = ImVec4(0.200f, 0.220f, 0.333f, 1.00f);  // #333855
+        c[ImGuiCol_ButtonActive]         = ImVec4(0.118f, 0.133f, 0.200f, 1.00f);  // #1e2233 (pressed = darker)
+        c[ImGuiCol_Header]               = ImVec4(accent.x, accent.y, accent.z, 0.30f);
+        c[ImGuiCol_HeaderHovered]        = ImVec4(accent.x, accent.y, accent.z, 0.45f);
+        c[ImGuiCol_HeaderActive]         = ImVec4(accent.x, accent.y, accent.z, 0.60f);
+        c[ImGuiCol_Separator]            = ImVec4(0.180f, 0.200f, 0.314f, 1.00f);  // = Border
         c[ImGuiCol_SeparatorHovered]     = accent;
         c[ImGuiCol_SeparatorActive]      = accentHi;
-        c[ImGuiCol_ResizeGrip]           = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
-        c[ImGuiCol_ResizeGripHovered]    = accent;
+        c[ImGuiCol_ResizeGrip]           = ImVec4(1.00f, 1.00f, 1.00f, 0.05f);
+        c[ImGuiCol_ResizeGripHovered]    = ImVec4(accent.x, accent.y, accent.z, 0.60f);
         c[ImGuiCol_ResizeGripActive]     = accentHi;
-        // Header sits in the same flat frame family as the combos/inputs (not a
-        // dark block) so it reads as part of the UI chrome.
-        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.135f, 0.145f, 0.168f, 1.00f);
+        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.137f, 0.149f, 0.227f, 1.00f);  // = FrameBg
         c[ImGuiCol_TableBorderStrong]    = ImVec4(1.00f, 1.00f, 1.00f, 0.060f);
         c[ImGuiCol_TableBorderLight]     = ImVec4(1.00f, 1.00f, 1.00f, 0.028f);
         c[ImGuiCol_TableRowBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-        c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.00f, 1.00f, 1.00f, 0.018f);
+        c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.00f, 1.00f, 1.00f, 0.020f);
         c[ImGuiCol_TextSelectedBg]       = ImVec4(accent.x, accent.y, accent.z, 0.35f);
         c[ImGuiCol_TextLink]             = accentHi;  // the extends / field-type jump links
         c[ImGuiCol_DragDropTarget]       = accentHi;
-        c[ImGuiCol_NavHighlight]         = accent;
+        c[ImGuiCol_NavCursor]            = accent;
+        // Tabs (Scripts window) — dim when unselected, accent-tinted selected.
+        c[ImGuiCol_Tab]                  = ImVec4(0.118f, 0.122f, 0.169f, 1.00f);
+        c[ImGuiCol_TabHovered]           = ImVec4(accent.x, accent.y, accent.z, 0.40f);
+        c[ImGuiCol_TabSelected]          = ImVec4(0.137f, 0.149f, 0.227f, 1.00f);
+        c[ImGuiCol_TabSelectedOverline]  = accent;
+        c[ImGuiCol_TabDimmed]            = ImVec4(0.086f, 0.086f, 0.118f, 1.00f);
+        c[ImGuiCol_TabDimmedSelected]    = ImVec4(0.118f, 0.122f, 0.169f, 1.00f);
+        c[ImGuiCol_NavWindowingHighlight]= ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
+        c[ImGuiCol_NavWindowingDimBg]    = ImVec4(0.086f, 0.086f, 0.118f, 0.60f);
+        c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0.055f, 0.055f, 0.078f, 0.55f);
     }
 
     void load_fonts(float dpi_scale)
@@ -252,6 +276,12 @@ namespace
             cfg.GlyphMinAdvanceX = 16.0f * dpi_scale;  // keep icons a consistent width
             cfg.GlyphOffset      = ImVec2(0.0f, 2.0f * dpi_scale);  // sit on the text baseline
             io.Fonts->AddFontFromFileTTF(icon_ttf.c_str(), 15.0f * dpi_scale, &cfg, icon_ranges);
+        }
+
+        // Monospace font for the Scripts code editor (Consolas ships with Windows).
+        if (std::ifstream{ "C:\\Windows\\Fonts\\consola.ttf", std::ios::binary }.good())
+        {
+            g_font_mono = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", base_px);
         }
     }
 }
@@ -357,8 +387,16 @@ namespace
 
     // ── Scripts window state ──────────────────────────────────────────────────
     bool  g_show_scripts{ false };
-    std::vector<char> g_script_buf;        // editable script source (lazily sized)
+    TextEditor g_editor;                   // syntax-highlighted code editor (BalazsJako)
+    bool  g_editor_seeded{ false };        // language def + starter applied once
     char  g_script_hdr[512]{};             // generated-wrapper header path (for #include)
+    // Completion (built from the generated wrapper header + C++/vmhook API).
+    complete::Index  g_complete_index;
+    bool             g_cmpl_open{ false };
+    std::vector<int> g_cmpl_items;
+    int              g_cmpl_sel{ 0 };
+    std::string      g_cmpl_token;
+    bool             g_cmpl_reindex{ false };  // rebuild the index next frame
     std::atomic<int>  g_build_state{ 0 };  // 0 idle / 1 building / 2 ok / 3 fail
     std::string       g_build_log;         // compiler output (read after join)
     std::string       g_build_dll;         // built DLL path
@@ -468,11 +506,11 @@ namespace
         ImVec4 col; const char* text;
         switch (st)
         {
-        case viewer::Status::Idle:      col = ImVec4(0.5f,0.5f,0.55f,1); text = "Idle";      break;
-        case viewer::Status::Injecting: col = ImVec4(0.95f,0.7f,0.2f,1); text = "Injecting"; break;
-        case viewer::Status::Receiving: col = ImVec4(0.3f,0.6f,0.95f,1); text = "Receiving"; break;
-        case viewer::Status::Done:      col = ImVec4(0.35f,0.8f,0.45f,1);text = "Done";      break;
-        default:                        col = ImVec4(0.9f,0.35f,0.35f,1);text = "Error";     break;
+        case viewer::Status::Idle:      col = theme::status_idle();      text = "Idle";      break;
+        case viewer::Status::Injecting: col = theme::status_injecting(); text = "Injecting"; break;
+        case viewer::Status::Receiving: col = theme::status_receiving(); text = "Receiving"; break;
+        case viewer::Status::Done:      col = theme::status_done();      text = "Done";      break;
+        default:                        col = theme::status_error();     text = "Error";     break;
         }
         // Status dot drawn as a filled circle (no font-glyph dependency), text
         // vertically centered against the toolbar's framed widgets.
@@ -489,13 +527,7 @@ namespace
         ImGui::PopStyleColor();
     }
 
-    ImVec4 vis_color(std::uint16_t f)
-    {
-        if (f & 0x0001u) return ImVec4(0.52f, 0.82f, 0.56f, 1.0f);  // public
-        if (f & 0x0002u) return ImVec4(0.90f, 0.52f, 0.52f, 1.0f);  // private
-        if (f & 0x0004u) return ImVec4(0.92f, 0.74f, 0.42f, 1.0f);  // protected
-        return ImVec4(0.62f, 0.63f, 0.70f, 1.0f);                   // package-private
-    }
+    ImVec4 vis_color(std::uint16_t f) { return theme::visibility(f); }
 
     // Primary class kind from the class-file access flags (+ super for records),
     // with a distinct badge colour.  ANNOTATION implies INTERFACE, and ENUM
@@ -505,14 +537,14 @@ namespace
     ClassKind class_kind(const viewer::ClassInfo& c)
     {
         const std::uint16_t f{ c.access };
-        if (f & 0x2000u) return { "annotation", ImVec4(0.80f, 0.68f, 0.95f, 1.0f) };
-        if (f & 0x0200u) return { "interface",  ImVec4(0.52f, 0.82f, 0.92f, 1.0f) };
-        if (f & 0x4000u) return { "enum",       ImVec4(0.95f, 0.80f, 0.45f, 1.0f) };
-        if (c.super_name == "java/lang/Record") return { "record", ImVec4(0.60f, 0.86f, 0.66f, 1.0f) };
-        if (f & 0x0400u) return { "abstract",   ImVec4(0.82f, 0.66f, 0.60f, 1.0f) };
+        if (f & 0x2000u) return { "annotation", theme::kind_annotation() };
+        if (f & 0x0200u) return { "interface",  theme::kind_interface() };
+        if (f & 0x4000u) return { "enum",       theme::kind_enum() };
+        if (c.super_name == "java/lang/Record") return { "record", theme::kind_record() };
+        if (f & 0x0400u) return { "abstract",   theme::kind_abstract() };
         // Flags unavailable but super says enum → still label it.
-        if (f == 0u && c.super_name == "java/lang/Enum") return { "enum", ImVec4(0.95f, 0.80f, 0.45f, 1.0f) };
-        return { "class", ImVec4(0.62f, 0.72f, 0.85f, 1.0f) };
+        if (f == 0u && c.super_name == "java/lang/Enum") return { "enum", theme::kind_enum() };
+        return { "class", theme::kind_class() };
     }
 
     // The Java source keyword(s) that would declare this class, for export.
@@ -596,7 +628,7 @@ namespace
             if (it != app.name_to_index.end())
             {
                 if (ImGui::TextLink(base.c_str())) navigate_to(it->second);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to open)", internal.c_str());
+                ImGui::SetItemTooltip("%s  (click to open)", internal.c_str());
             }
             else
             {
@@ -745,13 +777,13 @@ namespace
         ImGui::BeginDisabled(!app.has_baseline.load());
         ui::Toggle("Auto", &g_auto_rescan);
         ImGui::EndDisabled();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Live class-load tracking: arms the on_class_loaded hook and adds each new class\nthe moment ClassLoader.defineClass defines it — no full re-scan. (Rescan button = full list + diff.)");
+        ImGui::SetItemTooltip("Live class-load tracking: arms the on_class_loaded hook and adds each new class\nthe moment ClassLoader.defineClass defines it — no full re-scan. (Rescan button = full list + diff.)");
 
         // Object clipboard toggle (shows the count so it reads at a glance).
         ImGui::SameLine(0.0f, em(0.7f));
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetFrameHeight() * 0.13f);
         ui::Toggle("Clipboard", &g_show_clipboard);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show the saved-objects strip — stash objects, then place them into fields / method args");
+        ImGui::SetItemTooltip("Show the saved-objects strip — stash objects, then place them into fields / method args");
         if (!g_clipboard.empty())
         {
             ImGui::SameLine(0.0f, em(0.3f));
@@ -764,12 +796,12 @@ namespace
         ImGui::BeginDisabled(!app.has_baseline.load());
         if (ui::Button(ICON_FA_CODE "  Wrapper")) g_show_wrapper = true;
         ImGui::EndDisabled();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Generate a C++ wrapper of the JVM's classes (customizable naming / namespaces)");
+        ImGui::SetItemTooltip("Generate a C++ wrapper of the JVM's classes (customizable naming / namespaces)");
         ImGui::SameLine(0.0f, em(0.4f));
         ImGui::BeginDisabled(!app.has_baseline.load());
         if (ui::Button(ICON_FA_SCROLL "  Scripts")) g_show_scripts = true;
         ImGui::EndDisabled();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Write, compile and inject a C++ script built on the generated wrapper");
+        ImGui::SetItemTooltip("Write, compile and inject a C++ script built on the generated wrapper");
 
         row_divider();
         const viewer::Status st{ app.status.load() };
@@ -779,7 +811,7 @@ namespace
             ImGui::SameLine(0.0f, em(0.6f));
             const float r{ ImGui::GetFrameHeight() * 0.32f };
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetFrameHeight() * 0.5f - r) - ImGui::GetStyle().FramePadding.y);
-            ui::Spinner("##spin", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ui::Spinner("##spin", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(theme::accent()));
             ImGui::SameLine(0.0f, em(0.45f));
             ImGui::AlignTextToFramePadding();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.74f, 1.0f, 1.0f));
@@ -800,19 +832,19 @@ namespace
         // Ghost (transparent) window controls that only tint on hover — subtle
         // chrome rather than loud primary buttons.
         if (ui::IconButton(ICON_FA_CIRCLE_Q, "help", bw, ui::BtnGhost)) ImGui::OpenPopup("shortcuts");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyboard shortcuts (F1)");
+        ImGui::SetItemTooltip("Keyboard shortcuts (F1)");
         if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) ImGui::OpenPopup("shortcuts");
         ImGui::SameLine(0.0f, gap);
         if (ui::IconButton(ICON_FA_MINUS, "min", bw, ui::BtnGhost) && g_hwnd) ShowWindow(g_hwnd, SW_MINIMIZE);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimize");
+        ImGui::SetItemTooltip("Minimize");
         ImGui::SameLine(0.0f, gap);
         const bool maximized{ g_hwnd && IsZoomed(g_hwnd) };
         if (ui::IconButton(maximized ? ICON_FA_COMPRESS : ICON_FA_EXPAND, "maxrestore", bw, ui::BtnGhost) && g_hwnd)
             ShowWindow(g_hwnd, maximized ? SW_RESTORE : SW_MAXIMIZE);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip(maximized ? "Restore" : "Maximize");
+        ImGui::SetItemTooltip(maximized ? "Restore" : "Maximize");
         ImGui::SameLine(0.0f, gap);
         if (ui::IconButton(ICON_FA_XMARK, "close", bw, ui::BtnDanger) && g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close");
+        ImGui::SetItemTooltip("Close");
         if (ImGui::BeginPopup("shortcuts"))
         {
             ImGui::SeparatorText("Keyboard shortcuts");
@@ -828,7 +860,7 @@ namespace
                 for (const auto& [k, desc] : keys)
                 {
                     ImGui::TableNextRow(); ImGui::TableNextColumn();
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.72f, 1.0f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, theme::link());
                     ImGui::TextUnformatted(k);
                     ImGui::PopStyleColor();
                     ImGui::TableNextColumn(); ImGui::TextUnformatted(desc);
@@ -863,7 +895,7 @@ namespace
         {
             ImGui::SameLine(0.0f, em(0.3f));
             if (ui::IconButton(ICON_FA_XMARK, "clear")) g_search[0] = '\0';
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear (Esc)");
+            ImGui::SetItemTooltip("Clear (Esc)");
         }
 
         std::lock_guard<std::mutex> lock{ app.data_mutex };
@@ -871,7 +903,7 @@ namespace
         // ── scope selector (+ kind filter for Classes) on one compact row ───
         static const char* k_kind_names[]{ "All kinds", "class", "interface", "enum", "abstract", "annotation", "record" };
         ui::Combo("##scope", &g_search_scope, "Classes\0Methods\0Fields\0", em(7.5f));
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Search across every class's methods or fields");
+        ImGui::SetItemTooltip("Search across every class's methods or fields");
         if (g_search_scope == 0)
         {
             ImGui::SameLine(0.0f, em(0.5f));
@@ -917,7 +949,7 @@ namespace
             std::snprintf(lbl, sizeof(lbl), "+%d new%s", n_new, g_new_only ? "  (shown)" : "");
             if (ImGui::TextLink(lbl)) g_new_only = !g_new_only;
             ImGui::PopStyleColor(2);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Classes loaded since the previous scan — click to filter to them");
+            ImGui::SetItemTooltip("Classes loaded since the previous scan — click to filter to them");
         }
         // Sort key + Age display, right-aligned on the count row.  The combo picks
         // WHAT to sort by; clicking the "Class" header below reverses the direction.
@@ -927,13 +959,13 @@ namespace
             const int prev_key{ g_class_sort_key };
             ui::Combo("##classsort", &g_class_sort_key,
                       "Sort: Natural\0Sort: Name\0Sort: Package\0Sort: Age\0Sort: Kind\0Sort: Members\0", sort_w);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sort the class list. Natural = load order.\nClick the \"Class\" header to reverse the direction.");
+            ImGui::SetItemTooltip("Sort the class list. Natural = load order.\nClick the \"Class\" header to reverse the direction.");
             if (g_class_sort_key != prev_key)  // sensible default direction per key
                 g_class_sort_desc = (g_class_sort_key == 3 || g_class_sort_key == 5);  // Age / Members -> most first
             ImGui::SameLine(0.0f, em(0.5f));
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetFrameHeight() * 0.13f);
             ui::Toggle("Age", &g_show_age);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show how long ago each class was first observed (\"· 12s\").\nBaseline classes share the attach time (loaded before the viewer attached).");
+            ImGui::SetItemTooltip("Show how long ago each class was first observed (\"· 12s\").\nBaseline classes share the attach time (loaded before the viewer attached).");
         }
         // Show the age suffix whenever it's toggled on OR we're sorting by age.
         const bool show_age_col{ g_show_age || g_class_sort_key == 3 };
@@ -1114,7 +1146,7 @@ namespace
         if (needle.empty())
         {
             ImGui::Dummy(ImVec2(0.0f, em(1.5f)));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.55f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::muted());
             const std::string hint{ std::string("Type above to search ") + (fields ? "fields" : "methods") + " across every loaded class." };
             const float w{ ImGui::CalcTextSize(hint.c_str()).x };
             ImGui::SetCursorPosX((std::max)((ImGui::GetContentRegionAvail().x - w) * 0.5f, 0.0f));
@@ -1174,7 +1206,7 @@ namespace
                     }
                     ImGui::TableSetColumnIndex(2);
                     ImGui::TextDisabled("%s", dotted.c_str());
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", dotted.c_str());
+                    ImGui::SetItemTooltip("%s", dotted.c_str());
                     ImGui::PopID();
                 }
             }
@@ -1229,14 +1261,14 @@ namespace
         if (c.access & 0x0010u && !(c.access & 0x4000u))  // final (enums are implicitly final)
         {
             ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::muted());
             ImGui::TextUnformatted("[final]");
             ImGui::PopStyleColor();
         }
         if (c.internal_name.find('$') != std::string::npos)
         {
             ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::muted());
             ImGui::TextUnformatted("[nested]");
             ImGui::PopStyleColor();
         }
@@ -1329,7 +1361,7 @@ namespace
             ImGui::SetTooltip("Read this class's live static-field values (editable, freezable) + call static methods");
         ImGui::Spacing();
         ui::Toggle("Show inherited members", &g_show_inherited);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include methods & fields from superclasses (shown dimmed)");
+        ImGui::SetItemTooltip("Include methods & fields from superclasses (shown dimmed)");
         ImGui::Separator();
 
         // Member source chain: this class, plus (optionally) its superclasses.
@@ -1396,7 +1428,7 @@ namespace
                         const bool inh{ row.owner != &c };
                         ImGui::TableNextRow(); ImGui::TableNextColumn();
                         ImGui::PushID(r);
-                        if (inh) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
+                        if (inh) ImGui::PushStyleColor(ImGuiCol_Text, theme::muted());
                         ImGui::TextUnformatted(m.name.c_str());
                         if (inh) ImGui::PopStyleColor();
                         owner_tooltip(row.owner);
@@ -1446,7 +1478,7 @@ namespace
                         const bool inh{ row.owner != &c };
                         ImGui::TableNextRow(); ImGui::TableNextColumn();
                         ImGui::PushID(r);
-                        if (inh) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
+                        if (inh) ImGui::PushStyleColor(ImGuiCol_Text, theme::muted());
                         ImGui::TextUnformatted(f.name.c_str());
                         if (inh) ImGui::PopStyleColor();
                         owner_tooltip(row.owner);
@@ -1494,14 +1526,7 @@ namespace
 
     // Colour a formatted field value by its kind so the table scans easily:
     // strings, object refs (<...>), booleans, and null each get their own tint.
-    ImVec4 value_color(const std::string& v)
-    {
-        if (v == "null")                 return ImVec4(0.55f, 0.57f, 0.62f, 1.0f);  // dim grey
-        if (v == "true" || v == "false") return ImVec4(0.90f, 0.66f, 0.40f, 1.0f);  // amber
-        if (!v.empty() && v.front() == '"') return ImVec4(0.56f, 0.81f, 0.58f, 1.0f);  // string green
-        if (!v.empty() && v.front() == '<') return ImVec4(0.56f, 0.71f, 0.96f, 1.0f);  // ref blue
-        return ImGui::GetStyleColorVec4(ImGuiCol_Text);                             // number/default
-    }
+    ImVec4 value_color(const std::string& v) { return theme::value(v); }
 
     // ── object clipboard + field editing + method invocation ──────────────────
 
@@ -1654,10 +1679,10 @@ namespace
         const auto refreeze_if{ [&](const std::string& v) { if (frozen) ui_freeze(app, scope, cls, addr, field, v); } };
 
         // Freeze lock
-        ImGui::PushStyleColor(ImGuiCol_Text, frozen ? ImVec4(0.36f, 0.63f, 1.0f, 1.0f) : ImVec4(0.52f, 0.54f, 0.60f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, frozen ? theme::accent() : ImVec4(0.52f, 0.54f, 0.60f, 1.0f));
         const bool lk{ ui::IconButton(frozen ? ICON_FA_LOCK : ICON_FA_UNLOCK, "frz") };
         ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip(frozen ? "Frozen — click to unlock" : "Freeze at the current value");
+        ImGui::SetItemTooltip(frozen ? "Frozen — click to unlock" : "Freeze at the current value");
         if (lk)
         {
             if (frozen) ui_unfreeze(app, scope, cls, addr, field);
@@ -1671,7 +1696,7 @@ namespace
             std::snprintf(g_edit_buf, sizeof(g_edit_buf), "%s", writeable_value(desc, value, ref_addr).c_str());
             ImGui::OpenPopup("editfield");
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit value");
+        ImGui::SetItemTooltip("Edit value");
 
         // Grab (references only, non-null)
         if (is_ref && !ref_addr.empty())
@@ -1679,7 +1704,7 @@ namespace
             ImGui::SameLine(0.0f, em(0.1f));
             if (ui::IconButton(ICON_FA_THUMBTACK, "grab"))
                 add_saved_object(app, cls_short(cls) + "." + field, class_of_ref_value(value), ref_addr);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Grab this object into the clipboard");
+            ImGui::SetItemTooltip("Grab this object into the clipboard");
             obj_drag_source(ref_addr, class_of_ref_value(value), cls_short(cls) + "." + field);
         }
 
@@ -1830,7 +1855,7 @@ namespace
             const std::string ptxt{ g_pretty ? viewer::pretty_field(pds[(std::size_t)a], false) : pds[(std::size_t)a] };
             ImGui::AlignTextToFramePadding();
             ImGui::TextDisabled("arg%d", a); ImGui::SameLine(0.0f, em(0.3f));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.71f, 0.96f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::link());
             ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(ptxt.c_str());
             ImGui::PopStyleColor();
             ImGui::SameLine(em(10.0f));
@@ -1876,7 +1901,7 @@ namespace
             }
             else
             {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.46f, 0.46f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::danger());
                 ImGui::TextWrapped("%s", cs.result.error.c_str());
                 ImGui::PopStyleColor();
             }
@@ -1912,10 +1937,10 @@ namespace
             ImGui::BeginGroup();
             const ImVec2 p0{ ImGui::GetCursorScreenPos() };
             ImGui::Dummy(ImVec2(em(13.0f), 0));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.9f, 1.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::heading());
             ImGui::TextUnformatted(so.label.empty() ? "object" : so.label.c_str());
             ImGui::PopStyleColor();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.56f, 0.71f, 0.96f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::link());
             ImGui::TextUnformatted(dotted_name(cls_short(so.class_name)).c_str());
             ImGui::PopStyleColor();
             ImGui::TextDisabled("%s", so.address.c_str());
@@ -1973,24 +1998,24 @@ namespace
         std::string dotted{ app.inst_class };
         for (char& ch : dotted) if (ch == '/') ch = '.';
         ImGui::AlignTextToFramePadding();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::header());
         ImGui::TextUnformatted(dotted.empty() ? "(no class selected)" : dotted.c_str());
         ImGui::PopStyleColor();
         if (st == viewer::Status::Receiving)
         {
             ImGui::SameLine(0.0f, em(0.5f));
             const float r{ ImGui::GetFrameHeight() * 0.28f };
-            ui::Spinner("##iscan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ui::Spinner("##iscan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(theme::accent()));
         }
         ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(17.0f), ImGui::GetCursorPosX() + em(1.0f)));
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + toggle_dy);
         ui::Toggle("Live", &g_instances_live);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Re-scan the heap ~every 1.5s so field values update live");
+        ImGui::SetItemTooltip("Re-scan the heap ~every 1.5s so field values update live");
         ImGui::SameLine(0.0f, em(0.7f));
         if (ui::Button("Refresh")) g_instances_refresh_now = true;
         ImGui::SameLine(0.0f, em(0.4f));
         if (ui::Button("Copy table")) g_copy_instance_table = true;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy every instance's fields to the clipboard as TSV");
+        ImGui::SetItemTooltip("Copy every instance's fields to the clipboard as TSV");
 
         // ── filter row: filter + Age + Inherited + cap ──
         ui::InputText("##ifilter", ICON_FA_SEARCH "  Filter instances",
@@ -1999,11 +2024,11 @@ namespace
         ImGui::SameLine(0.0f, em(0.6f));
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + toggle_dy);
         ui::Toggle("Age", &g_inst_show_age);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show how long ago each instance was first observed + sort newest-first.\nHotSpot has no per-object creation time and a moving GC can reset this — best-effort.");
+        ImGui::SetItemTooltip("Show how long ago each instance was first observed + sort newest-first.\nHotSpot has no per-object creation time and a moving GC can reset this — best-effort.");
         ImGui::SameLine(0.0f, em(0.6f));
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + toggle_dy);
         ui::Toggle("Inherited", &g_inst_show_inherited);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include inherited fields in the detail pane");
+        ImGui::SetItemTooltip("Include inherited fields in the detail pane");
         ImGui::SameLine(0.0f, em(0.6f));
         ImGui::SetNextItemWidth(em(7.5f));
         int cap{ app.inst_cap };
@@ -2013,7 +2038,7 @@ namespace
             g_instance_cap = app.inst_cap;
             g_instances_refresh_now = true;
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Max instances to scan for on the heap");
+        ImGui::SetItemTooltip("Max instances to scan for on the heap");
 
         // filter the rows (address or any field value)
         std::string needle{ g_instance_filter };
@@ -2123,7 +2148,7 @@ namespace
                         copy_menu("addr", inst.address);
                         obj_drag_source(inst.address, app.inst_class, cls_short(app.inst_class));
                         ImGui::SetCursorScreenPos(rp);
-                        ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : ImVec4(0.58f, 0.68f, 0.82f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : theme::muted());
                         ImGui::TextUnformatted(inst.address.c_str());
                         ImGui::PopStyleColor();
                         if (g_inst_show_age)
@@ -2160,7 +2185,7 @@ namespace
             if (!selp)
             {
                 ImGui::Dummy(ImVec2(0, em(1.0f)));
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.55f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::muted());
                 const char* hint{ "Select an instance on the left to see its fields." };
                 const float w{ ImGui::CalcTextSize(hint).x };
                 ImGui::SetCursorPosX((std::max)((ImGui::GetContentRegionAvail().x - w) * 0.5f, 0.0f));
@@ -2172,11 +2197,11 @@ namespace
                 std::string dcls{ app.inst_class };
                 for (char& ch : dcls) if (ch == '/') ch = '.';
                 ImGui::AlignTextToFramePadding();
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::header());
                 ImGui::TextUnformatted(dcls.c_str());
                 ImGui::PopStyleColor();
                 ImGui::SameLine(0.0f, em(0.35f)); ImGui::TextDisabled("@"); ImGui::SameLine(0.0f, em(0.35f));
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.68f, 0.82f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::muted());
                 ImGui::TextUnformatted(selp->address.c_str());
                 ImGui::PopStyleColor();
                 if (g_inst_show_age)
@@ -2187,11 +2212,11 @@ namespace
                 ImGui::SameLine(0.0f, em(0.8f));
                 if (ui::Button(ICON_FA_THUMBTACK " Grab"))
                     add_saved_object(app, cls_short(app.inst_class), app.inst_class, selp->address);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stash this instance in the clipboard");
+                ImGui::SetItemTooltip("Stash this instance in the clipboard");
                 obj_drag_source(selp->address, app.inst_class, cls_short(app.inst_class));
                 ImGui::SameLine(0.0f, em(0.4f));
                 if (ui::Button("Statics")) { g_statics_class = app.inst_class; g_statics_refresh_now = true; g_show_statics = true; }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open this class's static fields");
+                ImGui::SetItemTooltip("Open this class's static fields");
                 ImGui::SameLine(0.0f, em(0.4f));
                 if (ui::Button("Copy addr")) ImGui::SetClipboardText(selp->address.c_str());
                 ImGui::SameLine(0.0f, em(0.4f));
@@ -2232,9 +2257,9 @@ namespace
                         const std::string desc{ eff_desc(f) };
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
-                        if (!f.owner.empty()) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.62f, 0.70f, 1.0f));
+                        if (!f.owner.empty()) ImGui::PushStyleColor(ImGuiCol_Text, theme::muted());
                         ImGui::TextUnformatted(f.name.c_str());
-                        if (!f.owner.empty()) { ImGui::PopStyleColor(); if (ImGui::IsItemHovered()) ImGui::SetTooltip("inherited from %s", f.owner.c_str()); }
+                        if (!f.owner.empty()) { ImGui::PopStyleColor(); ImGui::SetItemTooltip("inherited from %s", f.owner.c_str()); }
 
                         ImGui::TableSetColumnIndex(1);
                         bool linked{ false };
@@ -2242,7 +2267,7 @@ namespace
                         {
                             if (ImGui::TextLink(f.value.c_str()))
                                 open_array(f.ref_addr, desc, dotted_name(cls_short(app.inst_class)) + "." + f.name);
-                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to view the array's elements)", f.ref_addr.c_str());
+                            ImGui::SetItemTooltip("%s  (click to view the array's elements)", f.ref_addr.c_str());
                             linked = true;
                         }
                         else if (f.value.size() > 2 && f.value.front() == '<' && f.value.back() == '>')
@@ -2251,7 +2276,7 @@ namespace
                             if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
                             {
                                 if (ImGui::TextLink(f.value.c_str())) navigate_to(it->second);
-                                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to open · drag to grab)", internal.c_str());
+                                ImGui::SetItemTooltip("%s  (click to open · drag to grab)", internal.c_str());
                                 linked = true;
                             }
                         }
@@ -2322,7 +2347,7 @@ namespace
         std::string dotted{ app.stat_class };
         for (char& ch : dotted) if (ch == '/') ch = '.';
         ImGui::AlignTextToFramePadding();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::header());
         ImGui::TextUnformatted(dotted.empty() ? "(no class)" : dotted.c_str());
         ImGui::PopStyleColor();
         ImGui::SameLine(0.0f, em(0.35f));
@@ -2331,12 +2356,12 @@ namespace
         {
             ImGui::SameLine(0.0f, em(0.5f));
             const float r{ ImGui::GetFrameHeight() * 0.28f };
-            ui::Spinner("##sscan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ui::Spinner("##sscan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(theme::accent()));
         }
         ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(11.0f), ImGui::GetCursorPosX() + em(1.0f)));
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + toggle_dy);
         ui::Toggle("Live", &g_statics_live);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Re-read the static fields ~every 1.5s");
+        ImGui::SetItemTooltip("Re-read the static fields ~every 1.5s");
         ImGui::SameLine(0.0f, em(0.6f));
         if (ui::Button("Refresh")) g_statics_refresh_now = true;
 
@@ -2383,7 +2408,7 @@ namespace
                 {
                     if (ImGui::TextLink(f.value.c_str()))
                         open_array(f.ref_addr, desc, dotted_name(cls_short(app.stat_class)) + "." + f.name);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to view the array's elements)", f.ref_addr.c_str());
+                    ImGui::SetItemTooltip("%s  (click to view the array's elements)", f.ref_addr.c_str());
                     linked = true;
                 }
                 else if (f.value.size() > 2 && f.value.front() == '<' && f.value.back() == '>')
@@ -2392,7 +2417,7 @@ namespace
                     if (const auto it{ app.name_to_index.find(internal) }; it != app.name_to_index.end())
                     {
                         if (ImGui::TextLink(f.value.c_str())) navigate_to(it->second);
-                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (click to open · drag to grab)", internal.c_str());
+                        ImGui::SetItemTooltip("%s  (click to open · drag to grab)", internal.c_str());
                         linked = true;
                     }
                 }
@@ -2437,14 +2462,14 @@ namespace
         const viewer::Status st{ app.arr_status.load() };
 
         ImGui::AlignTextToFramePadding();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.82f, 1.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::header());
         ImGui::TextUnformatted(g_array_label.empty() ? "array" : g_array_label.c_str());
         ImGui::PopStyleColor();
         if (st == viewer::Status::Receiving)
         {
             ImGui::SameLine(0.0f, em(0.5f));
             const float r{ ImGui::GetFrameHeight() * 0.28f };
-            ui::Spinner("##ascan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ui::Spinner("##ascan", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(theme::accent()));
         }
         ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - em(5.0f), ImGui::GetCursorPosX() + em(1.0f)));
         if (ui::Button("Refresh")) g_array_refresh = true;
@@ -2499,13 +2524,13 @@ namespace
                     std::snprintf(g_edit_buf, sizeof(g_edit_buf), "%s", writeable_value(g_array_elemdesc, e.value, e.ref_addr).c_str());
                     ImGui::OpenPopup("editelem");
                 }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit element");
+                ImGui::SetItemTooltip("Edit element");
                 if (!e.ref_addr.empty())
                 {
                     ImGui::SameLine(0.0f, em(0.1f));
                     if (ui::IconButton(ICON_FA_THUMBTACK, "grab"))
                         add_saved_object(app, "elem[" + e.name + "]", class_of_ref_value(e.value), e.ref_addr);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Grab this element into the clipboard");
+                    ImGui::SetItemTooltip("Grab this element into the clipboard");
                 }
                 if (ImGui::BeginPopup("editelem"))
                 {
@@ -2615,6 +2640,8 @@ namespace
         });
     }
 
+    void reseed_editor();  // defined with the Scripts editor below; used by "Use in a script"
+
     void draw_wrapper_window(viewer::App& app)
     {
         ImGui::SetNextWindowSize(ImVec2(em(36.0f), em(38.0f)), ImGuiCond_FirstUseEver);
@@ -2633,10 +2660,10 @@ namespace
 
         row_label("Root namespace"); ImGui::SameLine(lw); ui::InputText("##wns", "jvm", g_w_ns, sizeof g_w_ns, em(12.0f));
         row_label("Namespaces");     ImGui::SameLine(lw); ui::Combo("##wlay", &g_w_layout, "Nested (mirror packages)\0Flat (one namespace)\0", em(18.0f));
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nested mirrors Java packages as nested C++ namespaces (jvm::net::minecraft::client::Minecraft).\nFlat puts every class in one namespace and disambiguates leaf collisions.");
+        ImGui::SetItemTooltip("Nested mirrors Java packages as nested C++ namespaces (jvm::net::minecraft::client::Minecraft).\nFlat puts every class in one namespace and disambiguates leaf collisions.");
         row_label("Class names");    ImGui::SameLine(lw); ui::Combo("##wtc", &g_w_type_case, cases, 4, em(12.0f));
         row_label("Member names");   ImGui::SameLine(lw); ui::Combo("##wmc", &g_w_member_case, cases, 4, em(12.0f));
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Applied to method accessors and field getter/setter names.");
+        ImGui::SetItemTooltip("Applied to method accessors and field getter/setter names.");
         row_label("Getter prefix");  ImGui::SameLine(lw); ui::InputText("##wg", "get_", g_w_getter, sizeof g_w_getter, em(6.0f));
         ImGui::SameLine(0.0f, em(0.8f)); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Setter");
         ImGui::SameLine(0.0f, em(0.4f)); ui::InputText("##ws", "set_", g_w_setter, sizeof g_w_setter, em(6.0f));
@@ -2647,7 +2674,7 @@ namespace
         ui::Toggle("Fields",  &g_w_fields);
         ui::Toggle("Public only", &g_w_public_only); ImGui::SameLine(em(9.0f));
         ui::Toggle("Include JDK", &g_w_jdk);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include java/*, javax/*, sun/*, jdk/* classes. The full JDK is large and slow to compile — leave off to wrap just the app's own classes.");
+        ImGui::SetItemTooltip("Include java/*, javax/*, sun/*, jdk/* classes. The full JDK is large and slow to compile — leave off to wrap just the app's own classes.");
 
         ImGui::Spacing();
         row_label("Include only"); ImGui::SameLine(lw); ui::InputText("##winc", "all packages (e.g. net/minecraft, com/example)", g_w_include, sizeof g_w_include, -1.0f);
@@ -2667,7 +2694,7 @@ namespace
         ImGui::TextDisabled("%d of %d classes match the filter.", matched, total);
         if (matched > 4000)
         {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.80f, 0.45f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::warning());
             ImGui::TextWrapped("Heads up: wrapping this many classes makes a large header that is slow to compile. Consider an 'Include only' filter.");
             ImGui::PopStyleColor();
         }
@@ -2680,13 +2707,13 @@ namespace
         if (st == 1)
         {
             ImGui::SameLine(0.0f, em(0.6f));
-            ui::Spinner("##wspin", ImGui::GetFrameHeight() * 0.32f, em(0.14f), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ui::Spinner("##wspin", ImGui::GetFrameHeight() * 0.32f, em(0.14f), ImGui::GetColorU32(theme::accent()));
             ImGui::SameLine(0.0f, em(0.5f)); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Generating...");
         }
         else if (st == 2)
         {
             if (g_w_thread.joinable()) g_w_thread.join();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.80f, 0.60f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::success());
             ImGui::TextWrapped("%s", g_w_msg.c_str());
             ImGui::PopStyleColor();
             if (!g_w_path.empty())
@@ -2697,7 +2724,7 @@ namespace
                 if (ui::Button(ICON_FA_SCROLL "  Use in a script"))
                 {
                     std::snprintf(g_script_hdr, sizeof g_script_hdr, "%s", g_w_path.c_str());
-                    g_script_buf.clear();  // force the editor to re-seed with this header
+                    reseed_editor();  // re-seed the editor with this header's include + reindex
                     g_show_scripts = true;
                 }
             }
@@ -2705,7 +2732,7 @@ namespace
         else if (st == 3)
         {
             if (g_w_thread.joinable()) g_w_thread.join();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.46f, 0.46f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::danger());
             ImGui::TextWrapped("%s", g_w_msg.c_str());
             ImGui::PopStyleColor();
         }
@@ -2735,18 +2762,85 @@ namespace
         return script_host::starter_body(inc, example);
     }
 
-    void seed_script_buffer_if_empty()
+    // A dark editor palette tuned to the Tokyo Night theme.
+    const TextEditor::Palette& editor_palette()
     {
-        if (!g_script_buf.empty()) return;
+        using PI = TextEditor::PaletteIndex;
+        static TextEditor::Palette pal{};
+        static bool init{ false };
+        if (!init)
+        {
+            const auto u32{ [](const ImVec4& c) { return ImGui::ColorConvertFloat4ToU32(c); } };
+            pal = TextEditor::GetDarkPalette();  // sensible base
+            pal[(int)PI::Default]        = u32(theme::text());
+            pal[(int)PI::Keyword]        = u32(theme::accent_hi());
+            pal[(int)PI::Number]         = u32(theme::orange());
+            pal[(int)PI::String]         = u32(theme::green());
+            pal[(int)PI::CharLiteral]    = u32(theme::green());
+            pal[(int)PI::Punctuation]    = u32(theme::text());
+            pal[(int)PI::Preprocessor]   = u32(theme::purple());
+            pal[(int)PI::Identifier]     = u32(theme::text());
+            pal[(int)PI::KnownIdentifier]= u32(theme::cyan());
+            pal[(int)PI::Comment]        = u32(theme::muted());
+            pal[(int)PI::MultiLineComment]= u32(theme::muted());
+            pal[(int)PI::Background]      = u32(ImVec4(0.086f, 0.086f, 0.118f, 1.0f));  // #16161e
+            pal[(int)PI::Cursor]         = u32(theme::accent_hi());
+            pal[(int)PI::LineNumber]     = u32(theme::muted_dim());
+            pal[(int)PI::CurrentLineFill]= u32(ImVec4(1, 1, 1, 0.03f));
+            pal[(int)PI::CurrentLineFillInactive] = u32(ImVec4(1, 1, 1, 0.015f));
+            pal[(int)PI::CurrentLineEdge]= u32(ImVec4(0, 0, 0, 0));
+            init = true;
+        }
+        return pal;
+    }
+
+    void reseed_editor()
+    {
         const std::string starter{ script_starter_for(g_script_hdr[0] ? std::string{ g_script_hdr } : g_w_path) };
-        g_script_buf.assign((std::max<std::size_t>)(starter.size() + 1, 128u * 1024u), '\0');
-        std::memcpy(g_script_buf.data(), starter.c_str(), starter.size());
+        g_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::CPlusPlus());
+        g_editor.SetPalette(editor_palette());
+        g_editor.SetShowWhitespaces(false);
+        g_editor.SetText(starter);
+        g_editor_seeded = true;
+        g_cmpl_reindex = true;
+    }
+
+    void seed_editor_if_empty()
+    {
+        if (!g_editor_seeded) reseed_editor();
+    }
+
+    // Parse cl.exe diagnostics ("vmhook_script(N): error ...") into 1-based line
+    // markers.  compose_source() emits `#line 1 "vmhook_script"` before the user
+    // body, so N is already the editor line.
+    TextEditor::ErrorMarkers build_error_markers(const std::string& log)
+    {
+        TextEditor::ErrorMarkers markers;
+        std::size_t p{ 0 };
+        while (p < log.size())
+        {
+            const std::size_t nl{ log.find('\n', p) };
+            const std::string_view line{ log.data() + p, (nl == std::string::npos ? log.size() : nl) - p };
+            p = (nl == std::string::npos ? log.size() : nl + 1);
+            const std::size_t k{ line.find("vmhook_script(") };
+            if (k == std::string_view::npos) continue;
+            std::size_t o{ k + 14 };
+            int ln{ 0 }; bool any{ false };
+            while (o < line.size() && std::isdigit(static_cast<unsigned char>(line[o]))) { ln = ln * 10 + (line[o] - '0'); ++o; any = true; }
+            if (!any || ln <= 0) continue;
+            const std::size_t mp{ line.find("): ", o) };
+            std::string msg{ mp != std::string_view::npos ? std::string{ line.substr(mp + 3) } : std::string{ line.substr(o) } };
+            auto it{ markers.find(ln) };
+            if (it == markers.end()) markers[ln] = msg;
+            else if (it->second.size() < 400) it->second += "\n" + msg;
+        }
+        return markers;
     }
 
     void start_script_build(viewer::App& app, bool inject)
     {
         if (g_build_state.load() == 1) return;
-        std::string body{ g_script_buf.data() };  // up to the NUL
+        std::string body{ g_editor.GetText() };
         std::string wrapper_dir;
         if (g_script_hdr[0])
         {
@@ -2773,6 +2867,135 @@ namespace
         });
     }
 
+    // Replace the caret's partial identifier with `chosen`.
+    void insert_completion(const TextEditor::Coordinates& caret, int token_len, const std::string& chosen)
+    {
+        g_editor.SetSelection(TextEditor::Coordinates(caret.mLine, (std::max)(0, caret.mColumn - token_len)), caret);
+        g_editor.Delete();  // removes the current selection (DeleteSelection is private)
+        g_editor.InsertText(chosen);
+        g_cmpl_open = false;
+    }
+
+    // The syntax-highlighted code editor + an as-you-type completion popup built
+    // from the generated wrapper's symbols (namespaces / classes / accessors) plus
+    // the C++ / vmhook API.  Nav/accept keys are locked away from the editor for
+    // the frame so Up/Down/Tab/Enter drive the popup, not the caret.
+    void draw_code_editor(float height, bool read_only)
+    {
+        if (g_cmpl_reindex)
+        {
+            g_cmpl_reindex = false;
+            const std::string path{ g_script_hdr[0] ? std::string{ g_script_hdr } : g_w_path };
+            std::string hdr;
+            if (!path.empty()) { std::ifstream f{ path, std::ios::binary }; std::stringstream ss; ss << f.rdbuf(); hdr = ss.str(); }
+            g_complete_index = complete::build_from_header(hdr);
+        }
+
+        g_editor.SetReadOnly(read_only);
+
+        // Current identifier token at the caret (computed before Render).
+        const TextEditor::Coordinates cur{ g_editor.GetCursorPosition() };
+        const std::string lineText{ g_editor.GetCurrentLineText() };
+        const auto col_to_index{ [](const std::string& s, int col) -> int
+        {
+            int rc{ 0 }, i{ 0 };
+            for (; i < static_cast<int>(s.size()) && rc < col; ++i) rc += (s[i] == '\t') ? (4 - (rc % 4)) : 1;
+            return i;
+        } };
+        const int caret_i{ col_to_index(lineText, cur.mColumn) };
+        int tok_start{ caret_i };
+        while (tok_start > 0 && (std::isalnum(static_cast<unsigned char>(lineText[tok_start - 1])) || lineText[tok_start - 1] == '_')) --tok_start;
+        const std::string token{ lineText.substr(tok_start, caret_i - tok_start) };
+
+        if (!read_only && token.size() >= 2 && (std::isalpha(static_cast<unsigned char>(token[0])) || token[0] == '_'))
+        {
+            if (token != g_cmpl_token || !g_cmpl_open)
+            {
+                g_cmpl_token = token;
+                g_cmpl_items = complete::filter(g_complete_index, token, 40);
+                g_cmpl_sel = 0;
+            }
+            g_cmpl_open = !g_cmpl_items.empty();
+        }
+        else g_cmpl_open = false;
+
+        bool accept{ false };
+        if (g_cmpl_open)
+        {
+            const ImGuiID owner{ ImGui::GetID("##cmpl") };
+            const int n{ static_cast<int>(g_cmpl_items.size()) };
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) { g_cmpl_sel = (g_cmpl_sel + 1) % n; ImGui::SetKeyOwner(ImGuiKey_DownArrow, owner, ImGuiInputFlags_LockThisFrame); }
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))   { g_cmpl_sel = (g_cmpl_sel - 1 + n) % n; ImGui::SetKeyOwner(ImGuiKey_UpArrow, owner, ImGuiInputFlags_LockThisFrame); }
+            if (ImGui::IsKeyPressed(ImGuiKey_Tab, false) || ImGui::IsKeyPressed(ImGuiKey_Enter, false))
+            {
+                accept = true;
+                ImGui::SetKeyOwner(ImGuiKey_Tab, owner, ImGuiInputFlags_LockThisFrame);
+                ImGui::SetKeyOwner(ImGuiKey_Enter, owner, ImGuiInputFlags_LockThisFrame);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) g_cmpl_open = false;
+        }
+        if (accept && g_cmpl_sel >= 0 && g_cmpl_sel < static_cast<int>(g_cmpl_items.size()))
+            insert_completion(cur, static_cast<int>(token.size()), g_complete_index.all[g_cmpl_items[g_cmpl_sel]].name);
+
+        // Render the editor in the monospace font.
+        const char* const title{ "##scripteditor" };
+        if (g_font_mono) ImGui::PushFont(g_font_mono, 0.0f);
+        const float charW{ ImGui::CalcTextSize("m").x };
+        const float lineH{ ImGui::GetTextLineHeightWithSpacing() };
+        g_editor.Render(title, ImVec2(-1.0f, height), true);
+        if (g_font_mono) ImGui::PopFont();
+
+        // Completion popup near the caret.
+        if (g_cmpl_open && !g_cmpl_items.empty())
+        {
+            ImVec2 pos{ ImGui::GetItemRectMin() };
+            if (ImGuiWindow* ew{ ImGui::FindWindowByName(title) })
+            {
+                const int digits{ (std::max)(2, static_cast<int>(std::to_string((std::max)(1, g_editor.GetTotalLines())).size())) };
+                const float gutter{ (digits + 2) * charW };
+                pos = ImVec2(ew->Pos.x + gutter + cur.mColumn * charW - ew->Scroll.x,
+                             ew->Pos.y + (cur.mLine + 1) * lineH - ew->Scroll.y + em(0.2f));
+            }
+            const ImGuiViewport* vp{ ImGui::GetMainViewport() };
+            pos.x = std::clamp(pos.x, vp->WorkPos.x, vp->WorkPos.x + vp->WorkSize.x - em(20.0f));
+            pos.y = std::clamp(pos.y, vp->WorkPos.y, vp->WorkPos.y + vp->WorkSize.y - em(12.0f));
+            ImGui::SetNextWindowPos(pos);
+            ImGui::SetNextWindowSize(ImVec2(em(24.0f), 0.0f));
+            ImGui::SetNextWindowBgAlpha(0.98f);
+            const ImGuiWindowFlags fl{ ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                       ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize };
+            if (ImGui::Begin("##cmplpopup", nullptr, fl))
+            {
+                const int shown{ (std::min)(12, static_cast<int>(g_cmpl_items.size())) };
+                for (int i = 0; i < shown; ++i)
+                {
+                    const complete::Symbol& sym{ g_complete_index.all[g_cmpl_items[i]] };
+                    ImGui::PushID(i);
+                    if (ImGui::Selectable("##ci", i == g_cmpl_sel, ImGuiSelectableFlags_AllowOverlap))
+                        insert_completion(cur, static_cast<int>(token.size()), sym.name);
+                    ImGui::SameLine(em(0.4f));
+                    ImGui::TextUnformatted(sym.name.c_str());
+                    if (!sym.detail.empty())
+                    {
+                        ImGui::SameLine(em(12.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, theme::muted());
+                        ImGui::TextUnformatted(sym.detail.c_str());
+                        ImGui::PopStyleColor();
+                    }
+                    ImGui::PopID();
+                }
+                if (static_cast<int>(g_cmpl_items.size()) > shown)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, theme::muted_dim());
+                    ImGui::Text("   ... %d more", static_cast<int>(g_cmpl_items.size()) - shown);
+                    ImGui::PopStyleColor();
+                }
+            }
+            ImGui::End();
+        }
+    }
+
     void draw_scripts_window(viewer::App& app)
     {
         ImGui::SetNextWindowSize(ImVec2(em(54.0f), em(42.0f)), ImGuiCond_FirstUseEver);
@@ -2781,7 +3004,7 @@ namespace
             ImGui::End();
             return;
         }
-        seed_script_buffer_if_empty();
+        seed_editor_if_empty();
 
         ImGui::TextWrapped("Write a C++ script over the generated wrapper. It compiles to a DLL "
                            "that is injected into the attached JVM; install hooks in script_setup().");
@@ -2791,20 +3014,18 @@ namespace
         ui::InputText("##shdr", "path to the generated wrapper.hpp (optional)", g_script_hdr, sizeof g_script_hdr, em(28.0f));
         ImGui::SameLine();
         ImGui::BeginDisabled(g_w_path.empty());
-        if (ui::Button("Use last")) std::snprintf(g_script_hdr, sizeof g_script_hdr, "%s", g_w_path.c_str());
+        if (ui::Button("Use last")) { std::snprintf(g_script_hdr, sizeof g_script_hdr, "%s", g_w_path.c_str()); g_cmpl_reindex = true; }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ui::Button("Reset template")) { g_script_buf.clear(); seed_script_buffer_if_empty(); }
+        if (ui::Button("Reset template")) reseed_editor();
 
         const int bst{ g_build_state.load() };
         const bool building{ bst == 1 };
 
-        // Editor — fills the remaining height above the log pane.
+        // Editor (syntax-highlighted, line numbers, error markers, completion).
         const float log_h{ em(11.0f) };
         const float editor_h{ (std::max)(em(8.0f), ImGui::GetContentRegionAvail().y - log_h - em(4.0f)) };
-        ImGui::InputTextMultiline("##editor", g_script_buf.data(), g_script_buf.size(),
-                                  ImVec2(-1.0f, editor_h),
-                                  ImGuiInputTextFlags_AllowTabInput | (building ? ImGuiInputTextFlags_ReadOnly : 0));
+        draw_code_editor(editor_h, building);
 
         // Build / inject controls.
         const bool can_inject{ app.selected_jvm >= 0 && app.selected_jvm < (int)app.jvms.size() };
@@ -2818,7 +3039,7 @@ namespace
         if (building)
         {
             ImGui::SameLine(0.0f, em(0.6f));
-            ui::Spinner("##bspin", ImGui::GetFrameHeight() * 0.32f, em(0.14f), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ui::Spinner("##bspin", ImGui::GetFrameHeight() * 0.32f, em(0.14f), ImGui::GetColorU32(theme::accent()));
             ImGui::SameLine(0.0f, em(0.5f)); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Compiling (first build takes a while)...");
         }
         ImGui::SameLine();
@@ -2829,6 +3050,15 @@ namespace
         ImGui::Separator();
         if (bst == 3 && g_build_thread.joinable()) g_build_thread.join();
         if (bst == 2 && g_build_thread.joinable()) g_build_thread.join();
+
+        // On a build completing, mark (or clear) the editor's error lines once.
+        static int prev_bst{ 0 };
+        if (bst != prev_bst)
+        {
+            prev_bst = bst;
+            if (bst == 3)      g_editor.SetErrorMarkers(build_error_markers(g_build_log));
+            else if (bst == 2) g_editor.SetErrorMarkers(TextEditor::ErrorMarkers{});
+        }
 
         if (ImGui::BeginTabBar("scripttabs"))
         {
@@ -2845,13 +3075,13 @@ namespace
                 ImGui::BeginChild("clog", ImVec2(0, 0), ImGuiChildFlags_Borders);
                 if (bst == 3)
                 {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.46f, 0.46f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, theme::danger());
                     ImGui::TextUnformatted("Build failed:");
                     ImGui::PopStyleColor();
                 }
                 else if (bst == 2)
                 {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.80f, 0.60f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, theme::success());
                     ImGui::TextUnformatted("Build succeeded.");
                     ImGui::PopStyleColor();
                 }
@@ -3014,12 +3244,12 @@ namespace
                 std::snprintf(lbl, sizeof(lbl), "-%zu unloaded", nremoved);
                 if (ImGui::TextLink(lbl)) g_show_removed = true;
                 ImGui::PopStyleColor(2);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Classes unloaded since the previous scan — click to list");
+                ImGui::SetItemTooltip("Classes unloaded since the previous scan — click to list");
             }
             if (app.hook_armed.load())
             {
                 ImGui::SameLine(0.0f, em(0.6f));
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.72f, 1.0f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::link());
                 ImGui::Text("\xef\x80\xa1 hook: %llu", (unsigned long long)app.hook_total.load());
                 ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered())
@@ -3037,7 +3267,7 @@ namespace
                 std::snprintf(lbl, sizeof(lbl), ICON_FA_LOCK " frozen: %d", (int)g_frozen.size());
                 if (ImGui::TextLink(lbl)) g_show_frozen = true;
                 ImGui::PopStyleColor(2);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fields held at a fixed value — click to review / unfreeze");
+                ImGui::SetItemTooltip("Fields held at a fixed value — click to review / unfreeze");
             }
             ImGui::SameLine(0.0f, em(0.8f));
 
@@ -3055,8 +3285,8 @@ namespace
             {
                 std::lock_guard<std::mutex> lock{ app.data_mutex };
                 const viewer::Status st{ app.status.load() };
-                const ImVec4 mcol{ st == viewer::Status::Error ? ImVec4(0.95f, 0.46f, 0.46f, 1.0f)
-                                 : st == viewer::Status::Done  ? ImVec4(0.55f, 0.78f, 0.60f, 1.0f)
+                const ImVec4 mcol{ st == viewer::Status::Error ? theme::danger()
+                                 : st == viewer::Status::Done  ? theme::success()
                                  : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled) };
                 const std::string shown{ ellipsize(app.status_message, msg_max) };
                 ImGui::AlignTextToFramePadding();
@@ -3069,12 +3299,12 @@ namespace
 
             ImGui::SameLine((std::max)(ImGui::GetContentRegionMax().x - toggles_w, ImGui::GetCursorPosX() + em(0.5f)));
             ui::Toggle("Pretty signatures", &g_pretty);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show human-readable signatures/types instead of raw JVM descriptors");
+            ImGui::SetItemTooltip("Show human-readable signatures/types instead of raw JVM descriptors");
             ImGui::SameLine(0.0f, em(0.9f));
             ImGui::BeginDisabled(!g_pretty);
             ui::Toggle("Full names", &g_full_names);
             ImGui::EndDisabled();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show fully-qualified type names (java.lang.String) instead of simple ones (String)");
+            ImGui::SetItemTooltip("Show fully-qualified type names (java.lang.String) instead of simple ones (String)");
         }
 
         // Popup listing the classes unloaded at the last re-scan (they're gone
@@ -3134,7 +3364,7 @@ namespace
                         ImGui::TableSetColumnIndex(2);
                         ImGui::PushID(uid++);
                         if (ui::IconButton(ICON_FA_UNLOCK, "unf")) remove_key = key;
-                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Unfreeze");
+                        ImGui::SetItemTooltip("Unfreeze");
                         ImGui::PopID();
                     }
                     if (!remove_key.empty())
@@ -3244,7 +3474,7 @@ namespace
                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav))
             {
                 const bool err{ g_op_toast.rfind("Error", 0) == 0 };
-                ImGui::PushStyleColor(ImGuiCol_Text, err ? ImVec4(0.96f, 0.5f, 0.5f, 1.0f) : ImVec4(0.6f, 0.85f, 0.65f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, err ? theme::danger() : theme::success());
                 ImGui::TextUnformatted(g_op_toast.c_str());
                 ImGui::PopStyleColor();
             }
@@ -3334,7 +3564,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
         ImGui::NewFrame();
         render_ui(app);
         ImGui::Render();
-        const float clear[4]{ 0.055f, 0.06f, 0.072f, 1.0f };
+        const float clear[4]{ 0.102f, 0.106f, 0.149f, 1.0f };  // = WindowBg #1a1b26
         g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
         g_context->ClearRenderTargetView(g_rtv, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
