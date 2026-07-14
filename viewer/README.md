@@ -59,6 +59,19 @@ Claude/other AIs can drive it (see [`mcp/`](mcp/README.md)).
   kind, or member count — ascending or descending.
 - **Ctrl +/−/0** scales the UI font for accessibility / dense listings.
 - One-click **Copy all** (Java-like listing) / **Export .txt**.
+- **Generate Wrapper** — turn the whole enumerated class surface into a compile-ready
+  C++ wrapper in the `vmhook::object<>` style (`get_field(...)->get()` /
+  `get_method(...)->call(...)` accessors). **Fully customizable**: class- and
+  member-name case (Original / snake_case / camelCase / PascalCase), namespace layout
+  (nested — mirroring Java packages — or flat), root namespace, getter/setter prefixes,
+  include/exclude package filters, and an include-JDK toggle. Emits one amalgamated
+  header with forward declarations, class bodies, out-of-line member definitions (so
+  mutual references resolve), and a `register_all()`.
+- **Scripts** — write a C++ script over the generated wrapper, **compile** it (MSVC,
+  invoked in the background) into a self-contained DLL, and **inject** it into the
+  attached JVM to see its impact live. Install `vmhook::hook<...>` detours in
+  `script_setup()` — they fire on real Java threads, so calling Java methods from a
+  detour is safe. `script::log("...")` streams to the viewer's live log pane.
 - Re-attach works (the payload serves every attach; no restart needed).
 
 It:
@@ -130,3 +143,5 @@ is self-contained when injected.
 | write / freeze a field   | `vmhook::set_field<T>` (freeze = a payload thread re-writing it ~50×/s) |
 | call a method            | JNI `Call*MethodA` run inside a `vmhook::hook` detour on a real JavaThread |
 | new-class notifications  | `vmhook::on_class_loaded` (deopted `ClassLoader.defineClass` detour) |
+| generate wrapper         | `src/wrapper_gen.hpp` — emits `vmhook::object<T>` classes + `register_class<T>` calls |
+| compile + inject a script| `src/script_host.hpp` — MSVC builds a `vmhook::hook<T>` DLL, injected via `inject_dll` |

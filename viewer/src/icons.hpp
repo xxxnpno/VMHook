@@ -24,3 +24,6 @@
 #define ICON_FA_THUMBTACK "\xef\x82\x8d" // U+F08D thumbtack (grab object)
 #define ICON_FA_PLAY     "\xef\x81\x8b"  // U+F04B play (call method)
 #define ICON_FA_TRASH    "\xef\x87\xb8"  // U+F1F8 trash (remove saved object)
+#define ICON_FA_CODE     "\xef\x84\xa1"  // U+F121 code </> (generate wrapper)
+#define ICON_FA_SCROLL   "\xef\x9c\x8e"  // U+F70E scroll (scripts)
+#define ICON_FA_WRENCH   "\xef\x82\xad"  // U+F0AD wrench (build)

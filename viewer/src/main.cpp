@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +27,8 @@
 #include "descriptor.hpp"
 #include "icons.hpp"
 #include "widgets.hpp"
+#include "wrapper_gen.hpp"
+#include "script_host.hpp"
 
 #pragma comment(lib, "d3d11.lib")
 
@@ -239,6 +242,9 @@ namespace
                 0xF1E6, 0xF1E6,  // plug
                 0xF1F8, 0xF1F8,  // trash (remove saved object)
                 0xF304, 0xF304,  // pen (edit value)
+                0xF121, 0xF121,  // code (generate wrapper)
+                0xF70E, 0xF70E,  // scroll (scripts)
+                0xF0AD, 0xF0AD,  // wrench (build)
                 0 };
             ImFontConfig cfg{};
             cfg.MergeMode        = true;
@@ -326,6 +332,40 @@ namespace
     std::vector<int> g_filtered;  // rebuilt each frame from the search box
     // Global member-search results: (class index, member index) pairs.
     std::vector<std::pair<int,int>> g_member_results;
+
+    // ── Generate Wrapper window state ─────────────────────────────────────────
+    bool  g_show_wrapper{ false };
+    char  g_w_ns[64]{ "jvm" };
+    char  g_w_getter[24]{ "get_" };
+    char  g_w_setter[24]{ "set_" };
+    char  g_w_include[512]{};
+    char  g_w_exclude[512]{};
+    char  g_w_outdir[512]{};
+    int   g_w_layout{ 0 };        // 0 = nested namespaces, 1 = flat
+    int   g_w_type_case{ 3 };     // 0 orig / 1 snake / 2 camel / 3 pascal
+    int   g_w_member_case{ 1 };   // default snake
+    bool  g_w_setters{ true };
+    bool  g_w_methods{ true };
+    bool  g_w_fields{ true };
+    bool  g_w_jdk{ false };       // default: skip the (huge) JDK
+    bool  g_w_public_only{ false };
+    std::atomic<int> g_w_state{ 0 };   // 0 idle / 1 running / 2 done / 3 error
+    std::string      g_w_msg;          // result summary (read after join)
+    std::string      g_w_path;         // written header path
+    std::string      g_w_notes;        // generator notes
+    std::thread      g_w_thread;
+
+    // ── Scripts window state ──────────────────────────────────────────────────
+    bool  g_show_scripts{ false };
+    std::vector<char> g_script_buf;        // editable script source (lazily sized)
+    char  g_script_hdr[512]{};             // generated-wrapper header path (for #include)
+    std::atomic<int>  g_build_state{ 0 };  // 0 idle / 1 building / 2 ok / 3 fail
+    std::string       g_build_log;         // compiler output (read after join)
+    std::string       g_build_dll;         // built DLL path
+    std::thread       g_build_thread;
+    bool  g_build_inject{ false };         // auto-inject once a build succeeds
+    double g_script_log_poll{ 0.0 };
+    std::string g_script_log_text;         // tail of %TEMP%\vmhook_script.log
 
     // Back/forward navigation history (paired with the clickable `extends` jump
     // and class-list clicks) so browsing the class graph feels like a browser.
@@ -718,6 +758,18 @@ namespace
             ImGui::AlignTextToFramePadding();
             ImGui::TextDisabled("(%d)", (int)g_clipboard.size());
         }
+
+        // Generate Wrapper + Scripts — enabled once a class surface is loaded.
+        ImGui::SameLine(0.0f, em(0.7f));
+        ImGui::BeginDisabled(!app.has_baseline.load());
+        if (ui::Button(ICON_FA_CODE "  Wrapper")) g_show_wrapper = true;
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Generate a C++ wrapper of the JVM's classes (customizable naming / namespaces)");
+        ImGui::SameLine(0.0f, em(0.4f));
+        ImGui::BeginDisabled(!app.has_baseline.load());
+        if (ui::Button(ICON_FA_SCROLL "  Scripts")) g_show_scripts = true;
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Write, compile and inject a C++ script built on the generated wrapper");
 
         row_divider();
         const viewer::Status st{ app.status.load() };
@@ -2499,6 +2551,352 @@ namespace
         ImGui::End();
     }
 
+    // ── Generate Wrapper + Scripts ────────────────────────────────────────────
+
+    inline std::string vmhook_include_dir() { return exe_dir(); }  // CMake copies vmhook/ next to the exe
+    inline std::string default_wrapper_dir() { return exe_dir() + "generated"; }
+
+    wrapper::NameCase case_from_index(int v)
+    {
+        switch (v)
+        {
+        case 0:  return wrapper::NameCase::Original;
+        case 1:  return wrapper::NameCase::Snake;
+        case 2:  return wrapper::NameCase::Camel;
+        default: return wrapper::NameCase::Pascal;
+        }
+    }
+
+    wrapper::Options current_wrapper_options()
+    {
+        wrapper::Options o;
+        o.root_namespace  = g_w_ns[0] ? std::string{ g_w_ns } : std::string{ "jvm" };
+        o.ns_layout       = g_w_layout == 1 ? wrapper::NsLayout::Flat : wrapper::NsLayout::Nested;
+        o.type_case       = case_from_index(g_w_type_case);
+        o.member_case     = case_from_index(g_w_member_case);
+        o.getter_prefix   = g_w_getter;
+        o.setter_prefix   = g_w_setter;
+        o.emit_setters    = g_w_setters;
+        o.include_methods = g_w_methods;
+        o.include_fields  = g_w_fields;
+        o.include_jdk     = g_w_jdk;
+        o.public_only     = g_w_public_only;
+        o.include_prefixes = g_w_include;
+        o.exclude_prefixes = g_w_exclude;
+        return o;
+    }
+
+    void start_wrapper_generation(viewer::App& app)
+    {
+        if (g_w_state.load() == 1) return;
+        auto classes{ std::make_shared<std::vector<viewer::ClassInfo>>() };
+        { std::lock_guard<std::mutex> lock{ app.data_mutex }; *classes = app.classes; }
+        const wrapper::Options opt{ current_wrapper_options() };
+        const std::string outdir{ g_w_outdir[0] ? std::string{ g_w_outdir } : default_wrapper_dir() };
+        if (g_w_thread.joinable()) g_w_thread.join();
+        g_w_msg.clear(); g_w_path.clear(); g_w_notes.clear();
+        g_w_state.store(1);
+        g_w_thread = std::thread([classes, opt, outdir]
+        {
+            const wrapper::Result r{ wrapper::generate(*classes, opt) };
+            CreateDirectoryA(outdir.c_str(), nullptr);
+            const std::string path{ outdir + "\\wrapper.hpp" };
+            bool ok{ false };
+            { std::ofstream f{ path, std::ios::trunc }; f << r.header; ok = static_cast<bool>(f); }
+            g_w_path = ok ? path : std::string{};
+            g_w_msg  = ok
+                ? (std::to_string(r.stats.classes_emitted) + " classes, "
+                   + std::to_string(r.stats.methods_emitted) + " methods, "
+                   + std::to_string(r.stats.fields_emitted) + " fields  ("
+                   + std::to_string(r.header.size() / 1024) + " KB, "
+                   + std::to_string(r.stats.classes_skipped) + " classes filtered out).")
+                : ("Could not write " + path + " — is the folder writable?");
+            g_w_state.store(ok ? 2 : 3);
+        });
+    }
+
+    void draw_wrapper_window(viewer::App& app)
+    {
+        ImGui::SetNextWindowSize(ImVec2(em(36.0f), em(38.0f)), ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin(ICON_FA_CODE "  Generate Wrapper", &g_show_wrapper))
+        {
+            ImGui::End();
+            return;
+        }
+
+        ImGui::TextWrapped("Turn the attached JVM's classes into a compile-ready C++ wrapper "
+                           "(vmhook object<> style). Choose how names and namespaces are formed.");
+        ImGui::Spacing();
+
+        const float lw{ em(10.0f) };
+        static const char* const cases[]{ "Original", "snake_case", "camelCase", "PascalCase" };
+
+        row_label("Root namespace"); ImGui::SameLine(lw); ui::InputText("##wns", "jvm", g_w_ns, sizeof g_w_ns, em(12.0f));
+        row_label("Namespaces");     ImGui::SameLine(lw); ui::Combo("##wlay", &g_w_layout, "Nested (mirror packages)\0Flat (one namespace)\0", em(18.0f));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nested mirrors Java packages as nested C++ namespaces (jvm::net::minecraft::client::Minecraft).\nFlat puts every class in one namespace and disambiguates leaf collisions.");
+        row_label("Class names");    ImGui::SameLine(lw); ui::Combo("##wtc", &g_w_type_case, cases, 4, em(12.0f));
+        row_label("Member names");   ImGui::SameLine(lw); ui::Combo("##wmc", &g_w_member_case, cases, 4, em(12.0f));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Applied to method accessors and field getter/setter names.");
+        row_label("Getter prefix");  ImGui::SameLine(lw); ui::InputText("##wg", "get_", g_w_getter, sizeof g_w_getter, em(6.0f));
+        ImGui::SameLine(0.0f, em(0.8f)); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Setter");
+        ImGui::SameLine(0.0f, em(0.4f)); ui::InputText("##ws", "set_", g_w_setter, sizeof g_w_setter, em(6.0f));
+
+        ImGui::Spacing();
+        ui::Toggle("Setters", &g_w_setters);      ImGui::SameLine(em(9.0f));
+        ui::Toggle("Methods", &g_w_methods);      ImGui::SameLine(em(18.0f));
+        ui::Toggle("Fields",  &g_w_fields);
+        ui::Toggle("Public only", &g_w_public_only); ImGui::SameLine(em(9.0f));
+        ui::Toggle("Include JDK", &g_w_jdk);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include java/*, javax/*, sun/*, jdk/* classes. The full JDK is large and slow to compile — leave off to wrap just the app's own classes.");
+
+        ImGui::Spacing();
+        row_label("Include only"); ImGui::SameLine(lw); ui::InputText("##winc", "all packages (e.g. net/minecraft, com/example)", g_w_include, sizeof g_w_include, -1.0f);
+        row_label("Exclude");      ImGui::SameLine(lw); ui::InputText("##wexc", "none (e.g. com/sun, org/objectweb)", g_w_exclude, sizeof g_w_exclude, -1.0f);
+        row_label("Output folder"); ImGui::SameLine(lw); ui::InputText("##wout", default_wrapper_dir().c_str(), g_w_outdir, sizeof g_w_outdir, -1.0f);
+
+        // Live count of classes that pass the current filter.
+        int matched{ 0 }, total{ 0 };
+        {
+            const wrapper::Options opt{ current_wrapper_options() };
+            std::lock_guard<std::mutex> lock{ app.data_mutex };
+            total = static_cast<int>(app.classes.size());
+            for (const auto& c : app.classes)
+                if (!c.internal_name.empty() && wrapper::detail::passes_filter(c.internal_name, opt)) ++matched;
+        }
+        ImGui::Spacing();
+        ImGui::TextDisabled("%d of %d classes match the filter.", matched, total);
+        if (matched > 4000)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.80f, 0.45f, 1.0f));
+            ImGui::TextWrapped("Heads up: wrapping this many classes makes a large header that is slow to compile. Consider an 'Include only' filter.");
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Separator();
+        const int st{ g_w_state.load() };
+        ImGui::BeginDisabled(st == 1 || matched == 0);
+        if (ui::Button(ICON_FA_CODE "  Generate", ImVec2(em(10.0f), 0), ui::BtnPrimary)) start_wrapper_generation(app);
+        ImGui::EndDisabled();
+        if (st == 1)
+        {
+            ImGui::SameLine(0.0f, em(0.6f));
+            ui::Spinner("##wspin", ImGui::GetFrameHeight() * 0.32f, em(0.14f), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ImGui::SameLine(0.0f, em(0.5f)); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Generating...");
+        }
+        else if (st == 2)
+        {
+            if (g_w_thread.joinable()) g_w_thread.join();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.80f, 0.60f, 1.0f));
+            ImGui::TextWrapped("%s", g_w_msg.c_str());
+            ImGui::PopStyleColor();
+            if (!g_w_path.empty())
+            {
+                ImGui::TextDisabled("Wrote %s", g_w_path.c_str());
+                if (ui::Button("Copy path")) ImGui::SetClipboardText(g_w_path.c_str());
+                ImGui::SameLine();
+                if (ui::Button(ICON_FA_SCROLL "  Use in a script"))
+                {
+                    std::snprintf(g_script_hdr, sizeof g_script_hdr, "%s", g_w_path.c_str());
+                    g_script_buf.clear();  // force the editor to re-seed with this header
+                    g_show_scripts = true;
+                }
+            }
+        }
+        else if (st == 3)
+        {
+            if (g_w_thread.joinable()) g_w_thread.join();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.46f, 0.46f, 1.0f));
+            ImGui::TextWrapped("%s", g_w_msg.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::End();
+    }
+
+    std::string script_starter_for(const std::string& header_path)
+    {
+        std::string inc;
+        if (!header_path.empty())
+        {
+            std::string base{ header_path };
+            const std::size_t slash{ base.find_last_of("\\/") };
+            if (slash != std::string::npos) base = base.substr(slash + 1);
+            inc = "#include \"" + base + "\"";
+        }
+        std::string example;
+        example += "    // Example (uncomment + edit): hook a method and log each call.\n";
+        example += "    // Its detour runs on the real Java thread, so calling Java here is safe.\n";
+        example += "    // vmhook::hook<jvm::net::example::Player>(\"getHealth\", \"()I\",\n";
+        example += "    //     [](vmhook::return_value& ret, std::unique_ptr<jvm::net::example::Player> self)\n";
+        example += "    //     {\n";
+        example += "    //         script::log(\"getHealth() called\");\n";
+        example += "    //         // ret.set(999); // force a return value\n";
+        example += "    //     });\n";
+        return script_host::starter_body(inc, example);
+    }
+
+    void seed_script_buffer_if_empty()
+    {
+        if (!g_script_buf.empty()) return;
+        const std::string starter{ script_starter_for(g_script_hdr[0] ? std::string{ g_script_hdr } : g_w_path) };
+        g_script_buf.assign((std::max<std::size_t>)(starter.size() + 1, 128u * 1024u), '\0');
+        std::memcpy(g_script_buf.data(), starter.c_str(), starter.size());
+    }
+
+    void start_script_build(viewer::App& app, bool inject)
+    {
+        if (g_build_state.load() == 1) return;
+        std::string body{ g_script_buf.data() };  // up to the NUL
+        std::string wrapper_dir;
+        if (g_script_hdr[0])
+        {
+            std::string h{ g_script_hdr };
+            const std::size_t slash{ h.find_last_of("\\/") };
+            wrapper_dir = (slash != std::string::npos) ? h.substr(0, slash) : default_wrapper_dir();
+        }
+        else
+        {
+            wrapper_dir = default_wrapper_dir();
+        }
+        const std::string work{ exe_dir() + "script_build" };
+        const std::string vmh{ vmhook_include_dir() };
+        if (g_build_thread.joinable()) g_build_thread.join();
+        g_build_log.clear(); g_build_dll.clear();
+        g_build_inject = inject;
+        g_build_state.store(1);
+        g_build_thread = std::thread([body, work, vmh, wrapper_dir]
+        {
+            const script_host::BuildResult r{ script_host::build(body, work, vmh, wrapper_dir) };
+            g_build_log = r.log;
+            g_build_dll = r.dll_path;
+            g_build_state.store(r.ok ? 2 : 3);
+        });
+    }
+
+    void draw_scripts_window(viewer::App& app)
+    {
+        ImGui::SetNextWindowSize(ImVec2(em(54.0f), em(42.0f)), ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin(ICON_FA_SCROLL "  Scripts", &g_show_scripts))
+        {
+            ImGui::End();
+            return;
+        }
+        seed_script_buffer_if_empty();
+
+        ImGui::TextWrapped("Write a C++ script over the generated wrapper. It compiles to a DLL "
+                           "that is injected into the attached JVM; install hooks in script_setup().");
+        ImGui::Spacing();
+
+        row_label("Wrapper header"); ImGui::SameLine(em(9.0f));
+        ui::InputText("##shdr", "path to the generated wrapper.hpp (optional)", g_script_hdr, sizeof g_script_hdr, em(28.0f));
+        ImGui::SameLine();
+        ImGui::BeginDisabled(g_w_path.empty());
+        if (ui::Button("Use last")) std::snprintf(g_script_hdr, sizeof g_script_hdr, "%s", g_w_path.c_str());
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ui::Button("Reset template")) { g_script_buf.clear(); seed_script_buffer_if_empty(); }
+
+        const int bst{ g_build_state.load() };
+        const bool building{ bst == 1 };
+
+        // Editor — fills the remaining height above the log pane.
+        const float log_h{ em(11.0f) };
+        const float editor_h{ (std::max)(em(8.0f), ImGui::GetContentRegionAvail().y - log_h - em(4.0f)) };
+        ImGui::InputTextMultiline("##editor", g_script_buf.data(), g_script_buf.size(),
+                                  ImVec2(-1.0f, editor_h),
+                                  ImGuiInputTextFlags_AllowTabInput | (building ? ImGuiInputTextFlags_ReadOnly : 0));
+
+        // Build / inject controls.
+        const bool can_inject{ app.selected_jvm >= 0 && app.selected_jvm < (int)app.jvms.size() };
+        ImGui::BeginDisabled(building);
+        if (ui::Button(ICON_FA_WRENCH "  Compile", ImVec2(0, 0), ui::BtnPrimary)) start_script_build(app, /*inject=*/false);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!can_inject);
+        if (ui::Button(ICON_FA_PLAY "  Compile & Inject", ImVec2(0, 0), ui::BtnPrimary)) start_script_build(app, /*inject=*/true);
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        if (building)
+        {
+            ImGui::SameLine(0.0f, em(0.6f));
+            ui::Spinner("##bspin", ImGui::GetFrameHeight() * 0.32f, em(0.14f), ImGui::GetColorU32(ImVec4(0.34f, 0.63f, 1.0f, 1.0f)));
+            ImGui::SameLine(0.0f, em(0.5f)); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Compiling (first build takes a while)...");
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("|"); ImGui::SameLine();
+        if (ui::Button("Clear log")) { g_script_log_text.clear(); std::ofstream{ script_host::log_path(), std::ios::trunc }; }
+
+        // Compiler output (on failure) + the script's live log.
+        ImGui::Separator();
+        if (bst == 3 && g_build_thread.joinable()) g_build_thread.join();
+        if (bst == 2 && g_build_thread.joinable()) g_build_thread.join();
+
+        if (ImGui::BeginTabBar("scripttabs"))
+        {
+            if (ImGui::BeginTabItem("Script log"))
+            {
+                ImGui::BeginChild("slog", ImVec2(0, 0), ImGuiChildFlags_Borders);
+                ImGui::TextUnformatted(g_script_log_text.empty() ? "(no output yet)" : g_script_log_text.c_str());
+                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - em(2.0f)) ImGui::SetScrollHereY(1.0f);
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Compiler output"))
+            {
+                ImGui::BeginChild("clog", ImVec2(0, 0), ImGuiChildFlags_Borders);
+                if (bst == 3)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.46f, 0.46f, 1.0f));
+                    ImGui::TextUnformatted("Build failed:");
+                    ImGui::PopStyleColor();
+                }
+                else if (bst == 2)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.80f, 0.60f, 1.0f));
+                    ImGui::TextUnformatted("Build succeeded.");
+                    ImGui::PopStyleColor();
+                }
+                ImGui::TextUnformatted(g_build_log.empty() ? "(no build yet)" : g_build_log.c_str());
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+
+        ImGui::End();
+    }
+
+    // After a successful build, inject the DLL into the selected JVM (once).
+    void maybe_inject_script(viewer::App& app)
+    {
+        if (g_build_state.load() != 2 || !g_build_inject || g_build_dll.empty()) return;
+        g_build_inject = false;
+        if (app.selected_jvm < 0 || app.selected_jvm >= (int)app.jvms.size())
+        {
+            g_script_log_text += "\n[viewer] No JVM selected — cannot inject.\n";
+            return;
+        }
+        const std::uint32_t pid{ app.jvms[(std::size_t)app.selected_jvm].pid };
+        std::wstring wpath(g_build_dll.size() + 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, g_build_dll.c_str(), -1, wpath.data(), (int)wpath.size());
+        wpath.resize(wcslen(wpath.c_str()));
+        std::string err;
+        if (viewer::inject_dll(pid, wpath, err))
+            g_script_log_text += "\n[viewer] Injected script into pid " + std::to_string(pid) + ".\n";
+        else
+            g_script_log_text += "\n[viewer] Injection failed: " + err + "\n";
+    }
+
+    // Poll the script log file (written by the injected DLL) ~4x/sec.
+    void poll_script_log()
+    {
+        if (ImGui::GetTime() - g_script_log_poll < 0.25) return;
+        g_script_log_poll = ImGui::GetTime();
+        std::ifstream f{ script_host::log_path(), std::ios::binary };
+        if (!f) return;
+        std::stringstream ss; ss << f.rdbuf();
+        g_script_log_text = ss.str();
+    }
+
     void render_ui(viewer::App& app)
     {
         // Ctrl+F focuses the class search; Esc clears all filters.
@@ -2813,6 +3211,11 @@ namespace
             draw_array_window(app);
         }
 
+        // Generate Wrapper + Scripts windows (+ their async plumbing).
+        if (g_show_wrapper) draw_wrapper_window(app);
+        if (g_show_scripts) { poll_script_log(); draw_scripts_window(app); }
+        maybe_inject_script(app);
+
         // Consume a completed mutating op (set / freeze / call) exactly once:
         // route a call result to whichever panel dispatched it, otherwise show a
         // transient toast; a successful write triggers an immediate re-read so the
@@ -2947,6 +3350,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     }
 
     save_settings();  // remember preferences for next launch
+    // Join background workers (wrapper generation / script build) so their
+    // std::thread destructors don't std::terminate on a still-joinable thread.
+    if (g_w_thread.joinable())     g_w_thread.join();
+    if (g_build_thread.joinable()) g_build_thread.join();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

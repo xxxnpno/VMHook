@@ -101,6 +101,14 @@ add_custom_command(TARGET vmhook_viewer POST_BUILD
         "$<TARGET_FILE_DIR:vmhook_viewer>/fa-solid-900.ttf"
     VERBATIM)
 
+# Bundle the vmhook header next to the exe so the "Scripts" feature can compile
+# user scripts (which #include <vmhook/vmhook.hpp>) against it at runtime.
+add_custom_command(TARGET vmhook_viewer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${VMHOOK_INCLUDE}/vmhook/vmhook.hpp"
+        "$<TARGET_FILE_DIR:vmhook_viewer>/vmhook/vmhook.hpp"
+    VERBATIM)
+
 # ── headless end-to-end probe (test) ─────────────────────────────────────────
 add_executable(vmhook_cli_probe test/cli_probe.cpp)
 target_include_directories(vmhook_cli_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
