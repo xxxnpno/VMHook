@@ -814,7 +814,7 @@ namespace
             ui::Spinner("##spin", r, (std::max)(r * 0.35f, em(0.12f)), ImGui::GetColorU32(theme::accent()));
             ImGui::SameLine(0.0f, em(0.45f));
             ImGui::AlignTextToFramePadding();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.74f, 1.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::link());
             if (st == viewer::Status::Receiving)
                 ImGui::Text("%llu classes...", (unsigned long long)app.classes_streamed.load());
             else
@@ -942,7 +942,7 @@ namespace
         if (n_new > 0)
         {
             ImGui::SameLine(0.0f, em(0.6f));
-            const ImVec4 green{ g_new_only ? ImVec4(0.55f, 0.95f, 0.66f, 1.0f) : ImVec4(0.42f, 0.82f, 0.52f, 1.0f) };
+            const ImVec4 green{ theme::success() };
             ImGui::PushStyleColor(ImGuiCol_Text, green);
             ImGui::PushStyleColor(ImGuiCol_TextLink, green);
             char lbl[40];
@@ -1074,6 +1074,15 @@ namespace
                     const ImVec2 rp{ ImGui::GetCursorScreenPos() };
                     if (ImGui::Selectable("##row", sel, ImGuiSelectableFlags_SpanAllColumns))
                         navigate_to(idx, false);  // clicked row already visible
+                    // Left accent bar on the selected row (VS Code-style active marker).
+                    if (sel)
+                    {
+                        const float h{ ImGui::GetFontSize() };
+                        ImGui::GetWindowDrawList()->AddRectFilled(
+                            ImVec2(rp.x - em(0.62f), rp.y + h * 0.08f),
+                            ImVec2(rp.x - em(0.62f) + em(0.16f), rp.y + h * 0.92f),
+                            ImGui::GetColorU32(theme::accent()), em(0.06f));
+                    }
                     copy_menu("cls", c.internal_name);
                     std::string dotted{ c.internal_name };
                     for (char& ch : dotted) if (ch == '/') ch = '.';
@@ -1086,7 +1095,7 @@ namespace
                     for (char& ch : pkg) if (ch == '/') ch = '.';
                     if (!pkg.empty())
                     {
-                        ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImVec4(0.80f, 0.85f, 0.95f, 1.0f)
+                        ImGui::PushStyleColor(ImGuiCol_Text, sel ? theme::text()
                                                                  : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
                         ImGui::TextUnformatted((pkg + ".").c_str());
                         ImGui::PopStyleColor();
@@ -1106,7 +1115,7 @@ namespace
                     if (c.is_new)
                         ImGui::GetWindowDrawList()->AddCircleFilled(
                             ImVec2(rp.x - em(0.52f), rp.y + ImGui::GetFontSize() * 0.5f),
-                            em(0.17f), ImGui::GetColorU32(ImVec4(0.42f, 0.85f, 0.52f, 1.0f)));
+                            em(0.17f), ImGui::GetColorU32(theme::success()));
                     ImGui::PopID();
                     if (row == scroll_row && g_scroll_to_selected)
                     {
@@ -3464,12 +3473,22 @@ namespace
             }
             if (r.ok) { g_instances_refresh_now = true; g_statics_refresh_now = true; }
         }
-        // Floating toast for set / freeze feedback.
+        // Floating toast for set / freeze feedback — fades + slides in/out.
         if (!g_op_toast.empty() && ImGui::GetTime() < g_op_toast_until)
         {
+            const double remaining{ g_op_toast_until - ImGui::GetTime() };
+            const double elapsed{ 3.0 - remaining };
+            float a{ 1.0f };
+            if (elapsed  < 0.18) a = (std::min)(a, static_cast<float>(elapsed  / 0.18));   // fade in
+            if (remaining < 0.35) a = (std::min)(a, static_cast<float>(remaining / 0.35));  // fade out
+            a = std::clamp(a, 0.0f, 1.0f);
+            a = a * a * (3.0f - 2.0f * a);  // smoothstep
+            const float dy{ (1.0f - a) * em(0.9f) };  // slides up as it appears
+
             const ImGuiViewport* v{ ImGui::GetMainViewport() };
-            ImGui::SetNextWindowPos(ImVec2(v->WorkPos.x + v->WorkSize.x * 0.5f, v->WorkPos.y + v->WorkSize.y - em(3.0f)), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
-            ImGui::SetNextWindowBgAlpha(0.92f);
+            ImGui::SetNextWindowPos(ImVec2(v->WorkPos.x + v->WorkSize.x * 0.5f, v->WorkPos.y + v->WorkSize.y - em(3.0f) + dy), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+            ImGui::SetNextWindowBgAlpha(0.92f * a);
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a);
             if (ImGui::Begin("##optoast", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav))
             {
@@ -3479,6 +3498,7 @@ namespace
                 ImGui::PopStyleColor();
             }
             ImGui::End();
+            ImGui::PopStyleVar();
         }
     }
 }

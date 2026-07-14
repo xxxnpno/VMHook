@@ -223,9 +223,13 @@ namespace ui
     {
         ImGui::SetNextItemWidth(width);
         const bool changed{ ImGui::InputTextWithHint(id, hint, buf, sz) };
-        if (ImGui::IsItemActive() || ImGui::IsItemFocused())
+        // Accent focus ring that fades in/out with focus (smoother than a hard toggle).
+        const bool focused{ ImGui::IsItemActive() || ImGui::IsItemFocused() };
+        const float a{ anim::Approach(ImGui::GetItemID(), ImHashStr("ring"), focused ? 1.0f : 0.0f, 18.0f) };
+        if (a > 0.01f)
         {
-            const ImVec4 accent{ ImGui::GetStyle().Colors[ImGuiCol_SliderGrab] };
+            ImVec4 accent{ ImGui::GetStyle().Colors[ImGuiCol_SliderGrab] };
+            accent.w = a;
             ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
                 ImGui::GetColorU32(accent), ImGui::GetStyle().FrameRounding, 0, 1.5f);
         }
