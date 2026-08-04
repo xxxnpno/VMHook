@@ -3,46 +3,51 @@
 // ===========================================================================
 // !! READ THIS BEFORE EDITING — GC-SURVIVAL COVERAGE IS INTENTIONALLY ABSENT !!
 // ===========================================================================
-// vmhook::jni::global_ref is currently a NO-OP STUB.  The header says so in as
-// many words: the constructor stores the raw OOP you hand it, the destructor
-// does nothing, and oop() gives the stored address back verbatim.  There is no
-// VM-side registration, so the holder
+// vmhook::jni::global_ref is a RELOCATION DETECTOR, not a GC root.  The
+// constructor stores the raw OOP you hand it AND a vmhook::gc_epoch() sample;
+// oop() re-samples and returns nullptr the moment the epoch has moved on.  So
+// the holder
 //
-//   * does NOT keep the object alive (it is not a GC root), and
-//   * does NOT track relocation (a moving collector leaves it stale).
+//   * does NOT keep the object alive (it is still not a GC root), but
+//   * DOES refuse to hand back an address once a collection has happened.
 //
 // Therefore this file deliberately contains NO assertion — and no wording that
 // could be read as one — about an object surviving a collection, about a handle
 // being re-derived after a move, or about DeleteGlobalRef ever running.  Those
 // behaviours do not exist today and a test claiming them would be a lie that
-// passes.  What IS pinned down here is everything the stub genuinely promises:
+// passes.  What IS pinned down here is everything the type genuinely promises:
 //
-//   * move-only, final, standard-layout, one-pointer-wide type shape,
+//   * move-only, final, standard-layout, {oop + epoch} type shape,
 //   * EXPLICIT construction from an oop_t (no implicit pin from a raw pointer),
-//   * verbatim storage: oop() == handle() == the address passed in,
+//   * verbatim CAPTURE: raw_unsafe() == the address passed in,
+//   * FAIL-CLOSED reads: with no JVM the epoch is never valid, so is_stale() is
+//     true and oop() / handle() / operator bool are null/false for every
+//     holder, armed or not — the address is never handed back,
 //   * empty/null behaviour: default ctor, nullptr ctor, and reset() all agree,
 //   * reset() idempotence and dtor safety on both empty and armed holders,
-//   * move semantics as VALUE TRANSFER: the destination ends up holding exactly
+//   * move semantics as VALUE TRANSFER: the destination ends up carrying exactly
 //     the source's address and the source ends up empty — never a resurrection,
-//   * self-move / self-swap preserve the stored address (the `this != &other`
+//   * self-move / self-swap preserve the captured address (the `this != &other`
 //     guard), and container round-trips (vector / deque / map / optional /
-//     pair / tuple / array / move-iterators) preserve every stored address.
+//     pair / tuple / array / move-iterators) preserve every captured address.
 //
-// >>> WHEN THE REAL PIN LANDS: a genuine GC root must ALSO be covered by a
-// >>> live-JVM module (allocate, pin, drop all Java references, System.gc(),
-// >>> then prove oop() still resolves and — for a relocating collector — that
-// >>> it resolves to the NEW address).  That coverage belongs in
-// >>> tests/jvm/modules/, not here; this file cannot host it.  At that point
-// >>> the "verbatim storage" assertions below become WRONG and must be
-// >>> rewritten to the handle-indirection contract, and the
-// >>> is_trivially_destructible assertion in SECTION 1b must flip back to
-// >>> !is_trivially_destructible (a real pin needs a releasing destructor).
+// >>> WHEN A REAL PIN LANDS (layers 2/3 of gc_root_feasibility.md): a genuine
+// >>> GC root must ALSO be covered by a live-JVM module (allocate, pin, drop all
+// >>> Java references, System.gc(), then prove oop() still resolves and — for a
+// >>> relocating collector — that it resolves to the NEW address).  That
+// >>> coverage belongs in tests/jvm/modules/, not here; this file cannot host
+// >>> it.  At that point the is_trivially_destructible assertion in SECTION 1b
+// >>> must flip to !is_trivially_destructible (a real pin needs a releasing
+// >>> destructor).
 // ===========================================================================
 //
-// WHY every check below is deterministic without a JVM: the stub never calls
-// into the VM at all.  Construction, oop(), handle(), reset() and destruction
-// are pure pointer bookkeeping, so they behave identically with and without a
-// JVM present and no fabricated address is ever dereferenced by this file.
+// WHY every check below is deterministic without a JVM: no jvm.dll / libjvm.so
+// is loaded into this test binary, so gHotSpotVMStructs never resolves,
+// vm_capabilities() reports collector `unknown` / supported=false, and
+// gc_epoch() therefore returns an INVALID sample on every call.  That makes
+// is_stale() unconditionally true and the checked accessors unconditionally
+// null — deterministically, on every platform.  No fabricated address is ever
+// dereferenced by this file.
 #include <vmhook/vmhook.hpp>
 
 #include <array>
@@ -67,24 +72,40 @@ static auto check(const char* name, bool ok) -> void
 }
 
 // Returns true iff `g` is in the canonical empty state across EVERY observable
-// accessor at once (operator bool, oop(), handle()).  Used to assert the "all
-// three views agree" invariant after each lifecycle operation, so a bug that
-// nulls one view but not another is caught.
+// accessor at once (operator bool, oop(), handle(), raw_unsafe(), is_stale()).
+// Used to assert the "all views agree" invariant after each lifecycle
+// operation, so a bug that nulls one view but not another is caught.
+//
+// NOTE raw_unsafe(): it is the ONE accessor that distinguishes "empty" from
+// "armed but stale".  Without it, every armed holder in this no-JVM binary
+// would look empty and the move-semantics assertions below would be vacuous.
 static auto is_empty(const vmhook::jni::global_ref& g) -> bool
 {
-    return !static_cast<bool>(g) && g.oop() == nullptr && g.handle() == nullptr;
+    return !static_cast<bool>(g)
+        && g.oop() == nullptr
+        && g.handle() == nullptr
+        && g.raw_unsafe() == nullptr
+        && g.is_stale();
 }
 
-// Returns true iff `g` reports EXACTLY `expected` across every observable
-// accessor at once.  This is the positive counterpart of is_empty(): it pins
-// the stub's verbatim-storage contract (oop() and handle() are the same stored
-// address, and operator bool is precisely "that address is non-null").
+// Returns true iff `g` CARRIES `expected` as its captured address AND — with no
+// JVM in the process — correctly refuses to hand it back.  This is the positive
+// counterpart of is_empty(): it pins both halves of the new contract at once,
+//
+//   * the captured address is stored verbatim (raw_unsafe(), diagnostics only),
+//   * every CHECKED view fails closed, because vm_capabilities() reports the
+//     collector unknown/unsupported here so gc_epoch() is never valid.
+//
+// A `nullptr` expectation degenerates to the empty state, which is why the
+// null-OOP sections can keep using this helper unchanged.
 static auto holds(const vmhook::jni::global_ref& g,
                   const vmhook::oop_t expected) -> bool
 {
-    return g.oop() == expected
-        && g.handle() == expected
-        && static_cast<bool>(g) == (expected != nullptr);
+    return g.raw_unsafe() == expected
+        && g.is_stale()
+        && g.oop() == nullptr
+        && g.handle() == nullptr
+        && !static_cast<bool>(g);
 }
 
 // A minimal wrapper to exercise the pin(unique_ptr<T>) overload's compile path.
@@ -217,20 +238,27 @@ int main()
     //   assignment will and won't bind.
     // ========================================================================
 
-    // -- Layout: global_ref is a thin, standard-layout wrapper around ONE void*.
-    //    Asserting sizeof/alignof RELATIVE to void* (never an absolute byte
-    //    count) keeps this true on ILP32 and LP64 / LLP64 alike.
+    // -- Layout: global_ref is a thin, standard-layout wrapper around ONE void*
+    //    plus the gc_epoch_t sample the relocation detector needs.  Asserting
+    //    sizeof/alignof RELATIVE to those two types (never an absolute byte
+    //    count) keeps this true on ILP32 and LP64 / LLP64 alike, and it is a
+    //    tripwire for any hidden state creeping in.
     static_assert(std::is_standard_layout_v<global_ref>,
-                  "global_ref must be standard-layout (a single void* member, no vtable)");
-    static_assert(sizeof(global_ref) == sizeof(void*),
-                  "global_ref must be exactly one pointer wide (no hidden state)");
+                  "global_ref must be standard-layout (plain members, no vtable)");
+    static_assert(sizeof(global_ref) == sizeof(void*) + sizeof(vmhook::gc_epoch_t),
+                  "global_ref must be exactly {oop, gc_epoch_t} wide (no hidden state)");
     static_assert(alignof(global_ref) == alignof(void*),
-                  "global_ref must have pointer alignment (thin wrapper over void*)");
+                  "global_ref must have pointer alignment (thin wrapper over void* + epoch)");
+    // The epoch itself must stay a trivial, cheap-to-copy value type: it is
+    // copied on every move and returned by value from gc_epoch().
+    static_assert(std::is_trivially_copyable_v<vmhook::gc_epoch_t>
+                      && std::is_standard_layout_v<vmhook::gc_epoch_t>,
+                  "gc_epoch_t must stay a trivially-copyable, standard-layout value");
     // Not an aggregate (it has user-declared constructors / private members).
     static_assert(!std::is_aggregate_v<global_ref>,
                   "global_ref must not be an aggregate (it has user-declared ctors)");
     static_assert(!std::is_empty_v<global_ref>,
-                  "global_ref is not empty (it stores a void* member)");
+                  "global_ref is not empty (it stores an oop + an epoch)");
     static_assert(!std::is_polymorphic_v<global_ref>,
                   "global_ref must not be polymorphic (no virtual functions)");
 
@@ -246,20 +274,22 @@ int main()
                   "global_ref move ctor is user-provided (steals + nulls source) -> not trivial");
     static_assert(!std::is_trivially_move_assignable_v<global_ref>,
                   "global_ref move assignment is user-provided (steals + nulls source) -> not trivial");
-    // The default ctor is `= default` but the sole member carries an NSDMI
-    // (`= nullptr`), so default-construction is NOT trivial -- an uninitialised
-    // holder would be indistinguishable from an armed one.
+    // The default ctor is `= default` but both members carry NSDMIs, so
+    // default-construction is NOT trivial -- an uninitialised holder would be
+    // indistinguishable from an armed one, and an uninitialised EPOCH could
+    // read as valid and let a stale address through.
     static_assert(!std::is_trivially_default_constructible_v<global_ref>,
-                  "global_ref must value-initialise its member (NSDMI) -> not trivially default-constructible");
-    // -- STUB-SPECIFIC (see the file header): the destructor is `= default` and
-    //    releases nothing, because there is nothing registered with the VM to
-    //    release.  This assertion is the tripwire for that fact: the day a real
+                  "global_ref must value-initialise its members (NSDMIs) -> not trivially default-constructible");
+    // -- DETECTOR-SPECIFIC (see the file header): the destructor is `= default`
+    //    and releases nothing, because there is still nothing registered with
+    //    the VM to release -- the detector observes relocation, it does not root
+    //    anything.  This assertion is the tripwire for that fact: the day a real
     //    pin lands, its destructor MUST release the root, the type stops being
     //    trivially destructible, and this line fails -- which is exactly the
     //    signal to come back here and restore the GC-survival coverage that the
     //    file header says is missing.  Do not delete this assertion; flip it.
     static_assert(std::is_trivially_destructible_v<global_ref>,
-                  "STUB TRIPWIRE: global_ref's dtor releases nothing today.  If this fails, a "
+                  "DETECTOR TRIPWIRE: global_ref's dtor releases nothing today.  If this fails, a "
                   "real releasing destructor landed -- flip this to !is_trivially_destructible "
                   "and restore the GC-survival coverage described at the top of this file.");
 
@@ -408,12 +438,15 @@ int main()
     }
 
     // ========================================================================
-    // SECTION 4 -- Non-null OOP: the holder stores the address VERBATIM.
-    //   The stub performs no VM call and no tag masking, so every accessor must
-    //   report back exactly the address that was passed in, for ANY bit
-    //   pattern.  We sweep several distinct fake addresses to prove the result
-    //   is a pure pass-through and does not depend on the bit pattern.
-    //   (None of these addresses is ever dereferenced.)
+    // SECTION 4 -- Non-null OOP: the holder CAPTURES the address verbatim and
+    //   REFUSES to hand it back.
+    //   Construction performs no tag masking, so raw_unsafe() must report back
+    //   exactly the address that was passed in, for ANY bit pattern.  With no
+    //   JVM the epoch is never valid, so every checked accessor must be
+    //   null/false for the very same holders -- that pairing is the whole point
+    //   of the detector: capture faithfully, read fail-closed.  We sweep several
+    //   distinct fake addresses to prove neither half depends on the bit
+    //   pattern.  (None of these addresses is ever dereferenced.)
     // ========================================================================
     {
         const std::uintptr_t fakes[]{
@@ -422,29 +455,36 @@ int main()
             static_cast<std::uintptr_t>(0x7u),  // low-bit-tagged-looking value
         };
         bool all_hold{ true };
-        bool all_truthy{ true };
+        bool all_refuse{ true };
         for (const std::uintptr_t bits : fakes)
         {
             auto* const fake_oop{ oop_of(bits) };
             global_ref armed{ fake_oop };
             all_hold   = all_hold && holds(armed, fake_oop);
-            all_truthy = all_truthy && static_cast<bool>(armed);
-            // destructor runs here on an armed holder -> the stub's no-op
-            // release path, once per iteration -> no crash, no double-free.
+            all_refuse = all_refuse
+                      && armed.is_stale()
+                      && armed.oop() == nullptr
+                      && !static_cast<bool>(armed);
+            // destructor runs here on an armed holder -> the no-op release
+            // path, once per iteration -> no crash, no double-free.
         }
-        check("non_null_oop_is_stored_verbatim", all_hold);
-        check("non_null_oop_is_truthy", all_truthy);
+        check("non_null_oop_is_captured_verbatim", all_hold);
+        check("non_null_oop_is_refused_without_a_readable_epoch", all_refuse);
     }
 
-    // oop() and handle() are the SAME stored address (not two different views),
-    // and repeated reads are stable.
+    // oop() and handle() are the SAME view (not two different ones), repeated
+    // reads are stable, and raw_unsafe() is the only accessor that still shows
+    // the captured address.
     {
         auto* const fake_oop{ oop_of(0x4100u) };
         const global_ref armed{ fake_oop };
-        check("oop_and_handle_are_the_same_address",
-              armed.oop() == armed.handle() && armed.oop() == fake_oop);
+        check("oop_and_handle_are_the_same_view",
+              armed.oop() == armed.handle() && armed.oop() == nullptr);
+        check("raw_unsafe_bypasses_the_staleness_check",
+              armed.raw_unsafe() == fake_oop && armed.raw_unsafe() != armed.oop());
         check("armed_oop_reads_are_stable",
-              armed.oop() == armed.oop() && armed.handle() == armed.handle());
+              armed.oop() == armed.oop() && armed.handle() == armed.handle()
+                  && armed.raw_unsafe() == armed.raw_unsafe());
     }
 
     // reset() on an armed holder clears it, and is idempotent afterwards.
@@ -529,7 +569,7 @@ int main()
         b = std::move(a);
         check("move_assign_armed_src_emptied", is_empty(a));   // NOLINT(bugprone-use-after-move)
         check("move_assign_armed_dst_takes_src_address", holds(b, fake_a));
-        check("move_assign_armed_dst_dropped_old_address", b.oop() != fake_b);
+        check("move_assign_armed_dst_dropped_old_address", b.raw_unsafe() != fake_b);
     }
 
     // ========================================================================
@@ -637,7 +677,10 @@ int main()
         auto pinned = vmhook::pin(fake_oop);
         check("pin_nonnull_oop_stores_verbatim", holds(pinned, fake_oop));
         const global_ref direct{ fake_oop };
-        check("pin_matches_direct_construction", pinned.oop() == direct.oop());
+        check("pin_matches_direct_construction",
+              pinned.raw_unsafe() == direct.raw_unsafe()
+                  && pinned.oop() == direct.oop()
+                  && pinned.is_stale() == direct.is_stale());
     }
     {
         // The pin() result is a prvalue we can move-construct from directly
@@ -1255,12 +1298,12 @@ int main()
         auto* const fake_oop{ oop_of(0x1F000u) };
         global_ref g{ fake_oop };
         check("w28_armed_views_are_consistent",
-              static_cast<bool>(g) && g.oop() == fake_oop && g.handle() == fake_oop
-                  && !is_empty(g));
+              g.raw_unsafe() == fake_oop && g.oop() == nullptr && g.handle() == nullptr
+                  && !static_cast<bool>(g) && !is_empty(g));
         g.reset();
         check("w28_armed_then_reset_flips_all_views",
               !static_cast<bool>(g) && g.oop() == nullptr && g.handle() == nullptr
-                  && is_empty(g));
+                  && g.raw_unsafe() == nullptr && is_empty(g));
     }
 
     return failures == 0 ? 0 : 1;

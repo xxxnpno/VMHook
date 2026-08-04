@@ -7,6 +7,81 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **CRITICAL**: `method_proxy::call()` never worked, on any JDK.  It resolved the
+  call stub by looking up `StubRoutines::_call_stub_entry` in VMStructs — an entry
+  HotSpot has never published, on any version.  The in-source claim that "JDK 21+
+  dropped it" was wrong: it was equally absent on JDK 8.  `find_call_stub_entry()`
+  therefore returned `nullptr` everywhere, and once the JNI fallback was removed,
+  every Java method call became a silent no-op.  Measured on live JDK 8/21/26 by
+  two independent probes; a before/after control resolves `0x0` on all three at
+  the previous commit.  The entry is now derived from
+  `StubRoutines::_call_stub_return_address` (which *is* published on all three)
+  through four tiers — VMStructs, `.data` adjacency in **both** directions (`+8`
+  on 8/21, `−8` on 26), a ranked data scan, and a prologue scan below the return
+  address — each candidate positively validated by bounds, the `enter()` prologue
+  bytes and the `FF D2` dispatch before the return address.  Neither the adjacency
+  direction nor the return-address distance (179/404/175 bytes) is hardcoded.
+  Non-x86-64 degrades to `nullptr`, and failure is deliberately not cached so a
+  call before `StubRoutines::initialize()` cannot disable invocation for the
+  process lifetime.
+- **CRITICAL**: the call stub was passed `link = -1` where the VM expects a
+  `JavaCallWrapper*`.  HotSpot's frame walker dereferences it, so a GC that walked
+  the entry frame read `((JavaCallWrapper*)-1)->_anchor` — a negative control
+  crashed reading address `0x1f`.  `call()` now builds a real synthetic
+  `JavaCallWrapper`, trusting its sibling offsets only when the two
+  VMStructs-published facts (type size 64, `_anchor` at 32) corroborate them, and
+  reporting invocation unavailable rather than guessing when they do not.
+- `long` and `double` arguments occupied one call-stub slot; they occupy **two**,
+  with the value in the **high** slot.  Slot layout is now driven off the callee's
+  descriptor rather than the C++ argument type, so an `int` passed to a `J`
+  parameter (or a `float` to a `D`) is widened correctly.
+- Invoking a `native` Java method zeroes `_active_handles->_top`, silently
+  invalidating the caller's local references.  It is now saved and restored.
+- A Java exception thrown by the callee was left pending on the `JavaThread` with
+  no signal to the caller, which received decoded garbage.  `call()` now reads,
+  classifies and clears `ThreadShadow::_pending_exception` — this does **not**
+  require JNI, contrary to the comment that claimed it did — and reports the throw
+  through `value_t::threw()` / `exception_class` while returning a
+  value-initialised result.
+- Removed three probes for `Method::_from_compiled_code_entry_point`; the field is
+  `_from_compiled_entry` on every measured JDK, so the first lookup was dead work.
+
+### Added
+- `vmhook::vm_capabilities()` — a cached capability gate reporting the live
+  collector, barrier shape, `UseCompressedOops` and `UseCompactObjectHeaders`.
+  The collector is determined by walking the JVM flag table (`Flag` on JDK 8,
+  `JVMFlag` on 11+), taking the record stride from `gHotSpotVMTypes` rather than
+  `sizeof` (the `_doc` member exists only in non-product builds) and branching on
+  the exported `typeString` of `_type` rather than on any JDK version.  The flag
+  table is the only reliable source for `UseCompressedOops`: a zero narrow-oop
+  base and shift is genuinely ambiguous between "off" and "on with an unscaled
+  sub-4GB heap", and `heapOopSize` is exported nowhere.
+- `vmhook::gc_epoch()` / `gc_epoch_changed()` — a relocation detector sampling
+  `CollectedHeap::_total_collections` together with the STW-GC-active flag
+  (`_is_gc_active` before JDK 21, `_is_stw_gc_active` from 21).  Measured at
+  ~0.32 µs per call.
+
+### Changed
+- **`vmhook::jni::global_ref` no longer returns a stale address.**  It records the
+  GC epoch at capture; `oop()`, `handle()` and `operator bool` now report empty
+  once a relocating collection has occurred, and `is_stale()` exposes that
+  directly.  Everything fails closed — an unreadable epoch, unresolved offsets, an
+  unsupported collector or a pause in flight all yield "stale" rather than an
+  address the library cannot vouch for.  `raw_unsafe()` returns the verbatim
+  capture for diagnostics only.
+  **This is still not a GC root**: it does not keep the object alive.  It only
+  stops you dereferencing one that moved.
+  Verified on live JVMs across **15 collector × JDK configurations** (Serial,
+  Parallel, G1, ZGC, Shenandoah, Epsilon on JDK 8/21/26) — on every relocating run
+  the object physically moved and the reference reported stale; ZGC and Shenandoah
+  are refused outright, because their counters advance at cycle start, before
+  relocation, which would make the detector itself unsound there.
+
+> **Note:** the `Fixed` entries below this point describe `call_jni`, `jni_value`,
+> `write_jni_arg_to_slot` and other JNI-fallback code that the de-JNI effort has
+> since **removed entirely**.  They are retained as history; they do not describe
+> any code that still exists.
+
 - **CRITICAL**: `method_proxy::call_jni`'s argument diagnostic dump dereferenced
   `values[i].l` for EVERY argument, but `jni_value` is a union — for a primitive
   argument (e.g. `jint 1`) `.l` aliases the primitive bits (`0x1`), which is

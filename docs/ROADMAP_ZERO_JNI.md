@@ -433,10 +433,37 @@ The lifetime work stages into four independently-shippable layers:
 - **1.4** Fix **L3** (cross-thread TLAB race in `make_java_object`).
 - **1.5** ✅ **RESOLVED by measurement** — see §3.3. Invocation is derivable and cheap.
 
-### Phase 1b — restore method invocation *(promoted: this is what B2 is)*
+### Phase 1b — restore method invocation ✅ **DONE** *(commit `3b7f8e7`)*
 
-`method_proxy::call()` has never worked on any JDK. Fixing it is the single highest-value
-change in the whole roadmap and it is roughly a day:
+All seven items implemented and **proven on live JVMs: 29/29 on Temurin 8.0.492+9, Temurin
+21.0.11+10 and Oracle 26.0.1**, driving the real `find_call_stub_entry()` and `call()` from the
+edited header. Coverage included object args and returns, 2-slot long/double, an `int` widened
+into a `J` parameter, a `native` callee with `_top` preserved, a throwing callee classified as
+`java/lang/NumberFormatException` and cleared, `System.gc()` through the synthetic entry frame,
+20 000 invocations with a stable handle block, and a real vmhook hook on a cold `String` method
+with a **nested `call()` plus a full GC inside the detour** (two stacked synthetic entry frames).
+Before/after control on the same three JVMs: `HEAD` resolves `0x0` on all three.
+
+Two live-JVM findings that came out of that work and belong to later phases:
+
+- **Raw oops are still not GC roots.** The harness crashed on JDK 21 holding a receiver oop
+  across a young GC in a 20 000-call loop, until it re-read the oop each iteration. Nothing in
+  `call()` can fix that. This is direct empirical confirmation that the lifetime work
+  (Phase 1/2) is the real blocker, not a nicety.
+- **`make_java_string` fails on a freshly-booted VM** on all three JDKs — the `[B` array klass
+  reports "not loaded", then TLAB allocation fails. Unrelated to invocation, but it makes string
+  arguments unavailable in early-boot contexts. Not yet diagnosed.
+
+Not done from the research plan: an explicit opt-in for the `_thread_in_native` flip (the state
+is gated but the flip is implicit), the detour-hosted MPSC executor for non-JavaThread callers,
+and a public `invocation_capability()` reporting which tier resolved the stub. The tiers are
+x86-64-only by construction; aarch64 needs its own prologue pattern, and the non-Windows SysV
+`FF D6` variant is inferred, not measured.
+
+**Worth adding to CI:** assert `find_call_stub_entry() != nullptr` on every JDK in the matrix.
+It returned null on all of them for years and nothing noticed.
+
+<details><summary>Original plan (all items completed)</summary>
 
 - **1b.1** Tiered `find_call_stub_entry()`: read `StubRoutines::_call_stub_return_address`,
   derive the entry (`±8` adjacency, then a data scan), **validate positively** by prologue
@@ -451,6 +478,8 @@ change in the whole roadmap and it is roughly a day:
   delete the comment claiming this needs JNI.
 - **1b.6** Fix **L8** and correct the two comments claiming "JDK 21+ dropped `_call_stub_entry`".
 - **1b.7** Re-run the JVM suite and confirm the 284 failures collapse.
+
+</details>
 
 ### Phase 2 — the reference core
 - **2.1** `object_id`, `ref<T>`, `borrowed<T>`, `weak_ref<T>`, `root<T>` with mechanism **D**,

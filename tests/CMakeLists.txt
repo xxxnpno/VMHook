@@ -201,3 +201,10 @@ vmhook_add_test(shutdown_hooks_teardown_nojvm  SOURCES test_shutdown_hooks_teard
 vmhook_add_test(enum_singleton_nojvm           SOURCES test_enum_singleton_nojvm.cpp)
 vmhook_add_test(hook_unhook_double_free_nojvm  SOURCES test_hook_unhook_double_free_nojvm.cpp)
 vmhook_add_test(deoptimize_methods_nojvm       SOURCES test_deoptimize_methods_nojvm.cpp)
+
+# Layer 0 (vm_capabilities) + Layer 1 (gc_epoch / relocation detector) —
+# graceful-degradation contract with no JVM in the process: capabilities read
+# unknown/unsupported, gc_epoch() fails closed instead of faulting, and a
+# global_ref built on a fabricated address reports stale rather than handing
+# the address back.  Live-VM behaviour is out of scope here by construction.
+vmhook_add_test(gc_relocation_detector_nojvm   SOURCES test_gc_relocation_detector_nojvm.cpp)

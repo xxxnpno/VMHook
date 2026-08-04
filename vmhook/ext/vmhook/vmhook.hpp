@@ -20601,51 +20601,958 @@ namespace vmhook
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Object pins: a move-only holder for a raw heap OOP.
+    // =========================================================================
+    // LAYER 0 - VM capability gate   /   LAYER 1 - GC relocation detector
+    // =========================================================================
+    // Everything below is READ-ONLY.  Layer 0 answers "what is this VM, and is
+    // the relocation detector sound here?"; Layer 1 answers "has a collection
+    // happened since I captured this address?".  Together they turn the
+    // header's oldest silent bug - handing out a raw heap address that a
+    // relocating GC has since invalidated - into an observable nullptr.
     //
-    // WARNING: this is NOT currently a lifetime primitive.  Creating a real GC
-    // root requires a call into the VM, which this pure-VM build has no way to
-    // make, so the class below stores the address you hand it and gives it back
-    // verbatim.  It does not keep the object alive and it does not track
-    // relocation.  See the class doc for the exact contract before using it.
+    // Neither layer keeps an object ALIVE.  That needs a real GC root, which
+    // needs a VM call this pure-VM build cannot make.  See
+    // audit/research/gc_root_feasibility.md SS8, SS10.1, SS10.2.
+    // =========================================================================
+
+    /*
+        @brief The HotSpot collector this VM is actually running.
+        @details
+        Determined by walking the JVM flag table (`Flag` on JDK 8, `JVMFlag` on
+        11+) and reading the `Use*GC` booleans - i.e. by asking the VM what it
+        selected, not by guessing from a version number or from which types the
+        build happened to compile in.  `unknown` means the detection failed and
+        is treated as UNSUPPORTED, never as "probably fine".
+
+        `z` and `shenandoah` are recognised precisely so they can be REFUSED:
+        both relocate concurrently, and both bump their collection counters at
+        cycle START - phases before any object is copied - so an unchanged
+        counter proves nothing there and the detector would itself become
+        silent UB.  `epsilon` never moves anything, so it is supported with a
+        trivially-always-fresh epoch.
+    */
+    enum class gc_collector : std::uint8_t
+    {
+        unknown = 0,
+        serial,
+        parallel,
+        g1,
+        z,
+        shenandoah,
+        epsilon
+    };
+
+    /*
+        @brief Which spelling of the card-table / barrier-set hierarchy this VM
+               exports, derived from what RESOLVES rather than from a version.
+        @details
+        `card_table_modref_bs` is the JDK 8 shape, where the barrier set IS the
+        card table (`CardTableModRefBS::byte_map_base`, no leading underscore).
+        `card_table_barrier_set` is the JDK 11+ shape (static
+        `BarrierSet::_barrier_set` -> `CardTableBarrierSet::_card_table` ->
+        `CardTable::_byte_map_base`).  Recorded for diagnostics and for the
+        (not-yet-implemented) write-barrier layers; Layer 1 does not need it.
+
+        This is the SPELLING the VM exports, NOT evidence that a card table is
+        in use: the entries are compiled in unconditionally, so a ZGC or
+        Shenandoah VM still reports `card_table_barrier_set` (MEASURED on JDK 21
+        and 26).  Anything that intends to WRITE a card must gate on the
+        collector and on the barrier set's own kind tag, never on this value
+        alone.
+    */
+    enum class gc_barrier_shape : std::uint8_t
+    {
+        unknown = 0,
+        card_table_modref_bs,
+        card_table_barrier_set
+    };
+
+    /*
+        @brief Cached, computed-once description of what this JVM supports.
+        @details
+        Obtain it from vmhook::vm_capabilities().  Every member is derived from
+        `gHotSpotVMStructs` / `gHotSpotVMTypes` reads only - nothing here writes
+        to the VM, allocates, or takes a lock.  With no JVM in the process every
+        field keeps its default, which reads as "unknown / unsupported".
+
+        `supported` is the single gate the relocation detector consults: it is
+        true only for Serial, Parallel, G1 (where `_total_collections` provably
+        ticks BEFORE any object is copied) and Epsilon (which never copies).
+        It is false for ZGC, Shenandoah, an undetermined collector, or when the
+        epoch counter itself cannot be resolved.
+    */
+    struct vm_capabilities_t final
+    {
+        /* Collector selected by the VM, or `unknown` if it could not be read. */
+        vmhook::gc_collector     collector{ vmhook::gc_collector::unknown };
+        /* Card-table spelling this VM exports (diagnostics; unused by Layer 1). */
+        vmhook::gc_barrier_shape barrier{ vmhook::gc_barrier_shape::unknown };
+        /* True when the relocation detector is SOUND on this VM. */
+        bool supported{ false };
+        /* `-XX:+UseCompressedOops`.  The flag table is the only reliable source. */
+        bool compressed_oops{ false };
+        /* `-XX:+UseCompactObjectHeaders` (JDK 25+); changes the klass encoding. */
+        bool compact_object_headers{ false };
+        /* True when the flag walk succeeded; when false, the two booleans above
+           are defaults, not observations. */
+        bool flags_resolved{ false };
+        /* True when Universe::_collectedHeap + CollectedHeap::_total_collections
+           + the gc-active flag all resolved. */
+        bool epoch_readable{ false };
+    };
+
+    /*
+        @brief A sample of the VM's collection counter, taken as a PAIR.
+        @details
+        `collections` is `CollectedHeap::_total_collections`, which counts every
+        started collection (young and full) on Serial, Parallel and G1 and is
+        incremented BEFORE any object is copied.  `gc_active` is
+        `CollectedHeap::_is_gc_active` (renamed `_is_stw_gc_active` at JDK 21;
+        both names are probed) and is true only inside a stop-the-world pause.
+
+        `valid` is false whenever the sample could not be trusted - no JVM, the
+        offsets did not resolve, the read faulted, or the collector is one on
+        which the counter does not mean what we need it to mean.  An invalid
+        sample is ALWAYS treated as "stale"; it never degrades to "assume the
+        object did not move".
+    */
+    struct gc_epoch_t final
+    {
+        std::uint32_t collections{ 0 };
+        bool          gc_active{ true };
+        bool          valid{ false };
+    };
+
+    namespace detail
+    {
+        /*
+            @brief Reads a NUL-terminated C string out of possibly-unmapped
+                   memory without ever faulting.
+            @details
+            Copies in 16-byte chunks through os::safe_read (ReadProcessMemory /
+            process_vm_readv / mach_vm_read_overwrite) so a string pointer that
+            passes a range heuristic but lands on an unmapped page yields false
+            instead of an access violation - the discipline the no-SEH
+            toolchains (MinGW, clang-on-Windows) make mandatory.  Returns true
+            only when a terminator was found inside `capacity`.
+            Complexity: O(capacity).  Exception safety: noexcept.
+            Thread safety: safe (no shared state).
+        */
+        inline auto safe_read_c_string(const void* const pointer,
+                                       char* const out,
+                                       const std::size_t capacity) noexcept
+            -> bool
+        {
+            if (!pointer || !out || capacity == 0)
+            {
+                return false;
+            }
+            constexpr std::size_t chunk{ 16 };
+            std::size_t filled{ 0 };
+            while (filled + 1 < capacity)
+            {
+                const std::size_t want{ std::min<std::size_t>(chunk, capacity - 1 - filled) };
+                if (!vmhook::os::safe_read(out + filled,
+                                           static_cast<const std::uint8_t*>(pointer) + filled,
+                                           want))
+                {
+                    out[filled] = '\0';
+                    return false;
+                }
+                for (std::size_t i{ 0 }; i < want; ++i)
+                {
+                    if (out[filled + i] == '\0')
+                    {
+                        return true;
+                    }
+                }
+                filled += want;
+            }
+            out[capacity - 1] = '\0';
+            return false;
+        }
+
+        /*
+            @brief Resolved geometry of the HotSpot JVM flag table.
+            @details
+            `Flag` on JDK 8, renamed `JVMFlag` at JDK 11 (JDK-8211821); the
+            entry names and the walk are otherwise identical.  Two rules make
+            this robust and both are load-bearing:
+
+              * `stride` comes from `gHotSpotVMTypes[<flag type>].size`, NEVER
+                from sizeof - the `_doc` member exists only in non-product
+                builds, so a compiled-in struct size is wrong against a product
+                VM.
+              * `type_is_string` comes from the EXPORTED typeString of the
+                `_type` field ("const char*" => JDK 8/11 shape, "int" => the
+                17+ ordinal shape).  The table describes its own shape, so no
+                JDK version is ever sniffed.
+        */
+        struct jvm_flag_table_t final
+        {
+            const std::uint8_t* base{ nullptr };
+            std::size_t         count{ 0 };
+            std::size_t         stride{ 0 };
+            std::uint64_t       name_offset{ 0 };
+            std::uint64_t       addr_offset{ 0 };
+            std::uint64_t       type_offset{ 0 };
+            bool                has_type{ false };
+            bool                type_is_string{ false };
+            bool                resolved{ false };
+        };
+
+        /*
+            @brief Reads the flag name at `index` into `out`.
+            @details
+            Every hop is fault-safe: the record's `_name` slot is read with
+            safe_read_pointer and the string itself with safe_read_c_string.
+            Complexity: O(1) amortised.  Exception safety: noexcept.
+            Thread safety: safe (reads only).
+        */
+        inline auto read_jvm_flag_name(const vmhook::detail::jvm_flag_table_t& table,
+                                       const std::size_t index,
+                                       char* const out,
+                                       const std::size_t capacity) noexcept
+            -> bool
+        {
+            const std::uint8_t* const record{ table.base + index * table.stride };
+            const void* const name_pointer{
+                vmhook::hotspot::safe_read_pointer(record + table.name_offset) };
+            if (!name_pointer)
+            {
+                return false;
+            }
+            return vmhook::detail::safe_read_c_string(name_pointer, out, capacity);
+        }
+
+        /*
+            @brief Resolves the JVM flag table once, or reports it unusable.
+            @details
+            `Flag::flags` is an array on JDK 8 and a `JVMFlag*` on 11+, so the
+            base is recovered by trying the dereferenced value first and falling
+            back to the entry address itself; the winner is the one whose
+            record 0 yields a readable flag name.  `numFlags - 1` entries are
+            walkable - the last record is an all-null sentinel.
+
+            Every failure path returns an unresolved table rather than guessing,
+            so a JVM this code has never seen degrades to "capabilities unknown"
+            instead of misreading arbitrary memory.
+            Complexity: O(1) (a handful of VMStructs lookups + 2 probe reads).
+            Exception safety: noexcept.  Thread safety: safe (reads only).
+        */
+        inline auto resolve_jvm_flag_table() noexcept
+            -> const vmhook::detail::jvm_flag_table_t&
+        {
+            static const vmhook::detail::jvm_flag_table_t table{ []() noexcept
+                -> vmhook::detail::jvm_flag_table_t
+                {
+                    vmhook::detail::jvm_flag_table_t result{};
+
+                    const char* const type_name{
+                        vmhook::hotspot::iterate_struct_entries("JVMFlag", "flags")
+                            ? "JVMFlag"
+                            : "Flag" };
+
+                    const auto* const flags_entry{
+                        vmhook::hotspot::iterate_struct_entries(type_name, "flags") };
+                    const auto* const count_entry{
+                        vmhook::hotspot::iterate_struct_entries(type_name, "numFlags") };
+                    const auto* const name_entry{
+                        vmhook::hotspot::iterate_struct_entries(type_name, "_name") };
+                    const auto* const addr_entry{
+                        vmhook::hotspot::iterate_struct_entries(type_name, "_addr") };
+                    const auto* const type_entry{
+                        vmhook::hotspot::iterate_struct_entries(type_name, "_type") };
+                    const auto* const type_descriptor{
+                        vmhook::hotspot::iterate_type_entries(type_name) };
+
+                    if (!flags_entry || !flags_entry->address
+                     || !count_entry || !count_entry->address
+                     || !name_entry || !addr_entry
+                     || !type_descriptor || type_descriptor->size == 0)
+                    {
+                        return result;
+                    }
+
+                    // Stride from the VM's own type table, never sizeof.
+                    // Bound it so a garbage size cannot turn the walk into an
+                    // out-of-range stride computation.
+                    if (type_descriptor->size > 4096)
+                    {
+                        return result;
+                    }
+                    result.stride = static_cast<std::size_t>(type_descriptor->size);
+
+                    std::size_t flag_count{ 0 };
+                    if (!vmhook::os::safe_read(&flag_count, count_entry->address, sizeof(flag_count)))
+                    {
+                        return result;
+                    }
+                    // A plausible product VM publishes ~1000-2000 flags.  Reject
+                    // anything that cannot be a real count so a mis-resolved
+                    // static never drives a multi-million-iteration walk.
+                    if (flag_count < 2 || flag_count > 100000)
+                    {
+                        return result;
+                    }
+                    // The final record is an all-null sentinel (SA does the same).
+                    result.count = flag_count - 1;
+
+                    result.name_offset = name_entry->offset;
+                    result.addr_offset = addr_entry->offset;
+                    if (type_entry)
+                    {
+                        result.has_type    = true;
+                        result.type_offset = type_entry->offset;
+                        // The table declares its own shape: "const char*" is the
+                        // JDK 8 / 11 string spelling, anything else (int) is the
+                        // JDK 17+ ordinal spelling.
+                        result.type_is_string = type_entry->type_string
+                                             && std::strcmp(type_entry->type_string, "const char*") == 0;
+                    }
+
+                    // JDK 8 declares `static Flag flags[]`, JDK 11+ declares
+                    // `static JVMFlag* flags`.  Try the pointer reading first,
+                    // then the entry address itself, and accept whichever one
+                    // produces a readable flag name at record 0.
+                    const std::uint8_t* const candidates[]{
+                        static_cast<const std::uint8_t*>(
+                            vmhook::hotspot::safe_read_pointer(flags_entry->address)),
+                        static_cast<const std::uint8_t*>(flags_entry->address)
+                    };
+                    char probe[64]{};
+                    for (const std::uint8_t* const candidate : candidates)
+                    {
+                        if (!vmhook::hotspot::is_valid_pointer(candidate))
+                        {
+                            continue;
+                        }
+                        result.base = candidate;
+                        if (vmhook::detail::read_jvm_flag_name(result, 0, probe, sizeof(probe))
+                            && probe[0] >= 'A' && probe[0] <= 'z')
+                        {
+                            result.resolved = true;
+                            return result;
+                        }
+                    }
+
+                    result.base     = nullptr;
+                    result.resolved = false;
+                    return result;
+                }() };
+            return table;
+        }
+
+        /*
+            @brief The `bool` flags Layer 0 cares about, read in one table walk.
+        */
+        struct gc_flag_values_t final
+        {
+            bool use_serial{ false };
+            bool use_parallel{ false };
+            bool use_g1{ false };
+            bool use_z{ false };
+            bool use_shenandoah{ false };
+            bool use_epsilon{ false };
+            bool compressed_oops{ false };
+            bool compact_object_headers{ false };
+            bool resolved{ false };
+        };
+
+        /*
+            @brief Walks the flag table once and reads the eight bools we need.
+            @details
+            Only records whose `_type` says `bool` are read, and only ever one
+            byte at `_addr` - reading eight would bleed the neighbouring flags'
+            bytes in (measured).  Names are compared against a fixed list; every
+            name we want begins with 'U', so a one-byte prefix test skips the
+            overwhelming majority of records without a string compare.
+            Complexity: O(numFlags).  Exception safety: noexcept.
+            Thread safety: safe (reads only).
+        */
+        inline auto read_gc_flags() noexcept
+            -> vmhook::detail::gc_flag_values_t
+        {
+            vmhook::detail::gc_flag_values_t values{};
+            const vmhook::detail::jvm_flag_table_t& table{ vmhook::detail::resolve_jvm_flag_table() };
+            if (!table.resolved)
+            {
+                return values;
+            }
+
+            struct wanted_t final
+            {
+                const char* name;
+                bool vmhook::detail::gc_flag_values_t::* member;
+            };
+            static constexpr wanted_t wanted[]{
+                { "UseSerialGC",             &vmhook::detail::gc_flag_values_t::use_serial },
+                { "UseParallelGC",           &vmhook::detail::gc_flag_values_t::use_parallel },
+                { "UseG1GC",                 &vmhook::detail::gc_flag_values_t::use_g1 },
+                { "UseZGC",                  &vmhook::detail::gc_flag_values_t::use_z },
+                { "UseShenandoahGC",         &vmhook::detail::gc_flag_values_t::use_shenandoah },
+                { "UseEpsilonGC",            &vmhook::detail::gc_flag_values_t::use_epsilon },
+                { "UseCompressedOops",       &vmhook::detail::gc_flag_values_t::compressed_oops },
+                { "UseCompactObjectHeaders", &vmhook::detail::gc_flag_values_t::compact_object_headers },
+            };
+
+            char name[64]{};
+            std::size_t matched{ 0 };
+            for (std::size_t index{ 0 }; index < table.count; ++index)
+            {
+                if (!vmhook::detail::read_jvm_flag_name(table, index, name, sizeof(name)))
+                {
+                    continue;
+                }
+                if (name[0] != 'U')
+                {
+                    continue;
+                }
+
+                const wanted_t* hit{ nullptr };
+                for (const wanted_t& candidate : wanted)
+                {
+                    if (std::strcmp(name, candidate.name) == 0)
+                    {
+                        hit = &candidate;
+                        break;
+                    }
+                }
+                if (!hit)
+                {
+                    continue;
+                }
+
+                const std::uint8_t* const record{ table.base + index * table.stride };
+
+                // Only trust a record the VM itself labels `bool`.
+                if (table.has_type)
+                {
+                    if (table.type_is_string)
+                    {
+                        const void* const type_pointer{
+                            vmhook::hotspot::safe_read_pointer(record + table.type_offset) };
+                        char type_name[32]{};
+                        if (!vmhook::detail::safe_read_c_string(type_pointer, type_name, sizeof(type_name))
+                            || std::strcmp(type_name, "bool") != 0)
+                        {
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        std::int32_t ordinal{ -1 };
+                        if (!vmhook::os::safe_read(&ordinal, record + table.type_offset, sizeof(ordinal))
+                            || ordinal != 0)   // JVMFlag::TYPE_bool == 0 on every 17+ VM
+                        {
+                            continue;
+                        }
+                    }
+                }
+
+                const void* const value_address{
+                    vmhook::hotspot::safe_read_pointer(record + table.addr_offset) };
+                std::uint8_t raw{ 0 };
+                if (value_address
+                    && vmhook::os::safe_read(&raw, value_address, sizeof(raw)))
+                {
+                    values.*(hit->member) = raw != 0;
+                }
+
+                if (++matched >= (sizeof(wanted) / sizeof(wanted[0])))
+                {
+                    break;
+                }
+            }
+
+            values.resolved = true;
+            return values;
+        }
+
+        /*
+            @brief Collector fallback for VMs whose flag walk failed.
+            @details
+            `HeapRegion::GrainBytes` (renamed `G1HeapRegion::GrainBytes` on
+            master) and `ShenandoahHeapRegion::RegionSizeBytes` are statics that
+            stay ZERO until their collector initialises, so a non-zero value is
+            positive evidence the collector is running.  Deliberately NOT used:
+            VM_TYPES presence - `declare_type(ZCollectedHeap, ...)` is a
+            build-time INCLUDE_ZGC guard that is published even when ZGC is not
+            running - and vtable symbols, which jvm.dll does not export.
+            Complexity: O(1).  Exception safety: noexcept.
+            Thread safety: safe (reads only).
+        */
+        inline auto infer_collector_without_flags() noexcept
+            -> vmhook::gc_collector
+        {
+            const auto nonzero_static{ [](const char* const type_name,
+                                          const char* const field_name) noexcept -> bool
+            {
+                const auto* const entry{
+                    vmhook::hotspot::iterate_struct_entries(type_name, field_name) };
+                if (!entry || !entry->address)
+                {
+                    return false;
+                }
+                std::size_t value{ 0 };
+                return vmhook::os::safe_read(&value, entry->address, sizeof(value)) && value != 0;
+            } };
+
+            if (nonzero_static("HeapRegion", "GrainBytes")
+             || nonzero_static("G1HeapRegion", "GrainBytes"))
+            {
+                return vmhook::gc_collector::g1;
+            }
+            if (nonzero_static("ShenandoahHeapRegion", "RegionSizeBytes"))
+            {
+                return vmhook::gc_collector::shenandoah;
+            }
+            return vmhook::gc_collector::unknown;
+        }
+
+        /*
+            @brief Detects the card-table spelling this VM exports.
+            @details
+            Derived from what RESOLVES, never from a version number:
+            `CardTableModRefBS::byte_map_base` (no leading underscore) is the
+            JDK 8 shape; `CardTable::_byte_map_base` together with the static
+            `BarrierSet::_barrier_set` is the JDK 11+ shape.
+            Complexity: O(entries).  Exception safety: noexcept.
+            Thread safety: safe (reads only).
+        */
+        inline auto detect_barrier_shape() noexcept
+            -> vmhook::gc_barrier_shape
+        {
+            if (vmhook::hotspot::iterate_struct_entries("CardTableModRefBS", "byte_map_base"))
+            {
+                return vmhook::gc_barrier_shape::card_table_modref_bs;
+            }
+            if (vmhook::hotspot::iterate_struct_entries("CardTable", "_byte_map_base")
+             && vmhook::hotspot::iterate_struct_entries("BarrierSet", "_barrier_set"))
+            {
+                return vmhook::gc_barrier_shape::card_table_barrier_set;
+            }
+            return vmhook::gc_barrier_shape::unknown;
+        }
+
+        /*
+            @brief The two VMStructs coordinates the relocation detector needs.
+            @details
+            `Universe::_collectedHeap` (static) and
+            `CollectedHeap::_total_collections` (nonstatic) are exported on
+            EVERY JDK 8..26; the gc-active flag is `_is_gc_active` up to JDK 20
+            and `_is_stw_gc_active` from 21 - both names are probed, no version
+            is consulted.  Offsets are whatever VMStructs says (measured at
+            56 / 64 / 72 on JDK 8 / 21 / 26) and are never hardcoded.
+
+            `resolved` requires ALL THREE.  A VM that exports only some of them
+            leaves the detector unresolved, which makes every ref permanently
+            stale - fail closed, never "assume it did not move".
+        */
+        struct gc_epoch_sources_t final
+        {
+            const void*   heap_slot{ nullptr };
+            std::uint64_t total_collections_offset{ 0 };
+            std::uint64_t gc_active_offset{ 0 };
+            /* Byte span covering BOTH fields, so one fault-safe read fetches
+               them together.  Zero when they sit too far apart to be worth
+               batching, in which case two separate reads are used. */
+            std::uint64_t span_offset{ 0 };
+            std::size_t   span_size{ 0 };
+            bool          resolved{ false };
+        };
+
+        /* Upper bound on the batched read.  Both fields are adjacent members of
+           the same CollectedHeap object on every JDK 8..26 (measured spans of
+           8-24 bytes), so this is generous; anything larger falls back to two
+           reads rather than growing the buffer. */
+        inline constexpr std::size_t gc_epoch_span_limit{ 256 };
+
+        /*
+            @brief Resolves and caches the epoch coordinates.
+            Complexity: O(entries) once, O(1) after.
+            Exception safety: noexcept.  Thread safety: safe (magic statics).
+        */
+        inline auto resolve_gc_epoch_sources() noexcept
+            -> const vmhook::detail::gc_epoch_sources_t&
+        {
+            static const vmhook::detail::gc_epoch_sources_t sources{ []() noexcept
+                -> vmhook::detail::gc_epoch_sources_t
+                {
+                    vmhook::detail::gc_epoch_sources_t result{};
+
+                    const auto* const heap_entry{
+                        vmhook::hotspot::iterate_struct_entries("Universe", "_collectedHeap") };
+                    const auto* const total_entry{
+                        vmhook::hotspot::iterate_struct_entries("CollectedHeap", "_total_collections") };
+                    const auto* active_entry{
+                        vmhook::hotspot::iterate_struct_entries("CollectedHeap", "_is_stw_gc_active") };
+                    if (!active_entry)
+                    {
+                        active_entry =
+                            vmhook::hotspot::iterate_struct_entries("CollectedHeap", "_is_gc_active");
+                    }
+
+                    if (!heap_entry || !heap_entry->address || !total_entry || !active_entry)
+                    {
+                        return result;
+                    }
+
+                    result.heap_slot                = heap_entry->address;
+                    result.total_collections_offset = total_entry->offset;
+                    result.gc_active_offset         = active_entry->offset;
+
+                    // Batch the two reads when the fields sit close together,
+                    // which they do on every JDK 8..26.
+                    const std::uint64_t low{
+                        std::min<std::uint64_t>(result.total_collections_offset,
+                                                result.gc_active_offset) };
+                    const std::uint64_t high{
+                        std::max<std::uint64_t>(result.total_collections_offset + sizeof(std::uint32_t),
+                                                result.gc_active_offset + 1u) };
+                    if (high > low && (high - low) <= vmhook::detail::gc_epoch_span_limit)
+                    {
+                        result.span_offset = low;
+                        result.span_size   = static_cast<std::size_t>(high - low);
+                    }
+
+                    result.resolved = true;
+                    return result;
+                }() };
+            return sources;
+        }
+    }
+
+    /*
+        @brief Returns this VM's cached capability description (Layer 0).
+        @details
+        Computed on the first call and cached for the life of the process; every
+        later call is a load.  The computation is READ-ONLY - a flag-table walk
+        plus a handful of VMStructs lookups, all routed through
+        os::safe_read / hotspot::safe_read_pointer so it cannot fault even on a
+        VM whose layout this code has never seen.
+
+        With no JVM in the process every lookup returns null and the result is
+        the all-defaults struct: collector `unknown`, `supported == false`.  That
+        is the same answer given for ZGC, Shenandoah, or any VM whose collector
+        could not be pinned down, and it is deliberately the SAFE answer - the
+        relocation detector refuses to vouch for an address rather than guessing.
+
+        The one-off flag walk costs ~1-1.5 ms on a live VM (MEASURED on JDK 8 /
+        21 / 26) and is serialised by the magic-static guard, so the FIRST caller
+        pays it and any concurrent caller blocks behind it.  gc_epoch() - and
+        therefore every global_ref construction - goes through here, so if that
+        first call would otherwise land inside a latency-sensitive detour, warm
+        it by calling vm_capabilities() once during setup.
+
+        Complexity: O(numFlags) once, O(1) after.
+        Exception safety: noexcept.
+        Thread safety: safe - initialisation is a magic static, and the returned
+        reference is to immutable state.
+    */
+    inline auto vm_capabilities() noexcept
+        -> const vmhook::vm_capabilities_t&
+    {
+        static const vmhook::vm_capabilities_t capabilities{ []() noexcept
+            -> vmhook::vm_capabilities_t
+            {
+                vmhook::vm_capabilities_t result{};
+
+                const vmhook::detail::gc_flag_values_t flags{ vmhook::detail::read_gc_flags() };
+                result.flags_resolved = flags.resolved;
+                if (flags.resolved)
+                {
+                    result.compressed_oops        = flags.compressed_oops;
+                    result.compact_object_headers = flags.compact_object_headers;
+
+                    // Exactly one Use*GC must be set.  HotSpot's GCConfig always
+                    // ergonomically sets precisely one after VM init; zero (read
+                    // too early) or two (nonsense) both mean "do not guess".
+                    const int selected{ (flags.use_serial     ? 1 : 0)
+                                      + (flags.use_parallel   ? 1 : 0)
+                                      + (flags.use_g1         ? 1 : 0)
+                                      + (flags.use_z          ? 1 : 0)
+                                      + (flags.use_shenandoah ? 1 : 0)
+                                      + (flags.use_epsilon    ? 1 : 0) };
+                    if (selected == 1)
+                    {
+                        result.collector =
+                              flags.use_serial     ? vmhook::gc_collector::serial
+                            : flags.use_parallel   ? vmhook::gc_collector::parallel
+                            : flags.use_g1         ? vmhook::gc_collector::g1
+                            : flags.use_z          ? vmhook::gc_collector::z
+                            : flags.use_shenandoah ? vmhook::gc_collector::shenandoah
+                                                   : vmhook::gc_collector::epsilon;
+                    }
+                }
+
+                if (result.collector == vmhook::gc_collector::unknown)
+                {
+                    result.collector = vmhook::detail::infer_collector_without_flags();
+                }
+
+                result.barrier = vmhook::detail::detect_barrier_shape();
+
+                const vmhook::detail::gc_epoch_sources_t& sources{
+                    vmhook::detail::resolve_gc_epoch_sources() };
+                result.epoch_readable = sources.resolved;
+
+                switch (result.collector)
+                {
+                    case vmhook::gc_collector::serial:
+                    case vmhook::gc_collector::parallel:
+                    case vmhook::gc_collector::g1:
+                        // _total_collections provably ticks in gc_prologue /
+                        // pre_evacuate_collection_set, i.e. BEFORE any copying.
+                        result.supported = sources.resolved;
+                        break;
+                    case vmhook::gc_collector::epsilon:
+                        // Never moves anything; the epoch is trivially fresh and
+                        // no counter is needed.
+                        result.supported = true;
+                        break;
+                    case vmhook::gc_collector::z:
+                    case vmhook::gc_collector::shenandoah:
+                    case vmhook::gc_collector::unknown:
+                    default:
+                        // Concurrent relocation behind load barriers, counters
+                        // that tick at cycle start - an unchanged counter proves
+                        // nothing.  Refuse.
+                        result.supported = false;
+                        break;
+                }
+
+                return result;
+            }() };
+        return capabilities;
+    }
+
+    /*
+        @brief Human-readable name for a collector enumerator (for logs).
+        Complexity: O(1).  Exception safety: noexcept.  Thread safety: safe.
+    */
+    inline auto gc_collector_name(const vmhook::gc_collector collector) noexcept
+        -> std::string_view
+    {
+        switch (collector)
+        {
+            case vmhook::gc_collector::serial:     return "Serial";
+            case vmhook::gc_collector::parallel:   return "Parallel";
+            case vmhook::gc_collector::g1:         return "G1";
+            case vmhook::gc_collector::z:          return "ZGC";
+            case vmhook::gc_collector::shenandoah: return "Shenandoah";
+            case vmhook::gc_collector::epsilon:    return "Epsilon";
+            case vmhook::gc_collector::unknown:
+            default:                               return "unknown";
+        }
+    }
+
+    /*
+        @brief Samples the VM's collection epoch (Layer 1).
+        @details
+        Two fault-safe loads on a supported collector: the `CollectedHeap*` out
+        of `Universe::_collectedHeap`, then `_total_collections` and the
+        gc-active flag out of it.  Cheap enough to call on every dereference.
+
+        Returns an INVALID sample (`valid == false`) whenever it cannot vouch
+        for the answer: no JVM, unresolved offsets, a faulted read, or an
+        unsupported collector (ZGC / Shenandoah / unknown).  Callers must treat
+        an invalid sample as "stale", never as "unchanged".
+
+        Epsilon short-circuits to a constant valid sample: it has no relocation
+        to detect, so its epoch never moves.
+
+        Note the counter is a 32-bit `unsigned int` and wraps after ~4.3e9
+        collections - compare epochs for INEQUALITY, never for ordering.
+
+        Complexity: O(1) - one fault-safe read in the steady state.  The
+        offsets are cached at first use, the `CollectedHeap*` is cached once it
+        validates (the VM assigns it once at init), and the two fields are
+        adjacent so a single read fetches both.
+        Exception safety: noexcept.
+        Thread safety: safe.  The counter is written by the VM thread at a
+        safepoint and read here as an aligned 4-byte load, which cannot tear.
+    */
+    inline auto gc_epoch() noexcept
+        -> vmhook::gc_epoch_t
+    {
+        const vmhook::vm_capabilities_t& capabilities{ vmhook::vm_capabilities() };
+        if (!capabilities.supported)
+        {
+            return vmhook::gc_epoch_t{};
+        }
+        if (capabilities.collector == vmhook::gc_collector::epsilon)
+        {
+            return vmhook::gc_epoch_t{ 0u, false, true };
+        }
+
+        const vmhook::detail::gc_epoch_sources_t& sources{
+            vmhook::detail::resolve_gc_epoch_sources() };
+        if (!sources.resolved)
+        {
+            return vmhook::gc_epoch_t{};
+        }
+
+        // Universe::_collectedHeap is assigned once, during VM init, and never
+        // reassigned - so cache it, but only AFTER it validates.  Caching a
+        // null (this header can be loaded before the VM finishes booting) would
+        // disable the detector for the life of the process, so a null result is
+        // simply re-read next time.  safe_read_pointer, never a raw deref.
+        static std::atomic<const void*> cached_heap{ nullptr };
+        const void* collected_heap{ cached_heap.load(std::memory_order_relaxed) };
+        if (!collected_heap)
+        {
+            collected_heap = vmhook::hotspot::safe_read_pointer(sources.heap_slot);
+            if (!vmhook::hotspot::is_valid_pointer(collected_heap))
+            {
+                return vmhook::gc_epoch_t{};
+            }
+            cached_heap.store(collected_heap, std::memory_order_relaxed);
+        }
+
+        const auto* const heap_bytes{ static_cast<const std::uint8_t*>(collected_heap) };
+
+        std::uint32_t collections{ 0 };
+        std::uint8_t  active{ 1 };
+
+        if (sources.span_size != 0)
+        {
+            // One fault-safe read covering both fields.
+            std::uint8_t span[vmhook::detail::gc_epoch_span_limit]{};
+            if (!vmhook::os::safe_read(span, heap_bytes + sources.span_offset, sources.span_size))
+            {
+                return vmhook::gc_epoch_t{};
+            }
+            std::memcpy(&collections,
+                        span + (sources.total_collections_offset - sources.span_offset),
+                        sizeof(collections));
+            active = span[sources.gc_active_offset - sources.span_offset];
+        }
+        else
+        {
+            if (!vmhook::os::safe_read(&collections,
+                                       heap_bytes + sources.total_collections_offset,
+                                       sizeof(collections))
+             || !vmhook::os::safe_read(&active,
+                                       heap_bytes + sources.gc_active_offset,
+                                       sizeof(active)))
+            {
+                return vmhook::gc_epoch_t{};
+            }
+        }
+
+        return vmhook::gc_epoch_t{ collections, active != 0, true };
+    }
+
+    /*
+        @brief True when a collection may have moved objects since `recorded`.
+        @details
+        The whole soundness argument in one function.  Returns true (i.e. "do
+        not trust an address captured at `recorded`") when ANY of:
+
+          * `recorded` was never valid, or was taken while a pause was running;
+          * the current sample is invalid (unreadable, or unsupported collector);
+          * a pause is running right now;
+          * the collection counter differs from the recorded one.
+
+        Ordering inside a pause is `IsGCActiveMark` sets the flag -> gc_prologue
+        increments the counter -> objects move -> the mark clears the flag.  So a
+        pause that started and finished is caught by the counter, a pause still
+        running is caught by the flag, and a pause that had already incremented
+        before we sampled cannot exist because sampling refuses while active.
+        Therefore, on Serial / Parallel / G1: epoch unchanged => the object did
+        not move.
+
+        The converse is deliberately conservative - a collection that moved
+        nothing still invalidates.  A false "stale" costs a re-derivation; a
+        false "fresh" costs the process.
+
+        Complexity: O(1).  Exception safety: noexcept.  Thread safety: safe.
+    */
+    inline auto gc_epoch_changed(const vmhook::gc_epoch_t& recorded) noexcept
+        -> bool
+    {
+        if (!recorded.valid || recorded.gc_active)
+        {
+            return true;
+        }
+        const vmhook::gc_epoch_t now{ vmhook::gc_epoch() };
+        return !now.valid || now.gc_active || now.collections != recorded.collections;
+    }
+
+    // -------------------------------------------------------------------------
+    // Object pins: a move-only holder for a raw heap OOP, guarded by the
+    // Layer 1 relocation detector above.
+    //
+    // WARNING: this is still NOT a lifetime primitive.  Creating a real GC root
+    // requires a call into the VM, which this pure-VM build has no way to make,
+    // so the class below does not keep the object alive.  What it now DOES is
+    // refuse to hand back an address once a collection has happened, so a moved
+    // (or reclaimed) object surfaces as a nullptr instead of as undefined
+    // behaviour.  See the class doc for the exact contract before using it.
     // -------------------------------------------------------------------------
     namespace jni
     {
         /*
-            @brief Move-only, NON-OWNING holder for a raw heap OOP.  It is NOT a
-            GC root and does NOT survive a relocating GC.
+            @brief Move-only, NON-OWNING holder for a raw heap OOP that REFUSES
+            to hand the address back once a collection has happened.
             @details
-            READ THIS FIRST — this type does far less than its name suggests.
-            The constructor stores the raw decoded OOP you pass it, the destructor
-            does nothing, and oop() returns the stored address unchanged.  There
-            is no VM-side registration of any kind, so:
+            READ THIS FIRST — this type still does less than its name suggests,
+            but it is no longer a no-op.
 
-              * the object is NOT kept alive.  Drop the last Java-side reference
-                and the collector may reclaim it while this holder is still
-                non-empty; oop() then hands back a pointer into freed heap.
-              * the address is NOT updated.  Any relocating collection that moves
-                the object between construction and oop() leaves the stored
-                address stale, and dereferencing it corrupts your program.
+            WHAT IT DOES NOT DO: it is not a GC root.  There is no VM-side
+            registration of any kind, so the object is NOT kept alive.  Drop the
+            last Java-side reference and the collector may reclaim it while this
+            holder is still non-empty.
 
-            Safe use today is narrow: hold it only inside a single GC-quiet window
-            (typically one hook invocation), and only for objects that stay
-            reachable from live Java state for independent reasons.  Do NOT use it
-            to carry objects across ticks or between threads — that is precisely
-            the pattern it cannot support.
+            WHAT IT NOW DOES: the constructor records a vmhook::gc_epoch()
+            sample — `CollectedHeap::_total_collections` paired with the
+            gc-active flag — alongside the raw address.  oop() re-samples and
+            returns nullptr the moment the epoch has moved on, so an address
+            invalidated by a relocating collection surfaces as a null instead of
+            as undefined behaviour.  That converts the header's oldest silent
+            use-after-relocation bug into a detectable, checkable failure.
 
-            Copying is disabled and moving transfers the stored address, nulling
-            the source; that is ownership bookkeeping only, not a lifetime
-            guarantee.  Construction never touches the VM, so it behaves
-            identically with and without a JVM present.
+            THE CONTRACT, precisely: a ref is valid exactly until the next
+            collection.  That covers "compute now, consume later on this tick"
+            and every cross-thread hand-off that completes before a GC.  It does
+            NOT let you carry an object across a collection — nothing here can.
+
+            FAIL-CLOSED, ALWAYS.  When the epoch cannot be trusted the ref
+            reports stale rather than guessing.  Concretely, oop() is nullptr
+            whenever any of these hold:
+
+              * no JVM is present, or the VMStructs coordinates the detector
+                needs did not resolve;
+              * the collector is ZGC, Shenandoah, or could not be determined —
+                see vmhook::vm_capabilities().  Those collectors relocate
+                concurrently and their counters tick at cycle start, so an
+                unchanged counter proves nothing and the detector would itself
+                become silent UB;
+              * a stop-the-world pause was running when the ref was built, or is
+                running now;
+              * the collection counter differs from the recorded one.
+
+            Only Serial, Parallel and G1 (where `_total_collections` provably
+            increments before any object is copied) and Epsilon (which never
+            moves anything) ever report fresh.
+
+            raw_unsafe() bypasses the check and returns the captured address
+            verbatim.  It exists for diagnostics and logging — never dereference
+            it.
+
+            Copying is disabled; moving transfers the address AND its epoch,
+            emptying the source.  Construction touches the VM only through
+            fault-safe reads, so it behaves identically with and without a JVM
+            present (with no JVM, every ref is simply born stale).
 
                 vmhook::jni::global_ref pinned{ wrapper->get_instance() };
-                if (pinned) { use(pinned.oop()); }   // same tick, no GC in between
+                if (pinned) { use(pinned.oop()); }   // null after any collection
 
-            @note Scheduled for replacement.  This class is a placeholder for a
-            real pin, and both its name and its semantics are expected to change
-            once the header can root an object without a VM call.  Do not build
-            long-lived designs on it.
+            @note Layers 2 and 3 of audit/research/gc_root_feasibility.md would
+            add a real, relocation-tracking root.  Until they land, this remains
+            a detector, not a pin: it stops you using a moved object, it does not
+            stop the object being moved or collected.
         */
         class global_ref final
         {
@@ -20654,6 +21561,7 @@ namespace vmhook
 
             explicit global_ref(vmhook::oop_t const raw_oop) noexcept
                 : oop_{ raw_oop }
+                , epoch_{ vmhook::gc_epoch() }
             {
             }
 
@@ -20664,66 +21572,107 @@ namespace vmhook
 
             global_ref(global_ref&& other) noexcept
                 : oop_{ other.oop_ }
+                , epoch_{ other.epoch_ }
             {
-                other.oop_ = nullptr;
+                other.oop_   = nullptr;
+                other.epoch_ = vmhook::gc_epoch_t{};
             }
 
             auto operator=(global_ref&& other) noexcept -> global_ref&
             {
                 if (this != &other)
                 {
-                    this->oop_ = other.oop_;
-                    other.oop_ = nullptr;
+                    this->oop_   = other.oop_;
+                    this->epoch_ = other.epoch_;
+                    other.oop_   = nullptr;
+                    other.epoch_ = vmhook::gc_epoch_t{};
                 }
                 return *this;
             }
 
             /*
-                @brief The stored heap OOP, or nullptr if empty.
-                @details Returns the address captured at construction, unchanged
-                and unvalidated.  It is only meaningful while the object has
-                neither moved nor been collected since the holder was built (see
-                the class doc); a relocating GC in between makes it stale, and
-                dropping the last live Java reference makes it dangling.
+                @brief True when the captured address must not be used.
+                @details
+                Re-samples the collection epoch and compares it with the one
+                recorded at construction (see vmhook::gc_epoch_changed).  A
+                default-constructed or reset() holder is stale, and so is one
+                built on a VM where the detector cannot vouch for anything — an
+                unreadable epoch NEVER degrades to "assume it did not move".
+                Complexity: O(1) (three fault-safe reads).
+                Exception safety: noexcept.  Thread safety: safe.
+            */
+            auto is_stale() const noexcept -> bool
+            {
+                return vmhook::gc_epoch_changed(this->epoch_);
+            }
+
+            /*
+                @brief The stored heap OOP, or nullptr if empty OR stale.
+                @details
+                Returns the captured address only while the collection epoch is
+                unchanged; otherwise nullptr.  It is still not a liveness
+                guarantee — a non-relocating collector can reclaim the object
+                without bumping anything this can observe, and the holder is not
+                a root — but it will never hand back an address a relocating
+                collection may have invalidated.
+                Complexity: O(1).  Exception safety: noexcept.
+                Thread safety: safe.
             */
             auto oop() const noexcept -> vmhook::oop_t
             {
+                return this->is_stale() ? nullptr : this->oop_;
+            }
+
+            /*
+                @brief The captured address with NO staleness check.  May be
+                stale, may be dangling — for diagnostics and logging only.
+                @details
+                Exists so a log line can say which address went stale.  Never
+                dereference it and never pass it to anything that will.
+            */
+            auto raw_unsafe() const noexcept -> vmhook::oop_t
+            {
                 return this->oop_;
             }
 
             /*
-                @brief Clears the stored OOP early (idempotent).  oop() returns
-                nullptr after.  Nothing is released — there was no VM-side
-                registration to release.
+                @brief Clears the stored OOP and its epoch (idempotent).  oop()
+                and raw_unsafe() return nullptr after.  Nothing is released —
+                there was no VM-side registration to release.
             */
             auto reset() noexcept -> void
             {
-                this->oop_ = nullptr;
+                this->oop_   = nullptr;
+                this->epoch_ = vmhook::gc_epoch_t{};
             }
 
             /*
-                @brief The raw OOP (retained for API compatibility).  May be null.
+                @brief The usable OOP (retained for API compatibility).  Applies
+                the same staleness check as oop(); null when empty or stale.
             */
             auto handle() const noexcept -> void*
             {
-                return this->oop_;
+                return this->oop();
             }
 
             explicit operator bool() const noexcept
             {
-                return this->oop_ != nullptr;
+                return this->oop() != nullptr;
             }
 
         private:
-            vmhook::oop_t oop_{ nullptr };
+            vmhook::oop_t     oop_{ nullptr };
+            vmhook::gc_epoch_t epoch_{};
         };
     }
 
     /*
         @brief Wraps a raw OOP in a vmhook::jni::global_ref holder.
         @details One-liner for the `global_ref{ oop }` pattern.  This does NOT
-        protect the object from GC — see the global_ref class doc for the actual
-        (non-owning, relocation-unsafe) contract.
+        protect the object from GC and is NOT a root — it records the current
+        collection epoch so the holder reports stale (oop() == nullptr) after
+        the next collection instead of handing back a moved address.  See the
+        global_ref class doc for the full contract.
     */
     inline auto pin(vmhook::oop_t const oop) noexcept
         -> vmhook::jni::global_ref
@@ -20734,8 +21683,9 @@ namespace vmhook
     /*
         @brief Wraps the Java object behind a wrapper unique_ptr in a holder.
         @details `pin(wrapper)` instead of `vmhook::jni::global_ref{ wrapper->get_instance() }`.
-        Returns an empty holder for a null wrapper.  No GC protection — see the
-        global_ref class doc.
+        Returns an empty holder for a null wrapper.  No GC protection, and no
+        root — only the relocation detector described in the global_ref class
+        doc.
     */
     template<typename wrapper_type>
     inline auto pin(const std::unique_ptr<wrapper_type>& wrapper) noexcept
