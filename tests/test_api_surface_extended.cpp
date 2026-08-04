@@ -8,17 +8,21 @@
 //       JVM behind it.
 //
 //   (2) An EXHAUSTIVE compile-time lockdown of the PUBLIC API SURFACE — every
-//       free function and every public type in namespace vmhook:: and
-//       vmhook::jni:: is pinned with std::is_invocable_r_v / is_same_v /
-//       type-trait static_asserts that fix its exact callable shape (parameter
-//       types + return type) or its structural traits (move-only, noexcept
-//       destructor, base classes, defaulted members, ...).  If any entry point
-//       is removed, renamed, or has its signature drift, THIS TRANSLATION UNIT
-//       FAILS TO COMPILE on every compiler / platform in CI.  This is the same
-//       guarantee test_jni_forwarders.cpp gives for the jni:: layer, widened to
-//       the whole surface — new_global_ref / delete_global_ref went missing
-//       once with nothing noticing; this makes that class of regression a hard
-//       build break.
+//       free function and every public type in namespace vmhook:: (plus the one
+//       surviving vmhook::jni:: type, global_ref) is pinned with
+//       std::is_invocable_r_v / is_same_v / type-trait static_asserts that fix
+//       its exact callable shape (parameter types + return type) or its
+//       structural traits (move-only, noexcept destructor, base classes,
+//       defaulted members, ...).  If any entry point is removed, renamed, or has
+//       its signature drift, THIS TRANSLATION UNIT FAILS TO COMPILE on every
+//       compiler / platform in CI.  That class of regression is exactly what
+//       this file exists to catch — the global_ref primitives went missing once
+//       with nothing noticing.
+//
+//       NOTE: the header used to expose a vmhook::jni:: JNI forwarder layer.
+//       The de-JNI refactor (eaff990) deleted it; GROUP I below documents,
+//       forwarder by forwarder, which pure-VM entry point inherited the property
+//       and which capabilities have no equivalent at all.
 //
 // Every assertion here is platform-invariant: only is_invocable / type-trait
 // booleans and nullptr / empty / size / no-throw comparisons — no <charconv>,
@@ -164,7 +168,7 @@ inline constexpr auto i32_field_callback =
 // which is the whole point — the runtime checks in main() can only see
 // functions that still exist with a compatible shape.
 //
-// Conventions (mirroring tests/test_jni_forwarders.cpp + tests/test_traits.cpp):
+// Conventions (mirroring tests/test_traits.cpp):
 //   * Non-overloaded, non-template free functions: address-of fed into
 //     std::is_invocable_r_v<Return, decltype(&fn), Args...> (taking the address
 //     is unambiguous), plus an is_same_v on a representative unevaluated call to
@@ -183,8 +187,9 @@ namespace surface_lock
     // -----------------------------------------------------------------------
     // GROUP A — class lookup & cache control
     //   find_class / find_class_via_oop / override_class_lookup /
-    //   evict_class_lookup / reanchor_classes_via_oop / klass_from_oop /
-    //   klass_from_class_mirror(jni)
+    //   evict_class_lookup / reanchor_classes_via_oop / klass_from_oop
+    //   (jni::klass_from_class_mirror used to belong here; it was deleted by the
+    //   de-JNI refactor with no public replacement — see GROUP I)
     // -----------------------------------------------------------------------
     static_assert(std::is_same_v<
                       decltype(vmhook::find_class(std::declval<std::string_view>())),
@@ -289,7 +294,9 @@ namespace surface_lock
                   "vmhook::make_java_string(string_view) must return void* (jstring oop)");
     static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::make_java_string), std::string_view>,
                   "vmhook::make_java_string must take a string_view");
-    // make_java_array's 4th arg (allow_jni_fallback) is defaulted.  A function
+    // make_java_array's 4th arg (retained_for_abi, formerly allow_jni_fallback —
+    // now [[maybe_unused]], since there is no JNI fallback left) is defaulted.
+    // A function
     // POINTER cannot see default arguments, so the 3-arg form is pinned via a
     // decltype call expression (unevaluated calls DO honour defaults) and the
     // full 4-arg shape via address-of is_invocable.
@@ -299,7 +306,7 @@ namespace surface_lock
                                                        std::declval<std::size_t>())),
                       void*>,
                   "vmhook::make_java_array(name, length, element_size) must return void* "
-                  "(allow_jni_fallback defaulted)");
+                  "(4th arg defaulted)");
     static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::make_java_array),
                                         std::string_view, std::int32_t, std::size_t, bool>,
                   "vmhook::make_java_array's full shape is (string_view, int32, size_t, bool)");
@@ -533,116 +540,193 @@ namespace surface_lock
                   "jni::global_ref must be constructible from a raw oop_t");
 
     // -----------------------------------------------------------------------
-    // GROUP I — vmhook::jni:: forwarder layer (mirrors test_jni_forwarders.cpp;
-    //   duplicated here so this surface file is self-contained and a forwarder
-    //   that vanishes breaks BOTH files).  These are the public spelling of the
-    //   JNI helpers; several have zero call sites and could silently disappear.
+    // GROUP I — the pure-VM successors of the deleted vmhook::jni:: forwarder
+    //   layer.
+    //
+    //   The de-JNI refactor (eaff990) removed the entire JNI bridge from the
+    //   header.  vmhook::jni:: now contains EXACTLY ONE entity — the global_ref
+    //   holder, pinned in GROUP H.  Everything this group used to pin is gone:
+    //
+    //     jni::value / detail::jni_value          jni::decode_object
+    //     jni::find_class                          jni::get_object_class
+    //     jni::find_class_with_context_loader      jni::oop_handle
+    //     jni::new_string_utf                      jni::get_method_id
+    //     jni::get_string_utf                      jni::get_static_method_id
+    //     jni::exception_clear                     jni::get_static_field_id
+    //     jni::klass_from_class_mirror             jni::get_static_object_field
+    //     jni::function<slot, fn_t>                jni::call_object_method
+    //     detail::jni_new_global_ref               jni::call_static_object_method
+    //     detail::jni_delete_global_ref
+    //
+    //   Each of those is handled below in one of two ways: RE-POINTED at the
+    //   surviving pure-VM entry point that carries the same property (so the
+    //   capability still breaks the build if it disappears), or recorded as
+    //   DELETED WITH NO EQUIVALENT.  Nothing is weakened: every re-pointed
+    //   assertion pins an exact return type, and the group stays deliberately
+    //   self-contained (it re-states pins that also live in GROUP A/C/F/J) so
+    //   that "the JNI capability moved here" is greppable in one place.
     // -----------------------------------------------------------------------
-    static_assert(std::is_same_v<vmhook::jni::value, vmhook::detail::jni_value>,
-                  "jni::value must alias detail::jni_value");
-    static_assert(std::is_union_v<vmhook::jni::value>,
-                  "jni::value must be a union (the jvalue layout)");
+    // DELETED, NO EQUIVALENT — jni::value / detail::jni_value (the jvalue
+    // union) and jni::function<index, fn_t>(void* env) (the JNIEnv vtable-slot
+    // fetch).  Both were pure JNI-ABI constructs; there is no JNIEnv, no
+    // jvalue and no function table in a JNI-free header, so there is nothing to
+    // re-point them at.
+    //
+    // DELETED (self-contradictory duplicates) — the eaff990 mechanical rewrite
+    // sed-replaced BOTH `jni::find_class` AND `jni::find_class_with_context_loader`
+    // with `vmhook::find_class`, collapsing four assertions onto one function,
+    // two of which then claimed it returns `void*` ("jni::find_class must
+    // return void* exactly" was a hard compile failure).  vmhook::find_class
+    // returns vmhook::hotspot::klass*, which GROUP A already pins exactly
+    // (is_same_v + is_invocable_r_v), and the context-loader variant's surviving
+    // stand-in — vmhook::find_class_via_oop — is pinned in GROUP A too.  The
+    // false pins are dropped; the true property is untouched.
+    //
+    // DELETED, NO EQUIVALENT — jni::exception_clear().  The header no longer
+    // makes VM calls that can leave a pending JNI exception (all access is
+    // direct VMStructs reads), so there is no exception state to clear.
+    //
+    // DELETED, NO EQUIVALENT — jni::decode_object(jobject) -> oop.  It unwrapped
+    // a JNI local/global handle; with no JNI handles in the header there is
+    // nothing to unwrap, and the raw/compressed-oop decode that replaced it
+    // (vmhook::hotspot::decode_oop_pointer) is internal, not public surface.
+    //
+    // DELETED, NO EQUIVALENT — jni::klass_from_class_mirror(jclass) -> klass*.
+    // It read Klass* out of a java.lang.Class mirror reached through a jclass;
+    // there is no public mirror-unwrap entry point in the JNI-free header.
 
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::find_class), std::string_view>,
-                  "jni::find_class(string_view) must return void* (jclass handle)");
+    // RE-POINTED — jni::new_string_utf(string_view) -> void* (jstring) is now
+    // vmhook::make_java_string(string_view) -> void* (a raw String oop), and
+    // jni::get_string_utf(void*) -> std::string is now
+    // vmhook::read_java_string(void*) -> std::string.  Same properties, pure-VM
+    // spelling.
     static_assert(std::is_same_v<
-                      decltype(vmhook::find_class(std::declval<std::string_view>())), void*>,
-                  "jni::find_class must return void* exactly");
-    static_assert(std::is_invocable_r_v<vmhook::hotspot::klass*,
-                                        decltype(&vmhook::find_class),
-                                        std::string_view>,
-                  "jni::find_class_with_context_loader(string_view) must return klass*");
+                      decltype(vmhook::make_java_string(std::declval<std::string_view>())), void*>,
+                  "make_java_string(string_view) must return void* (succeeds jni::new_string_utf)");
+    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::make_java_string), std::string_view>,
+                  "make_java_string must take a string_view");
     static_assert(std::is_same_v<
-                      decltype(vmhook::find_class(
-                          std::declval<std::string_view>())),
+                      decltype(vmhook::read_java_string(std::declval<void*>())), std::string>,
+                  "read_java_string(void*) must return std::string (succeeds jni::get_string_utf)");
+    static_assert(std::is_invocable_r_v<std::string, decltype(&vmhook::read_java_string), void*>,
+                  "read_java_string must take a void*");
+
+    // RE-POINTED — jni::get_object_class(jobject) -> jclass is now
+    // vmhook::klass_from_oop(void*) -> hotspot::klass*: same question ("what
+    // class is this object?"), answered without a handle round-trip.
+    static_assert(std::is_same_v<
+                      decltype(vmhook::klass_from_oop(std::declval<void*>())),
                       vmhook::hotspot::klass*>,
-                  "jni::find_class_with_context_loader must return klass* exactly (NOT void*)");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::new_string_utf), std::string_view>,
-                  "jni::new_string_utf(string_view) must return void* (jstring)");
-    static_assert(std::is_same_v<
-                      decltype(vmhook::jni::get_string_utf(std::declval<void*>())), std::string>,
-                  "jni::get_string_utf(void*) must return std::string");
-    static_assert(std::is_invocable_r_v<std::string, decltype(&vmhook::jni::get_string_utf), void*>,
-                  "jni::get_string_utf must take a void*");
-    static_assert(std::is_invocable_r_v<void, decltype(&vmhook::jni::exception_clear)>,
-                  "jni::exception_clear() must take no args and return void");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::decode_object), void*>,
-                  "jni::decode_object(void*) must return void* (oop)");
-    static_assert(std::is_same_v<
-                      decltype(vmhook::jni::decode_object(std::declval<void*>())), void*>,
-                  "jni::decode_object must return void* exactly");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::get_object_class), void*>,
-                  "jni::get_object_class(void*) must return void* (jclass)");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::oop_handle), void*, void*&>,
-                  "jni::oop_handle(void* oop, void*& storage) must return void* and take a void*&");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::get_method_id),
-                                        void*, const std::string&, const std::string&>,
-                  "jni::get_method_id(void*, const string&, const string&) must return void*");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::get_static_method_id),
-                                        void*, const std::string&, const std::string&>,
-                  "jni::get_static_method_id(void*, const string&, const string&) must return void*");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::get_static_field_id),
-                                        void*, const std::string&, const std::string&>,
-                  "jni::get_static_field_id(void*, const string&, const string&) must return void*");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::get_static_object_field),
-                                        void*, void*>,
-                  "jni::get_static_object_field(void*, void*) must return void*");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::call_object_method),
-                                        void*, void*, const vmhook::jni::value*>,
-                  "jni::call_object_method(void*, void*, const value*) must return void*");
-    static_assert(std::is_same_v<
-                      decltype(vmhook::jni::call_object_method(std::declval<void*>(),
-                                                               std::declval<void*>())),
-                      void*>,
-                  "jni::call_object_method's args pointer must be defaulted (2-arg callable)");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::call_static_object_method),
-                                        void*, void*, const vmhook::jni::value*>,
-                  "jni::call_static_object_method(void*, void*, const value*) must return void*");
-    static_assert(std::is_same_v<
-                      decltype(vmhook::jni::call_static_object_method(std::declval<void*>(),
-                                                                      std::declval<void*>())),
-                      void*>,
-                  "jni::call_static_object_method's args pointer must be defaulted (2-arg callable)");
+                  "klass_from_oop(void*) must return klass* (succeeds jni::get_object_class)");
     static_assert(std::is_invocable_r_v<vmhook::hotspot::klass*,
-                                        decltype(&vmhook::jni::klass_from_class_mirror), void*>,
-                  "jni::klass_from_class_mirror(void*) must return klass*");
-    // jni::function<index, fn_t>(void* env) -> fn_t  (templated slot fetch).
+                                        decltype(&vmhook::klass_from_oop), void*>,
+                  "klass_from_oop must take a void*");
+
+    // RE-POINTED — jni::oop_handle(oop, void*& storage) minted a handle for a
+    // raw oop; detail::jni_new_global_ref / detail::jni_delete_global_ref were
+    // the two primitives behind global_ref.  All three are now internal to the
+    // JNI-free global_ref, which stores and clears the raw oop itself.  The
+    // original intent of those pins ("this capability went missing once; make it
+    // a hard build break") is preserved by pinning the accessor shapes that now
+    // ARE the primitive — these were previously only exercised at runtime
+    // (global_ref_*_inert_accessors below), never pinned at compile time.
     static_assert(std::is_same_v<
-                      decltype(vmhook::jni::function<21, void* (*)(void*, void*)>(
-                          std::declval<void*>())),
-                      void* (*)(void*, void*)>,
-                  "jni::function<index, fn_t>(void* env) must return the requested fn_t");
-    // jni::signature_for_arg<T>() -> std::string  (compile-time descriptor table).
+                      decltype(std::declval<const vmhook::jni::global_ref&>().oop()),
+                      vmhook::oop_t>,
+                  "jni::global_ref::oop() must return oop_t");
+    static_assert(noexcept(std::declval<const vmhook::jni::global_ref&>().oop()),
+                  "jni::global_ref::oop() must be noexcept");
+    static_assert(std::is_same_v<
+                      decltype(std::declval<const vmhook::jni::global_ref&>().handle()), void*>,
+                  "jni::global_ref::handle() must return void*");
+    static_assert(noexcept(std::declval<const vmhook::jni::global_ref&>().handle()),
+                  "jni::global_ref::handle() must be noexcept");
+    static_assert(std::is_same_v<
+                      decltype(std::declval<vmhook::jni::global_ref&>().reset()), void>,
+                  "jni::global_ref::reset() must return void");
+    static_assert(noexcept(std::declval<vmhook::jni::global_ref&>().reset()),
+                  "jni::global_ref::reset() must be noexcept");
+    static_assert(std::is_constructible_v<bool, vmhook::jni::global_ref>,
+                  "jni::global_ref must be contextually convertible to bool");
+    static_assert(!std::is_convertible_v<vmhook::jni::global_ref, bool>,
+                  "jni::global_ref::operator bool must be EXPLICIT (no implicit bool decay)");
+
+    // RE-POINTED — the JNI id-and-call quartet (jni::get_method_id,
+    // jni::get_static_method_id, jni::get_static_field_id,
+    // jni::get_static_object_field) and the two invoke forwarders
+    // (jni::call_object_method / jni::call_static_object_method) are all served
+    // pure-VM by the proxy layer: object_base::get_method(name[, sig]) and
+    // object<T>::static_method(name[, sig]) resolve a Method*,
+    // object<T>::static_field(name) resolves a static field and field_proxy::get()
+    // reads it (all pinned in GROUP J), and method_proxy::call(args...) performs
+    // the actual invoke.  call() itself was NOT pinned anywhere — GROUP J only
+    // pins method_proxy::value_t — so it is pinned here, where the JNI call
+    // forwarders used to be.
+    static_assert(std::is_same_v<
+                      decltype(std::declval<const vmhook::method_proxy&>().call()),
+                      vmhook::method_proxy::value_t>,
+                  "method_proxy::call() must return method_proxy::value_t "
+                  "(succeeds jni::call_object_method / jni::call_static_object_method)");
+    static_assert(std::is_same_v<
+                      decltype(std::declval<const vmhook::method_proxy&>().call(
+                          std::declval<std::int32_t>(), std::declval<const char*>())),
+                      vmhook::method_proxy::value_t>,
+                  "method_proxy::call(args...) must forward arbitrary args and return value_t");
+    static_assert(noexcept(std::declval<const vmhook::method_proxy&>().call()),
+                  "method_proxy::call() must be noexcept");
+    static_assert(std::is_same_v<
+                      decltype(std::declval<const vmhook::object_base&>().get_method(
+                          std::declval<std::string_view>())),
+                      std::optional<vmhook::method_proxy>>,
+                  "object_base::get_method(name) must return optional<method_proxy> "
+                  "(succeeds jni::get_method_id)");
+    static_assert(std::is_same_v<
+                      decltype(vmhook::object<dummy_wrapper>::static_method(
+                          std::declval<std::string_view>())),
+                      std::optional<vmhook::method_proxy>>,
+                  "object<T>::static_method(name) must return optional<method_proxy> "
+                  "(succeeds jni::get_static_method_id)");
+    static_assert(std::is_same_v<
+                      decltype(vmhook::object<dummy_wrapper>::static_field(
+                          std::declval<std::string_view>())),
+                      std::optional<vmhook::field_proxy>>,
+                  "object<T>::static_field(name) must return optional<field_proxy> "
+                  "(succeeds jni::get_static_field_id)");
+    static_assert(std::is_same_v<
+                      decltype(std::declval<const vmhook::field_proxy&>().get()),
+                      vmhook::field_proxy::value_t>,
+                  "field_proxy::get() must return field_proxy::value_t "
+                  "(succeeds jni::get_static_object_field)");
+
+    // SURVIVOR — detail::jni_signature_for_arg<T>() -> std::string.  Pure
+    // compile-time descriptor logic with no VM/JNI dependency, so the de-JNI
+    // refactor kept it (the name is historical).  Unchanged pins.
     static_assert(std::is_same_v<
                       decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>,
-                  "jni::signature_for_arg<int>() must return std::string");
+                  "detail::jni_signature_for_arg<int>() must return std::string");
     static_assert(std::is_same_v<
                       decltype(vmhook::detail::jni_signature_for_arg<bool>()), std::string>,
-                  "jni::signature_for_arg<bool>() must return std::string");
+                  "detail::jni_signature_for_arg<bool>() must return std::string");
     static_assert(std::is_same_v<
                       decltype(vmhook::detail::jni_signature_for_arg<double>()), std::string>,
-                  "jni::signature_for_arg<double>() must return std::string");
+                  "detail::jni_signature_for_arg<double>() must return std::string");
     static_assert(std::is_same_v<
                       decltype(vmhook::detail::jni_signature_for_arg<std::string>()), std::string>,
-                  "jni::signature_for_arg<std::string>() must return std::string");
-    // jni::make_unique<T>(const string&, args...) -> unique_ptr<T>.
+                  "detail::jni_signature_for_arg<std::string>() must return std::string");
+    // SURVIVOR — vmhook::make_unique<T>(args...) -> unique_ptr<T>.  It never was
+    // a jni:: name (the old comment here said "jni::make_unique", which was
+    // wrong even before eaff990); these two pins add the const-string& argument
+    // shapes that GROUP C does not cover.
     static_assert(std::is_same_v<
                       decltype(vmhook::make_unique<dummy_wrapper>(
                           std::declval<const std::string&>())),
                       std::unique_ptr<dummy_wrapper>>,
-                  "jni::make_unique<T>(const string&) must return unique_ptr<T>");
+                  "vmhook::make_unique<T>(const string&) must return unique_ptr<T>");
     static_assert(std::is_same_v<
                       decltype(vmhook::make_unique<dummy_wrapper>(
                           std::declval<const std::string&>(), 1, 2.0)),
                       std::unique_ptr<dummy_wrapper>>,
-                  "jni::make_unique<T>(const string&, args...) must return unique_ptr<T>");
-    // The detail primitives behind global_ref / any future jni::*_global_ref
-    // forwarder.  These DID go missing once; pin them so the capability can't
-    // silently vanish even though no public jni:: spelling exists today.
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::detail::jni_new_global_ref), void*>,
-                  "detail::jni_new_global_ref(void*) must return void* (the global_ref primitive)");
-    static_assert(std::is_invocable_r_v<void, decltype(&vmhook::detail::jni_delete_global_ref), void*>,
-                  "detail::jni_delete_global_ref(void*) must return void");
+                  "vmhook::make_unique<T>(const string&, args...) must return unique_ptr<T>");
 
     // -----------------------------------------------------------------------
     // GROUP J — public TYPE traits
@@ -1776,9 +1860,9 @@ int main()
     }
 
     // --- pin(oop) / pin(unique_ptr<T>&): no JVM -> inert global_ref -------
-    // global_ref{ null oop } never calls NewGlobalRef (the oop is null), so the
-    // handle is inert and its destructor is a no-op.  pin(empty unique_ptr)
-    // likewise yields a default (inert) global_ref.
+    // The JNI-free global_ref just stores the raw oop; global_ref{ null oop }
+    // therefore holds nullptr, makes no VM call at all, and its destructor is a
+    // no-op.  pin(empty unique_ptr) likewise yields a default (inert) global_ref.
     {
         bool threw{ false };
         try
@@ -1807,11 +1891,11 @@ int main()
     // =====================================================================
     {
         // --- find_class degenerate names: all null without a JVM, no throw ---
-        // find_class (vmhook.hpp:8146) short-circuits "" -> null (8161); a '['
-        // descriptor goes through jni_find_class (8175) which is null+cleared
-        // with no JVM; every other name falls through the ClassLoaderDataGraph
-        // walk + jni context-loader fallback, both null with no JVM, all under
-        // try/catch (8234-8265).  Mixed '.'/'/' separators do NOT short-circuit
+        // find_class short-circuits "" -> null; every other name (including '['
+        // array descriptors, which no longer have a JNI FindClass fallback since
+        // the de-JNI refactor) falls through the ClassLoaderDataGraph walk, which
+        // finds nothing with no JVM loaded, all under a catch-all try/catch.
+        // Mixed '.'/'/' separators do NOT short-circuit
         // -- they are resolved like any other name and simply miss -> null.
         bool threw{ false };
         bool all_null{ false };
@@ -2008,9 +2092,10 @@ int main()
     }
 
     // --- make_java_array degenerate args: null without a JVM, no throw -------
-    // make_java_array (vmhook.hpp:14403): negative length rejects at 14406;
-    // otherwise find_class is null and the '[' JNI fallback (14419) is null
-    // with no JVM, so it returns null at 14439.  noexcept, so it cannot throw.
+    // make_java_array rejects a negative length up front; otherwise it needs the
+    // element klass from find_class, which is null with no JVM (the '[' JNI
+    // FindClass fallback it used to fall back on is gone since the de-JNI
+    // refactor), so it returns null.  It is noexcept, so it cannot throw.
     {
         bool all_null{ false };
         all_null = vmhook::make_java_array("[I", 0, sizeof(std::int32_t)) == nullptr
@@ -2050,12 +2135,13 @@ int main()
     }
 
     // --- jni::global_ref inert-state accessors: no JVM, never deref ----------
-    // A default-constructed / null-pinned global_ref keeps handle_ == nullptr
-    // (vmhook.hpp:21731 default; 21735 the null-oop early return), so
-    // operator bool() is false (21811), oop() returns null without the
-    // tagged-handle deref (21776), handle() is null (21806), and reset() is an
-    // idempotent no-op (21797).  No fabricated non-null oop is pinned, so the
-    // jni_oop_handle / jni_new_global_ref deref path is never entered.
+    // A default-constructed / null-pinned global_ref keeps its stored oop at
+    // nullptr, so operator bool() is false, oop() returns null, handle() (the
+    // retained-for-compatibility spelling of the same field) is null, and
+    // reset() is an idempotent no-op.  Since the de-JNI refactor the holder
+    // makes no VM call on any path — construction, accessors and destruction are
+    // all plain field reads/writes — and no fabricated non-null oop is ever
+    // stored here, so nothing is dereferenced either way.
     {
         bool threw{ false };
         bool default_inert{ false };
@@ -2143,7 +2229,7 @@ int main()
     check("surface_lock_groupF_string_array_helpers_pinned", true);
     check("surface_lock_groupG_watchers_pinned", true);
     check("surface_lock_groupH_global_ref_pin_pinned", true);
-    check("surface_lock_groupI_jni_forwarders_pinned", true);
+    check("surface_lock_groupI_purevm_jni_successors_pinned", true);
     check("surface_lock_groupJ_public_type_traits_pinned", true);
     check("wave14_additive_degenerate_input_deepening_present", true);
 

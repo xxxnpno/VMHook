@@ -41,12 +41,14 @@ vmhook_add_test(odr_two_translation_units
     SOURCES test_odr_unit_a.cpp test_odr_unit_b.cpp)
 
 # 3) Type-trait + concept compile-time checks (no JVM required).
+vmhook_add_test(traits_static_assertions SOURCES test_traits.cpp)
 
 # 4) OS abstraction layer — page/protect/allocate round-trip (no JVM required).
 vmhook_add_test(os_layer_roundtrip SOURCES test_os_layer.cpp)
 
 # 5) Static API surface — make sure register_class, hook<>, etc. are callable
 #    with the right signatures even when no JVM is present (they no-op).
+vmhook_add_test(api_surface_no_jvm SOURCES test_api_surface.cpp)
 
 # 6) Unified `get_field` / `get_method` call syntax across static + instance.
 #    Toolchains with C++23 deducing-this resolve the overloads correctly in
@@ -58,6 +60,11 @@ vmhook_add_test(unified_call_syntax SOURCES test_unified_call_syntax.cpp)
 #    filters / untag, JVM sig -> BasicType, memory_protection enum mapping,
 #    build_dr7 (Windows-only), array_length/get_array_element/set_array_element
 #    on a fake buffer, and format_log fallback.  Pure-logic checks, no JVM.
+vmhook_add_test(helpers SOURCES test_helpers.cpp)
+target_compile_definitions("vmhook_test_helpers" PRIVATE
+    VMHOOK_CMAKE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    VMHOOK_CMAKE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    VMHOOK_CMAKE_VERSION_PATCH=${PROJECT_VERSION_PATCH})
 
 # 8) Tighter coverage of vmhook::os: non-page-aligned protect, page-crossing
 #    protect, safe_read against a PROT_NONE page, allocation_granularity vs
@@ -90,6 +97,7 @@ vmhook_add_test(os_safe_read                   SOURCES test_os_safe_read.cpp)
 vmhook_add_test(os_query_region                SOURCES test_os_query_region.cpp)
 vmhook_add_test(array_element_helpers          SOURCES test_array_element_helpers.cpp)
 vmhook_add_test(return_value                    SOURCES test_return_value.cpp)
+vmhook_add_test(object_factory                  SOURCES test_object_factory.cpp)
 vmhook_add_test(make_java_array_nojvm           SOURCES test_make_java_array_nojvm.cpp)
 vmhook_add_test(version_macros                  SOURCES test_version_macros.cpp)
 target_compile_definitions("vmhook_test_version_macros" PRIVATE
@@ -99,16 +107,21 @@ target_compile_definitions("vmhook_test_version_macros" PRIVATE
     VMHOOK_TEST_EXPECT_CMAKE_VERSION=1)
 vmhook_add_test(platform_capability_macros     SOURCES test_platform_capability_macros.cpp)
 vmhook_add_test(traits_extra                    SOURCES test_traits_extra.cpp)
+vmhook_add_test(api_surface_extended           SOURCES test_api_surface_extended.cpp)
 vmhook_add_test(logging_format                  SOURCES test_logging_format.cpp)
 vmhook_add_test(collection_type_tags           SOURCES test_collection_type_tags.cpp)
 vmhook_add_test(collection_map_cold_nojvm      SOURCES test_collection_map_cold_nojvm.cpp)
 vmhook_add_test(collection_linked_list_nojvm   SOURCES test_collection_linked_list_nojvm.cpp)
 vmhook_add_test(set_wrapper_nojvm              SOURCES test_set_wrapper_nojvm.cpp)
+vmhook_add_test(global_ref                      SOURCES test_global_ref.cpp)
 vmhook_add_test(method_enumeration             SOURCES test_method_enumeration.cpp)
 vmhook_add_test(method_explicit_signature_nojvm SOURCES test_method_explicit_signature_nojvm.cpp)
 vmhook_add_test(method_overload_nojvm           SOURCES test_method_overload_nojvm.cpp)
 vmhook_add_test(method_is_reference_nojvm      SOURCES test_method_is_reference_nojvm.cpp)
+vmhook_add_test(classloader_reanchor           SOURCES test_classloader_reanchor.cpp)
+vmhook_add_test(find_class_contracts           SOURCES test_find_class_contracts.cpp)
 vmhook_add_test(traits_function_traits         SOURCES test_traits_function_traits.cpp)
+vmhook_add_test(make_unique                     SOURCES test_make_unique.cpp)
 vmhook_add_test(os_page_size_granularity       SOURCES test_os_page_size_granularity.cpp)
 # logging_format only reaches the std::cout sink (VMHOOK_LOG_FILE undefined).
 # The opt-in FILE sink (detail::emit_log_line's `#ifdef VMHOOK_LOG_FILE` arm)
@@ -141,6 +154,13 @@ vmhook_add_test(method_call_return_void_nojvm  SOURCES test_method_call_return_v
 vmhook_add_test(method_call_return_type_sfinae_nojvm SOURCES test_method_call_return_type_sfinae_nojvm.cpp)
 vmhook_add_test(method_call_wide_args_nojvm    SOURCES test_method_call_wide_args_nojvm.cpp)
 vmhook_add_test(method_call_object_nojvm       SOURCES test_method_call_object_nojvm.cpp)
+# NOTE: the name is now misleading — the JNI invocation fallback this file was
+# written against was deleted by the de-JNI refactor, and what it actually
+# exercises today is method_proxy::call()'s cold guard arm (return-type
+# invariance, the noexcept arity matrix, value_t's variant API, and
+# copy/move-proxy idempotence).  Re-registered under its historical name to keep
+# this change reviewable; the rename is queued for a follow-up pass.
+vmhook_add_test(method_call_jni_fallback_nojvm SOURCES test_method_call_jni_fallback_nojvm.cpp)
 vmhook_add_test(seh_invoke_detour              SOURCES test_seh_invoke_detour.cpp)
 vmhook_add_test(dont_inline_dont_compile       SOURCES test_dont_inline_dont_compile.cpp)
 vmhook_add_test(hook_common_detour_dispatch    SOURCES test_hook_common_detour_dispatch.cpp)
@@ -161,6 +181,13 @@ vmhook_add_test(dllmain_bootstrap_nojvm        SOURCES test_dllmain_bootstrap_no
 vmhook_add_test(wrapper_pattern_nojvm          SOURCES test_wrapper_pattern_nojvm.cpp)
 vmhook_add_test(interface_polymorphism_nojvm   SOURCES test_interface_polymorphism_nojvm.cpp)
 vmhook_add_test(poly_inherited_oop_nojvm       SOURCES test_poly_inherited_oop_nojvm.cpp)
+vmhook_add_test(make_java_string_nojvm         SOURCES test_make_java_string_nojvm.cpp)
+# NOT REGISTERED: test_jni_local_ref_hygiene_nojvm.cpp.  It exists solely to
+# exercise vmhook::detail::jni_delete_local_ref (a test-local RAII wrapper used
+# the library function as its deleter); that function — and the whole notion of
+# a JNI local reference — was deleted by the de-JNI refactor, and pure-VM there
+# is no successor to re-point it at.  Recommended for deletion; left in tree so
+# the decision is made deliberately rather than silently.
 vmhook_add_test(for_each_instance_nojvm        SOURCES test_for_each_instance_nojvm.cpp)
 vmhook_add_test(for_each_thread_nojvm          SOURCES test_for_each_thread_nojvm.cpp)
 vmhook_add_test(for_each_loaded_class_nojvm    SOURCES test_for_each_loaded_class_nojvm.cpp)

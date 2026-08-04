@@ -11,20 +11,31 @@
 //     nullptr — proving the function never dereferences a JVM-derived
 //     pointer before string_klass is checked, and that the LEDGER's
 //     "4096+ char input boundary safe" claim holds at the entry gate.
-//   * the NewStringUTF / NewString(slot 163) fallback path is characterized
-//     here for the no-JVM case via the public detail wrapper
-//     jni_new_string_utf16_local — with hotspot::current_jni_env unset,
-//     jni_function<163, ...> returns null and the wrapper returns nullptr.
-//     This is the "NewStringUTF OOM" surrogate the LEDGER asks for: there
-//     is no JVM and therefore no JNI slot to call, so the cold contract
-//     is "return nullptr, do not crash, do not block".
+//   * the PURE-VM allocation chain the (now sole) TLAB path rides on is
+//     characterized cold: make_java_object() rejects a null klass, and
+//     make_java_array("[B"/"[C", ...) — the exact backing arrays the
+//     compact-LATIN1 / compact-UTF16 / classic branches allocate — return
+//     nullptr at their own find_class gate.  So the cold contract of the
+//     whole chain is "return nullptr, do not crash, do not block".
 //   * noexcept characterization: make_java_string is declared `noexcept`
 //     (vmhook.hpp:1702) — pinned as a static_assert below so any future
 //     accidental removal is a compile-time regression.  The same is
-//     pinned for jni_new_string_utf16 / jni_new_string_utf16_local /
+//     pinned for make_java_object / make_java_array /
 //     vmhook::detail::utf8_to_utf16 (their failure-mode contracts depend
 //     on it: nullptr-on-failure rather than a throw across a callback
 //     boundary).
+//
+// HISTORY (de-JNI refactor, commit eaff990): this file used to characterize
+// the JNIEnv::NewString(slot 163) over-cap fallback through the detail
+// wrappers jni_new_string_utf16 / jni_new_string_utf16_local.  Both wrappers,
+// and the fallback itself, were DELETED — make_java_string is now pure-VM and
+// builds the complete String through build_via_tlab() at ANY length, so the
+// former k_tlab_string_max_units routing cap no longer exists either.  The
+// four assertions that named those wrappers are therefore gone (they asserted
+// a function that no longer exists); the surviving-and-still-true "over-cap
+// input is not truncated / not special-cased" coverage is kept below, and the
+// pure-VM allocation chain that replaced the fallback is characterized in its
+// place.
 //
 // Embedded-NUL handling and astral round-trip are CHARACTERIZED for the
 // SHARED utf8_to_utf16 core in tests/test_read_java_string_nul_astral.cpp;
@@ -58,11 +69,19 @@ static_assert(noexcept(vmhook::make_java_string(std::string_view{})),
 static_assert(std::is_same_v<decltype(vmhook::make_java_string(std::string_view{})), void*>,
               "vmhook::make_java_string MUST return void* (raw String oop or nullptr)");
 
-// Companion contracts make_java_string's fallback ride on:
-static_assert(noexcept(vmhook::detail::jni_new_string_utf16(std::vector<std::uint16_t>{})),
-              "vmhook::detail::jni_new_string_utf16 MUST be noexcept");
-static_assert(noexcept(vmhook::detail::jni_new_string_utf16_local(std::string_view{})),
-              "vmhook::detail::jni_new_string_utf16_local MUST be noexcept");
+// Companion contracts the pure-VM build path rides on.  make_java_string
+// allocates the String instance through make_java_object() and its backing
+// byte[]/char[] through make_java_array(); both must stay noexcept so the
+// nullptr-on-failure contract is not replaced by a throw crossing the
+// noexcept boundary of make_java_string itself.
+static_assert(noexcept(vmhook::make_java_object(nullptr, std::size_t{ 0 })),
+              "vmhook::make_java_object MUST be noexcept");
+static_assert(std::is_same_v<decltype(vmhook::make_java_object(nullptr, std::size_t{ 0 })), void*>,
+              "vmhook::make_java_object MUST return void*");
+static_assert(noexcept(vmhook::make_java_array(std::string_view{}, std::int32_t{ 0 }, std::size_t{ 1 })),
+              "vmhook::make_java_array MUST be noexcept");
+static_assert(std::is_same_v<decltype(vmhook::make_java_array(std::string_view{}, std::int32_t{ 0 }, std::size_t{ 1 })), void*>,
+              "vmhook::make_java_array MUST return void*");
 static_assert(noexcept(vmhook::detail::utf8_to_utf16(std::string_view{})) == false,
               "vmhook::detail::utf8_to_utf16 returns std::vector and may throw on alloc "
               "— make_java_string treats that throw as fatal at the noexcept boundary, "
@@ -137,16 +156,17 @@ static auto test_cold_arbitrary_inputs_return_nullptr() -> void
 
 // ───────────────────────── cold-call: 4096 boundary safety ──────────────────
 //
-// The TLAB fast path is capped at 4096 code units (vmhook.hpp:14546); inputs
-// > 4096 deliberately bypass the TLAB and route through jni_new_string_utf16
-// (vmhook.hpp:14682).  Cold (no JVM) BOTH paths must early-out to nullptr:
-//   * find_class returns nullptr -> the function returns BEFORE either branch
-//     is even considered.
-// The "boundary safe" property the LEDGER asks for is that an input of
-// EXACTLY 4096 ASCII chars, exactly 4097 chars (just over), and a large
-// padding input do not allocate, do not crash, do not throw — they all return
-// nullptr at the same find_class gate.  This pins absence of off-by-one in
-// the entry gate.
+// 4096 code units used to be a ROUTING boundary: the hand-built TLAB path was
+// attempted only at or below it, and longer inputs were pushed to the
+// JNIEnv::NewString fallback.  That fallback is gone (de-JNI refactor) and
+// build_via_tlab() now constructs the complete String at ANY length, so 4096 is
+// no longer special at all.  These checks therefore pin something STRONGER than
+// before: the entry gate treats at-cap, just-over-cap and far-over-cap inputs
+// IDENTICALLY (all nullptr with no JVM, no allocation, no crash, no throw), and
+// the shared decoder emits an exact, untruncated code-unit count on both sides
+// of the old boundary.  A future re-introduction of a length cap — silently
+// truncating long strings, robustness bug #9 all over again — breaks the
+// utf8_to_utf16 length checks below.
 static auto test_cold_at_and_over_tlab_cap() -> void
 {
     constexpr std::int32_t k_tlab_cap{ 4096 };
@@ -178,41 +198,49 @@ static auto test_cold_at_and_over_tlab_cap() -> void
           over_units.size() == static_cast<std::size_t>(k_tlab_cap + 1));
 }
 
-// ───────────────────────── cold-call: NewStringUTF fallback OOM-equivalent ──
+// ───────────────────────── cold-call: the pure-VM allocation chain ──────────
 //
-// In a hot JVM make_java_string can fall through to JNIEnv::NewString
-// (vmhook.hpp:14682) when the TLAB attempt returns null OR the input is
-// over the cap.  The LEDGER asks for the "NewStringUTF OOM path
-// characterized" cold; the closest no-JVM observable is that the
-// jni_new_string_utf16_local wrapper — which is the SAME slot-163 call
-// the over-cap fallback issues — returns nullptr when no JNIEnv is
-// available (jni_function<163,...> sees a null current_jni_env and
-// returns null; the wrapper returns nullptr at vmhook.hpp:12901-12904).
-// That is the cold-side counterpart of "NewString returned null", which is
-// also the in-VM OOM signal (NewString returns 0 on OOM).
-static auto test_cold_jni_new_string_utf16_local_nullptr() -> void
+// make_java_string is now allocation-only: it builds the String instance with
+// make_java_object(string_klass, instance_size) and its backing storage with
+// make_java_array("[B"/"[C", ...).  There is no JNI slow path left to fail
+// over to, so "the allocation could not be satisfied" IS the failure mode that
+// replaced the old NewString-returned-null / OOM signal.  Cold, every link in
+// that chain must independently early-out to nullptr — which is what makes
+// make_java_string's own nullptr contract above structurally guaranteed rather
+// than incidental.
+static auto test_cold_pure_vm_allocation_chain_nullptr() -> void
 {
-    void* const ref{ vmhook::detail::jni_new_string_utf16_local(std::string_view{}) };
-    check("cold_jni: jni_new_string_utf16_local(\"\") -> nullptr (no JNIEnv)",
-          ref == nullptr);
+    // make_java_object's argument gate: a null klass is rejected before any
+    // thread-list walk or TLAB touch.
+    check("cold_alloc: make_java_object(nullptr, 24) -> nullptr (null klass gate)",
+          vmhook::make_java_object(nullptr, 24u) == nullptr);
 
-    void* const ref_h{ vmhook::detail::jni_new_string_utf16_local(std::string_view{ "hello" }) };
-    check("cold_jni: jni_new_string_utf16_local(\"hello\") -> nullptr (no JNIEnv)",
-          ref_h == nullptr);
+    // ...and a zero requested_size is rejected too (same gate), so a klass
+    // whose instance size reads back as 0 can never produce a 0-byte object.
+    check("cold_alloc: make_java_object(nullptr, 0) -> nullptr (zero-size gate)",
+          vmhook::make_java_object(nullptr, 0u) == nullptr);
 
-    // jni_new_string_utf16 (the raw-oop variant the over-cap path actually
-    // calls at vmhook.hpp:14682) is also nullptr cold.
-    const std::vector<std::uint16_t> units{ 'h', 'i' };
-    void* const oop{ vmhook::detail::jni_new_string_utf16(units) };
-    check("cold_jni: jni_new_string_utf16({h,i}) -> nullptr (no JNIEnv)",
-          oop == nullptr);
+    // The compact-LATIN1 branch's backing array ("[B", 1 byte per unit).
+    check("cold_alloc: make_java_array(\"[B\", 5, 1) -> nullptr (no JVM)",
+          vmhook::make_java_array("[B", 5, sizeof(std::uint8_t)) == nullptr);
 
-    // Empty-units edge: NewString(env,nullptr,0) is the well-defined empty
-    // form in a hot JVM; cold it stays nullptr (no JNIEnv).
-    const std::vector<std::uint16_t> empty_units{};
-    void* const oop_e{ vmhook::detail::jni_new_string_utf16(empty_units) };
-    check("cold_jni: jni_new_string_utf16({}) -> nullptr (no JNIEnv)",
-          oop_e == nullptr);
+    // The compact-UTF16 branch's backing array ("[B", 2 bytes per unit).
+    check("cold_alloc: make_java_array(\"[B\", 10, 1) -> nullptr (UTF16 coder shape)",
+          vmhook::make_java_array("[B", 10, sizeof(std::uint8_t)) == nullptr);
+
+    // The classic (JDK 8) branch's backing array ("[C", 2 bytes per unit).
+    check("cold_alloc: make_java_array(\"[C\", 5, 2) -> nullptr (no JVM)",
+          vmhook::make_java_array("[C", 5, sizeof(std::uint16_t)) == nullptr);
+
+    // A zero-length backing array (the empty-String shape) takes the same
+    // find_class gate — it must not shortcut into a header-only allocation.
+    check("cold_alloc: make_java_array(\"[B\", 0, 1) -> nullptr (empty-String shape)",
+          vmhook::make_java_array("[B", 0, sizeof(std::uint8_t)) == nullptr);
+
+    // A negative length is rejected by make_java_array's own argument gate,
+    // BEFORE find_class — so the guard survives even on a hot JVM.
+    check("cold_alloc: make_java_array(\"[B\", -1, 1) -> nullptr (negative-length gate)",
+          vmhook::make_java_array("[B", -1, sizeof(std::uint8_t)) == nullptr);
 }
 
 auto main() -> int
@@ -220,7 +248,7 @@ auto main() -> int
     test_empty_cold_returns_nullptr();
     test_cold_arbitrary_inputs_return_nullptr();
     test_cold_at_and_over_tlab_cap();
-    test_cold_jni_new_string_utf16_local_nullptr();
+    test_cold_pure_vm_allocation_chain_nullptr();
 
     if (failures == 0)
     {

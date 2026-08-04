@@ -2161,20 +2161,33 @@ int main()
     }
 
     // =====================================================================
-    // J0. jni:: forwarder matrix — every forwarder that resolves its JNI slot
-    // through jni_function(current_jni_env) is null/no-op WITHOUT a JVM, because
-    // current_jni_env is a thread_local nullptr until ensure_current_java_thread
-    // attaches a thread (which fails with no JVM), so jni_function returns a null
-    // slot pointer and each forwarder bails BEFORE dereferencing its handle
-    // argument.  We therefore drive the full name/handle matrix with nullptr
-    // handles (and varied names), proving null-return + no-throw.  We do NOT
-    // pass a fabricated non-null handle to decode_object()/get_object_class():
-    // decode_object raw-derefs the handle BEFORE the env check, so only a null
-    // handle is contract-safe there (a fabricated pointer would SEGV on POSIX).
+    // J0. Cross-entry-point no-JVM matrix — every entry point the object factory
+    // leans on is null/no-op WITHOUT a JVM, because gHotSpotVMStructs is not
+    // exported and ensure_current_java_thread() fails, so each one bails at its
+    // own gate BEFORE dereferencing its oop / name argument.  We drive the full
+    // name/handle matrix with nullptr oops (and varied names), proving
+    // null-return + no-throw.  We never pass a fabricated NON-null oop: only a
+    // null oop is contract-safe for the header-reading entry points (a
+    // fabricated pointer that slipped past is_valid_pointer would SEGV on
+    // POSIX).
+    //
+    // De-JNI refactor: this section used to drive the vmhook::jni:: forwarder
+    // surface (which resolved slots through a thread_local current_jni_env).
+    // That whole namespace was deleted.  Where a forwarder has a pure-VM
+    // successor with the same shape and the same null contract, the checks are
+    // RE-POINTED at it (new_string_utf -> make_java_string, get_string_utf ->
+    // read_java_string, get_object_class/klass_from_class_mirror ->
+    // klass_from_oop); where it does not, the checks are deleted and each
+    // deletion is named below.
     // =====================================================================
     {
-        // jni::find_class — bails at ensure_current_java_thread() for any name
-        // shape (incl. embedded NUL via string_view), returns nullptr, no throw.
+        // find_class — bails at its graph-head gate for any name shape (incl.
+        // embedded NUL via string_view), returns nullptr, no throw.  The second
+        // probe is find_class_via_oop over the same names with a null anchor —
+        // a genuinely DIFFERENT entry point.  (It replaces a
+        // find_class_with_context_loader loop that the mechanical de-JNI rewrite
+        // had turned into a verbatim duplicate of the find_class loop above it,
+        // i.e. two checks that asserted the same call twice.)
         const std::string nul_name{ std::string("a\0b/C", 5) };
         const std::array<std::string_view, 7> names{ {
             std::string_view{ "" },
@@ -2195,21 +2208,22 @@ int main()
             catch (...) { find_class_no_throw = false; }
             try
             {
-                if (vmhook::find_class(names[i]) != nullptr)
+                if (vmhook::find_class_via_oop(nullptr, names[i]) != nullptr)
                 {
                     ctx_loader_all_null = false;
                 }
             }
             catch (...) { ctx_loader_no_throw = false; }
         }
-        check("J0_jni_find_class_all_names_null_no_jvm", find_class_all_null);
-        check("J0_jni_find_class_no_throw", find_class_no_throw);
-        check("J0_jni_find_class_with_context_loader_all_null_no_jvm", ctx_loader_all_null);
-        check("J0_jni_find_class_with_context_loader_no_throw", ctx_loader_no_throw);
+        check("J0_find_class_all_names_null_no_jvm", find_class_all_null);
+        check("J0_find_class_no_throw", find_class_no_throw);
+        check("J0_find_class_via_oop_all_names_null_no_jvm", ctx_loader_all_null);
+        check("J0_find_class_via_oop_no_throw", ctx_loader_no_throw);
     }
     {
-        // jni::new_string_utf — resolves a slot via current_jni_env (null), so
-        // it returns nullptr for every input shape and never throws.
+        // make_java_string (the pure-VM successor of jni::new_string_utf) —
+        // bails at its find_class("java/lang/String") gate, so it returns
+        // nullptr for every input shape and never throws.
         const std::array<std::string_view, 4> values{ {
             std::string_view{ "" },
             std::string_view{ "hello" },
@@ -2220,84 +2234,85 @@ int main()
         bool no_throw{ true };
         for (std::size_t i{ 0 }; i < values.size(); ++i)
         {
-            try { if (vmhook::jni::new_string_utf(values[i]) != nullptr) { all_null = false; } }
+            try { if (vmhook::make_java_string(values[i]) != nullptr) { all_null = false; } }
             catch (...) { no_throw = false; }
         }
-        check("J0_jni_new_string_utf_all_null_no_jvm", all_null);
-        check("J0_jni_new_string_utf_no_throw", no_throw);
+        check("J0_make_java_string_all_null_no_jvm", all_null);
+        check("J0_make_java_string_no_throw", no_throw);
     }
     {
-        // jni::signature_for_arg<T> is the SAME compile-time table as
-        // detail::jni_signature_for_arg<T> (it forwards directly), so it is fully
-        // deterministic with no JVM.  Pin a representative spread of tokens and
-        // the wrapper forwarding identity for the read-side argument types.
+        // detail::jni_signature_for_arg<T> is a pure compile-time table (it
+        // survived the de-JNI refactor intact, being logic rather than a JNI
+        // call), so it is fully deterministic with no JVM.  Pin a representative
+        // spread of tokens for the read-side argument types.
         check("J0_jni_sig_bool_Z", vmhook::detail::jni_signature_for_arg<bool>() == "Z");
         check("J0_jni_sig_int_I", vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I");
         check("J0_jni_sig_long_J", vmhook::detail::jni_signature_for_arg<std::int64_t>() == "J");
         check("J0_jni_sig_double_D", vmhook::detail::jni_signature_for_arg<double>() == "D");
         check("J0_jni_sig_string", vmhook::detail::jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
-        check("J0_jni_sig_forwards_to_detail",
-              vmhook::detail::jni_signature_for_arg<std::int32_t>()
-              == vmhook::detail::jni_signature_for_arg<std::int32_t>());
-        // An unregistered wrapper still falls back to Object through the forwarder.
+        // (A "forwarder forwards to detail" identity check sat here; the
+        //  mechanical rewrite had collapsed both sides onto the same expression,
+        //  making it `x == x`.  Deleted as vacuous — the public jni:: forwarder
+        //  it compared against no longer exists.  Replaced with the descriptor
+        //  tokens that were NOT previously pinned, so the table stays covered.)
+        check("J0_jni_sig_float_F", vmhook::detail::jni_signature_for_arg<float>() == "F");
+        check("J0_jni_sig_short_S", vmhook::detail::jni_signature_for_arg<std::int16_t>() == "S");
+        check("J0_jni_sig_byte_B", vmhook::detail::jni_signature_for_arg<std::int8_t>() == "B");
+        // An unregistered wrapper still falls back to Object.
         check("J0_jni_sig_unregistered_wrapper_object",
               vmhook::detail::jni_signature_for_arg<registry_unmapped>() == "Ljava/lang/Object;");
     }
     {
-        // Handle-taking forwarders whose slot resolves through jni_function: with
-        // current_jni_env null the slot pointer is null, so each is null/no-op and
-        // NEVER dereferences the (null) handle / id we pass.  Drive them all with
-        // nullptr handles — the contract-safe degenerate input.
-        bool exc_clear_no_throw{ true };
-        try { vmhook::jni::exception_clear(); } catch (...) { exc_clear_no_throw = false; }
-        check("J0_jni_exception_clear_no_throw_no_jvm", exc_clear_no_throw);
-
+        // Oop-taking entry points: each is null/no-op with no JVM and NEVER
+        // dereferences the (null) oop we pass.  Drive them all with a nullptr
+        // oop — the contract-safe degenerate input.
+        //
+        // DELETED with the JNI surface (no pure-VM successor to re-point at):
+        //   * jni::exception_clear()          — pure-VM raises no JNI exception
+        //                                       state, so there is nothing to
+        //                                       clear.
+        //   * jni::get_method_id / get_static_method_id / get_static_field_id
+        //                                     — JNI ID lookup; superseded by the
+        //                                       direct VMStructs walks that take
+        //                                       a klass*, already covered by
+        //                                       test_method_enumeration.cpp and
+        //                                       test_field_introspection_nojvm.cpp.
+        //   * jni::get_static_object_field / call_object_method /
+        //     call_static_object_method       — JNI dispatch; gone entirely.
+        //   * jni::decode_object              — decoded a JNI handle; pure-VM
+        //                                       there are no handles to decode.
+        //   * jni::oop_handle                 — wrapped an oop in caller storage;
+        //                                       its successor is the
+        //                                       global_ref / pin() holder, whose
+        //                                       storage round-trip is covered in
+        //                                       test_global_ref.cpp.
+        // RE-POINTED (same shape, same null contract):
+        //   * get_object_class / klass_from_class_mirror -> klass_from_oop
+        //   * get_string_utf                             -> read_java_string
         bool ok{ true };
         bool threw{ false };
         try
         {
-            if (vmhook::jni::get_object_class(nullptr) != nullptr) { ok = false; }
-            if (vmhook::jni::get_method_id(nullptr, std::string{ "m" }, std::string{ "()V" }) != nullptr) { ok = false; }
-            if (vmhook::jni::get_static_method_id(nullptr, std::string{ "m" }, std::string{ "()V" }) != nullptr) { ok = false; }
-            if (vmhook::jni::get_static_field_id(nullptr, std::string{ "f" }, std::string{ "I" }) != nullptr) { ok = false; }
-            if (vmhook::jni::get_static_object_field(nullptr, nullptr) != nullptr) { ok = false; }
-            if (vmhook::jni::call_object_method(nullptr, nullptr) != nullptr) { ok = false; }
-            if (vmhook::jni::call_static_object_method(nullptr, nullptr) != nullptr) { ok = false; }
-            if (vmhook::jni::klass_from_class_mirror(nullptr) != nullptr) { ok = false; }
+            if (vmhook::klass_from_oop(nullptr) != nullptr) { ok = false; }
         }
         catch (...) { threw = true; }
-        check("J0_jni_handle_forwarders_all_null_no_jvm", ok);
-        check("J0_jni_handle_forwarders_no_throw_no_jvm", threw == false);
+        check("J0_oop_entry_points_all_null_no_jvm", ok);
+        check("J0_oop_entry_points_no_throw_no_jvm", threw == false);
 
-        // get_string_utf returns a std::string by value; with no JVM it must be
-        // the empty string and must not throw, for a null handle.
+        // read_java_string returns a std::string by value; with no JVM it must be
+        // the empty string and must not throw, for a null oop.
         bool gsu_threw{ false };
         std::string gsu{ "sentinel" };
-        try { gsu = vmhook::jni::get_string_utf(nullptr); } catch (...) { gsu_threw = true; }
-        check("J0_jni_get_string_utf_empty_no_jvm", gsu.empty());
-        check("J0_jni_get_string_utf_no_throw_no_jvm", !gsu_threw);
-    }
-    {
-        // jni::decode_object(nullptr) is the ONE contract-safe input for the
-        // raw-deref decoder (its `if (!handle) return nullptr;` guard runs before
-        // the deref).  Null in -> null out, no throw.  (A non-null fabricated
-        // handle is deliberately NOT exercised — it would deref a fake pointer.)
-        bool threw{ false };
-        void* decoded{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1)) };
-        try { decoded = vmhook::jni::decode_object(nullptr); } catch (...) { threw = true; }
-        check("J0_jni_decode_object_null_in_null_out", decoded == nullptr);
-        check("J0_jni_decode_object_no_throw", !threw);
+        try { gsu = vmhook::read_java_string(nullptr); } catch (...) { gsu_threw = true; }
+        check("J0_read_java_string_empty_no_jvm", gsu.empty());
+        check("J0_read_java_string_no_throw_no_jvm", !gsu_threw);
 
-        // jni::oop_handle stores the oop into caller storage and returns a pointer
-        // to that storage — pure pointer assignment, no JVM, no deref.  Round-trip
-        // a null oop: storage becomes null and the returned handle points at it.
-        void* storage{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xFEED)) };
-        void* handle{ nullptr };
-        bool oh_threw{ false };
-        try { handle = vmhook::jni::oop_handle(nullptr, storage); } catch (...) { oh_threw = true; }
-        check("J0_jni_oop_handle_returns_storage_address", handle == static_cast<void*>(&storage));
-        check("J0_jni_oop_handle_stored_null_oop", storage == nullptr);
-        check("J0_jni_oop_handle_no_throw", !oh_threw);
+        // write_java_string is the write-side sibling: a null oop must be a
+        // no-op that returns cleanly rather than faulting.
+        bool wjs_threw{ false };
+        try { vmhook::write_java_string(nullptr, std::string_view{ "x" }); }
+        catch (...) { wjs_threw = true; }
+        check("J0_write_java_string_null_oop_no_throw", !wjs_threw);
     }
 
     // =====================================================================
@@ -2349,16 +2364,24 @@ int main()
         check("T0_make_java_string_returns_void_ptr",
               std::is_same_v<decltype(vmhook::make_java_string(std::string_view{})), void*>);
 
-        // The jni forwarder return-type contract (observed): find_class -> void*,
-        // find_class_with_context_loader -> klass*, get_string_utf -> std::string,
-        // signature_for_arg -> std::string.
-        check("T0_jni_find_class_returns_void_ptr",
-              std::is_same_v<decltype(vmhook::find_class(std::string_view{})), void*>);
-        check("T0_jni_ctx_loader_returns_klass_ptr",
+        // Return-type contract (observed at runtime): find_class -> klass*,
+        // read_java_string -> std::string, make_java_string -> void*,
+        // jni_signature_for_arg -> std::string.
+        //
+        // De-JNI refactor: a "find_class -> void*" check sat at the top of this
+        // group.  It named the DELETED jni::find_class, and the mechanical
+        // rewrite pointed it at vmhook::find_class — which returns klass*, so
+        // the check had become a guaranteed runtime FAILURE that nobody saw
+        // because the file was unregistered.  Deleted; the klass* pin below it
+        // (also collapsed onto vmhook::find_class, and correct) is kept and
+        // renamed.  get_string_utf -> read_java_string is a re-point.
+        check("T0_find_class_returns_klass_ptr",
               std::is_same_v<decltype(vmhook::find_class(std::string_view{})),
                              vmhook::hotspot::klass*>);
-        check("T0_jni_get_string_utf_returns_string",
-              std::is_same_v<decltype(vmhook::jni::get_string_utf(nullptr)), std::string>);
+        check("T0_read_java_string_returns_string",
+              std::is_same_v<decltype(vmhook::read_java_string(nullptr)), std::string>);
+        check("T0_make_java_string_returns_void_ptr",
+              std::is_same_v<decltype(vmhook::make_java_string(std::string_view{})), void*>);
         check("T0_jni_signature_for_arg_returns_string",
               std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>);
     }

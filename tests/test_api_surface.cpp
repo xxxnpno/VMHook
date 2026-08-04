@@ -621,16 +621,19 @@ namespace matrix
                       std::unique_ptr<fx::plain_w>>,
                   "make_unique<T>(string_view, int64)");
 
-    // jni::make_unique<T>(const string&, args...) — the JNI sibling factory.
+    // make_unique<T>(const string&, args...) — the const-lvalue-string arg
+    // category.  (Labelled "jni::make_unique" before the de-JNI refactor; the
+    // separate JNI sibling factory is gone and vmhook::make_unique — which
+    // these pins already name — is the whole factory surface.)
     static_assert(std::is_same_v<
                       decltype(vmhook::make_unique<fx::plain_w>(std::declval<const std::string&>())),
                       std::unique_ptr<fx::plain_w>>,
-                  "jni::make_unique<T>(const string&)");
+                  "make_unique<T>(const string&)");
     static_assert(std::is_same_v<
                       decltype(vmhook::make_unique<fx::ntd_w>(
                           std::declval<const std::string&>(), 1, 2.0, false)),
                       std::unique_ptr<fx::ntd_w>>,
-                  "jni::make_unique<T>(const string&, args...) over a non-trivial-dtor wrapper");
+                  "make_unique<T>(const string&, args...) over a non-trivial-dtor wrapper");
 
     // ===== GROUP 7 — hook<T> CALLABLE-SHAPE + OVERLOAD MATRIX ================
     // hook<T> must accept every documented detour shape AND every documented
@@ -1065,7 +1068,8 @@ namespace matrix
 
     // ===== GROUP 15 — method_proxy ACCESSOR + call MATRIX ====================
     // The extended file pins method_proxy::value_t introspection but NOT the
-    // method_proxy accessors or the call/call_jni argument matrix.
+    // method_proxy accessors or the call(...) argument matrix.  (call_jni was
+    // deleted by the de-JNI refactor; call(...) is the whole surface now.)
     static_assert(std::is_same_v<
                       decltype(std::declval<const vmhook::method_proxy&>().name()), std::string>,
                   "method_proxy::name() must return std::string");
@@ -1088,8 +1092,8 @@ namespace matrix
     static_assert(std::is_constructible_v<vmhook::method_proxy,
                                           void*, vmhook::hotspot::method*, std::string, bool>,
                   "method_proxy(void*, method*, string, bool pinned) ctor must exist");
-    // call(args...) / call_jni(args...) over argument-category matrices —
-    // both return value_t for any argument list (variadic forwarding).
+    // call(args...) over argument-category matrices — returns value_t for any
+    // argument list (variadic forwarding).
     static_assert(std::is_same_v<
                       decltype(std::declval<const vmhook::method_proxy&>().call()),
                       vmhook::method_proxy::value_t>,
@@ -1109,11 +1113,10 @@ namespace matrix
                           std::declval<const std::unique_ptr<fx::plain_w>&>())),
                       vmhook::method_proxy::value_t>,
                   "method_proxy::call(const unique_ptr<wrapper>&) -> value_t");
-    static_assert(std::is_same_v<
-                      decltype(std::declval<const vmhook::method_proxy&>().call_jni(
-                          std::declval<int>())),
-                      vmhook::method_proxy::value_t>,
-                  "method_proxy::call_jni(int) -> value_t");
+    // NOTE (de-JNI refactor): method_proxy::call_jni(...) was DELETED — there is
+    // no JNI dispatch path left, so call(...) above is the whole invocation
+    // surface and its value_t pins (all four arg shapes) are unchanged.  The
+    // call_jni return-type pin had nothing left to name.
     // method_proxy::value_t scalar-conversion category matrix.
     static_assert(std::is_convertible_v<vmhook::method_proxy::value_t, int>,
                   "method_proxy::value_t -> int");
@@ -1173,24 +1176,33 @@ namespace matrix
                                         std::nullptr_t, std::initializer_list<std::string_view>>,
                   "reanchor_classes_via_oop must accept a nullptr anchor");
 
-    // ===== GROUP 18 — jni:: forwarder ARGUMENT-CATEGORY MATRIX ===============
-    // The extended file pins each jni:: forwarder's exact signature once; here
-    // we widen the STRING-argument categories on the string-taking forwarders.
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::find_class), const char*>,
-                  "jni::find_class(const char*)");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::find_class), std::string>,
-                  "jni::find_class(std::string)");
-    static_assert(std::is_invocable_r_v<klass*,
-                                        decltype(&vmhook::find_class),
-                                        std::string_view>,
-                  "jni::find_class_with_context_loader(string_view)");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::new_string_utf), const char*>,
-                  "jni::new_string_utf(const char*)");
-    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::jni::new_string_utf), std::string>,
-                  "jni::new_string_utf(std::string)");
-    static_assert(std::is_invocable_r_v<std::string, decltype(&vmhook::jni::get_string_utf),
+    // ===== GROUP 18 — STRING-ARGUMENT CATEGORY MATRIX ========================
+    // The extended file pins each entry point's exact signature once; here we
+    // widen the STRING-argument categories on the string-taking entry points.
+    //
+    // De-JNI refactor: this group used to cover the jni:: forwarders.
+    // jni::find_class / jni::find_class_with_context_loader were deleted and
+    // their duty is now vmhook::find_class alone (the third pin below had
+    // already been collapsed onto it, becoming a duplicate of the second).
+    // jni::new_string_utf / jni::get_string_utf were deleted too — but their
+    // duty survives verbatim in the pure-VM vmhook::make_java_string /
+    // vmhook::read_java_string, so those pins are RE-POINTED rather than
+    // dropped and the string-category coverage is retained.
+    static_assert(std::is_invocable_r_v<klass*, decltype(&vmhook::find_class), const char*>,
+                  "find_class(const char*)");
+    static_assert(std::is_invocable_r_v<klass*, decltype(&vmhook::find_class), std::string>,
+                  "find_class(std::string)");
+    static_assert(std::is_invocable_r_v<klass*, decltype(&vmhook::find_class), std::string_view>,
+                  "find_class(string_view)");
+    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::make_java_string), const char*>,
+                  "make_java_string(const char*)");
+    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::make_java_string), std::string>,
+                  "make_java_string(std::string)");
+    static_assert(std::is_invocable_r_v<void*, decltype(&vmhook::make_java_string), std::string_view>,
+                  "make_java_string(string_view)");
+    static_assert(std::is_invocable_r_v<std::string, decltype(&vmhook::read_java_string),
                                         std::nullptr_t>,
-                  "jni::get_string_utf(nullptr)");
+                  "read_java_string(nullptr)");
     // jni::signature_for_arg<T>() over a broad C++ type set — every arg type a
     // hook detour parameter or make_unique ctor arg could carry.
     template<typename T>
@@ -1416,7 +1428,7 @@ static auto run_runtime_noop_checks() -> void
         bool not_reference{ true };
         bool compressed_zero{ false };
         bool call_is_void{ false };
-        bool call_jni_is_void{ false };
+        bool call_args_is_void{ false };
         try
         {
             vmhook::method_proxy mp{ nullptr,
@@ -1428,7 +1440,11 @@ static auto run_runtime_noop_checks() -> void
             not_reference   = mp.is_reference();
             compressed_zero = mp.get_compressed_oop() == 0u;
             call_is_void    = mp.call().is_void();
-            call_jni_is_void = mp.call_jni(1, 2.0).is_void();
+            // (the sibling `mp.call_jni(1, 2.0).is_void()` probe went with
+            //  method_proxy::call_jni; the arg-carrying variant of the surviving
+            //  entry point is exercised in its place so the "a null proxy with
+            //  ARGUMENTS still yields a void value_t" property is not lost)
+            call_args_is_void = mp.call(1, 2.0).is_void();
         }
         catch (...) { threw = true; }
         check("null_method_proxy_name_empty", name_empty);
@@ -1437,7 +1453,7 @@ static auto run_runtime_noop_checks() -> void
         check("null_method_proxy_not_reference", not_reference == false);
         check("null_method_proxy_compressed_oop_zero", compressed_zero);
         check("null_method_proxy_call_is_void", call_is_void);
-        check("null_method_proxy_call_jni_is_void", call_jni_is_void);
+        check("null_method_proxy_call_with_args_is_void", call_args_is_void);
         check("null_method_proxy_accessors_do_not_throw", !threw);
     }
 
@@ -1563,10 +1579,17 @@ static auto run_extra_noop_checks() -> void
     check("build_dr7_skipped_off_platform", true);
 #endif // VMHOOK_HAS_HW_DATA_BREAKPOINTS
 
-    // --- jni:: forwarder no-op contract at RUNTIME, no JVM: every string-taking
-    // forwarder returns null/empty over the full string-argument matrix, and the
-    // handle-taking ones tolerate a null handle.  None throw (all are noexcept;
-    // we still wrap to PROVE the no-throw contract end to end).
+    // --- String / class entry points: no-op contract at RUNTIME, no JVM.  Every
+    // string-taking entry point returns null/empty over the full string-argument
+    // matrix, and the oop-taking ones tolerate a null oop.  None throw (we still
+    // wrap to PROVE the no-throw contract end to end).
+    //
+    // De-JNI refactor: this block used to drive the jni:: forwarders
+    // (new_string_utf / get_string_utf) plus a find_class_with_context_loader
+    // probe that the mechanical rewrite had already collapsed into a duplicate
+    // find_class call.  The forwarders' pure-VM successors — make_java_string
+    // and read_java_string — take the SAME argument categories and carry the
+    // same null/empty no-JVM contract, so the coverage is RE-POINTED, not lost.
     {
         bool threw{ false };
         bool all_null_or_empty{ false };
@@ -1577,24 +1600,23 @@ static auto run_extra_noop_checks() -> void
             const void* fc_str { vmhook::find_class(std::string{ "java/util/List" }) };
             const void* fc_sv  { vmhook::find_class(std::string_view{ "java/lang/Object" }) };
             const void* fc_empty{ vmhook::find_class("") };
-            // find_class_with_context_loader -> Klass* (null with no JVM).
-            const vmhook::hotspot::klass* fccl{
-                vmhook::find_class(std::string_view{ "java/lang/Thread" }) };
-            // new_string_utf over const char* / std::string / "".
-            const void* ns_cstr{ vmhook::jni::new_string_utf("hello") };
-            const void* ns_str { vmhook::jni::new_string_utf(std::string{ "world" }) };
-            const void* ns_empty{ vmhook::jni::new_string_utf("") };
-            // get_string_utf over a null handle -> empty string.
-            const std::string gs_null{ vmhook::jni::get_string_utf(nullptr) };
+            // make_java_string over const char* / std::string / std::string_view / "".
+            const void* ns_cstr{ vmhook::make_java_string("hello") };
+            const void* ns_str { vmhook::make_java_string(std::string{ "world" }) };
+            const void* ns_sv  { vmhook::make_java_string(std::string_view{ "sv" }) };
+            const void* ns_empty{ vmhook::make_java_string("") };
+            // read_java_string over a null oop -> empty string.
+            const std::string gs_null{ vmhook::read_java_string(nullptr) };
             all_null_or_empty =
                 (fc_cstr == nullptr) && (fc_str == nullptr) && (fc_sv == nullptr)
-                && (fc_empty == nullptr) && (fccl == nullptr)
-                && (ns_cstr == nullptr) && (ns_str == nullptr) && (ns_empty == nullptr)
+                && (fc_empty == nullptr)
+                && (ns_cstr == nullptr) && (ns_str == nullptr) && (ns_sv == nullptr)
+                && (ns_empty == nullptr)
                 && gs_null.empty();
         }
         catch (...) { threw = true; }
-        check("jni_forwarders_null_or_empty_without_jvm", all_null_or_empty);
-        check("jni_forwarders_do_not_throw_without_jvm", !threw);
+        check("string_entry_points_null_or_empty_without_jvm", all_null_or_empty);
+        check("string_entry_points_do_not_throw_without_jvm", !threw);
     }
 
     // --- register_class / object-factory no-JVM contract: with no JVM,
@@ -1702,7 +1724,7 @@ int main()
     check("matrix_g15_method_proxy_call_matrix", true);
     check("matrix_g16_container_member_type_matrix", true);
     check("matrix_g17_reanchor_initlist_matrix", true);
-    check("matrix_g18_jni_forwarder_arg_matrix", true);
+    check("matrix_g18_string_entry_point_arg_matrix", true);
     check("matrix_g19_dr7_bitfield_and_enum_layout", true);
 
     std::printf("vmhook API surface (no-JVM): %s\n",

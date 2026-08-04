@@ -7,8 +7,19 @@
 //   * vmhook::os::to_native_protect      (memory_protection -> native flags roundtrip)
 //   * vmhook::os::detail_dr::build_dr7   (Windows + x86_64 only)
 //   * vmhook::array_length / get_array_element / set_array_element on a fake buffer
+//   * vmhook::detail::is_unique_ptr        (unique_ptr<W> arg unwrap trait)
+//   * vmhook::detail::jni_signature_for_arg (C++ arg type -> JVM descriptor)
+//   * the type_to_class_map / g_type_factory_map wrapper registry round-trip
 //
 // All cases run without a JVM in-process.
+//
+// NOTE: the de-JNI refactor deleted vmhook's entire JNI surface (detail::
+// jni_value, detail::write_jni_arg_to_slot, detail::jni_delete_local_ref, the
+// public vmhook::jni::* forwarder namespace, method_proxy::call_jni).  Checks
+// in this file that observed those APIs were either re-pointed at the
+// surviving pure-VM equivalent (detail::jni_signature_for_arg /
+// detail::is_unique_ptr) or deleted; every deletion site carries a
+// "REMOVED (de-JNI refactor)" comment naming what went and why.
 
 #include <vmhook/vmhook.hpp>
 
@@ -583,7 +594,7 @@ static auto test_format_log_safe_on_bad_pattern() -> void
 }
 
 // ---------------------------------------------------------------------------
-// 10. write_jni_arg_to_slot for unique_ptr<wrapper> — regression test for the
+// 10. detail::is_unique_ptr<T>::value_type_t — regression test for the
 //     value_type-shadowing bug that silently dropped every IChatComponent arg
 //     into Lunar / Forge / vanilla addChatMessage calls.
 //
@@ -597,83 +608,140 @@ static auto test_format_log_safe_on_bad_pattern() -> void
 //     std::integral_constant<bool, true>; inside the class body unqualified
 //     name lookup found the inherited typedef first, so value_type_t became
 //     bool, then `is_base_of_v<object_base, value_type_t>` evaluated to
-//     `is_base_of_v<object_base, bool>` -> false, the unique_ptr branch in
-//     write_jni_arg_to_slot was silently skipped, and the JVM received
-//     values[0].l == nullptr for the IChatComponent arg.
+//     `is_base_of_v<object_base, bool>` -> false, the unique_ptr branch of
+//     every argument-dispatch site was silently skipped, and the JVM received
+//     a null reference for the IChatComponent arg.
 //
-//     This test wraps a sentinel oop in a test_wrapper, runs the arg slot
-//     packer, and asserts that value.l points back at the storage cell
-//     containing our sentinel.  Re-introducing the trait bug would set
-//     value.l to nullptr and this would fail loudly.
+//     REMOVED by the de-JNI refactor: the original body drove
+//     detail::write_jni_arg_to_slot() and inspected the resulting
+//     detail::jni_value union (value.l == &storage, *value.l == the sentinel
+//     oop, needs_release == false).  Both the union and the arg packer are
+//     gone, and nothing in the pure-VM path reproduces that indirect-handle
+//     representation, so those specific reads have no target left.
+//
+//     RE-POINTED at the two surviving consumers of the SAME trait:
+//       * the trait itself — value_type_t must name the wrapped type, never
+//         the `bool` inherited from std::integral_constant (compile time), and
+//       * detail::jni_signature_for_arg<std::unique_ptr<W>>(), whose
+//         unique_ptr branch unwraps via is_unique_ptr<...>::value_type_t and
+//         then resolves the wrapper by typeid.  Re-introducing the shadow
+//         makes wrapper_type == bool, which (a) trips that branch's
+//         is_base_of_v<object_base, wrapper_type> static_assert at compile
+//         time and (b) would look up typeid(bool) and silently hand back the
+//         "Ljava/lang/Object;" fallback instead of the registered class.
 // ---------------------------------------------------------------------------
 namespace {
     struct test_wrapper_helpers : public vmhook::object<test_wrapper_helpers> {
         using vmhook::object<test_wrapper_helpers>::object;
     };
+
+    struct test_wrapper_deleter {
+        auto operator()(test_wrapper_helpers* p) const noexcept -> void { delete p; }
+    };
 }
 
-static auto test_write_jni_arg_to_slot_unique_ptr_branch() -> void
+// The exact shape of the historical bug: the partial specialisation's
+// value_type_t must name the WRAPPED type, not std::integral_constant's
+// inherited `value_type` typedef (= bool).
+static_assert(std::is_same_v<
+                  vmhook::detail::is_unique_ptr<
+                      std::unique_ptr<test_wrapper_helpers>>::value_type_t,
+                  test_wrapper_helpers>,
+              "is_unique_ptr<unique_ptr<W>>::value_type_t must be W");
+static_assert(!std::is_same_v<
+                  vmhook::detail::is_unique_ptr<
+                      std::unique_ptr<test_wrapper_helpers>>::value_type_t,
+                  bool>,
+              "is_unique_ptr<unique_ptr<W>>::value_type_t must NOT collapse to the "
+              "std::true_type-inherited `value_type` typedef (bool)");
+// A custom deleter must not perturb the unwrap either.
+static_assert(std::is_same_v<
+                  vmhook::detail::is_unique_ptr<
+                      std::unique_ptr<test_wrapper_helpers, test_wrapper_deleter>>::value_type_t,
+                  test_wrapper_helpers>,
+              "is_unique_ptr must unwrap unique_ptr<W, D> to W as well");
+// ...and the unwrapped type must still satisfy the predicate every
+// arg-dispatch branch actually tests before taking the wrapper path.
+static_assert(std::is_base_of_v<vmhook::object_base,
+                                vmhook::detail::is_unique_ptr<
+                                    std::unique_ptr<test_wrapper_helpers>>::value_type_t>,
+              "the unwrapped unique_ptr element type must derive from object_base");
+// is_unique_ptr_v strips cv/ref first, so every argument spelling of a
+// unique_ptr reaches the unique_ptr branch — and nothing else does.
+static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<test_wrapper_helpers>>);
+static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<test_wrapper_helpers>&>);
+static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<test_wrapper_helpers>&&>);
+static_assert(vmhook::detail::is_unique_ptr_v<
+                  std::unique_ptr<test_wrapper_helpers, test_wrapper_deleter>>);
+static_assert(!vmhook::detail::is_unique_ptr_v<test_wrapper_helpers>);
+static_assert(!vmhook::detail::is_unique_ptr_v<test_wrapper_helpers*>);
+static_assert(!vmhook::detail::is_unique_ptr_v<int>);
+
+static auto test_unique_ptr_arg_unwrap_not_shadowed() -> void
 {
-    // Sentinel OOP value - just an opaque pointer.  We never deref it; the
-    // arg-packer only stores it.
-    auto* const sentinel_oop{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xDEADBEEFCAFE0000ull)) };
-    auto wrapper{ std::make_unique<test_wrapper_helpers>(sentinel_oop) };
+    // Register the wrapper exactly the way register_class<T>() would (the map
+    // itself needs no JVM), so the unique_ptr branch has a name to resolve and
+    // a correct unwrap is distinguishable from the Object fallback.
+    const std::string class_name{ "com/example/UniquePtrUnwrap" };
+    const std::type_index key{ typeid(test_wrapper_helpers) };
+    {
+        std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
+        vmhook::type_to_class_map.insert_or_assign(key, class_name);
+    }
 
-    vmhook::detail::jni_value value{};
-    void* storage{ nullptr };
-    bool needs_release{ true };
-    vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, wrapper);
+    const std::string expected{ "L" + class_name + ";" };
 
-    // An object handle is a synthetic stack pointer, NOT a JNI local ref —
-    // the cleanup must never DeleteLocalRef it.
-    check("write_jni_arg_to_slot_unique_ptr_no_release", needs_release == false);
+    // The by-value wrapper is the control...
+    check("unique_ptr_unwrap_by_value_wrapper_resolves",
+          vmhook::detail::jni_signature_for_arg<test_wrapper_helpers>() == expected);
+    // ...and unique_ptr<W> must land on the SAME descriptor.  Under the
+    // shadowing bug this resolved typeid(bool) and fell back to Object.
+    check("unique_ptr_unwrap_unique_ptr_resolves_same_class",
+          vmhook::detail::jni_signature_for_arg<std::unique_ptr<test_wrapper_helpers>>()
+              == expected);
+    check("unique_ptr_unwrap_not_object_fallback",
+          vmhook::detail::jni_signature_for_arg<std::unique_ptr<test_wrapper_helpers>>()
+              != "Ljava/lang/Object;");
+    // A custom deleter must not change the descriptor either.
+    check("unique_ptr_unwrap_custom_deleter_resolves_same_class",
+          vmhook::detail::jni_signature_for_arg<
+              std::unique_ptr<test_wrapper_helpers, test_wrapper_deleter>>() == expected);
+    // cv/ref spellings decay to the same descriptor.
+    check("unique_ptr_unwrap_const_ref_resolves_same_class",
+          vmhook::detail::jni_signature_for_arg<
+              const std::unique_ptr<test_wrapper_helpers>&>() == expected);
 
-    // value.l must be a NON-NULL pointer (specifically, &storage).
-    check("write_jni_arg_to_slot_unique_ptr_value_l_non_null",
-          value.l != nullptr);
+    // Restore global state so the suite leaves no side effects.
+    {
+        std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
+        vmhook::type_to_class_map.erase(key);
+    }
 
-    // value.l must point at our local `storage` slot - that is the
-    // indirect-handle pattern the JVM expects (jobject = jobject*).
-    check("write_jni_arg_to_slot_unique_ptr_value_l_points_at_storage",
-          value.l == static_cast<void*>(&storage));
-
-    // The storage slot must hold our sentinel.  Re-introducing the trait
-    // shadow bug (value_type_t = bool) would skip both writes and leave
-    // storage == nullptr.
-    check("write_jni_arg_to_slot_unique_ptr_storage_holds_oop",
-          storage == sentinel_oop);
-
-    // Dereferencing value.l (the JVM-internal JNIHandles::resolve operation)
-    // must yield the sentinel - this is what call_jni's diagnostic dump
-    // does, and is also exactly what the JVM does inside CallVoidMethodA.
-    check("write_jni_arg_to_slot_unique_ptr_deref_yields_oop",
-          *static_cast<void**>(value.l) == sentinel_oop);
+    // After the erase the read path re-evaluates the map and the documented
+    // fallback returns — proving the resolution above was a real lookup.
+    check("unique_ptr_unwrap_after_cleanup_falls_back",
+          vmhook::detail::jni_signature_for_arg<std::unique_ptr<test_wrapper_helpers>>()
+              == "Ljava/lang/Object;");
 }
 
-static auto test_write_jni_arg_to_slot_null_unique_ptr() -> void
-{
-    // A null unique_ptr arg should result in storage == nullptr but
-    // value.l still pointing at &storage (so the JVM receives a NULL jobject,
-    // not garbage).
-    std::unique_ptr<test_wrapper_helpers> wrapper{};   // empty
-
-    vmhook::detail::jni_value value{};
-    void* storage{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xDEADull)) };  // pre-fill to detect overwrite
-    bool needs_release{ true };
-    vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, wrapper);
-
-    check("write_jni_arg_to_slot_null_unique_ptr_no_release", needs_release == false);
-    check("write_jni_arg_to_slot_null_unique_ptr_value_l_still_points_at_storage",
-          value.l == static_cast<void*>(&storage));
-    check("write_jni_arg_to_slot_null_unique_ptr_storage_cleared",
-          storage == nullptr);
-}
+// REMOVED (de-JNI refactor): test_write_jni_arg_to_slot_null_unique_ptr().
+// It asserted the JNI indirect-handle representation for an EMPTY unique_ptr
+// arg (value.l still pointing at &storage while storage was cleared to
+// nullptr, so the JVM saw a NULL jobject rather than garbage).
+// detail::jni_value and detail::write_jni_arg_to_slot no longer exist and the
+// pure-VM arg path has no equivalent observable representation, so the
+// property cannot be re-pointed — only deleted.
 
 // ---------------------------------------------------------------------------
-// 11. vmhook::jni wrappers - verify they delegate to the underlying detail
-//     functions with no signature drift.  signature_for_arg<T> returns a
-//     std::string (non-constexpr) so we cross-check at runtime instead of
-//     via static_assert.
+// 11. detail::jni_signature_for_arg — the C++ argument type -> JVM type
+//     descriptor mapping (test_signature_for_arg, below).  It returns a
+//     std::string (non-constexpr), so the mapping is pinned at runtime rather
+//     than via static_assert.
+//
+//     REMOVED by the de-JNI refactor: the public `vmhook::jni::*` forwarder
+//     namespace (jni::signature_for_arg and friends) is gone, so the
+//     "public wrapper delegates to detail:: without drift" half of this
+//     section has no second endpoint left to compare against.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // 12. is_valid_pointer must reject debug-poison sentinel patterns
@@ -797,115 +865,51 @@ static auto test_return_value_set_nullptr_for_wrapper() -> void
           slot.retval == static_cast<std::int64_t>(-1));
 }
 
-static auto test_jni_namespace_signature_for_arg() -> void
+static auto test_signature_for_arg() -> void
 {
-    check("jni::signature_for_arg<bool> == 'Z'",
+    check("jni_signature_for_arg<bool> == 'Z'",
           vmhook::detail::jni_signature_for_arg<bool>() == "Z");
-    check("jni::signature_for_arg<int8_t> == 'B'",
+    check("jni_signature_for_arg<int8_t> == 'B'",
           vmhook::detail::jni_signature_for_arg<std::int8_t>() == "B");
-    check("jni::signature_for_arg<int16_t> == 'S'",
+    check("jni_signature_for_arg<int16_t> == 'S'",
           vmhook::detail::jni_signature_for_arg<std::int16_t>() == "S");
-    check("jni::signature_for_arg<uint16_t> == 'C'",
+    check("jni_signature_for_arg<uint16_t> == 'C'",
           vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C");
-    check("jni::signature_for_arg<int32_t> == 'I'",
+    check("jni_signature_for_arg<int32_t> == 'I'",
           vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I");
-    check("jni::signature_for_arg<int64_t> == 'J'",
+    check("jni_signature_for_arg<int64_t> == 'J'",
           vmhook::detail::jni_signature_for_arg<std::int64_t>() == "J");
-    check("jni::signature_for_arg<float> == 'F'",
+    check("jni_signature_for_arg<float> == 'F'",
           vmhook::detail::jni_signature_for_arg<float>() == "F");
-    check("jni::signature_for_arg<double> == 'D'",
+    check("jni_signature_for_arg<double> == 'D'",
           vmhook::detail::jni_signature_for_arg<double>() == "D");
-    check("jni::signature_for_arg<string> == 'Ljava/lang/String;'",
+    check("jni_signature_for_arg<string> == 'Ljava/lang/String;'",
           vmhook::detail::jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
-    check("jni::signature_for_arg<string_view> == 'Ljava/lang/String;'",
+    check("jni_signature_for_arg<string_view> == 'Ljava/lang/String;'",
           vmhook::detail::jni_signature_for_arg<std::string_view>() == "Ljava/lang/String;");
-    check("jni::signature_for_arg<const char*> == 'Ljava/lang/String;'",
+    check("jni_signature_for_arg<const char*> == 'Ljava/lang/String;'",
           vmhook::detail::jni_signature_for_arg<const char*>() == "Ljava/lang/String;");
 
-    // Cross-check that the wrapper returns the same string as the underlying
-    // implementation it delegates to.  Catches accidental drift between the
-    // two if someone adds a new type to detail::jni_signature_for_arg but
-    // forgets the corresponding wrapper instantiation (templates compile
-    // lazily, so without this check the wrapper would just silently fall to
-    // the default 'I' branch).
-    check("jni::signature_for_arg<bool> matches detail::jni_signature_for_arg<bool>",
-          vmhook::detail::jni_signature_for_arg<bool>()
-          == vmhook::detail::jni_signature_for_arg<bool>());
-    check("jni::signature_for_arg<string> matches detail::jni_signature_for_arg<string>",
-          vmhook::detail::jni_signature_for_arg<std::string>()
-          == vmhook::detail::jni_signature_for_arg<std::string>());
-    check("jni::signature_for_arg<int64_t> matches detail::jni_signature_for_arg<int64_t>",
-          vmhook::detail::jni_signature_for_arg<std::int64_t>()
-          == vmhook::detail::jni_signature_for_arg<std::int64_t>());
+    // REMOVED (de-JNI refactor): three "jni::signature_for_arg<T> matches
+    // detail::jni_signature_for_arg<T>" drift checks.  The public
+    // vmhook::jni::signature_for_arg forwarder was deleted, so both sides of
+    // the comparison now name the same function and the check is a tautology
+    // rather than a delegation guard.  The mapping itself stays covered by
+    // the per-type assertions above and, exhaustively, by E6.
 }
 
-static auto test_write_jni_arg_to_slot_primitive_branches() -> void
-{
-    // Sanity that the primitive branches still hit, after the static_assert
-    // guard was added in the trailing else.
-    //
-    // The `needs_release` out-parameter is the critical-bug regression guard:
-    // jni_value is a union, so a primitive arg aliases .l.  If the cleanup path
-    // ever decided "is this a JNI local ref?" by reading .l back, a primitive
-    // bit pattern (e.g. jlong 0x1122334455667788) would be handed to
-    // DeleteLocalRef as a garbage pointer.  Every primitive branch MUST leave
-    // needs_release == false; only the string branches set it true.
-    {
-        vmhook::detail::jni_value value{};
-        void* storage{};
-        bool needs_release{ true };  // start true to prove the branch clears it
-        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, true);
-        check("write_jni_arg_to_slot_bool", value.z == true);
-        check("write_jni_arg_to_slot_bool_no_release", needs_release == false);
-    }
-    {
-        vmhook::detail::jni_value value{};
-        void* storage{};
-        bool needs_release{ true };
-        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, std::int32_t{ 42 });
-        check("write_jni_arg_to_slot_int", value.i == 42);
-        check("write_jni_arg_to_slot_int_no_release", needs_release == false);
-    }
-    {
-        // The smoking-gun value: a jlong whose bits, read back as .l, look like
-        // a plausible heap pointer.  Must NOT be flagged for release.
-        vmhook::detail::jni_value value{};
-        void* storage{};
-        bool needs_release{ true };
-        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, std::int64_t{ 0x1122334455667788ll });
-        check("write_jni_arg_to_slot_long", value.j == 0x1122334455667788ll);
-        check("write_jni_arg_to_slot_long_no_release", needs_release == false);
-    }
-    {
-        vmhook::detail::jni_value value{};
-        void* storage{};
-        bool needs_release{ true };
-        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, 3.14f);
-        check("write_jni_arg_to_slot_float", value.f == 3.14f);
-        check("write_jni_arg_to_slot_float_no_release", needs_release == false);
-    }
-    {
-        vmhook::detail::jni_value value{};
-        void* storage{};
-        bool needs_release{ true };
-        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, 2.71828);
-        check("write_jni_arg_to_slot_double", value.d == 2.71828);
-        check("write_jni_arg_to_slot_double_no_release", needs_release == false);
-    }
-    {
-        // Object-base derived arg: value.l points at the synthetic stack handle
-        // (storage), which is NOT a JNI local ref — must not be released.
-        // We can't construct a real object_base without a JVM, but a c-string
-        // with a null pointer exercises the "string branch produced null" path:
-        // needs_release must stay false because there's nothing to delete.
-        vmhook::detail::jni_value value{};
-        void* storage{};
-        bool needs_release{ true };
-        const char* null_cstr{ nullptr };
-        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, null_cstr);
-        check("write_jni_arg_to_slot_null_cstr_no_release", needs_release == false);
-    }
-}
+// REMOVED (de-JNI refactor): test_write_jni_arg_to_slot_primitive_branches().
+// It packed bool / int32 / int64 / float / double / null-const-char* args
+// through detail::write_jni_arg_to_slot and asserted (a) each landed in the
+// matching detail::jni_value union member (.z/.i/.j/.f/.d) and (b) the
+// `needs_release` out-parameter stayed false so a primitive bit pattern
+// aliasing .l could never be handed to DeleteLocalRef.  The union, the packer
+// and the local-ref lifetime concept are all gone; there is no surviving
+// pure-VM analogue of "which union member / does this need releasing".
+// The ARGUMENT-TYPE-MAPPING half of its intent (which JVM value kind each C++
+// type maps to) is re-pointed onto detail::jni_signature_for_arg and is
+// already asserted for every one of these types by test_signature_for_arg
+// above and, exhaustively, by test_jni_signature_for_arg_exhaustive (E6).
 
 // ---------------------------------------------------------------------------
 // 15. iterate_struct_entries / iterate_type_entries hardening
@@ -1386,28 +1390,13 @@ static auto test_field_proxy_set_size_guard() -> void
     check("field_proxy_set_null_field_pointer_is_safe", true);  // no crash
 }
 
-// ---------------------------------------------------------------------------
-// 24a. jni_delete_local_ref - new helper added in v0.4.1 to release jstring
-//      locals from set_arg's string path.  Must be a safe no-op in the
-//      no-JVM unit test: null current_jni_env means jni_function returns
-//      nullptr and the helper exits without calling through.  We exercise
-//      both the null-handle branch (early return) and the non-null branch
-//      (table-resolution fall-through).
-// ---------------------------------------------------------------------------
-static auto test_jni_delete_local_ref_no_jvm() -> void
-{
-    // Null handle: documented JNI no-op.
-    vmhook::detail::jni_delete_local_ref(nullptr);
-    check("jni_delete_local_ref_null_handle_does_not_crash", true);
-
-    // Non-null handle in a no-JVM process: current_jni_env is null, so the
-    // function-table lookup short-circuits and the helper returns without
-    // dereferencing anything.  We just want to assert no fault.
-    void* const fake_handle{ reinterpret_cast<void*>(
-        static_cast<std::uintptr_t>(0xABCDEF1234567880ull)) };
-    vmhook::detail::jni_delete_local_ref(fake_handle);
-    check("jni_delete_local_ref_no_jvm_returns_safely", true);
-}
+// REMOVED (de-JNI refactor): section 24a, test_jni_delete_local_ref_no_jvm().
+// It exercised detail::jni_delete_local_ref()'s two safety branches in a
+// no-JVM process (null handle -> documented no-op; non-null handle ->
+// current_jni_env is null so the function-table lookup short-circuits before
+// dereferencing anything).  jni_delete_local_ref, current_jni_env and the
+// whole JNI function-table path were deleted; the pure-VM code never creates
+// a local ref, so there is no equivalent lifetime helper to re-point at.
 
 // ---------------------------------------------------------------------------
 // 24b. dr_arm_one / dr_unarm_one refcount transitions
@@ -1994,7 +1983,6 @@ static auto test_build_dr7_exhaustive() -> void
 //   * unregistered unique_ptr<W>   -> "Ljava/lang/Object;" fallback
 //   * registered object wrapper    -> "L<name>;"
 //   * registered unique_ptr<W>     -> "L<name>;"
-//   * jni::signature_for_arg wrapper matches detail:: for the registered type
 //   * the stored factory function constructs a W from a raw oop and the
 //     wrapper round-trips that oop via get_instance()
 //
@@ -2044,10 +2032,9 @@ static auto test_factory_registry_roundtrip() -> void
     check("registry_registered_unique_ptr_signature_resolves",
           jni_signature_for_arg<std::unique_ptr<registry_wrapper>>() == expected_sig);
 
-    // ---- The public jni:: wrapper must delegate without drift.
-    check("registry_public_signature_for_arg_matches_detail",
-          vmhook::detail::jni_signature_for_arg<registry_wrapper>()
-              == jni_signature_for_arg<registry_wrapper>());
+    // ---- REMOVED (de-JNI refactor): "the public jni:: wrapper must delegate
+    //      without drift" — vmhook::jni::signature_for_arg no longer exists, so
+    //      both operands of that comparison named the same function.
 
     // ---- The stored factory builds a wrapper from a raw oop, and the wrapper
     //      round-trips that oop.  This is the path frame::get_arguments uses to
@@ -2089,9 +2076,11 @@ static auto test_factory_registry_roundtrip() -> void
 }
 
 // ---------------------------------------------------------------------------
-// E6. jni_signature_for_arg / jni::signature_for_arg — EXHAUSTIVE over the
-//     full set of SUPPORTED C++ argument types, asserting both the exact
-//     descriptor AND that the public wrapper delegates with zero drift.
+// E6. detail::jni_signature_for_arg — EXHAUSTIVE over the full set of
+//     SUPPORTED C++ argument types, asserting the exact descriptor for each.
+//     (The "and the public jni::signature_for_arg wrapper delegates with zero
+//     drift" half was REMOVED by the de-JNI refactor: the public forwarder
+//     namespace no longer exists.)
 //
 // Note on what is intentionally NOT instantiated: char / char16_t / char32_t /
 // wchar_t are distinct types from int8_t/uint8_t/uint16_t and would hit the
@@ -2104,9 +2093,10 @@ static auto test_factory_registry_roundtrip() -> void
 template <typename arg_type>
 static auto sig_pair_ok(const char* tag, std::string_view want) -> void
 {
+    // Was a detail-vs-public-wrapper pair check; the wrapper is gone, so this
+    // now pins the single surviving implementation against the expectation.
     const std::string detail_sig{ vmhook::detail::jni_signature_for_arg<arg_type>() };
-    const std::string public_sig{ vmhook::detail::jni_signature_for_arg<arg_type>() };
-    check(tag, detail_sig == want && public_sig == want && detail_sig == public_sig);
+    check(tag, detail_sig == want);
 }
 
 static auto test_jni_signature_for_arg_exhaustive() -> void
@@ -2656,178 +2646,21 @@ static auto test_field_proxy_set_size_guard_matrix() -> void
     check("fp_matrix_null_field_pointer_all_descriptors_safe", true);
 }
 
-// ---------------------------------------------------------------------------
-// E11. convert_jni_arg (via write_jni_arg_to_slot) — EXHAUSTIVE primitive
-//      union-slot + needs_release + full-width-clear coverage.
-//
-// The header zeroes the widest union member (out.j = 0) and sets
-// needs_release = false BEFORE the per-type branch, so every primitive arg
-// lands in the correct member with the upper bytes of the 8-byte cell clean
-// and is NEVER flagged for DeleteLocalRef.  We sweep boundary values for each
-// primitive and assert (a) the right member holds the value, (b) needs_release
-// stays false, and (c) the union's full 64-bit cell has no stale high bits for
-// narrow members.
-// ---------------------------------------------------------------------------
-// Endianness-AGNOSTIC "upper bytes clean" probe for the jni_value union.
-//
-// Every union member starts at byte offset 0, and convert_jni_arg zeroes the
-// full 8-byte cell (out.j = 0) before writing a narrow member, so a value of
-// width `active_bytes` occupies object-representation bytes [0, active_bytes)
-// and the remaining bytes [active_bytes, 8) must be zero — on BOTH byte orders
-// (we test which byte OFFSETS are zero, never a value-position bit shift).
-static auto union_upper_bytes_clear(const vmhook::detail::jni_value& value,
-                                    std::size_t active_bytes) -> bool
-{
-    std::array<unsigned char, sizeof(vmhook::detail::jni_value)> bytes{};
-    std::memcpy(bytes.data(), &value, bytes.size());
-    for (std::size_t i{ active_bytes }; i < bytes.size(); ++i)
-    {
-        if (bytes[i] != 0u)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-static auto test_convert_jni_arg_primitive_exhaustive() -> void
-{
-    using vmhook::detail::write_jni_arg_to_slot;
-    using vmhook::detail::jni_value;
-
-    // bool: both values land in .z, are never released, and leave bytes 1..7
-    // of the cell zero.
-    {
-        bool all_ok{ true };
-        for (const bool bv : { false, true })
-        {
-            jni_value value{};
-            void* storage{ nullptr };
-            bool needs_release{ true };
-            write_jni_arg_to_slot(value, storage, needs_release, bv);
-            if (value.z != bv || needs_release
-                || !union_upper_bytes_clear(value, sizeof(bool)))
-            {
-                all_ok = false;
-            }
-        }
-        check("convert_jni_arg_bool_both_values_clean", all_ok);
-    }
-
-    // int32_t boundaries -> .i, bytes 4..7 of the cell must be zero.
-    {
-        bool all_ok{ true };
-        for (const std::int32_t iv : { std::numeric_limits<std::int32_t>::min(),
-                                       std::int32_t{ -1 }, std::int32_t{ 0 },
-                                       std::int32_t{ 1 },
-                                       std::numeric_limits<std::int32_t>::max() })
-        {
-            jni_value value{};
-            void* storage{ nullptr };
-            bool needs_release{ true };
-            write_jni_arg_to_slot(value, storage, needs_release, iv);
-            if (value.i != iv || needs_release
-                || !union_upper_bytes_clear(value, sizeof(std::int32_t)))
-            {
-                all_ok = false;
-            }
-        }
-        check("convert_jni_arg_int32_boundaries_clean_upper", all_ok);
-    }
-
-    // int64_t boundaries -> .j (fills the whole cell), never released.
-    {
-        bool all_ok{ true };
-        for (const std::int64_t jv : { std::numeric_limits<std::int64_t>::min(),
-                                       std::int64_t{ -1 }, std::int64_t{ 0 },
-                                       std::int64_t{ 0x1122334455667788ll },
-                                       std::numeric_limits<std::int64_t>::max() })
-        {
-            jni_value value{};
-            void* storage{ nullptr };
-            bool needs_release{ true };
-            write_jni_arg_to_slot(value, storage, needs_release, jv);
-            if (value.j != jv || needs_release)
-            {
-                all_ok = false;
-            }
-        }
-        check("convert_jni_arg_int64_boundaries_no_release", all_ok);
-    }
-
-    // int8_t -> .i via the <=4-byte integral branch (NOT .b): the header maps
-    // every integral <=4 bytes through out.i.  Confirm the int32 view matches
-    // the sign-extended-to-int32 value and bytes 4..7 are clean.
-    {
-        bool all_ok{ true };
-        for (const int raw : { -128, -1, 0, 1, 127 })
-        {
-            const std::int8_t bv{ static_cast<std::int8_t>(raw) };
-            jni_value value{};
-            void* storage{ nullptr };
-            bool needs_release{ true };
-            write_jni_arg_to_slot(value, storage, needs_release, bv);
-            if (value.i != static_cast<std::int32_t>(bv) || needs_release
-                || !union_upper_bytes_clear(value, sizeof(std::int32_t)))
-            {
-                all_ok = false;
-            }
-        }
-        check("convert_jni_arg_int8_routed_through_i_clean", all_ok);
-    }
-
-    // int16_t / uint16_t -> .i branch as well (<=4 bytes integral).
-    {
-        jni_value value{};
-        void* storage{ nullptr };
-        bool needs_release{ true };
-        write_jni_arg_to_slot(value, storage, needs_release, std::int16_t{ -12345 });
-        check("convert_jni_arg_int16_to_i",
-              value.i == static_cast<std::int32_t>(std::int16_t{ -12345 })
-              && !needs_release);
-    }
-    {
-        jni_value value{};
-        void* storage{ nullptr };
-        bool needs_release{ true };
-        write_jni_arg_to_slot(value, storage, needs_release, std::uint16_t{ 0xBEEF });
-        check("convert_jni_arg_uint16_to_i",
-              value.i == static_cast<std::int32_t>(std::uint16_t{ 0xBEEF })
-              && !needs_release);
-    }
-
-    // float / double bit-fidelity, never released.  float occupies 4 bytes;
-    // bytes 4..7 must be clean.
-    {
-        jni_value value{};
-        void* storage{ nullptr };
-        bool needs_release{ true };
-        write_jni_arg_to_slot(value, storage, needs_release, 1.5f);
-        check("convert_jni_arg_float_value_and_clean_upper",
-              value.f == 1.5f && !needs_release
-              && union_upper_bytes_clear(value, sizeof(float)));
-    }
-    {
-        jni_value value{};
-        void* storage{ nullptr };
-        bool needs_release{ true };
-        write_jni_arg_to_slot(value, storage, needs_release, 2.5);
-        check("convert_jni_arg_double_value_no_release",
-              value.d == 2.5 && !needs_release);
-    }
-
-    // The smoking-gun: a jlong whose bit pattern, read back as .l, looks like a
-    // heap pointer must NOT be flagged for release (union aliasing trap).
-    {
-        jni_value value{};
-        void* storage{ nullptr };
-        bool needs_release{ true };
-        write_jni_arg_to_slot(value, storage, needs_release,
-                              std::int64_t{ 0x00007F1234567890ll });
-        check("convert_jni_arg_pointerlike_jlong_no_release",
-              value.j == 0x00007F1234567890ll && !needs_release);
-    }
-}
+// REMOVED (de-JNI refactor): section E11, union_upper_bytes_clear() and
+// test_convert_jni_arg_primitive_exhaustive().  They swept boundary values for
+// every primitive through detail::write_jni_arg_to_slot and asserted, on the
+// detail::jni_value union, (a) the value landed in the right member, (b)
+// needs_release stayed false, and (c) the bytes above the active member of the
+// 8-byte cell were zero (the endianness-agnostic "upper bytes clean" probe).
+// detail::jni_value and detail::write_jni_arg_to_slot are both gone, and no
+// surviving pure-VM type has a union representation or a local-ref release
+// flag to observe, so the union/needs_release properties are deleted outright.
+// Their ARGUMENT-TYPE-MAPPING intent (which JVM kind each C++ primitive maps
+// to) survives via detail::jni_signature_for_arg and is already asserted for
+// every type E11 swept - bool, int8_t, int16_t, uint16_t, int32_t, int64_t,
+// float, double - by E6 above.  Value-fidelity of narrow-to-wide primitive
+// stores keeps its own coverage in E7 (return_value::set sign-extension /
+// bit-fidelity) and E10 (field_proxy::set width matrix).
 
 // ---------------------------------------------------------------------------
 // E12. is_valid_pointer — sentinel rejection is INDEPENDENT of the upper 32
@@ -3604,10 +3437,8 @@ int main()
     test_array_helpers();
     test_format_log_safe_on_bad_pattern();
     test_format_log_positive();
-    test_write_jni_arg_to_slot_unique_ptr_branch();
-    test_write_jni_arg_to_slot_null_unique_ptr();
-    test_write_jni_arg_to_slot_primitive_branches();
-    test_jni_namespace_signature_for_arg();
+    test_unique_ptr_arg_unwrap_not_shadowed();
+    test_signature_for_arg();
     test_is_valid_pointer_rejects_sentinels();
     test_is_valid_pointer_boundaries();
     test_return_value_sign_extension();
@@ -3618,7 +3449,6 @@ int main()
     test_iterate_entries_no_jvm();
     test_vm_types_and_structs_no_jvm();
     test_find_jvm_module_no_jvm();
-    test_jni_delete_local_ref_no_jvm();
     test_jvm_primitive_byte_width();
     test_field_proxy_set_size_guard();
 #if VMHOOK_HAS_HW_DATA_BREAKPOINTS
@@ -3642,7 +3472,6 @@ int main()
     test_untag_pointer_exhaustive();
     test_is_valid_pointer_gates_array_helpers();
     test_field_proxy_set_size_guard_matrix();
-    test_convert_jni_arg_primitive_exhaustive();
     test_is_valid_pointer_sentinel_upper_half_exhaustive();
 
     if (failures == 0)

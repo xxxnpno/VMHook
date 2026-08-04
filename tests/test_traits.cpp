@@ -20,8 +20,11 @@
 // is_vector_v / is_unique_ptr_v / is_unique_object_ptr negative space,
 // dependent_false_v) AND pins the TYPE-LEVEL contract of the public API surface
 // the rest of the library is built on: oop_t / oop_type_t, object_base, object<D>,
-// return_value, the vmhook::jni:: forwarders, and the register_class / hook /
-// make_unique entry-point signatures.  Every fact is derived from the live header
+// return_value, the surviving pure-VM entry points (find_class / make_java_string /
+// read_java_string), and the register_class / hook / make_unique entry-point
+// signatures.  (The vmhook::jni:: forwarder surface this file used to pin was
+// deleted wholesale by the de-JNI refactor; see the two sections below for the
+// itemised list of what went with it.)  Every fact is derived from the live header
 // and asserted with static_assert (the strongest guarantee — a regression breaks
 // the build before it can reach a runtime check); a small deterministic runtime
 // tally at the end echoes a representative subset so the produced executable also
@@ -88,8 +91,14 @@ static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<int>&>,
 // `value_type` finds the INHERITED typedef before the template parameter of
 // the same name, so value_type_t collapsed to bool for every wrapper type.
 // Downstream `if constexpr (is_base_of_v<object_base, value_type_t>)` then
-// silently skipped the JNI-arg-write branch, leaving values[i].l == 0 and
+// silently skipped the wrapper branch, leaving the argument slot zero and
 // dispatching null IChatComponent into Lunar / Forge / vanilla.
+// (The consumer named in the original comment, detail::write_jni_arg_to_slot,
+// was deleted by the de-JNI refactor.  The identical `if constexpr` on
+// value_type_t survives in detail::jni_signature_for_arg (vmhook.hpp ~12379)
+// and in the field-proxy / call-argument conversion paths (~14896, ~15167,
+// ~15550), so the shadow bug is still live-fire — the trait facts below are
+// unchanged and still load-bearing.)
 static_assert(std::is_same_v<typename vmhook::detail::is_unique_ptr<std::unique_ptr<int>>::value_type_t, int>,
               "is_unique_ptr<unique_ptr<int>>::value_type_t must be int, NOT bool "
               "(template-parameter shadow regression).");
@@ -97,8 +106,9 @@ static_assert(std::is_same_v<typename vmhook::detail::is_unique_ptr<std::unique_
               "is_unique_ptr<unique_ptr<string>>::value_type_t must be string");
 static_assert(std::is_same_v<typename vmhook::detail::is_unique_ptr<std::unique_ptr<vmhook::object_base>>::value_type_t, vmhook::object_base>,
               "is_unique_ptr<unique_ptr<object_base>>::value_type_t must be object_base "
-              "(this is the exact trait usage that drives write_jni_arg_to_slot and "
-              "would re-introduce the chat-not-sending bug if it broke).");
+              "(this is the exact trait usage that drives detail::jni_signature_for_arg's "
+              "unique_ptr<wrapper> branch and would re-introduce the chat-not-sending "
+              "bug if it broke).");
 
 // And the indirect chain that makes the bug bite: a typical vmhook wrapper
 // like `class my_wrapper : public vmhook::object<my_wrapper>` is what users
@@ -111,7 +121,7 @@ namespace {
 }
 static_assert(std::is_base_of_v<vmhook::object_base, test_wrapper>,
               "vmhook::object<T> -> object_base inheritance must hold for the "
-              "static_assert in write_jni_arg_to_slot to accept user wrappers");
+              "static_assert in detail::jni_signature_for_arg to accept user wrappers");
 static_assert(std::is_base_of_v<
                   vmhook::object_base,
                   typename vmhook::detail::is_unique_ptr<std::unique_ptr<test_wrapper>>::value_type_t>,
@@ -131,8 +141,11 @@ static_assert(!vmhook::detail::is_unique_object_ptr<int>::value,
               "is_unique_object_ptr must report false for raw int");
 
 // -----------------------------------------------------------------------------
-// dependent_false_v — the lazy static_assert helper used by the new
-// fall-through guards in write_jni_arg_to_slot / append_jni_arg.
+// dependent_false_v — the lazy static_assert helper used by the fall-through
+// guards in detail::jni_signature_for_arg and the value-conversion paths
+// (vmhook.hpp ~10181, ~12419, ~14427).  (The write_jni_arg_to_slot /
+// append_jni_arg consumers named here originally were deleted by the de-JNI
+// refactor; the helper and its remaining three call sites are unaffected.)
 // -----------------------------------------------------------------------------
 static_assert(!vmhook::detail::dependent_false_v<int>,
               "dependent_false_v<T> must always be false (it is meant to be passed "
@@ -142,36 +155,57 @@ static_assert(!vmhook::detail::dependent_false_v<std::vector<int>>,
               "dependent_false_v<T> must be false for any T");
 
 // -----------------------------------------------------------------------------
-// vmhook::jni namespace — public surface
+// Pure-VM class resolution / string marshalling — public surface
 //
-// New public spelling for the JNI helpers that used to require digging into
-// vmhook::detail::jni_*.  These static_asserts pin down the type signatures
-// of the wrappers so accidental drift between detail::jni_* and jni::* (or
-// missing wrappers as the API grows) is caught at build time.
+// This section used to pin the vmhook::jni::* forwarder type-signatures.  The
+// de-JNI refactor DELETED that entire namespace-level surface, so the following
+// assertions were removed here (no surviving API expresses the same property):
+//   * vmhook::jni::value / vmhook::detail::jni_value — the JNI argument union is
+//     gone, so there is no alias left to pin.
+//   * vmhook::jni::decode_object — the jobject->oop unwrap has no pure-VM public
+//     replacement (the header decodes OOPs internally via decode_oop_pointer).
+//   * vmhook::jni::exception_clear — there is no JNIEnv to clear a pending
+//     exception on any more.
+//   * vmhook::jni::get_object_class — the jobject->jclass forwarder is gone; the
+//     pure-VM direction that survives is klass::get_java_mirror(), which is the
+//     INVERSE mapping and therefore not the same property.
+// The remaining two — new_string_utf and get_string_utf — DO have exact pure-VM
+// equivalents and are re-pointed at them below rather than deleted.
+//
+// Additionally, the eaff990 sed rewrote `jni::find_class` to `vmhook::find_class`
+// in place, which left this file asserting that ONE function returns BOTH void*
+// (here) and hotspot::klass* (in the second forwarder section further down).
+// vmhook::find_class returns hotspot::klass*; the void* spelling only compiled
+// because klass* implicitly converts.  Both loose is_invocable_r_v<void*, ...>
+// pins are deleted and replaced by the exact return-type identity, once, here.
 // -----------------------------------------------------------------------------
-static_assert(std::is_same_v<vmhook::jni::value, vmhook::detail::jni_value>,
-              "vmhook::jni::value must alias the underlying jni_value union");
+// find_class(string_view) -> hotspot::klass* — the ClassLoaderDataGraph walk.
+static_assert(std::is_same_v<decltype(vmhook::find_class(std::declval<std::string_view>())),
+                             vmhook::hotspot::klass*>,
+              "vmhook::find_class(string_view) must return hotspot::klass* exactly - "
+              "NOT an opaque void* JNI-style handle");
+static_assert(std::is_invocable_r_v<vmhook::hotspot::klass*,
+                  decltype(vmhook::find_class), std::string_view>,
+              "vmhook::find_class must accept a string_view and yield a klass*");
 
-// These are non-template, non-overloaded - take their address and check the type.
-// If the wrapper signature ever drifts from the underlying detail function, the
-// types won't match and this fires at compile time.
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::find_class), std::string_view>,
-              "vmhook::find_class must accept string_view and return void* (jclass handle)");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::decode_object), void*>,
-              "vmhook::jni::decode_object must take a jobject and return the decoded oop");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::new_string_utf), std::string_view>,
-              "vmhook::jni::new_string_utf must accept string_view");
-static_assert(std::is_invocable_r_v<std::string, decltype(vmhook::jni::get_string_utf), void*>,
-              "vmhook::jni::get_string_utf must return std::string");
-static_assert(std::is_invocable_r_v<void, decltype(vmhook::jni::exception_clear)>,
-              "vmhook::jni::exception_clear must take no args");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::get_object_class), void*>,
-              "vmhook::jni::get_object_class must take a jobject and return a jclass");
+// RE-POINTED from vmhook::jni::new_string_utf / ::get_string_utf: the pure-VM
+// String marshalling pair carries exactly the same contract (UTF-8 text -> raw
+// java.lang.String OOP, and back to std::string).
+static_assert(std::is_same_v<decltype(vmhook::make_java_string(std::declval<std::string_view>())),
+                             void*>,
+              "vmhook::make_java_string must accept string_view and return the raw "
+              "java.lang.String OOP as void* (was jni::new_string_utf)");
+static_assert(noexcept(vmhook::make_java_string(std::declval<std::string_view>())),
+              "vmhook::make_java_string is noexcept");
+static_assert(std::is_same_v<decltype(vmhook::read_java_string(std::declval<void*>())),
+                             std::string>,
+              "vmhook::read_java_string must return std::string (was jni::get_string_utf)");
 
-// signature_for_arg<T> returns std::string (non-constexpr) so the cross-check
-// against the underlying detail::jni_signature_for_arg lives in
-// test_helpers.cpp where we can call it at runtime.  Here we just confirm the
-// wrapper exists and the return type matches.
+// signature_for_arg<T> returns std::string (non-constexpr) so the VALUE cross-
+// check lives in test_helpers.cpp where we can call it at runtime.  Here we just
+// confirm it exists and the return type matches.  (The public
+// vmhook::jni::signature_for_arg forwarder was deleted; detail::jni_signature_for_arg
+// is the surviving spelling and is pure compile-time logic.)
 static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>,
               "signature_for_arg<T> must return std::string");
 
@@ -764,58 +798,28 @@ static_assert(std::is_same_v<
               "caller_info::valid() returns bool");
 
 // -----------------------------------------------------------------------------
-// vmhook::jni:: — the public JNI forwarder surface (header: vmhook.hpp ~13273).
-// The original file pins a handful; this completes the type-signature coverage
-// of the non-template, non-overloaded forwarders (so any drift from the
-// underlying detail::jni_* is caught) plus signature_for_arg<T>'s return type
-// across the full argument-type set.  These are TYPE checks only — no JVM call.
+// signature_for_arg<T> — the argument-descriptor return-type table.
+//
+// This section used to complete the type-signature coverage of the
+// vmhook::jni:: forwarder surface.  The de-JNI refactor deleted every one of
+// those forwarders, so the following assertions were REMOVED — none has a
+// surviving pure-VM equivalent that expresses the same property:
+//   jni::value (the detail::jni_value union alias), jni::decode_object,
+//   jni::oop_handle (the raw oop -> jobject-handle round-trip; the surviving
+//   holder is vmhook::jni::global_ref / vmhook::pin, whose type surface is owned
+//   by tests/test_global_ref.cpp), jni::exception_clear, jni::get_object_class,
+//   jni::get_method_id, jni::get_static_method_id, jni::get_static_field_id,
+//   jni::get_static_object_field, jni::call_object_method,
+//   jni::call_static_object_method, jni::klass_from_class_mirror.
+// jni::new_string_utf and jni::get_string_utf were RE-POINTED at
+// vmhook::make_java_string / vmhook::read_java_string in the section above.
+//
+// The two find_class pins that lived here are gone as well: they were the
+// self-contradictory pair the eaff990 sed produced (the same vmhook::find_class
+// asserted to return void* AND hotspot::klass*, the latter still carrying the
+// deleted `find_class_with_context_loader` name in its message).  The single
+// exact return-type identity now lives once, in the section above.
 // -----------------------------------------------------------------------------
-static_assert(std::is_same_v<vmhook::jni::value, vmhook::detail::jni_value>,
-              "jni::value aliases the detail jni_value union");
-// Pointer-handle / oop forwarders.
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::decode_object), void*>,
-              "jni::decode_object(jobject) -> void*");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::oop_handle), void*, void*&>,
-              "jni::oop_handle(oop, storage&) -> void*");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::find_class), std::string_view>,
-              "jni::find_class(name) -> void*");
-static_assert(std::is_invocable_r_v<vmhook::hotspot::klass*,
-                  decltype(vmhook::find_class), std::string_view>,
-              "jni::find_class_with_context_loader(name) -> klass*");
-static_assert(std::is_invocable_r_v<void, decltype(vmhook::jni::exception_clear)>,
-              "jni::exception_clear() -> void");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::get_object_class), void*>,
-              "jni::get_object_class(jobject) -> jclass(void*)");
-// ID lookups.
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::get_method_id),
-                  void*, const std::string&, const std::string&>,
-              "jni::get_method_id(klass, name, sig) -> void*");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::get_static_method_id),
-                  void*, const std::string&, const std::string&>,
-              "jni::get_static_method_id(klass, name, sig) -> void*");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::get_static_field_id),
-                  void*, const std::string&, const std::string&>,
-              "jni::get_static_field_id(klass, name, sig) -> void*");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::get_static_object_field),
-                  void*, void*>,
-              "jni::get_static_object_field(klass, field_id) -> void*");
-// Calls.  (std::is_invocable ignores default arguments — they are not part of
-// the function TYPE — so we pass all three parameters; the third has a default
-// at the declaration, which is a separate, call-site-only convenience.)
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::call_object_method),
-                  void*, void*, const vmhook::jni::value*>,
-              "jni::call_object_method(obj, mid, args) -> void*");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::call_static_object_method),
-                  void*, void*, const vmhook::jni::value*>,
-              "jni::call_static_object_method(klass, mid, args) -> void*");
-// klass <-> mirror, strings.
-static_assert(std::is_invocable_r_v<vmhook::hotspot::klass*,
-                  decltype(vmhook::jni::klass_from_class_mirror), void*>,
-              "jni::klass_from_class_mirror(jclass) -> klass*");
-static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::new_string_utf), std::string_view>,
-              "jni::new_string_utf(text) -> jstring(void*)");
-static_assert(std::is_invocable_r_v<std::string, decltype(vmhook::jni::get_string_utf), void*>,
-              "jni::get_string_utf(jstring) -> std::string");
 // signature_for_arg<T>() returns std::string for EVERY supported argument type
 // (the VALUE table is in test_helpers.cpp; here we pin the return type uniformly
 // across the whole accepted set — primitives, wide ints, string spellings, and a
@@ -835,10 +839,12 @@ static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std:
 static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<const char*>()),        std::string>, "sig<const char*> -> string");
 static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<char*>()),              std::string>, "sig<char*> -> string");
 static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::unique_ptr<zoo::wrapper_a>>()), std::string>, "sig<unique_ptr<wrapper>> -> string");
-// And the public wrapper forwards to the detail implementation (same type).
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<int>()),
-                             decltype(vmhook::detail::jni_signature_for_arg<int>())>,
-              "jni::signature_for_arg<T> return type matches detail::jni_signature_for_arg<T>");
+// REMOVED: the "public wrapper forwards to the detail implementation" pin.  The
+// public vmhook::jni::signature_for_arg forwarder was deleted by the de-JNI
+// refactor, and the eaff990 sed rewrote its side of the comparison into
+// detail::jni_signature_for_arg — leaving `is_same_v<decltype(X), decltype(X)>`,
+// a tautology that asserted nothing.  detail::jni_signature_for_arg is now the
+// only spelling and its return type is pinned by the table immediately above.
 
 // -----------------------------------------------------------------------------
 // Public entry-point signatures: register_class<T>, hook<T>, make_unique<T>.
@@ -881,9 +887,11 @@ static_assert(std::is_same_v<decltype(vmhook::make_unique<zoo::wrapper_a>(std::i
 //       no dereference; works on every OS because the bit layout is replicated
 //       from the Intel-SDM formula in source and cross-checked against the real
 //       build_dr7 on the Windows/x86_64 config that compiles it).
-//   (B) jni:: forwarders — the NULL/empty/false no-JVM contract over the
-//       handle/name matrix (every call short-circuits on a null JNIEnv or null
-//       handle WITHOUT dereferencing a fabricated address).
+//   (B) String marshalling — the NULL/empty no-JVM contract of the surviving
+//       pure-VM pair make_java_string / read_java_string (each short-circuits on
+//       an unresolvable klass or a null oop WITHOUT dereferencing a fabricated
+//       address).  This was the jni:: forwarder matrix before the de-JNI
+//       refactor deleted it; see the runtime block for the itemised removals.
 //   (C) register_class / make_unique — the no-JVM map+factory contract
 //       (register_class returns false and leaves type_to_class_map unpopulated
 //       when find_class cannot verify the class; make_unique yields null).
@@ -1158,34 +1166,35 @@ int main()
     }
 #endif
 
-    // (B) jni:: forwarders — NULL/empty no-JVM contract (current_jni_env is the
-    //     thread_local null default; every forwarder short-circuits with no
-    //     dereference of a fabricated address).  Type signatures are pinned by
-    //     the static_asserts above; here we exercise the runtime no-op behaviour.
-    {
-        void* storage{ nullptr };
-        // oop_handle is pure pointer-arithmetic: it stores its first argument into
-        // `storage` and returns &storage — never dereferencing the value.  Passing
-        // a known is_valid_pointer-rejected low constant is safe (never read).
-        void* const fake_oop{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1234u)) };
-        check("jni::oop_handle returns &storage",  vmhook::jni::oop_handle(fake_oop, storage) == &storage);
-        check("jni::oop_handle stores the oop",    storage == fake_oop);
-    }
-    check("jni::decode_object(nullptr) == nullptr",      vmhook::jni::decode_object(nullptr) == nullptr);
-    check("jni::get_object_class(nullptr) == nullptr",   vmhook::jni::get_object_class(nullptr) == nullptr);
-    check("jni::klass_from_class_mirror(nullptr)==null", vmhook::jni::klass_from_class_mirror(nullptr) == nullptr);
-    check("jni::get_method_id(null) == nullptr",         vmhook::jni::get_method_id(nullptr, "m", "()V") == nullptr);
-    check("jni::get_static_method_id(null) == nullptr",  vmhook::jni::get_static_method_id(nullptr, "m", "()V") == nullptr);
-    check("jni::get_static_field_id(null) == nullptr",   vmhook::jni::get_static_field_id(nullptr, "f", "I") == nullptr);
-    check("jni::get_static_object_field(null)==nullptr", vmhook::jni::get_static_object_field(nullptr, nullptr) == nullptr);
-    check("jni::call_object_method(null) == nullptr",    vmhook::jni::call_object_method(nullptr, nullptr) == nullptr);
-    check("jni::call_static_object_method(null)==null",  vmhook::jni::call_static_object_method(nullptr, nullptr) == nullptr);
-    check("jni::new_string_utf(no JVM) == nullptr",      vmhook::jni::new_string_utf("x") == nullptr);
-    check("jni::get_string_utf(nullptr) is empty",       vmhook::jni::get_string_utf(nullptr).empty());
-    // exception_clear() is a void no-op when no JNIEnv resolves; calling it must
-    // not fault — observe by confirming control reaches the next line.
-    vmhook::jni::exception_clear();
-    check("jni::exception_clear() is a no-op (returned)", true);
+    // (B) String marshalling — NULL/empty no-JVM contract of the surviving
+    //     pure-VM pair.  Each short-circuits with no dereference of a fabricated
+    //     address: make_java_string bails when find_class("java/lang/String")
+    //     cannot resolve (no gHotSpotVMStructs), read_java_string bails on a null
+    //     oop.  Type signatures are pinned by the static_asserts above; here we
+    //     exercise the runtime no-op behaviour.
+    //
+    //     RE-POINTED from jni::new_string_utf / jni::get_string_utf, which the
+    //     de-JNI refactor deleted along with the rest of the forwarder surface.
+    //     The following runtime checks were REMOVED outright — no surviving API
+    //     carries the same property:
+    //       * jni::oop_handle round-trip (stores an oop verbatim into caller
+    //         storage and hands back a pointer to it).  The surviving verbatim
+    //         holder is vmhook::jni::global_ref / vmhook::pin, and its
+    //         store-and-return-unchanged behaviour is already covered
+    //         exhaustively by tests/test_global_ref.cpp — re-asserting it here
+    //         would duplicate, which this file's scope rule forbids.
+    //       * jni::decode_object(nullptr), jni::get_object_class(nullptr),
+    //         jni::klass_from_class_mirror(nullptr), jni::get_method_id,
+    //         jni::get_static_method_id, jni::get_static_field_id,
+    //         jni::get_static_object_field, jni::call_object_method,
+    //         jni::call_static_object_method — every one of these took a JNIEnv
+    //         or a jobject/jmethodID/jfieldID handle, none of which the header
+    //         produces any more.
+    //       * jni::exception_clear() no-fault probe — there is no JNIEnv left to
+    //         hold a pending exception.
+    check("make_java_string(no JVM) == nullptr",   vmhook::make_java_string("x") == nullptr);
+    check("make_java_string(\"\", no JVM)==null",  vmhook::make_java_string("") == nullptr);
+    check("read_java_string(nullptr) is empty",    vmhook::read_java_string(nullptr).empty());
 
     // (C) register_class / make_unique — no-JVM map+factory contract.
     //     Without a JVM, find_class() cannot verify the class, so register_class

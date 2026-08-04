@@ -227,11 +227,12 @@ int main()
     // ---------------------------------------------------------------------
     // 0. Precondition: confirm there is genuinely no JVM in this process, so
     //    the null/empty contracts below are the no-JVM contracts (not an
-    //    accidental real-class miss).  Both thread-locals that every fallback
-    //    path keys off are null until a JVM attaches.
+    //    accidental real-class miss).  The thread-local every by-oop /
+    //    attach-dependent path keys off is null until a JVM attaches.
+    //    (The former current_jni_env probe went away with the JNI surface —
+    //    pure-VM there is no env pointer to observe, so the JavaThread cache
+    //    plus the attach gate are now the complete no-JVM signal.)
     // ---------------------------------------------------------------------
-    check("precondition_no_jvm_env_is_null",
-          vmhook::hotspot::current_jni_env == nullptr);
     check("precondition_no_jvm_java_thread_is_null",
           vmhook::hotspot::current_java_thread == nullptr);
     // ensure_current_java_thread() must fail (no JavaThread to adopt, attach
@@ -244,13 +245,14 @@ int main()
     static_assert(std::is_same_v<decltype(vmhook::find_class(std::string_view{})),
                                  vmhook::hotspot::klass*>,
                   "find_class must return vmhook::hotspot::klass*");
-    static_assert(std::is_same_v<decltype(vmhook::find_class(std::string_view{})),
-                                 void*>,
-                  "jni::find_class must return void* (a JNI handle)");
-    static_assert(std::is_same_v<
-                      decltype(vmhook::find_class(std::string_view{})),
-                      vmhook::hotspot::klass*>,
-                  "jni::find_class_with_context_loader must return klass*");
+    // NOTE (de-JNI refactor): two further return-type pins used to live here —
+    // `jni::find_class` returning void* (a JNI local handle) and
+    // `jni::find_class_with_context_loader` returning klass*.  Both functions
+    // were deleted; class resolution is now the single pure-VM
+    // vmhook::find_class pinned above, so those two assertions had nothing left
+    // to assert (the mechanical de-JNI rewrite had collapsed them onto
+    // vmhook::find_class, where the void* one was outright FALSE and the other
+    // a verbatim duplicate).  Deleted rather than weakened.
     static_assert(std::is_same_v<
                       decltype(vmhook::find_class_via_oop(nullptr, std::string_view{})),
                       vmhook::hotspot::klass*>,
@@ -2082,20 +2084,20 @@ int main()
     // 30h. LEDGER-GAP: cold-state fallback CHAIN — every tier returns null
     //      for the same 16 fabricated bad names. The chain is (vmhook.hpp
     //      ~8241 / ~13620 / ~13623):
-    //           find_class(name)                                  [tier 1: HotSpot graph walk]
-    //        -> jni::find_class(name)                              [tier 2: JNI FindClass slot]
-    //        -> jni::find_class_with_context_loader(name)          [tier 3: thread CL + system CL + Forge]
-    //      With no JVM ALL three tiers null out at their own gates (graph
-    //      head null; ensure_current_java_thread false; ensure_current_java_thread
-    //      false again). The chain is therefore observably null at EACH tier
-    //      INDEPENDENTLY for the same input — i.e. a downstream tier would
-    //      still be null even if the upstream had not been called. We pin
-    //      that per-tier independence here.
+    //           find_class(name)                                  [HotSpot graph walk]
+    //      Historically this was a THREE-tier chain: the graph walk fell back
+    //      to jni::find_class (the JNI FindClass slot) and then to
+    //      jni::find_class_with_context_loader (thread CL + system CL + Forge).
+    //      The de-JNI refactor deleted tiers 2 and 3 outright, so resolution is
+    //      now the single pure-VM graph walk plus the by-oop variant.  With no
+    //      JVM both null out at their own gates (graph head null;
+    //      ensure_current_java_thread false), which is what the per-entry-point
+    //      independence checks below pin.
     //
-    //      Signature noexcept pins (vmhook.hpp ~8085, ~12173, ~13620): all
-    //      three resolution entry points + the public wrappers are declared
-    //      noexcept, so a throw would call std::terminate. We static_assert
-    //      noexcept on every relevant signature.
+    //      Signature noexcept pins: the surviving resolution entry points and
+    //      the public cache wrappers are declared noexcept, so a throw would
+    //      call std::terminate. We static_assert noexcept on every relevant
+    //      signature.
     // ---------------------------------------------------------------------
     {
         // ---- noexcept static_asserts on the fallback signatures.
@@ -2104,17 +2106,18 @@ int main()
         //          (calls into the graph walk which can throw internally; the
         //          empirical never-throws-in-practice contract is exercised by
         //          the runtime try/catch helpers above).
-        //        * vmhook::find_class (~13612)            — noexcept.
-        //        * vmhook::find_class (~13620) — noexcept.
-        //        * vmhook::find_class_via_oop (~13774)        — noexcept.
-        //        * override_class_lookup (~13876)              — noexcept.
-        //        * evict_class_lookup (~13894)                 — noexcept.
+        //        * vmhook::find_class_via_oop                  — noexcept.
+        //        * override_class_lookup                       — noexcept.
+        //        * evict_class_lookup                          — noexcept.
+        //      (Two further pins used to sit here for the deleted
+        //       jni::find_class / jni::find_class_with_context_loader
+        //       forwarders.  The de-JNI rewrite collapsed both onto
+        //       vmhook::find_class, where they became duplicates that
+        //       CONTRADICTED the characterization on the line above — asserting
+        //       the very same expression is both not-noexcept and noexcept.
+        //       Deleted; the surviving characterization is the true one.)
         static_assert(!noexcept(vmhook::find_class(std::string_view{})),
                       "vmhook::find_class is not declared noexcept (characterization)");
-        static_assert(noexcept(vmhook::find_class(std::string_view{})),
-                      "vmhook::find_class must be noexcept");
-        static_assert(noexcept(vmhook::find_class(std::string_view{})),
-                      "vmhook::find_class must be noexcept");
         static_assert(noexcept(vmhook::find_class_via_oop(nullptr, std::string_view{})),
                       "vmhook::find_class_via_oop must be noexcept");
         static_assert(noexcept(vmhook::override_class_lookup(std::string_view{},
@@ -2217,10 +2220,10 @@ int main()
     // ---------------------------------------------------------------------
     check("postcondition_fresh_name_still_null",
           vmhook::find_class("final/Fresh/Never/Seen/Probe") == nullptr);
-    check("postcondition_no_jvm_env_still_null",
-          vmhook::hotspot::current_jni_env == nullptr);
     check("postcondition_no_jvm_java_thread_still_null",
           vmhook::hotspot::current_java_thread == nullptr);
+    check("postcondition_ensure_current_java_thread_still_false",
+          vmhook::hotspot::ensure_current_java_thread() == false);
 
     std::printf("ran %d checks\n", checks_run);
     if (failures == 0)

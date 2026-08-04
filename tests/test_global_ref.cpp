@@ -1,35 +1,48 @@
 // Standalone (no-JVM) unit test for vmhook::jni::global_ref and vmhook::pin().
 //
-// global_ref is the GC-pin lifetime primitive ported from the NPNOQOL fork:
-// it keeps a Java object alive across relocating GCs and re-derives the live
-// (relocated) address via oop().  The cross-GC behaviour itself needs a live
-// JVM (covered by the JVM integration suite / tests/jvm/modules/global_ref.cpp);
-// here we pin down the parts that are FULLY testable without a JVM:
-//   * move-only semantics (copy is statically disabled, move is available),
-//   * null / empty / no-JVM construction is safe and inert,
-//   * a moved-from pin is empty, the moved-to pin owns the (empty) state,
-//   * move-assign self-assignment doesn't corrupt state or double-free,
-//   * chained / repeated moves never resurrect a handle,
-//   * a default / empty global_ref is null / falsy and safe to destroy & reset,
-//   * with no JVM, constructing from ANY non-null fake OOP stays empty
-//     (NewGlobalRef cannot run: current_jni_env is null), and destruction /
-//     reset / oop() / handle() / operator bool never crash,
-//   * pin() free helpers (oop overload + unique_ptr<wrapper> overload) compile
-//     and produce empty pins without a JVM, and round-trip through containers.
+// ===========================================================================
+// !! READ THIS BEFORE EDITING — GC-SURVIVAL COVERAGE IS INTENTIONALLY ABSENT !!
+// ===========================================================================
+// vmhook::jni::global_ref is currently a NO-OP STUB.  The header says so in as
+// many words: the constructor stores the raw OOP you hand it, the destructor
+// does nothing, and oop() gives the stored address back verbatim.  There is no
+// VM-side registration, so the holder
 //
-// WHY this is deterministic without a JVM:
-//   global_ref's ctor calls vmhook::detail::jni_new_global_ref(local_handle),
-//   which resolves slot 21 off vmhook::hotspot::current_jni_env.  In a plain
-//   test process current_jni_env is null, so jni_function<21> returns null and
-//   jni_new_global_ref returns nullptr -> handle_ stays null.  A null raw_oop is
-//   rejected even earlier (ctor early-return).  Therefore EVERY no-JVM-reachable
-//   global_ref has handle_ == nullptr, oop() == nullptr, !bool, and reset()/dtor
-//   hit the documented null no-op in jni_delete_global_ref.  oop()'s mask-and-
-//   deref branch is unreachable here (it requires a non-null handle), so no test
-//   below ever dereferences a fabricated handle -- there is no UB in this file.
+//   * does NOT keep the object alive (it is not a GC root), and
+//   * does NOT track relocation (a moving collector leaves it stale).
 //
-// Anything requiring a real pinned object that survives System.gc() is out of
-// scope here -- see the live-JVM module tests/jvm/modules/global_ref.cpp.
+// Therefore this file deliberately contains NO assertion — and no wording that
+// could be read as one — about an object surviving a collection, about a handle
+// being re-derived after a move, or about DeleteGlobalRef ever running.  Those
+// behaviours do not exist today and a test claiming them would be a lie that
+// passes.  What IS pinned down here is everything the stub genuinely promises:
+//
+//   * move-only, final, standard-layout, one-pointer-wide type shape,
+//   * EXPLICIT construction from an oop_t (no implicit pin from a raw pointer),
+//   * verbatim storage: oop() == handle() == the address passed in,
+//   * empty/null behaviour: default ctor, nullptr ctor, and reset() all agree,
+//   * reset() idempotence and dtor safety on both empty and armed holders,
+//   * move semantics as VALUE TRANSFER: the destination ends up holding exactly
+//     the source's address and the source ends up empty — never a resurrection,
+//   * self-move / self-swap preserve the stored address (the `this != &other`
+//     guard), and container round-trips (vector / deque / map / optional /
+//     pair / tuple / array / move-iterators) preserve every stored address.
+//
+// >>> WHEN THE REAL PIN LANDS: a genuine GC root must ALSO be covered by a
+// >>> live-JVM module (allocate, pin, drop all Java references, System.gc(),
+// >>> then prove oop() still resolves and — for a relocating collector — that
+// >>> it resolves to the NEW address).  That coverage belongs in
+// >>> tests/jvm/modules/, not here; this file cannot host it.  At that point
+// >>> the "verbatim storage" assertions below become WRONG and must be
+// >>> rewritten to the handle-indirection contract, and the
+// >>> is_trivially_destructible assertion in SECTION 1b must flip back to
+// >>> !is_trivially_destructible (a real pin needs a releasing destructor).
+// ===========================================================================
+//
+// WHY every check below is deterministic without a JVM: the stub never calls
+// into the VM at all.  Construction, oop(), handle(), reset() and destruction
+// are pure pointer bookkeeping, so they behave identically with and without a
+// JVM present and no fabricated address is ever dereferenced by this file.
 #include <vmhook/vmhook.hpp>
 
 #include <array>
@@ -54,12 +67,24 @@ static auto check(const char* name, bool ok) -> void
 }
 
 // Returns true iff `g` is in the canonical empty state across EVERY observable
-// no-JVM accessor at once (operator bool, oop(), handle()).  Used to assert the
-// "all three views agree" invariant after each lifecycle operation, so a bug
-// that nulls one view but not another is caught.
+// accessor at once (operator bool, oop(), handle()).  Used to assert the "all
+// three views agree" invariant after each lifecycle operation, so a bug that
+// nulls one view but not another is caught.
 static auto is_empty(const vmhook::jni::global_ref& g) -> bool
 {
     return !static_cast<bool>(g) && g.oop() == nullptr && g.handle() == nullptr;
+}
+
+// Returns true iff `g` reports EXACTLY `expected` across every observable
+// accessor at once.  This is the positive counterpart of is_empty(): it pins
+// the stub's verbatim-storage contract (oop() and handle() are the same stored
+// address, and operator bool is precisely "that address is non-null").
+static auto holds(const vmhook::jni::global_ref& g,
+                  const vmhook::oop_t expected) -> bool
+{
+    return g.oop() == expected
+        && g.handle() == expected
+        && static_cast<bool>(g) == (expected != nullptr);
 }
 
 // A minimal wrapper to exercise the pin(unique_ptr<T>) overload's compile path.
@@ -87,29 +112,27 @@ namespace
     // SAME object as both arguments exercises global_ref's `this != &other`
     // self-assignment guard at runtime WITHOUT any compiler seeing a syntactic
     // self-move at the call site -- so clang's -Wself-move never fires under
-    // -Werror (it is a purely syntactic diagnostic).  Mirrors the technique in
-    // the sibling test_jni_forwarders.cpp.
+    // -Werror (it is a purely syntactic diagnostic).
     auto launder_move_assign(vmhook::jni::global_ref& dst,
                              vmhook::jni::global_ref& src) -> void
     {
         dst = std::move(src);
     }
 
-    // Returns a global_ref BY VALUE built from the given OOP.  Used to drive the
-    // return-by-value / NRVO / guaranteed-elision paths through a real function
-    // boundary (a prvalue returned from a named local).  With no JVM the result
-    // is always empty; the point is that the move-on-return path is well-formed
-    // and leaves no armed handle behind.
-    auto make_ref(const std::uintptr_t bits) -> vmhook::jni::global_ref
-    {
-        vmhook::jni::global_ref local{ reinterpret_cast<vmhook::oop_t>(bits) };
-        return local;  // NRVO / implicit move of a local on return
-    }
-
     // Convenience: turn a uintptr_t bit pattern into an oop_t at a call site.
     auto oop_of(const std::uintptr_t bits) noexcept -> vmhook::oop_t
     {
         return reinterpret_cast<vmhook::oop_t>(bits);
+    }
+
+    // Returns a global_ref BY VALUE built from the given OOP.  Used to drive the
+    // return-by-value / NRVO / guaranteed-elision paths through a real function
+    // boundary (a prvalue returned from a named local).  The returned holder
+    // must carry the address through the move-on-return unchanged.
+    auto make_ref(const std::uintptr_t bits) -> vmhook::jni::global_ref
+    {
+        vmhook::jni::global_ref local{ oop_of(bits) };
+        return local;  // NRVO / implicit move of a local on return
     }
 }
 
@@ -135,8 +158,8 @@ int main()
     static_assert(std::is_nothrow_destructible_v<global_ref>,
                   "global_ref destructor must be noexcept (RAII release must not throw)");
     static_assert(std::is_nothrow_default_constructible_v<global_ref>,
-                  "global_ref default ctor must be noexcept (empty handle, no JNI call)");
-    // The from-OOP ctor is the one JNI-touching constructor: pin it noexcept.
+                  "global_ref default ctor must be noexcept (empty holder, no VM call)");
+    // The from-OOP ctor is the only value-taking constructor: pin it noexcept.
     static_assert(std::is_nothrow_constructible_v<global_ref, vmhook::oop_t>,
                   "global_ref(oop_t) must be noexcept");
     // The from-OOP ctor must be explicit: an oop_t (void*) must NOT implicitly
@@ -170,8 +193,8 @@ int main()
                   "reset() must be noexcept");
     check("move_only_type_traits", true);
 
-    // pin() free-function return types: both overloads yield an owning global_ref
-    // BY VALUE (never a reference / wrapper).  Pin the signatures.
+    // pin() free-function return types: both overloads yield a global_ref BY
+    // VALUE (never a reference / wrapper).  Pin the signatures.
     static_assert(
         std::is_same_v<decltype(vmhook::pin(std::declval<vmhook::oop_t>())), global_ref>,
         "pin(oop_t) must return a global_ref by value");
@@ -181,20 +204,22 @@ int main()
         "pin(unique_ptr<wrapper>&) must return a global_ref by value");
     static_assert(noexcept(vmhook::pin(std::declval<vmhook::oop_t>())),
                   "pin(oop_t) must be noexcept");
+    static_assert(noexcept(vmhook::pin(std::declval<const std::unique_ptr<dummy_wrapper>&>())),
+                  "pin(unique_ptr<wrapper>&) must be noexcept");
     check("pin_free_function_signatures", true);
 
     // ========================================================================
     // SECTION 1b -- DEEPER type properties: layout, triviality, swappability,
     //   constructibility/assignability value-category matrix (compile-time).
     //   These go beyond the basic move-only contract: they pin the EXACT
-    //   special-member shape (user-provided, hence non-trivial), the thin-
-    //   wrapper memory layout, swap support, and the precise set of argument
-    //   value-categories the (move-only) ctor / assignment will and won't bind.
+    //   special-member shape, the thin-wrapper memory layout, swap support, and
+    //   the precise set of argument value-categories the (move-only) ctor /
+    //   assignment will and won't bind.
     // ========================================================================
 
-    // -- Layout: global_ref is a thin, standard-layout wrapper around ONE void*
-    //    handle.  Asserting sizeof/alignof RELATIVE to void* (never an absolute
-    //    byte count) keeps this true on ILP32 and LP64 / LLP64 alike.
+    // -- Layout: global_ref is a thin, standard-layout wrapper around ONE void*.
+    //    Asserting sizeof/alignof RELATIVE to void* (never an absolute byte
+    //    count) keeps this true on ILP32 and LP64 / LLP64 alike.
     static_assert(std::is_standard_layout_v<global_ref>,
                   "global_ref must be standard-layout (a single void* member, no vtable)");
     static_assert(sizeof(global_ref) == sizeof(void*),
@@ -205,28 +230,38 @@ int main()
     static_assert(!std::is_aggregate_v<global_ref>,
                   "global_ref must not be an aggregate (it has user-declared ctors)");
     static_assert(!std::is_empty_v<global_ref>,
-                  "global_ref is not empty (it stores a void* handle)");
+                  "global_ref is not empty (it stores a void* member)");
     static_assert(!std::is_polymorphic_v<global_ref>,
                   "global_ref must not be polymorphic (no virtual functions)");
 
-    // -- Triviality: EVERY special member that matters is user-provided, so the
-    //    type is deliberately non-trivial in each of these axes.  A drift to a
-    //    defaulted/trivial move or dtor (which would skip DeleteGlobalRef) is a
-    //    real bug; pin the non-triviality so such a drift fails to compile.
+    // -- Triviality.  The move operations are user-provided (they steal and null
+    //    the source), so the type is deliberately non-trivial on those axes; a
+    //    drift to a defaulted/trivial move (which would leave the source armed,
+    //    duplicating the address) is a real bug and must fail to compile.
     static_assert(!std::is_trivially_copyable_v<global_ref>,
-                  "global_ref must NOT be trivially copyable (custom move + deleted copy + custom dtor)");
+                  "global_ref must NOT be trivially copyable (custom move + deleted copy)");
     static_assert(!std::is_trivial_v<global_ref>,
                   "global_ref must NOT be trivial");
-    static_assert(!std::is_trivially_destructible_v<global_ref>,
-                  "global_ref dtor is user-provided (it must run DeleteGlobalRef) -> not trivially destructible");
     static_assert(!std::is_trivially_move_constructible_v<global_ref>,
                   "global_ref move ctor is user-provided (steals + nulls source) -> not trivial");
     static_assert(!std::is_trivially_move_assignable_v<global_ref>,
-                  "global_ref move assignment is user-provided (releases old, steals, nulls) -> not trivial");
-    // Default ctor IS trivial in effect? No -- it is `= default` but the class
-    // has a non-trivial dtor, so the type is not trivially-default-constructible.
+                  "global_ref move assignment is user-provided (steals + nulls source) -> not trivial");
+    // The default ctor is `= default` but the sole member carries an NSDMI
+    // (`= nullptr`), so default-construction is NOT trivial -- an uninitialised
+    // holder would be indistinguishable from an armed one.
     static_assert(!std::is_trivially_default_constructible_v<global_ref>,
-                  "global_ref is not trivially default-constructible (non-trivial dtor present)");
+                  "global_ref must value-initialise its member (NSDMI) -> not trivially default-constructible");
+    // -- STUB-SPECIFIC (see the file header): the destructor is `= default` and
+    //    releases nothing, because there is nothing registered with the VM to
+    //    release.  This assertion is the tripwire for that fact: the day a real
+    //    pin lands, its destructor MUST release the root, the type stops being
+    //    trivially destructible, and this line fails -- which is exactly the
+    //    signal to come back here and restore the GC-survival coverage that the
+    //    file header says is missing.  Do not delete this assertion; flip it.
+    static_assert(std::is_trivially_destructible_v<global_ref>,
+                  "STUB TRIPWIRE: global_ref's dtor releases nothing today.  If this fails, a "
+                  "real releasing destructor landed -- flip this to !is_trivially_destructible "
+                  "and restore the GC-survival coverage described at the top of this file.");
 
     // -- Swappability: a move-only type that is nothrow-move-constructible AND
     //    nothrow-move-assignable is itself nothrow-swappable via std::swap.
@@ -269,15 +304,19 @@ int main()
     // qualified for assignment); pin that a const lvalue is not an assign target.
     static_assert(!std::is_assignable_v<const global_ref&, global_ref&&>,
                   "a const global_ref must not be an assignment target");
+    // Nor may a raw oop_t / nullptr be assigned in: there is no converting
+    // assignment operator, and the converting ctor is explicit.
+    static_assert(!std::is_assignable_v<global_ref&, vmhook::oop_t>,
+                  "a raw oop_t must NOT be assignable to a global_ref (explicit ctor, no converting assign)");
+    static_assert(!std::is_assignable_v<global_ref&, std::nullptr_t>,
+                  "nullptr must NOT be assignable to a global_ref (use reset())");
 
     // -- Move ctor / move assign EXPRESSION noexcept (decltype-level, in
-    //    addition to the is_nothrow_* traits above): constructing/assigning from
-    //    std::move(...) must be a noexcept expression.
+    //    addition to the is_nothrow_* traits above).
     static_assert(noexcept(global_ref{ std::declval<global_ref&&>() }),
                   "move-construction expression must be noexcept");
     static_assert(noexcept(std::declval<global_ref&>() = std::declval<global_ref&&>()),
                   "move-assignment expression must be noexcept");
-    // std::swap on two global_refs must be a noexcept expression too.
     static_assert(noexcept(std::swap(std::declval<global_ref&>(), std::declval<global_ref&>())),
                   "std::swap(global_ref&, global_ref&) must be noexcept");
 
@@ -355,7 +394,7 @@ int main()
     }
 
     // ========================================================================
-    // SECTION 3 -- Null-OOP construction is empty / inert (no NewGlobalRef)
+    // SECTION 3 -- Null-OOP construction is empty / inert
     // ========================================================================
     {
         global_ref from_null{ static_cast<vmhook::oop_t>(nullptr) };
@@ -363,16 +402,18 @@ int main()
         check("null_oop_construct_oop_is_null", from_null.oop() == nullptr);
         check("null_oop_construct_handle_is_null", from_null.handle() == nullptr);
         check("null_oop_construct_all_views_agree", is_empty(from_null));
+        check("null_oop_construct_matches_default_ctor", holds(from_null, nullptr));
         from_null.reset();
         check("null_oop_construct_reset_safe", is_empty(from_null));
     }
 
     // ========================================================================
-    // SECTION 4 -- Non-null fake OOP with NO JVM: NewGlobalRef can't run.
-    //   current_jni_env is null in this process, so jni_new_global_ref returns
-    //   nullptr; the pin must end up EMPTY, never holding a bogus handle.
-    //   We sweep several distinct fake addresses to make sure the result does
-    //   not depend on the particular bit pattern of the (rejected) OOP.
+    // SECTION 4 -- Non-null OOP: the holder stores the address VERBATIM.
+    //   The stub performs no VM call and no tag masking, so every accessor must
+    //   report back exactly the address that was passed in, for ANY bit
+    //   pattern.  We sweep several distinct fake addresses to prove the result
+    //   is a pure pass-through and does not depend on the bit pattern.
+    //   (None of these addresses is ever dereferenced.)
     // ========================================================================
     {
         const std::uintptr_t fakes[]{
@@ -380,195 +421,209 @@ int main()
             static_cast<std::uintptr_t>(~static_cast<std::uintptr_t>(0)),  // all-ones
             static_cast<std::uintptr_t>(0x7u),  // low-bit-tagged-looking value
         };
-        bool all_empty{ true };
-        bool all_oop_null{ true };
-        bool all_handle_null{ true };
+        bool all_hold{ true };
+        bool all_truthy{ true };
         for (const std::uintptr_t bits : fakes)
         {
-            auto* const fake_oop{ reinterpret_cast<vmhook::oop_t>(bits) };
-            global_ref no_jvm{ fake_oop };
-            all_empty       = all_empty && !static_cast<bool>(no_jvm);
-            all_oop_null    = all_oop_null && (no_jvm.oop() == nullptr);
-            all_handle_null = all_handle_null && (no_jvm.handle() == nullptr);
-            // destructor runs here on an empty handle -> exercises the null
-            // no-op path of jni_delete_global_ref each iteration -> no crash.
+            auto* const fake_oop{ oop_of(bits) };
+            global_ref armed{ fake_oop };
+            all_hold   = all_hold && holds(armed, fake_oop);
+            all_truthy = all_truthy && static_cast<bool>(armed);
+            // destructor runs here on an armed holder -> the stub's no-op
+            // release path, once per iteration -> no crash, no double-free.
         }
-        check("non_null_oop_without_jvm_is_empty", all_empty);
-        check("non_null_oop_without_jvm_oop_is_null", all_oop_null);
-        check("non_null_oop_without_jvm_handle_is_null", all_handle_null);
+        check("non_null_oop_is_stored_verbatim", all_hold);
+        check("non_null_oop_is_truthy", all_truthy);
     }
 
-    // reset() on a (no-JVM) pin built from a non-null OOP is still safe.
+    // oop() and handle() are the SAME stored address (not two different views),
+    // and repeated reads are stable.
     {
-        auto* const fake_oop{ reinterpret_cast<vmhook::oop_t>(
-            static_cast<std::uintptr_t>(0x4000)) };
-        global_ref no_jvm{ fake_oop };
-        no_jvm.reset();
-        check("non_null_oop_without_jvm_reset_safe", is_empty(no_jvm));
-        no_jvm.reset();  // idempotent again
-        check("non_null_oop_without_jvm_reset_idempotent", is_empty(no_jvm));
+        auto* const fake_oop{ oop_of(0x4100u) };
+        const global_ref armed{ fake_oop };
+        check("oop_and_handle_are_the_same_address",
+              armed.oop() == armed.handle() && armed.oop() == fake_oop);
+        check("armed_oop_reads_are_stable",
+              armed.oop() == armed.oop() && armed.handle() == armed.handle());
+    }
+
+    // reset() on an armed holder clears it, and is idempotent afterwards.
+    {
+        auto* const fake_oop{ oop_of(0x4000u) };
+        global_ref armed{ fake_oop };
+        check("armed_before_reset", holds(armed, fake_oop));
+        armed.reset();
+        check("reset_clears_armed_holder", is_empty(armed));
+        armed.reset();  // idempotent
+        armed.reset();
+        check("reset_on_armed_is_idempotent", is_empty(armed));
     }
 
     // ========================================================================
-    // SECTION 5 -- Move construction transfers ownership; source becomes empty
+    // SECTION 5 -- Move construction is VALUE TRANSFER: the destination ends up
+    //   holding exactly the source's address, and the source ends up empty.
     // ========================================================================
     {
-        global_ref a{};                       // empty (no JVM anyway)
+        global_ref a{};                       // empty
         global_ref b{ std::move(a) };
-        check("moved_from_is_falsy", !static_cast<bool>(a));            // NOLINT(bugprone-use-after-move)
-        check("moved_from_oop_is_null", a.oop() == nullptr);           // NOLINT(bugprone-use-after-move)
-        check("moved_from_handle_is_null", a.handle() == nullptr);     // NOLINT(bugprone-use-after-move)
-        check("moved_from_all_views_agree", is_empty(a));              // NOLINT(bugprone-use-after-move)
-        check("moved_to_is_consistent", is_empty(b));  // both empty here
+        check("moved_from_empty_is_falsy", !static_cast<bool>(a));            // NOLINT(bugprone-use-after-move)
+        check("moved_from_empty_oop_is_null", a.oop() == nullptr);           // NOLINT(bugprone-use-after-move)
+        check("moved_from_empty_handle_is_null", a.handle() == nullptr);     // NOLINT(bugprone-use-after-move)
+        check("moved_from_empty_all_views_agree", is_empty(a));              // NOLINT(bugprone-use-after-move)
+        check("moved_to_from_empty_is_empty", is_empty(b));
     }
 
-    // Move-construct from a no-JVM pin built off a non-null OOP: still both empty
-    // (because the source was already empty), and no double-free at scope end.
+    // Move-construct from an ARMED holder: the address migrates, the source is
+    // nulled (no duplicate holder of the same address exists afterwards).
     {
-        auto* const fake_oop{ reinterpret_cast<vmhook::oop_t>(
-            static_cast<std::uintptr_t>(0x2000)) };
-        global_ref a{ fake_oop };          // empty: NewGlobalRef no-op'd
+        auto* const fake_oop{ oop_of(0x2000u) };
+        global_ref a{ fake_oop };
         global_ref b{ std::move(a) };
-        check("move_ctor_from_nonnull_oop_src_empty", is_empty(a));    // NOLINT(bugprone-use-after-move)
-        check("move_ctor_from_nonnull_oop_dst_empty", is_empty(b));
+        check("move_ctor_src_is_emptied", is_empty(a));                      // NOLINT(bugprone-use-after-move)
+        check("move_ctor_dst_takes_address", holds(b, fake_oop));
     }
 
     // A moved-from pin is a valid object: it can be reset, re-checked, and
-    // re-assigned-into afterwards (no resurrection of a stale handle).
+    // re-assigned-into afterwards (no resurrection of the stolen address).
     {
-        global_ref a{};
+        auto* const fake_oop{ oop_of(0x2100u) };
+        global_ref a{ fake_oop };
         global_ref b{ std::move(a) };
-        (void)b;
+        check("moved_from_before_reset_empty", is_empty(a));                 // NOLINT(bugprone-use-after-move)
         a.reset();                                  // legal on a moved-from object
-        check("moved_from_can_be_reset", is_empty(a));   // NOLINT(bugprone-use-after-move)
-        a = global_ref{};                           // re-assign into moved-from
-        check("moved_from_can_be_reassigned", is_empty(a));
+        check("moved_from_can_be_reset", is_empty(a));
+        a = global_ref{ oop_of(0x2200u) };          // re-arm the moved-from holder
+        check("moved_from_can_be_rearmed", holds(a, oop_of(0x2200u)));
+        check("move_ctor_dst_unaffected_by_src_rearm", holds(b, fake_oop));
     }
 
     // ========================================================================
-    // SECTION 6 -- Move assignment: releases old, steals source, nulls source
+    // SECTION 6 -- Move assignment: steals the source's address, nulls source
     // ========================================================================
     {
         global_ref a{};
         global_ref b{};
         b = std::move(a);
-        check("move_assign_source_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
-        check("move_assign_dest_consistent", is_empty(b));
+        check("move_assign_empty_source_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
+        check("move_assign_empty_dest_empty", is_empty(b));
     }
 
     // Move-assign returns *this (so `(c = std::move(b))` chains correctly), and
     // the reference it returns is the destination object itself.
     {
-        global_ref a{};
+        auto* const fake_oop{ oop_of(0x2300u) };
+        global_ref a{ fake_oop };
         global_ref b{};
         global_ref& result{ (b = std::move(a)) };
         check("move_assign_returns_this", &result == &b);
-        check("move_assign_returns_dest_state", is_empty(result));
+        check("move_assign_returns_dest_state", holds(result, fake_oop));
     }
 
-    // Move-assign over a (no-JVM) pin that itself was built from a non-null OOP:
-    // the destination's prior handle is released (here: already null) before the
-    // steal -- exercises the `jni_delete_global_ref(this->handle_)` line in the
-    // assignment operator with both operands deterministically empty.
+    // Move-assign OVER an armed destination: the destination's prior address is
+    // dropped (overwritten) and replaced by the source's; the source is nulled.
     {
-        auto* const fake_a{ reinterpret_cast<vmhook::oop_t>(
-            static_cast<std::uintptr_t>(0x3000)) };
-        auto* const fake_b{ reinterpret_cast<vmhook::oop_t>(
-            static_cast<std::uintptr_t>(0x5000)) };
-        global_ref a{ fake_a };   // empty
-        global_ref b{ fake_b };   // empty
+        auto* const fake_a{ oop_of(0x3000u) };
+        auto* const fake_b{ oop_of(0x5000u) };
+        global_ref a{ fake_a };
+        global_ref b{ fake_b };
         b = std::move(a);
-        check("move_assign_nonnull_src_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
-        check("move_assign_nonnull_dst_empty", is_empty(b));
+        check("move_assign_armed_src_emptied", is_empty(a));   // NOLINT(bugprone-use-after-move)
+        check("move_assign_armed_dst_takes_src_address", holds(b, fake_a));
+        check("move_assign_armed_dst_dropped_old_address", b.oop() != fake_b);
     }
 
     // ========================================================================
-    // SECTION 7 -- Self-move-assign must not corrupt or double-free
+    // SECTION 7 -- Self-move-assign must not corrupt the holder.
     //   The operator is guarded by `if (this != &other)`, so a self-move is a
-    //   no-op: it must NOT delete-then-steal-from-itself (which would null the
-    //   handle).  We launder the self-reference through a pointer so the
-    //   compiler can't see it is a self-move (silences -Wself-move while still
-    //   exercising the runtime guard).
+    //   no-op: it must NOT null the stored address.  We launder the self-
+    //   reference through a pointer so the compiler can't see it is a self-move
+    //   (silences -Wself-move while still exercising the runtime guard).
+    //   NOTE: with the stub storing addresses verbatim this is now a REAL
+    //   assertion -- before the de-JNI change every holder was empty, so a
+    //   broken guard would have gone unnoticed here.
     // ========================================================================
     {
         global_ref a{};
         global_ref* const self{ &a };
-        *self = std::move(a);   // guarded self-move on an empty pin
+        *self = std::move(a);   // guarded self-move on an empty holder
         check("self_move_assign_empty_safe", is_empty(a));
     }
     {
-        auto* const fake_oop{ reinterpret_cast<vmhook::oop_t>(
-            static_cast<std::uintptr_t>(0x6000)) };
-        global_ref a{ fake_oop };   // empty (no JVM)
+        auto* const fake_oop{ oop_of(0x6000u) };
+        global_ref a{ fake_oop };
         global_ref* const self{ &a };
-        *self = std::move(a);   // guarded self-move; must not double-free
-        check("self_move_assign_nonnull_oop_safe", is_empty(a));
+        *self = std::move(a);   // guarded self-move; must NOT clear the address
+        check("self_move_assign_preserves_address", holds(a, fake_oop));
     }
     // Repeated self-move-assign stays safe (no accumulating corruption).
     {
-        global_ref a{};
+        auto* const fake_oop{ oop_of(0x6100u) };
+        global_ref a{ fake_oop };
         global_ref* const self{ &a };
         *self = std::move(a);
         *self = std::move(a);
         *self = std::move(a);
-        check("self_move_assign_repeated_safe", is_empty(a));
+        check("self_move_assign_repeated_preserves_address", holds(a, fake_oop));
     }
 
     // ========================================================================
-    // SECTION 8 -- Chained / double moves never resurrect a handle
+    // SECTION 8 -- Chained / double moves carry the address exactly once
     // ========================================================================
     {
-        global_ref a{};
+        auto* const fake_oop{ oop_of(0x7100u) };
+        global_ref a{ fake_oop };
         global_ref b{ std::move(a) };
         global_ref c{ std::move(b) };  // chain the move-ctor
         check("double_move_ctor_first_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
         check("double_move_ctor_middle_empty", is_empty(b));  // NOLINT(bugprone-use-after-move)
-        check("double_move_ctor_last_empty", is_empty(c));
+        check("double_move_ctor_last_holds_address", holds(c, fake_oop));
     }
     {
-        global_ref a{};
-        global_ref b{};
+        auto* const fake_a{ oop_of(0x7200u) };
+        auto* const fake_b{ oop_of(0x7300u) };
+        global_ref a{ fake_a };
+        global_ref b{ fake_b };
         global_ref c{};
         c = std::move(b);
         b = std::move(a);  // move-assign chain in the other direction
         check("chained_move_assign_a_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
-        check("chained_move_assign_b_empty", is_empty(b));
-        check("chained_move_assign_c_empty", is_empty(c));
+        check("chained_move_assign_b_holds_a", holds(b, fake_a));
+        check("chained_move_assign_c_holds_b", holds(c, fake_b));
     }
     // Mixed: move-construct, then move-assign the result onward.
     {
-        global_ref a{};
+        auto* const fake_oop{ oop_of(0x7400u) };
+        global_ref a{ fake_oop };
         global_ref b{ std::move(a) };
         global_ref c{};
         c = std::move(b);
         check("move_ctor_then_move_assign_src_empty", is_empty(a));  // NOLINT(bugprone-use-after-move)
         check("move_ctor_then_move_assign_mid_empty", is_empty(b));  // NOLINT(bugprone-use-after-move)
-        check("move_ctor_then_move_assign_dst_empty", is_empty(c));
+        check("move_ctor_then_move_assign_dst_holds", holds(c, fake_oop));
     }
 
     // ========================================================================
-    // SECTION 9 -- std::move on a non-null-OOP pin (no JVM) drops cleanly
-    //   Build several no-JVM pins from non-null OOPs and shuffle ownership
-    //   through ctor + assignment; at scope exit every dtor sees a null handle.
+    // SECTION 9 -- Shuffling ownership through ctor + assignment: exactly one
+    //   holder ends up with each address, the rest are empty, and every dtor at
+    //   scope exit is safe.
     // ========================================================================
     {
-        auto fake = [](std::uintptr_t v) {
-            return reinterpret_cast<vmhook::oop_t>(v);
-        };
-        global_ref a{ fake(0x10) };
-        global_ref b{ fake(0x20) };
-        global_ref c{ std::move(a) };
-        b = std::move(c);
+        auto* const fake_a{ oop_of(0x10u) };
+        auto* const fake_b{ oop_of(0x20u) };
+        global_ref a{ fake_a };
+        global_ref b{ fake_b };
+        global_ref c{ std::move(a) };   // c <- a's address, a empty
+        b = std::move(c);               // b <- a's address (b's own dropped), c empty
         global_ref d{};
-        d = std::move(b);
+        d = std::move(b);               // d <- a's address, b empty
         check("shuffle_a_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
         check("shuffle_b_empty", is_empty(b));   // NOLINT(bugprone-use-after-move)
         check("shuffle_c_empty", is_empty(c));   // NOLINT(bugprone-use-after-move)
-        check("shuffle_d_empty", is_empty(d));
+        check("shuffle_d_holds_first_address", holds(d, fake_a));
     }
 
     // ========================================================================
-    // SECTION 10 -- pin(oop_t) free helper: inert without a JVM
+    // SECTION 10 -- pin(oop_t) free helper: identical to direct construction
     // ========================================================================
     {
         auto pinned = vmhook::pin(static_cast<vmhook::oop_t>(nullptr));
@@ -576,24 +631,33 @@ int main()
         check("pin_null_oop_all_views_agree", is_empty(pinned));
     }
     {
-        // Non-null OOP, no JVM -> pin() must also be empty (NewGlobalRef no-op).
-        auto pinned = vmhook::pin(reinterpret_cast<vmhook::oop_t>(
-            static_cast<std::uintptr_t>(0x7000)));
-        check("pin_nonnull_oop_without_jvm_is_empty", is_empty(pinned));
+        // Non-null OOP -> pin() must produce the same verbatim-storage holder as
+        // `global_ref{ oop }` does.
+        auto* const fake_oop{ oop_of(0x7000u) };
+        auto pinned = vmhook::pin(fake_oop);
+        check("pin_nonnull_oop_stores_verbatim", holds(pinned, fake_oop));
+        const global_ref direct{ fake_oop };
+        check("pin_matches_direct_construction", pinned.oop() == direct.oop());
     }
     {
         // The pin() result is a prvalue we can move-construct from directly
-        // (guaranteed-copy-elision path + an explicit move both end empty).
-        global_ref moved_from_pin{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
-        check("pin_result_move_constructs_empty", is_empty(moved_from_pin));
+        // (guaranteed-copy-elision path) and move-assign from; the address must
+        // survive both.
+        auto* const fake_oop{ oop_of(0x7500u) };
+        global_ref moved_from_pin{ vmhook::pin(fake_oop) };
+        check("pin_result_move_constructs_with_address", holds(moved_from_pin, fake_oop));
 
         global_ref sink{};
-        sink = vmhook::pin(static_cast<vmhook::oop_t>(nullptr));  // move-assign from prvalue
-        check("pin_result_move_assigns_empty", is_empty(sink));
+        sink = vmhook::pin(oop_of(0x7600u));  // move-assign from prvalue
+        check("pin_result_move_assigns_with_address", holds(sink, oop_of(0x7600u)));
+
+        global_ref null_sink{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
+        check("pin_null_result_move_constructs_empty", is_empty(null_sink));
     }
 
     // ========================================================================
-    // SECTION 11 -- pin(unique_ptr<wrapper>) free helper: inert without a JVM
+    // SECTION 11 -- pin(unique_ptr<wrapper>) free helper: forwards the wrapper's
+    //   instance OOP, and yields an EMPTY holder for a null wrapper.
     // ========================================================================
     {
         std::unique_ptr<dummy_wrapper> null_wrapper{};
@@ -603,18 +667,21 @@ int main()
     }
     {
         // A *non-null* wrapper around a non-null fake OOP: pin() forwards
-        // wrapper->get_instance() into the global_ref ctor, which still no-ops
-        // without a JVM -> empty pin.  (MSVC copy-init for the unique_ptr.)
+        // wrapper->get_instance() into the global_ref ctor, which stores it
+        // verbatim -> the pin reports the wrapper's instance address.
+        auto* const fake_oop{ oop_of(0x8000u) };
         std::unique_ptr<dummy_wrapper> live_wrapper{
-            std::make_unique<dummy_wrapper>(
-                reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0x8000))) };
+            std::make_unique<dummy_wrapper>(fake_oop) };
         auto pinned_wrapper = vmhook::pin(live_wrapper);
-        check("pin_nonnull_wrapper_without_jvm_is_empty", is_empty(pinned_wrapper));
+        check("pin_nonnull_wrapper_forwards_instance", holds(pinned_wrapper, fake_oop));
         // pin() takes the unique_ptr by const&, so the wrapper is NOT consumed.
         check("pin_does_not_consume_wrapper", static_cast<bool>(live_wrapper));
         check("pin_wrapper_instance_preserved",
-              live_wrapper->vmhook::object_base::get_instance() ==
-                  reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0x8000)));
+              live_wrapper->vmhook::object_base::get_instance() == fake_oop);
+        // Pinning the same wrapper twice yields two holders on the same address
+        // (the stub has no ownership semantics to violate here).
+        auto pinned_again = vmhook::pin(live_wrapper);
+        check("pin_wrapper_twice_agrees", holds(pinned_again, fake_oop));
     }
     {
         // A second, DIFFERENT wrapper type to prove the template isn't hard-wired.
@@ -622,46 +689,55 @@ int main()
         auto pinned_other = vmhook::pin(null_other);
         check("pin_other_null_wrapper_is_empty", is_empty(pinned_other));
 
+        auto* const fake_oop{ oop_of(0x9000u) };
         std::unique_ptr<other_wrapper> live_other{
-            std::make_unique<other_wrapper>(
-                reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0x9000))) };
+            std::make_unique<other_wrapper>(fake_oop) };
         auto pinned_live_other = vmhook::pin(live_other);
-        check("pin_other_nonnull_wrapper_without_jvm_is_empty", is_empty(pinned_live_other));
+        check("pin_other_nonnull_wrapper_forwards_instance", holds(pinned_live_other, fake_oop));
     }
 
     // ========================================================================
-    // SECTION 12 -- Container round-trips (the unordered_map / snapshot use case)
+    // SECTION 12 -- Container round-trips (the snapshot / registry use case).
+    //   Every relocation, erase, growth and move must carry each stored address
+    //   to its new slot unchanged.
     // ========================================================================
     {
         std::vector<global_ref> pins;
         pins.emplace_back();
         pins.emplace_back(static_cast<vmhook::oop_t>(nullptr));
+        pins.emplace_back(oop_of(0x1234u));
         pins.reserve(64);  // forces a move-relocation of existing elements
         check("vector_of_pins_relocates",
-              pins.size() == 2 && is_empty(pins[0]) && is_empty(pins[1]));
+              pins.size() == 3 && is_empty(pins[0]) && is_empty(pins[1])
+                  && holds(pins[2], oop_of(0x1234u)));
     }
     {
         // Grow across multiple reallocations (each push past capacity move-
-        // relocates every element); every pin stays empty and nothing double-frees.
+        // relocates every element); every address must survive every relocation.
         std::vector<global_ref> pins;
         for (int i = 0; i < 50; ++i)
         {
-            pins.emplace_back(reinterpret_cast<vmhook::oop_t>(
-                static_cast<std::uintptr_t>(0x100 + i)));
+            pins.emplace_back(oop_of(static_cast<std::uintptr_t>(0x100 + i)));
         }
-        bool all_empty{ pins.size() == 50 };
-        for (const auto& p : pins)
+        bool all_hold{ pins.size() == 50 };
+        for (int i = 0; i < 50; ++i)
         {
-            all_empty = all_empty && is_empty(p);
+            all_hold = all_hold
+                && holds(pins[static_cast<std::size_t>(i)],
+                         oop_of(static_cast<std::uintptr_t>(0x100 + i)));
         }
-        check("vector_growth_keeps_pins_empty", all_empty);
+        check("vector_growth_preserves_addresses", all_hold);
 
-        // Erase from the middle (shifts elements via move-assignment).
+        // Erase from the middle (shifts elements LEFT via move-assignment): the
+        // remaining addresses shift with their elements, none are duplicated.
         pins.erase(pins.begin() + 10);
-        check("vector_erase_shifts_cleanly",
-              pins.size() == 49 && is_empty(pins.front()) && is_empty(pins.back()));
+        bool shift_ok{ pins.size() == 49
+            && holds(pins.front(), oop_of(0x100u))
+            && holds(pins[10], oop_of(0x100u + 11u))     // 0x10A was erased
+            && holds(pins.back(), oop_of(0x100u + 49u)) };
+        check("vector_erase_shifts_addresses_left", shift_ok);
 
-        // Clear releases all (every dtor sees a null handle).
+        // Clear releases all (every dtor runs on an armed holder).
         pins.clear();
         check("vector_clear_is_safe", pins.empty());
     }
@@ -669,80 +745,100 @@ int main()
         // std::move the whole vector: pins follow the buffer, originals drained.
         std::vector<global_ref> src;
         src.emplace_back();
-        src.emplace_back(static_cast<vmhook::oop_t>(nullptr));
+        src.emplace_back(oop_of(0x1250u));
         std::vector<global_ref> dst{ std::move(src) };
         check("vector_move_transfers_pins",
-              dst.size() == 2 && is_empty(dst[0]) && is_empty(dst[1]));
+              dst.size() == 2 && is_empty(dst[0]) && holds(dst[1], oop_of(0x1250u)));
     }
     {
         // A std::unique_ptr<global_ref> -- heap-owned pin, deleted via dtor.
         auto heap_pin = std::make_unique<global_ref>();
         check("unique_ptr_global_ref_is_empty", is_empty(*heap_pin));
+        *heap_pin = global_ref{ oop_of(0x1260u) };
+        check("unique_ptr_global_ref_rearms", holds(*heap_pin, oop_of(0x1260u)));
         heap_pin->reset();
         check("unique_ptr_global_ref_reset_safe", is_empty(*heap_pin));
-        heap_pin.reset();  // delete the heap global_ref -> dtor on null handle
+        heap_pin.reset();  // delete the heap global_ref -> dtor runs
         check("unique_ptr_global_ref_delete_safe", heap_pin == nullptr);
     }
 
     // ========================================================================
-    // SECTION 13 -- Lifetime / scope nesting: many ctor+dtor cycles
+    // SECTION 13 -- Lifetime / scope nesting: many ctor+dtor cycles.
     //   A tight loop of build-then-destroy proves there is no leak / corruption
-    //   path that accumulates across repeated RAII cycles (all on null handles).
+    //   path that accumulates across repeated RAII cycles.
     // ========================================================================
     {
         bool ok{ true };
         for (int i = 0; i < 1000; ++i)
         {
-            global_ref scoped{ reinterpret_cast<vmhook::oop_t>(
-                static_cast<std::uintptr_t>(0x10000 + i)) };
-            ok = ok && is_empty(scoped);
+            auto* const bits{ oop_of(static_cast<std::uintptr_t>(0x10000 + i)) };
+            global_ref scoped{ bits };
+            ok = ok && holds(scoped, bits);
             scoped.reset();
             ok = ok && is_empty(scoped);
         }  // dtor each iteration
         check("repeated_raii_cycles_stable", ok);
     }
     {
-        // Nested scopes with overlapping lifetimes, inner moved out to outer.
+        // Nested scopes with overlapping lifetimes, inner moved out to outer:
+        // the address outlives the inner scope inside the outer holder.
+        auto* const fake_oop{ oop_of(0x13100u) };
         global_ref outer{};
         {
-            global_ref inner{ static_cast<vmhook::oop_t>(nullptr) };
+            global_ref inner{ fake_oop };
             outer = std::move(inner);
             check("nested_inner_moved_out_empty", is_empty(inner));  // NOLINT(bugprone-use-after-move)
-        }  // inner dtor on null handle
-        check("nested_outer_holds_empty", is_empty(outer));
+        }  // inner dtor
+        check("nested_outer_holds_moved_address", holds(outer, fake_oop));
     }
 
     // ========================================================================
     // SECTION 14 -- std::swap: the move-only swap path (move-ctor + 2 move-
-    //   assigns under the hood).  Both operands empty in the no-JVM state, so
-    //   the swap must leave them both empty and never double-free a handle.
+    //   assigns under the hood) must EXCHANGE the two stored addresses.
     // ========================================================================
     {
-        global_ref a{ oop_of(0xA000u) };   // empty (no JVM)
-        global_ref b{ oop_of(0xB000u) };   // empty (no JVM)
+        auto* const fake_a{ oop_of(0xA000u) };
+        auto* const fake_b{ oop_of(0xB000u) };
+        global_ref a{ fake_a };
+        global_ref b{ fake_b };
         using std::swap;
         swap(a, b);
-        check("swap_two_empties_a_empty", is_empty(a));
-        check("swap_two_empties_b_empty", is_empty(b));
+        check("swap_exchanges_addresses_a", holds(a, fake_b));
+        check("swap_exchanges_addresses_b", holds(b, fake_a));
+        swap(a, b);  // swap back
+        check("swap_roundtrip_restores_a", holds(a, fake_a));
+        check("swap_roundtrip_restores_b", holds(b, fake_b));
+    }
+    {
+        // Swap an armed holder with an empty one: the emptiness swaps too.
+        auto* const fake_oop{ oop_of(0xB800u) };
+        global_ref armed{ fake_oop };
+        global_ref empty{};
+        using std::swap;
+        swap(armed, empty);
+        check("swap_armed_with_empty_src_now_empty", is_empty(armed));
+        check("swap_armed_with_empty_dst_now_armed", holds(empty, fake_oop));
     }
     {
         // Self-swap via std::swap: std::swap(a, a) routes both refs to the same
         // object internally (NOT a syntactic self-move, so -Wself-move stays
-        // silent) and must leave the pin intact / empty -- no double-free.
-        global_ref a{ oop_of(0xC000u) };
+        // silent) and must leave the stored address intact.
+        auto* const fake_oop{ oop_of(0xC000u) };
+        global_ref a{ fake_oop };
         using std::swap;
         swap(a, a);
-        check("self_swap_is_safe", is_empty(a));
+        check("self_swap_preserves_address", holds(a, fake_oop));
     }
     {
-        // A 3-way rotation built from two swaps; every pin stays empty.
+        // A 3-way rotation built from two swaps; track where each address lands.
+        auto* const fake_b{ oop_of(0xD000u) };
         global_ref a{};
-        global_ref b{ oop_of(0xD000u) };
+        global_ref b{ fake_b };
         global_ref c{ static_cast<vmhook::oop_t>(nullptr) };
         using std::swap;
-        swap(a, b);
-        swap(b, c);
-        check("three_way_swap_a_empty", is_empty(a));
+        swap(a, b);   // a <- 0xD000, b <- empty
+        swap(b, c);   // b <- empty,  c <- empty
+        check("three_way_swap_a_holds", holds(a, fake_b));
         check("three_way_swap_b_empty", is_empty(b));
         check("three_way_swap_c_empty", is_empty(c));
     }
@@ -750,20 +846,20 @@ int main()
     // ========================================================================
     // SECTION 15 -- Return-by-value / NRVO / guaranteed-elision through a real
     //   function boundary.  make_ref() returns a prvalue global_ref; bind it,
-    //   move-assign it, and feed it straight into a container.  Every path is
-    //   well-formed and ends empty (no JVM) with nothing left armed.
+    //   move-assign it, and feed it straight into a container.  The address must
+    //   survive the move-on-return in every path.
     // ========================================================================
     {
         global_ref r{ make_ref(0xE000u) };   // move-on-return into a fresh pin
-        check("return_by_value_binds_empty", is_empty(r));
+        check("return_by_value_carries_address", holds(r, oop_of(0xE000u)));
 
         global_ref sink{};
         sink = make_ref(0xE100u);             // move-assign from a returned prvalue
-        check("return_by_value_move_assigns_empty", is_empty(sink));
+        check("return_by_value_move_assigns_address", holds(sink, oop_of(0xE100u)));
 
-        // Returned prvalue consumed directly by is_empty() (a temporary that
-        // lives only for the full expression, then its dtor runs on a null handle).
-        check("return_by_value_temporary_empty", is_empty(make_ref(0xE200u)));
+        // Returned prvalue consumed directly (a temporary that lives only for
+        // the full expression, then its dtor runs).
+        check("return_by_value_temporary_holds", holds(make_ref(0xE200u), oop_of(0xE200u)));
     }
     {
         // A returned pin pushed into a vector (the prvalue is moved into the
@@ -772,70 +868,79 @@ int main()
         v.push_back(make_ref(0xE300u));
         v.push_back(make_ref(0xE400u));
         check("return_by_value_into_vector",
-              v.size() == 2 && is_empty(v.front()) && is_empty(v.back()));
+              v.size() == 2 && holds(v.front(), oop_of(0xE300u))
+                  && holds(v.back(), oop_of(0xE400u)));
     }
 
     // ========================================================================
-    // SECTION 16 -- Ternary / conditional yielding a prvalue global_ref.
-    //   Both arms produce an (empty) pin; the selected prvalue is bound and
-    //   must be empty regardless of which arm ran.
+    // SECTION 16 -- Ternary / conditional yielding a prvalue global_ref.  The
+    //   selected arm's address must be the one that survives into the binding.
     // ========================================================================
     {
-        const bool take_left{ (failures % 2) == 0 };  // value-dependent, both arms empty
+        const bool take_left{ (failures % 2) == 0 };
         global_ref chosen{ take_left ? global_ref{ oop_of(0xF000u) }
                                      : global_ref{ static_cast<vmhook::oop_t>(nullptr) } };
-        check("ternary_prvalue_is_empty", is_empty(chosen));
+        check("ternary_prvalue_selects_correct_arm",
+              take_left ? holds(chosen, oop_of(0xF000u)) : is_empty(chosen));
     }
 
     // ========================================================================
     // SECTION 17 -- std::optional<global_ref>: a move-only payload in optional.
     //   emplace / reset / move-construct / move-assign the optional and confirm
-    //   the contained pin's empty contract survives each transition.
+    //   the contained holder's address survives each transition.
     // ========================================================================
     {
         std::optional<global_ref> opt;
         check("optional_starts_disengaged", !opt.has_value());
 
-        opt.emplace(oop_of(0x11000u));           // construct a pin in place
+        opt.emplace(oop_of(0x11000u));           // construct a holder in place
         check("optional_emplaced_engaged", opt.has_value());
-        check("optional_emplaced_value_empty", is_empty(*opt));
+        check("optional_emplaced_value_holds", holds(*opt, oop_of(0x11000u)));
 
-        opt.reset();                              // destroy the contained pin
+        opt.reset();                              // destroy the contained holder
         check("optional_reset_disengaged", !opt.has_value());
 
-        // Move-construct an engaged optional into another; source becomes a
-        // disengaged-or-empty optional, destination holds an empty pin.
+        // Move-construct an engaged optional into another; the address migrates
+        // to the destination and the source's contained holder is emptied.
         std::optional<global_ref> src;
-        src.emplace(static_cast<vmhook::oop_t>(nullptr));
+        src.emplace(oop_of(0x11100u));
         std::optional<global_ref> dst{ std::move(src) };
-        check("optional_move_ctor_dst_has_empty", dst.has_value() && is_empty(*dst));
+        check("optional_move_ctor_dst_holds", dst.has_value() && holds(*dst, oop_of(0x11100u)));
+        check("optional_move_ctor_src_contained_emptied",
+              src.has_value() && is_empty(*src));   // NOLINT(bugprone-use-after-move)
 
         // Move-assign a fresh engaged optional over an engaged one.
         std::optional<global_ref> reassigned;
         reassigned.emplace(oop_of(0x12000u));
         reassigned = std::optional<global_ref>{ global_ref{ oop_of(0x13000u) } };
-        check("optional_move_assign_holds_empty", reassigned.has_value() && is_empty(*reassigned));
+        check("optional_move_assign_holds_new_address",
+              reassigned.has_value() && holds(*reassigned, oop_of(0x13000u)));
     }
 
     // ========================================================================
     // SECTION 18 -- global_ref inside std::pair / std::tuple (move-only members
-    //   in aggregates the STL move as a unit).  Build, move the whole pair/tuple,
-    //   and confirm the embedded pin stays empty.
+    //   in aggregates the STL moves as a unit).  Build, move the whole
+    //   pair/tuple, and confirm each embedded address survives.
     // ========================================================================
     {
         std::pair<int, global_ref> p{ 7, global_ref{ oop_of(0x14000u) } };
-        check("pair_member_pin_empty", is_empty(p.second));
+        check("pair_member_holds", holds(p.second, oop_of(0x14000u)));
         std::pair<int, global_ref> moved{ std::move(p) };
-        check("pair_moved_member_pin_empty", moved.first == 7 && is_empty(moved.second));
+        check("pair_moved_member_holds",
+              moved.first == 7 && holds(moved.second, oop_of(0x14000u)));
+        check("pair_moved_from_member_emptied", is_empty(p.second));  // NOLINT(bugprone-use-after-move)
     }
     {
         std::tuple<global_ref, int, global_ref> t{
             global_ref{ oop_of(0x15000u) }, 9, global_ref{ static_cast<vmhook::oop_t>(nullptr) } };
-        check("tuple_members_pins_empty",
-              is_empty(std::get<0>(t)) && std::get<1>(t) == 9 && is_empty(std::get<2>(t)));
+        check("tuple_members_hold",
+              holds(std::get<0>(t), oop_of(0x15000u)) && std::get<1>(t) == 9
+                  && is_empty(std::get<2>(t)));
         std::tuple<global_ref, int, global_ref> moved{ std::move(t) };
-        check("tuple_moved_members_pins_empty",
-              is_empty(std::get<0>(moved)) && std::get<1>(moved) == 9 && is_empty(std::get<2>(moved)));
+        check("tuple_moved_members_hold",
+              holds(std::get<0>(moved), oop_of(0x15000u)) && std::get<1>(moved) == 9
+                  && is_empty(std::get<2>(moved)));
+        check("tuple_moved_from_member_emptied", is_empty(std::get<0>(t)));  // NOLINT(bugprone-use-after-move)
     }
 
     // ========================================================================
@@ -849,16 +954,19 @@ int main()
         {
             dq.emplace_back(oop_of(static_cast<std::uintptr_t>(0x16000 + i)));
         }
-        bool all_empty{ dq.size() == 40 };
-        for (const auto& p : dq)
+        bool all_hold{ dq.size() == 40 };
+        for (int i = 0; i < 40; ++i)
         {
-            all_empty = all_empty && is_empty(p);
+            all_hold = all_hold
+                && holds(dq[static_cast<std::size_t>(i)],
+                         oop_of(static_cast<std::uintptr_t>(0x16000 + i)));
         }
-        check("deque_growth_keeps_pins_empty", all_empty);
+        check("deque_growth_preserves_addresses", all_hold);
         dq.pop_front();   // shrink from the front (deque-specific path)
         dq.pop_back();
         check("deque_pop_ends_safe",
-              dq.size() == 38 && is_empty(dq.front()) && is_empty(dq.back()));
+              dq.size() == 38 && holds(dq.front(), oop_of(0x16001u))
+                  && holds(dq.back(), oop_of(0x16000u + 38u)));
         dq.clear();
         check("deque_clear_safe", dq.empty());
     }
@@ -867,21 +975,21 @@ int main()
         m.emplace(1, global_ref{ oop_of(0x17000u) });
         m.emplace(2, global_ref{ static_cast<vmhook::oop_t>(nullptr) });
         m.emplace(3, global_ref{});
-        // operator[] default-constructs then move-assigns a fresh pin in.
+        // operator[] default-constructs then move-assigns a fresh holder in.
         m[4] = global_ref{ oop_of(0x17400u) };
-        bool all_empty{ m.size() == 4 };
-        for (const auto& kv : m)
-        {
-            all_empty = all_empty && is_empty(kv.second);
-        }
-        check("map_of_pins_all_empty", all_empty);
-        m.erase(2);   // node removal -> dtor on a null handle
-        check("map_erase_safe", m.size() == 3 && is_empty(m.at(1)) && is_empty(m.at(4)));
+        check("map_of_pins_holds_addresses",
+              m.size() == 4 && holds(m.at(1), oop_of(0x17000u)) && is_empty(m.at(2))
+                  && is_empty(m.at(3)) && holds(m.at(4), oop_of(0x17400u)));
+        m.erase(2);   // node removal -> dtor
+        check("map_erase_safe",
+              m.size() == 3 && holds(m.at(1), oop_of(0x17000u))
+                  && holds(m.at(4), oop_of(0x17400u)));
     }
 
     // ========================================================================
     // SECTION 20 -- Bulk move between containers via move-iterators.  Drains the
-    //   source elements (each left empty / moved-from) into the destination.
+    //   source elements (each left empty) into the destination, which must end
+    //   up holding every address in order.
     // ========================================================================
     {
         std::vector<global_ref> src;
@@ -894,14 +1002,16 @@ int main()
         dst.insert(dst.end(),
                    std::make_move_iterator(src.begin()),
                    std::make_move_iterator(src.end()));
-        bool dst_empty{ dst.size() == 16 };
-        for (const auto& p : dst)
+        bool dst_ok{ dst.size() == 16 };
+        for (int i = 0; i < 16; ++i)
         {
-            dst_empty = dst_empty && is_empty(p);
+            dst_ok = dst_ok
+                && holds(dst[static_cast<std::size_t>(i)],
+                         oop_of(static_cast<std::uintptr_t>(0x18000 + i)));
         }
-        check("move_iterator_transfer_dst_empty", dst_empty);
-        // The source elements were moved-from: still alive, still empty (no
-        // resurrection, no double-free at either vector's teardown).
+        check("move_iterator_transfer_dst_holds_all", dst_ok);
+        // The source elements were moved-from: still alive, now empty (no
+        // resurrection, no duplicated address in two containers at once).
         bool src_drained{ src.size() == 16 };
         for (const auto& p : src)
         {
@@ -911,33 +1021,36 @@ int main()
     }
     {
         // std::vector::insert in the MIDDLE move-shifts the tail RIGHT (distinct
-        // from the erase/left-shift already covered) -- every pin stays empty.
+        // from the erase/left-shift already covered) -- every address must land
+        // in its new slot unchanged.
         std::vector<global_ref> v;
         for (int i = 0; i < 20; ++i)
         {
             v.emplace_back(oop_of(static_cast<std::uintptr_t>(0x19000 + i)));
         }
         v.insert(v.begin() + 5, global_ref{ oop_of(0x19500u) });
-        bool ok{ v.size() == 21 };
-        for (const auto& p : v)
-        {
-            ok = ok && is_empty(p);
-        }
-        check("vector_insert_middle_shifts_cleanly", ok);
+        bool ok{ v.size() == 21
+            && holds(v[4], oop_of(0x19004u))
+            && holds(v[5], oop_of(0x19500u))     // the inserted element
+            && holds(v[6], oop_of(0x19005u))     // the shifted-right tail
+            && holds(v.back(), oop_of(0x19013u)) };
+        check("vector_insert_middle_shifts_addresses_right", ok);
 
-        // resize UP (default-constructs new empty pins) then DOWN (destroys tail).
+        // resize UP (default-constructs new empty holders) then DOWN (destroys
+        // the tail; the survivors keep their addresses).
         v.resize(30);
         check("vector_resize_up_appends_empty",
-              v.size() == 30 && is_empty(v.back()));
+              v.size() == 30 && is_empty(v.back()) && holds(v[5], oop_of(0x19500u)));
         v.resize(3);
         check("vector_resize_down_destroys_tail",
-              v.size() == 3 && is_empty(v.front()) && is_empty(v.back()));
+              v.size() == 3 && holds(v.front(), oop_of(0x19000u))
+                  && holds(v.back(), oop_of(0x19002u)));
     }
 
     // ========================================================================
-    // SECTION 21 -- C-array / std::array of pins, and a deeper double-use-after-
-    //   move chain (a moved-from pin used as BOTH a move source AND a move
-    //   destination repeatedly).  No handle is ever resurrected.
+    // SECTION 21 -- C-array / std::array of holders, and a deeper double-use-
+    //   after-move chain (a moved-from holder used as BOTH a move source AND a
+    //   move destination repeatedly).  No address is ever resurrected.
     // ========================================================================
     {
         // Double braces: std::array is an aggregate wrapping a C array, so a
@@ -947,60 +1060,60 @@ int main()
             global_ref{ static_cast<vmhook::oop_t>(nullptr) },
             global_ref{ oop_of(0x1A200u) },
             global_ref{} } };
-        bool all_empty{ true };
-        for (const auto& p : arr)
-        {
-            all_empty = all_empty && is_empty(p);
-        }
-        check("std_array_of_pins_empty", all_empty);
+        check("std_array_of_pins_holds",
+              holds(arr[0], oop_of(0x1A000u)) && is_empty(arr[1])
+                  && holds(arr[2], oop_of(0x1A200u)) && is_empty(arr[3]));
     }
     {
-        // A moved-from pin is a valid empty object: move it AGAIN (as source),
-        // then move INTO it (as destination), alternating several times.  Each
-        // step must keep every participant empty.
-        global_ref a{ oop_of(0x1B000u) };
-        global_ref b{ std::move(a) };          // a moved-from
+        // A moved-from holder is a valid empty object: move it AGAIN (as
+        // source), then move INTO it (as destination), alternating several
+        // times.  The address must never be duplicated or resurrected.
+        auto* const fake_oop{ oop_of(0x1B000u) };
+        global_ref a{ fake_oop };
+        global_ref b{ std::move(a) };          // b takes 0x1B000, a moved-from
         global_ref c{ std::move(a) };          // move the moved-from a AGAIN  // NOLINT(bugprone-use-after-move)
         check("double_move_from_same_source_a_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
-        check("double_move_from_same_source_b_empty", is_empty(b));
+        check("double_move_from_same_source_b_holds", holds(b, fake_oop));
         check("double_move_from_same_source_c_empty", is_empty(c));
 
         a = std::move(b);                       // move INTO the moved-from a
-        check("reassign_into_moved_from_a_empty", is_empty(a));
+        check("reassign_into_moved_from_a_holds", holds(a, fake_oop));
         check("reassign_into_moved_from_b_empty", is_empty(b));   // NOLINT(bugprone-use-after-move)
 
-        a = std::move(c);                       // and again
+        a = std::move(c);                       // and again -- c is empty, so a is cleared
         check("reassign_into_moved_from_again_a_empty", is_empty(a));
         check("reassign_into_moved_from_again_c_empty", is_empty(c));   // NOLINT(bugprone-use-after-move)
     }
 
     // ========================================================================
-    // SECTION 22 -- re-pin after reset / re-arm after move; and the laundered
-    //   self-move (matching the sibling forwarder test's technique) over both
-    //   the default and non-null-OOP states.  Confirms reset() does not poison
-    //   the object for a subsequent (no-JVM, still-empty) re-pin.
+    // SECTION 22 -- re-arm after reset / re-arm after move; and the laundered
+    //   self-move over both the empty and armed states.  Confirms reset() does
+    //   not poison the object for a subsequent re-arm.
     // ========================================================================
     {
         global_ref g{ oop_of(0x1C000u) };
+        check("reset_then_repin_initial_holds", holds(g, oop_of(0x1C000u)));
         g.reset();
         check("reset_then_repin_reset_empty", is_empty(g));
-        g = global_ref{ oop_of(0x1C100u) };     // re-pin via move-assign from prvalue
-        check("reset_then_repin_reassigned_empty", is_empty(g));
+        g = global_ref{ oop_of(0x1C100u) };     // re-arm via move-assign from prvalue
+        check("reset_then_repin_rearmed_holds", holds(g, oop_of(0x1C100u)));
         g.reset();
         check("reset_then_repin_final_reset_empty", is_empty(g));
     }
     {
         // Move OUT of g (g becomes moved-from), then re-arm g via assignment, in
-        // a loop -- proves an object can cycle move-out / re-arm indefinitely.
+        // a loop -- proves an object can cycle move-out / re-arm indefinitely
+        // and that each cycle's address lands where it should.
         global_ref g{};
         bool ok{ true };
         for (int i = 0; i < 64; ++i)
         {
             global_ref taken{ std::move(g) };
             ok = ok && is_empty(g);             // NOLINT(bugprone-use-after-move)
-            g = global_ref{ oop_of(static_cast<std::uintptr_t>(0x1D000 + i)) };
-            ok = ok && is_empty(g);
-            (void)taken;                         // taken dtors here on null handle
+            auto* const bits{ oop_of(static_cast<std::uintptr_t>(0x1D000 + i)) };
+            g = global_ref{ bits };
+            ok = ok && holds(g, bits);
+            (void)taken;                         // taken dtors here
         }
         check("move_out_then_rearm_cycle_stable", ok);
     }
@@ -1011,57 +1124,59 @@ int main()
         launder_move_assign(empty_self, empty_self);
         check("laundered_self_move_empty_safe", is_empty(empty_self));
 
-        global_ref oop_self{ oop_of(0x1E000u) };
+        auto* const fake_oop{ oop_of(0x1E000u) };
+        global_ref oop_self{ fake_oop };
         launder_move_assign(oop_self, oop_self);
-        check("laundered_self_move_nonnull_oop_safe", is_empty(oop_self));
+        check("laundered_self_move_preserves_address", holds(oop_self, fake_oop));
 
         // Repeated laundered self-moves accumulate no corruption.
-        global_ref repeat_self{ oop_of(0x1E100u) };
+        auto* const repeat_oop{ oop_of(0x1E100u) };
+        global_ref repeat_self{ repeat_oop };
         launder_move_assign(repeat_self, repeat_self);
         launder_move_assign(repeat_self, repeat_self);
         launder_move_assign(repeat_self, repeat_self);
-        check("laundered_self_move_repeated_safe", is_empty(repeat_self));
+        check("laundered_self_move_repeated_preserves_address", holds(repeat_self, repeat_oop));
     }
 
     // ========================================================================
-    // SECTION 23 -- Exhaustive bit-pattern sweep of the no-JVM from-OOP ctor.
-    //   Drives the ctor with addresses that look like JNI-tagged handles (every
-    //   low-3-bit tag), is_valid_pointer debug-fill sentinels, alignment edges,
-    //   and pointer-width extremes.  Without a JVM the NewGlobalRef table slot is
-    //   unresolved, so EVERY pattern must yield an empty pin (handle stays null)
-    //   -- the result must not depend on the bit pattern of the rejected OOP, and
-    //   oop()'s mask-and-deref branch is never reached (handle_ is null).
+    // SECTION 23 -- Exhaustive bit-pattern sweep of the from-OOP ctor.  Drives
+    //   the ctor with addresses that look like JNI-tagged handles (every low-3-
+    //   bit tag), is_valid_pointer debug-fill sentinels, alignment edges, and
+    //   pointer-width extremes.  The stub applies NO masking, NO untagging and
+    //   NO validation, so every pattern must come back out bit-for-bit -- if a
+    //   future change starts masking tag bits, these fail loudly instead of
+    //   silently corrupting addresses.  (Nothing here is dereferenced.)
     // ========================================================================
     {
         // All eight low-3-bit "tag" values OR'd onto an otherwise-valid base, to
         // mimic JDK 9+ tagged JNI handles the ctor would receive on a live JVM.
-        bool all_empty{ true };
+        bool all_hold{ true };
         for (std::uintptr_t tag = 0; tag < 8u; ++tag)
         {
             const std::uintptr_t bits{ 0x20000u | tag };
             global_ref g{ oop_of(bits) };
-            all_empty = all_empty && is_empty(g);
+            all_hold = all_hold && holds(g, oop_of(bits));
         }
-        check("ctor_all_low3_tag_patterns_empty", all_empty);
+        check("ctor_all_low3_tag_patterns_stored_unmasked", all_hold);
     }
     {
-        // The debug-fill / sentinel low-32 patterns is_valid_pointer rejects;
-        // the ctor still no-ops without a JVM regardless, so all stay empty.
+        // The debug-fill / sentinel low-32 patterns is_valid_pointer rejects.
+        // The ctor does no validation, so all are stored verbatim.
         const std::uintptr_t sentinels[]{
             0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
             0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu,
         };
-        bool all_empty{ true };
+        bool all_hold{ true };
         for (const std::uintptr_t bits : sentinels)
         {
             global_ref g{ oop_of(bits) };
-            all_empty = all_empty && is_empty(g);
+            all_hold = all_hold && holds(g, oop_of(bits));
         }
-        check("ctor_sentinel_patterns_empty", all_empty);
+        check("ctor_sentinel_patterns_stored_verbatim", all_hold);
     }
     {
-        // Alignment edges and pointer-width extremes (all reinterpret-only; never
-        // dereferenced because the handle stays null without a JVM).
+        // Alignment edges and pointer-width extremes (all reinterpret-only;
+        // never dereferenced).  Each is stored verbatim, and reset() clears it.
         const std::uintptr_t edges[]{
             std::uintptr_t{ 1u },
             std::uintptr_t{ 2u },
@@ -1072,22 +1187,22 @@ int main()
             static_cast<std::uintptr_t>(~std::uintptr_t{ 0 }) & ~std::uintptr_t{ 0b111 },  // all-ones, aligned
             static_cast<std::uintptr_t>(std::uintptr_t{ 1 } << (sizeof(void*) * 8u - 1u)), // top bit only
         };
-        bool all_empty{ true };
+        bool all_ok{ true };
         for (const std::uintptr_t bits : edges)
         {
             global_ref g{ oop_of(bits) };
-            all_empty = all_empty && is_empty(g);
-            g.reset();                            // reset on each is a no-op
-            all_empty = all_empty && is_empty(g);
+            all_ok = all_ok && holds(g, oop_of(bits));
+            g.reset();
+            all_ok = all_ok && is_empty(g);
         }
-        check("ctor_alignment_and_width_edges_empty", all_empty);
+        check("ctor_alignment_and_width_edges_stored_then_reset", all_ok);
     }
 
     // ========================================================================
     // SECTION W28 -- LEDGER-driven deepening: re-pin the explicit "default ctor
-    //   holds nullptr", "move-only via deleted copy", "reset()/dtor safe on null"
-    //   and the noexcept triad on a FRESH set of static_asserts + runtime checks,
-    //   so a regression cannot quietly remove ANY ONE of them.
+    //   holds nullptr", "move-only via deleted copy", "reset()/dtor safe on
+    //   null" and the noexcept triad on a FRESH set of static_asserts + runtime
+    //   checks, so a regression cannot quietly remove ANY ONE of them.
     // ========================================================================
 
     // Move-only contract via the precise deleted-vs-defined trait pairing.
@@ -1109,7 +1224,7 @@ int main()
         check("w28_default_ctor_holds_nullptr",
               g.handle() == nullptr && g.oop() == nullptr && !static_cast<bool>(g));
     }
-    // Runtime: reset() on an already-null pin is a no-op (still null, idempotent).
+    // Runtime: reset() on an already-null holder is a no-op (still null, idempotent).
     {
         global_ref g{};
         g.reset();
@@ -1118,7 +1233,7 @@ int main()
         check("w28_reset_idempotent_on_null",
               g.handle() == nullptr && g.oop() == nullptr && !static_cast<bool>(g));
     }
-    // Runtime: destructor on a null pin is safe (exits cleanly).
+    // Runtime: destructor on a null holder is safe (exits cleanly).
     {
         {
             global_ref g{};
@@ -1132,6 +1247,20 @@ int main()
         global_ref b{ nullptr };
         check("w28_nullptr_ctor_matches_default",
               is_empty(a) && is_empty(b));
+    }
+    // Runtime: an armed holder is the exact complement of an empty one across
+    // all three views at once (bool / oop() / handle()), so a future change that
+    // desyncs one view from the others fails here.
+    {
+        auto* const fake_oop{ oop_of(0x1F000u) };
+        global_ref g{ fake_oop };
+        check("w28_armed_views_are_consistent",
+              static_cast<bool>(g) && g.oop() == fake_oop && g.handle() == fake_oop
+                  && !is_empty(g));
+        g.reset();
+        check("w28_armed_then_reset_flips_all_views",
+              !static_cast<bool>(g) && g.oop() == nullptr && g.handle() == nullptr
+                  && is_empty(g));
     }
 
     return failures == 0 ? 0 : 1;

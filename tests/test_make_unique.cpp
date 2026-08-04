@@ -353,11 +353,16 @@ static auto wrap_oop_roundtrips(vmhook::oop_t oop, bool& threw) -> bool
 int main()
 {
     // --- Precondition: we really are running with no JVM --------------------
-    // make_unique's first statement (ensure_current_java_thread) fails here, so
-    // every make_unique below returns null at that guard.  current_jni_env being
-    // null is the same no-JVM signal the sibling no-JVM suites assert.
-    check("precondition_no_jvm_env_is_null",
-          vmhook::hotspot::current_jni_env == nullptr);
+    // make_unique's first statement is ensure_current_java_thread(), which fails
+    // here, so every make_unique below returns null at that guard.  We assert the
+    // gate DIRECTLY (rather than an indirect proxy): with no HotSpot thread list
+    // to walk, this OS thread cannot be identified as a JavaThread, so the gate
+    // is false and the thread-local cache stays null.  Same signal the sibling
+    // no-JVM suites assert (see test_classloader_reanchor.cpp).
+    check("precondition_ensure_current_java_thread_false",
+          vmhook::hotspot::ensure_current_java_thread() == false);
+    check("precondition_no_cached_java_thread",
+          vmhook::hotspot::current_java_thread == nullptr);
 
     // =====================================================================
     // SECTION A — RETURN-TYPE CONTRACT (compile-time).

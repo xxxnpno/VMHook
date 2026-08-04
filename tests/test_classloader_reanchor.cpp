@@ -174,12 +174,12 @@ namespace
 
     // ---- ADDITIVE deepening (section 13) no-throw probes ---------------------
     // The remaining no-JVM-observable entry points of the classloader_reanchor
-    // feature beyond the four already covered above: the public JNI context-
-    // loader resolver (vmhook::find_class), the
-    // HotSpot-internal find_class consumer that override/evict actually steer
-    // (vmhook::find_class), and the detail:: host-classloader-inheritance
-    // machinery (klass_to_class_loader_oop / capture_host_classloader_klass /
-    // inherit_host_context_classloader_for_current_thread).  Each must honour the
+    // feature beyond the four already covered above: the class resolver that
+    // override/evict actually steer (vmhook::find_class) and the detail::
+    // host-classloader machinery (klass_to_class_loader_oop /
+    // capture_host_classloader_klass).  (The separate JNI context-loader
+    // resolver and inherit_host_context_classloader_for_current_thread were
+    // deleted by the de-JNI refactor.)  Each must honour the
     // no-JVM contract (null / no-op, never throw, never fault on a NON-deref'd
     // null / is_valid_pointer-rejected argument).  None of these fabricates a
     // live oop/klass and reads through it: with no JVM, ensure_current_java_thread
@@ -209,11 +209,12 @@ namespace
         try { vmhook::detail::capture_host_classloader_klass(k); return true; }
         catch (...) { return false; }
     }
-    auto inherit_host_never_throws() -> bool
-    {
-        try { vmhook::detail::inherit_host_context_classloader_for_current_thread(); return true; }
-        catch (...) { return false; }
-    }
+    // NOTE (de-JNI refactor): an `inherit_host_never_throws()` sibling used to
+    // sit here for detail::inherit_host_context_classloader_for_current_thread().
+    // That function was DELETED — the library no longer attaches native threads,
+    // so there is no freshly-attached thread for a host context loader to be
+    // inherited onto (see the removal note at vmhook.hpp ~1643).  There is no
+    // surviving equivalent to re-point at, so its never-throws probe is gone.
 
     // A spread of fake non-null anchor pointers.  None is ever dereferenced:
     // find_class_via_oop bails at the ensure_current_java_thread() gate BEFORE
@@ -304,10 +305,10 @@ int main()
     // 0. Precondition: genuinely NO JVM in this process, so the contracts
     //    below are the no-JVM contracts (not an accidental real-class miss).
     //    The reanchor paths key off ensure_current_java_thread() — pin that it
-    //    is false and that both thread-locals it consults are null.
+    //    is false and that the thread-local it consults is null.  (The former
+    //    current_jni_env probe went with the JNI surface; pure-VM there is no
+    //    env pointer to observe.)
     // ---------------------------------------------------------------------
-    check("precondition_no_jvm_env_is_null",
-          vmhook::hotspot::current_jni_env == nullptr);
     check("precondition_no_jvm_java_thread_is_null",
           vmhook::hotspot::current_java_thread == nullptr);
     check("precondition_ensure_current_java_thread_false",
@@ -963,19 +964,17 @@ int main()
     //     exercised above.  Three further entry points are part of this
     //     feature per the header (vmhook.hpp):
     //
-    //       * vmhook::find_class(name)  (~13620)
-    //           -> detail::jni_find_class_with_context_loader (~12173), which
-    //           short-circuits to nullptr on !ensure_current_java_thread()
-    //           (~12176).  Public, noexcept, klass*.
-    //       * vmhook::find_class(name)  (~8146) — the HotSpot-internal consumer
-    //           that override_class_lookup / reanchor actually steer.  Its
-    //           empty-name fast-reject (~8161) and array-name '[' branch (~8175,
-    //           via jni_find_class which also gates on ensure_current_java_thread
-    //           ~11872) make it a clean nullptr with no JVM for EVERY shape.
-    //       * detail host-classloader inheritance: klass_to_class_loader_oop
-    //           (~12463), capture_host_classloader_klass (~12492),
-    //           inherit_host_context_classloader_for_current_thread (~12534),
-    //           and the host_classloader_klass latch (~12451).  With no JVM,
+    //       * vmhook::find_class(name) — the sole class resolver that
+    //           override_class_lookup / reanchor actually steer.  Its
+    //           empty-name fast-reject and array-name '[' branch make it a
+    //           clean nullptr with no JVM for EVERY shape.  (It used to fall
+    //           back to detail::jni_find_class_with_context_loader and a
+    //           separate public context-loader resolver; both were deleted by
+    //           the de-JNI refactor, so this is now the whole resolution path.)
+    //       * detail host-classloader machinery: klass_to_class_loader_oop,
+    //           capture_host_classloader_klass, and the host_classloader_klass
+    //           latch.  (inherit_host_context_classloader_for_current_thread
+    //           was deleted along with native-thread attachment.)  With no JVM,
     //           iterate_struct_entries("Klass", ...) is null (gHotSpotVMStructs
     //           unexported) so klass_to_class_loader_oop returns nullptr WITHOUT
     //           dereferencing its argument; capture is therefore a no-op and the
@@ -989,16 +988,18 @@ int main()
     // =====================================================================
 
     // ---- 13a. Compile-time signature / return-type / noexcept contracts -----
-    static_assert(std::is_same_v<
-                      decltype(vmhook::find_class(std::string_view{})),
-                      vmhook::hotspot::klass*>,
-                  "find_class_with_context_loader must return vmhook::hotspot::klass*");
-    static_assert(noexcept(vmhook::find_class(std::string_view{})),
-                  "find_class_with_context_loader must be noexcept");
+    // NOTE (de-JNI refactor): find_class_with_context_loader was DELETED, and
+    // the mechanical rewrite collapsed its two pins onto vmhook::find_class —
+    // producing an exact duplicate of the find_class return-type pin below plus
+    // a noexcept pin that is FALSE (vmhook::find_class is deliberately not
+    // declared noexcept; see test_find_class_contracts.cpp, which characterizes
+    // that).  Both collapsed pins deleted; the true find_class pins are kept.
     static_assert(std::is_same_v<
                       decltype(vmhook::find_class(std::string_view{})),
                       vmhook::hotspot::klass*>,
                   "find_class must return vmhook::hotspot::klass*");
+    static_assert(!noexcept(vmhook::find_class(std::string_view{})),
+                  "find_class is deliberately NOT noexcept (characterization)");
     static_assert(std::is_same_v<
                       decltype(vmhook::detail::klass_to_class_loader_oop(nullptr)),
                       void*>,
@@ -1011,22 +1012,19 @@ int main()
                   "capture_host_classloader_klass must return void");
     static_assert(noexcept(vmhook::detail::capture_host_classloader_klass(nullptr)),
                   "capture_host_classloader_klass must be noexcept");
-    static_assert(std::is_same_v<
-                      decltype(vmhook::detail::inherit_host_context_classloader_for_current_thread()),
-                      void>,
-                  "inherit_host_context_classloader_for_current_thread must return void");
-    static_assert(noexcept(vmhook::detail::inherit_host_context_classloader_for_current_thread()),
-                  "inherit_host_context_classloader_for_current_thread must be noexcept");
+    // (The two return-type / noexcept pins for
+    //  detail::inherit_host_context_classloader_for_current_thread were deleted
+    //  with the function itself — no thread attachment, no loader to inherit.)
     // The host-klass latch is a std::atomic<klass*>.
     static_assert(std::is_same_v<decltype(vmhook::detail::host_classloader_klass),
                       std::atomic<vmhook::hotspot::klass*>>,
                   "host_classloader_klass must be std::atomic<klass*>");
     check("section13_compile_time_contracts_compiled", true);
 
-    // ---- 13b. find_class_with_context_loader: null for EVERY name shape -----
-    //      The ensure_current_java_thread() gate (~12176) fails with no JVM, so
-    //      every name resolves to nullptr without any JNI / loadClass work, and
-    //      it never throws nor mutates the cache.
+    // ---- 13b. find_class: null for EVERY name shape ------------------------
+    //      With no JVM the ClassLoaderDataGraph head is unreadable, so every
+    //      name resolves to nullptr without any loadClass work, and it never
+    //      throws nor mutates the cache.
     {
         const std::size_t before{ cache_size() };
         const auto names{ build_name_matrix() };
@@ -1146,17 +1144,22 @@ int main()
         check("host_latch_still_null_after_capture",
               vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) == nullptr);
 
-        // inherit_*: latch is null -> immediate no-op, never throws.
-        check("inherit_host_no_throw", inherit_host_never_throws());
+        // (the inherit_* never-throws check was deleted with the function; its
+        //  precondition — "latch is null so the follow-on step is a no-op" — is
+        //  still asserted directly by the latch checks either side of it.)
+        // Re-capture with the SAME null candidate to prove capture_* is
+        // idempotent and still leaves the latch unpublished, which is the
+        // property the deleted inherit_* check was really riding on.
+        check("capture_null_candidate_idempotent_no_throw", capture_host_never_throws(nullptr));
         check("host_latch_null_at_section_exit",
               vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) == nullptr);
     }
 
     // ---- 13f. Concurrent no-JVM smoke for the added resolution entry points --
-    //      find_class_with_context_loader, find_class, klass_to_class_loader_oop
-    //      (null), capture (null) and inherit hammered from many threads must all
-    //      hold the no-JVM contract and never crash.  We count any non-null /
-    //      any latch publication; both must remain zero / null.
+    //      find_class, klass_to_class_loader_oop (null) and capture (null)
+    //      hammered from many threads must all hold the no-JVM contract and
+    //      never crash.  We count any non-null / any latch publication; both
+    //      must remain zero / null.
     {
         constexpr int thread_count{ 8 };
         constexpr int iterations{ 200 };
@@ -1182,7 +1185,10 @@ int main()
                         ++resolved[static_cast<std::size_t>(t)];
                     }
                     vmhook::detail::capture_host_classloader_klass(nullptr);
-                    vmhook::detail::inherit_host_context_classloader_for_current_thread();
+                    // (the inherit_host_context_classloader_for_current_thread()
+                    //  call that used to close this loop body went with the
+                    //  function; capture_* is now the whole latch surface the
+                    //  concurrency check can hammer)
                 }
             });
         }
@@ -1322,15 +1328,21 @@ int main()
     //      pointer-to-function identity (catches a silent overload/template
     //      drift) and the exact noexcept / return-type / arg-type triple.
     {
-        using ctx_loader_fn_t = vmhook::hotspot::klass*(*)(std::string_view) noexcept;
+        // The public resolver's pointer-to-function identity.  NOTE: the pair of
+        // pins that used to live here named the DELETED
+        // find_class_with_context_loader / detail::jni_find_class_with_context_loader,
+        // and the mechanical rewrite pointed the first at vmhook::find_class
+        // while keeping the old `noexcept` in the function type — which is wrong
+        // (find_class is not noexcept).  Re-pointed at vmhook::find_class with
+        // its ACTUAL type, so the pointer-to-function identity coverage (silent
+        // overload / template drift) is preserved rather than dropped; the
+        // second pin is gone with its function.
+        using resolver_fn_t = vmhook::hotspot::klass*(*)(std::string_view);
         static_assert(std::is_same_v<
                           decltype(&vmhook::find_class),
-                          ctx_loader_fn_t>,
-                      "find_class_with_context_loader must be klass*(string_view) noexcept");
-        static_assert(std::is_same_v<
-                          decltype(&vmhook::detail::jni_find_class_with_context_loader),
-                          ctx_loader_fn_t>,
-                      "detail::jni_find_class_with_context_loader must match the public sig");
+                          resolver_fn_t>,
+                      "vmhook::find_class must be klass*(string_view) — not noexcept, "
+                      "not an overload set, not a template");
         // klass_to_class_loader_oop: void*(klass*) noexcept.
         using k2l_fn_t = void*(*)(vmhook::hotspot::klass*) noexcept;
         static_assert(std::is_same_v<
@@ -1343,12 +1355,8 @@ int main()
                           decltype(&vmhook::detail::capture_host_classloader_klass),
                           capture_fn_t>,
                       "capture_host_classloader_klass must be void(klass*) noexcept");
-        // inherit_host_context_classloader_for_current_thread: void() noexcept.
-        using inherit_fn_t = void(*)() noexcept;
-        static_assert(std::is_same_v<
-                          decltype(&vmhook::detail::inherit_host_context_classloader_for_current_thread),
-                          inherit_fn_t>,
-                      "inherit_* must be void() noexcept");
+        // (the inherit_host_context_classloader_for_current_thread identity pin
+        //  was deleted with the function)
         // Use is_always_lock_free (constexpr) instead of is_lock_free() —
         // the runtime call requires linking libatomic on Linux clang for
         // certain compilers/configs (undefined __atomic_is_lock_free).
