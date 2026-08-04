@@ -1622,9 +1622,9 @@ namespace vmhook
         /*
             @brief Adopts the calling thread's HotSpot JavaThread* if it has one.
             @details
-            PURE-VM (no JNI): checks whether the current OS thread is already a
-            registered HotSpot JavaThread and, if so, caches it.  It does NOT
-            attach a fresh native thread (that needs a VM call) — inside a detour /
+            Checks whether the current OS thread is already a registered HotSpot
+            JavaThread and, if so, caches it.  It does NOT attach a fresh native
+            thread — that would require a call into the VM — so inside a detour /
             hooked method the calling thread is always a JavaThread, and heap
             allocation walks the whole thread list rather than requiring THIS thread.
             Defined later in the file after java_thread is fully declared.
@@ -1640,9 +1640,9 @@ namespace vmhook
     {
         inline auto find_call_stub_entry() noexcept -> void*;
 
-        // inherit_host_context_classloader_for_current_thread() removed
-        // (JNI-based host-loader inheritance; pure-VM build no longer attaches
-        // native threads, so there is nothing to inherit onto).
+        // inherit_host_context_classloader_for_current_thread() removed: the
+        // library no longer attaches native threads, so there is no freshly
+        // attached thread for a host context loader to be inherited onto.
 
         /*
             @brief Forward declaration for the JVM primitive field-width helper used
@@ -1827,7 +1827,7 @@ namespace vmhook
         // `using value_type_t = value_type;` silently resolves to
         // `using value_type_t = bool;`, every unique_ptr<Wrapper> arg
         // collapses to is_base_of<object_base, bool> == false at the call
-        // site, and the JNI arg slot is left zero-initialised.  Use `wrapped_type`
+        // site, and the outgoing argument slot is left zero-initialised.  Use `wrapped_type`
         // (or any name that does not collide with the base typedef) instead.
         template<typename wrapped_type, typename deleter_type>
         struct is_unique_ptr<std::unique_ptr<wrapped_type, deleter_type>> : std::true_type
@@ -3248,26 +3248,20 @@ namespace vmhook
 
             /*
                 @brief Returns the from-compiled entry point.
-                @details The VMStruct field name changed across JDK versions:
-                         JDK <= 20: "_from_compiled_code_entry_point"
-                         JDK 21+:   "_from_compiled_entry"
-                         Both names are tried at first call; the result is cached.
+                @details The VMStructs field is "_from_compiled_entry".  A
+                         "_from_compiled_code_entry_point" probe used to run
+                         first here on the belief that older JDKs spelled it that
+                         way; it was MEASURED absent on live JDK 8, 21 and 26
+                         alike (the field has always been "_from_compiled_entry",
+                         at offset 64 on all three), so the extra table walk was
+                         dead work on every supported version and is gone.
+                         The result is cached.
             */
             auto get_from_compiled_entry() const noexcept
                 -> void*
             {
-                static const vmhook::hotspot::vm_struct_entry_t* const entry{ []() noexcept
-                    -> const vmhook::hotspot::vm_struct_entry_t*
-                        {
-                            const vmhook::hotspot::vm_struct_entry_t* found_entry{ vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_code_entry_point") };
-                            if (!found_entry)
-                            {
-                                found_entry = vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_entry");
-                            }
-
-                            return found_entry;
-                        }()
-                };
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{
+                    vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_entry") };
                 if (!entry)
                 {
                     return nullptr;
@@ -3301,18 +3295,10 @@ namespace vmhook
             auto set_from_compiled_entry(void* const entry_point) noexcept
                 -> void
             {
-                static const vmhook::hotspot::vm_struct_entry_t* const entry{ []() noexcept
-                    -> const vmhook::hotspot::vm_struct_entry_t*
-                    {
-                        const vmhook::hotspot::vm_struct_entry_t* found_entry{ vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_code_entry_point") };
-                        if (!found_entry)
-                        {
-                            found_entry = vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_entry");
-                        }
-
-                        return found_entry;
-                    }()
-                };
+                // "_from_compiled_entry" is the name on every measured JDK
+                // (8 / 21 / 26) — see get_from_compiled_entry().
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{
+                    vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_entry") };
                 if (!entry || !vmhook::hotspot::is_valid_pointer(this))
                 {
                     return;
@@ -4503,8 +4489,7 @@ namespace vmhook
                 The bootstrap loader is represented by a null pointer here,
                 so a null return is a valid result for bootstrap classes
                 (java.lang, jdk.internal, etc.).  For everything else this is
-                the heap ClassLoader oop suitable for use as a fake JNI handle
-                target.
+                the raw heap oop of the java.lang.ClassLoader instance itself.
 
                 Complexity: O(1) after VMStructs offset is cached on first call.
                 Exception safety: noexcept — returns nullptr on any failure.
@@ -5376,14 +5361,14 @@ namespace vmhook
 
 
         /*
-            @brief Adopts the calling thread's HotSpot JavaThread* if it has one (pure-VM, no JNI).
+            @brief Adopts the calling thread's HotSpot JavaThread* if it has one.
             @details
             Resolution order:
               1. Thread-local current_java_thread is already set — fast return.
               2. Search the HotSpot thread list for the current OS thread ID.
-              3. Not a JavaThread — return false.  (The old JNI AttachCurrentThread
-                 step is gone: pure-VM cannot attach a fresh native thread, and a
-                 detour always runs on a thread that is already a JavaThread.)
+              3. Not a JavaThread — return false.  There is no attach step: the
+                 library cannot register a fresh native thread with the VM, and a
+                 detour always runs on a thread that is already a JavaThread.
 
             Complexity: O(N) worst case on first call, where N = number of live Java threads.
             Exception safety: noexcept — returns false on failure.
@@ -5408,13 +5393,13 @@ namespace vmhook
                 return true;
             }
 
-            // Pure-VM: no JNI AttachCurrentThread.  Inside a detour / hooked method
-            // the calling thread is ALWAYS a HotSpot JavaThread and is adopted above.
-            // A native thread that HotSpot has never seen cannot be attached without a
-            // VM call, so report false here; operations that only need SOME JavaThread
-            // (TLAB allocation walks the whole thread list) do not depend on this.
-            VMHOOK_LOG("{} ensure_current_java_thread(): OS thread {} is not a HotSpot JavaThread "
-                       "and pure-VM cannot attach it (no JNI).",
+            // Inside a detour / hooked method the calling thread is ALWAYS a HotSpot
+            // JavaThread and is adopted above.  A native thread that HotSpot has never
+            // seen cannot be registered without a call into the VM, so report false
+            // here; operations that only need SOME JavaThread (TLAB allocation walks
+            // the whole thread list) do not depend on this.
+            VMHOOK_LOG("{} ensure_current_java_thread(): OS thread {} is not a HotSpot JavaThread; "
+                       "this library cannot register a native thread with the VM.",
                        vmhook::info_tag, current_os_thread_id);
             return false;
         }
@@ -5814,9 +5799,9 @@ namespace vmhook
                      and the legacy +8 fallback decodes to nothing.
             @details
             Mirrors the writer make_java_object (~vmhook.hpp:14554).  Centralising
-            here removes the four copy-paste hardcoded `+8 / uint32 / decode` sites
-            (klass_from_object_header, klass_from_oop, for_each_instance scanner,
-            jni_make_unique diagnostic) that previously decoded garbage on the
+            here removes the copy-paste hardcoded `+8 / uint32 / decode` sites
+            (klass_from_object_header, klass_from_oop, the for_each_instance
+            scanner) that previously decoded garbage on the
             uncompressed-class-pointer config.
             Exception safety: noexcept — pure pointer arithmetic + decode_klass_pointer.
         */
@@ -8313,14 +8298,11 @@ namespace vmhook
             add_skip("_i2i_entry");
             add_skip("_from_interpreted_entry");
 
-            // Preferred guess: the slot just before _from_compiled_entry
-            // (or its JDK 21+ alias _from_compiled_code_entry_point).
+            // Preferred guess: the slot just before _from_compiled_entry (the
+            // only spelling of that field on any measured JDK — 8, 21 and 26 all
+            // publish "_from_compiled_entry" at offset 64).
             // Validate it before committing.
-            const auto* fce_entry{ vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_code_entry_point") };
-            if (!fce_entry)
-            {
-                fce_entry = vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_entry");
-            }
+            const auto* const fce_entry{ vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_entry") };
             if (fce_entry && fce_entry->offset >= sizeof(void*))
             {
                 const std::size_t guess{ static_cast<std::size_t>(fce_entry->offset) - sizeof(void*) };
@@ -8375,8 +8357,8 @@ namespace vmhook
             @brief Remembers candidate as the host-application's class source.
             @details
             Forward declaration; defined alongside the rest of the
-            host-context-classloader machinery further down so it can call into
-            the JNI helpers.  No-op when candidate is null or bootstrap-loaded.
+            host-context-classloader machinery further down.  No-op when candidate
+            is null or bootstrap-loaded.
         */
         inline auto capture_host_classloader_klass(vmhook::hotspot::klass* candidate) noexcept
             -> void;
@@ -8426,37 +8408,23 @@ namespace vmhook
         -> vmhook::hotspot::klass*
     {
         // Empty-name fast-reject.  An empty internal class name can never name a
-        // loaded class, so there is nothing to resolve.  Short-circuiting here is
-        // not merely an optimisation: without it an empty name falls through the
-        // full ClassLoaderDataGraph walk and then into
-        // jni_find_class_with_context_loader, which invokes
-        // ClassLoader.loadClass("") via JNI on the calling (possibly freshly-
-        // attached) thread.  On a cold JDK 17+ JVM that empty-binary-name path is
-        // far less travelled than an ordinary ClassNotFoundException miss, and a
-        // fault inside it escapes the library's MinGW/clang try/catch (which can
-        // only contain C++ throws, not a structured AV) and tears the JVM down.
-        // Rejecting "" up front is behaviour-preserving — the previous code also
-        // returned nullptr for an empty name, just by the long way around.
+        // loaded class, so there is nothing to resolve and the full
+        // ClassLoaderDataGraph walk would be pure waste.  Behaviour is unchanged
+        // either way — the walk also returns nullptr for "" — this just takes the
+        // short way around, and keeps the empty string out of the lookup cache.
         if (class_name.empty())
         {
             return nullptr;
         }
 
-        // Array klasses ("[I", "[[J", "[Ljava/lang/String;") are not in any Dictionary
-        // / ClassLoaderDataGraph, and the loadClass-based context-loader fallback below
-        // rejects their descriptor names, so the normal resolution returns NULL for
-        // them.  JNIEnv::FindClass DOES accept array descriptors (make_java_array relies
-        // on this at 14203), so resolve them directly here: decode the returned class
-        // mirror to its Klass*, release the local ref, and ALWAYS clear any pending
-        // exception -- a '[' whose ELEMENT class is missing leaves a
-        // ClassNotFoundException pending that -Xcheck:jni would use to abort the next
-        // JNI call (the unconditional clear is a no-op on the success path).  Library #5.
+        // Array klasses ("[I", "[[J", "[Ljava/lang/String;") need their own
+        // resolution path: on JDK 8-17 a per-ClassLoaderData Dictionary holds
+        // InstanceKlasses only, so the ordinary walk below never sees them.
+        // resolve_array_klass covers both generations — the CLDG _klasses walk
+        // lists array klasses on JDK 21+, and older JDKs are served from the
+        // Universe primitive-array statics + InstanceKlass::_array_klasses.
         if (class_name.front() == '[')
         {
-            // Pure-VM array-klass resolution (was JNIEnv::FindClass).  The CLDG
-            // _klasses walk lists array klasses on JDK 21+; resolve_array_klass
-            // covers JDK 8-17 (per-CLD Dictionary is InstanceKlass-only) via the
-            // Universe primitive-array statics + InstanceKlass::_array_klasses.
             return vmhook::resolve_array_klass(class_name);
         }
 
@@ -8513,10 +8481,9 @@ namespace vmhook
 
             if (!found_klass)
             {
-                // Pure-VM: no JNI context-loader loadClass fallback.  The CLDG walk
-                // above enumerates every LOADED class across all loaders; a miss means
-                // the class is not yet loaded (vmhook observes live VM state and does
-                // not trigger class loading).
+                // No fallback: the CLDG walk above enumerates every LOADED class
+                // across all loaders, so a miss means the class is not loaded yet.
+                // vmhook observes live VM state and never triggers class loading.
                 return nullptr;
             }
 
@@ -8542,10 +8509,9 @@ namespace vmhook
     }
 
     /*
-        @brief Pure-VM resolution of an array klass by JVM descriptor.
-        @details Replaces the former JNIEnv::FindClass path for '[' names.  The
-        ClassLoaderDataGraph _klasses walk already enumerates array klasses on
-        JDK 21+; this covers JDK 8-17, whose per-CLD Dictionary lists
+        @brief Resolves an array klass by JVM descriptor, from VM state alone.
+        @details The ClassLoaderDataGraph _klasses walk already enumerates array
+        klasses on JDK 21+; this covers JDK 8-17, whose per-CLD Dictionary lists
         InstanceKlasses only:
           [X (primitive) -> Universe::_<type>ArrayKlassObj static  (1-dim TypeArrayKlass)
           [Lfoo;         -> component InstanceKlass::_array_klasses (1-dim ObjArrayKlass)
@@ -9114,8 +9080,8 @@ namespace vmhook
         if (!target_klass)
         {
             VMHOOK_LOG("{} for_each_instance: find_class('{}') returned null - the registered "
-                       "class is not loaded in the JVM yet (or VMStructs+JNI fallback couldn't "
-                       "resolve it).  Visitor will not be invoked.",
+                       "class is not loaded in the JVM yet, or the ClassLoaderDataGraph walk "
+                       "could not resolve it.  Visitor will not be invoked.",
                        vmhook::warning_tag, type_map_it->second);
             return 0;
         }
@@ -10606,24 +10572,15 @@ namespace vmhook
         }
         else if constexpr (std::is_same_v<clean_value_type, std::string> || std::is_same_v<clean_value_type, std::string_view>)
         {
-            // jni_new_string_utf16_local returns a JNI local reference.  The OOP
-            // we extract goes into the interpreter local-variable slot (a GC
-            // root), so the String stays reachable after we release the
-            // handle.  Skipping DeleteLocalRef would leak one local per call
-            // on long-lived attached threads - HotSpot's default ref table
-            // capacity is 16 and there's no implicit per-detour-frame
-            // teardown, so the leak surfaces as JNI "local reference table
-            // overflow" warnings after enough hot-path string injections.
+            // Build the String oop directly via make_java_string (TLAB allocation
+            // + UTF-16 value/coder field encode).  There is no intermediate handle
+            // to release, so no reference bookkeeping is needed; store_oop then
+            // parks the oop in an interpreter local slot, which IS a GC root, so
+            // the String is reachable from the moment it is stored.
             //
-            // Length-counted UTF-16 (NewString), NOT NewStringUTF: a std::string
-            // is standard UTF-8 — NewStringUTF would truncate at an interior NUL
-            // and mangle astral scalars (it decodes modified UTF-8).  make_java_string
-            // is the GC-aware fallback and already encodes via the same UTF-16 path,
-            // so both routes agree byte-for-byte.
-            // Pure-VM: build the String oop directly via make_java_string (TLAB
-            // allocation + UTF-16 value/coder field encode).  No JNI NewString,
-            // no local reference, so no DeleteLocalRef bookkeeping.  The oop goes
-            // into an interpreter local slot (a GC root) via store_oop.
+            // The encoder is length-counted UTF-16, which matters: a std::string
+            // is standard UTF-8, so a NUL-terminated modified-UTF-8 encoding would
+            // truncate at an interior NUL and mangle astral scalars.
             void* const string_oop{ vmhook::make_java_string(value) };
             if (!string_oop)
             {
@@ -10638,10 +10595,9 @@ namespace vmhook
         else if constexpr (std::is_same_v<clean_value_type, const char*> || std::is_same_v<clean_value_type, char*>)
         {
             // const char* is a C string (no interior NULs), but can still hold
-            // standard-UTF-8 astral bytes, so use the length-counted UTF-16 encoder
-            // (NewString) rather than NewStringUTF to avoid modified-UTF-8 mangling.
+            // standard-UTF-8 astral bytes, so it goes through the same
+            // length-counted UTF-16 encoder to avoid modified-UTF-8 mangling.
             const std::string_view text{ value ? std::string_view{ value } : std::string_view{} };
-            // Pure-VM: build the String oop directly (no JNI NewString/local ref).
             void* const string_oop{ vmhook::make_java_string(text) };
             if (!string_oop)
             {
@@ -10717,7 +10673,7 @@ namespace vmhook
         7. If the i2i entry is new, locate the injection point via find_hook_location(),
            allocate a trampoline via midi2i_hook, and register it in g_hooked_i2i_entries.
 
-        @note Unlike the JNI/JVMTI version, this implementation does not force a class
+        @note Unlike a JVMTI-based agent, this implementation cannot force a class
               retransformation to flush existing inline caches. Hooking early is still best:
               compiled callers that already cached an nmethod can keep bypassing the hook
               until HotSpot repairs that call site at a safepoint.
@@ -11839,7 +11795,7 @@ namespace vmhook
         // never fired — silently dead.  The mod-loader "tear down + re-init on
         // world switch" pattern hits exactly this, and so did the integration
         // suite (every test after the first shutdown_hooks() observed its hook
-        // not firing once the call_jni crash that masked it was fixed).  Clear
+        // not firing, once an unrelated crash that had masked it was fixed).  Clear
         // both latches so a subsequent install is fully live again; the
         // wait_for_exit() above guarantees the old watchdog is gone first.
         vmhook::detail::auto_repair::g_started.store(false, std::memory_order_release);
@@ -12124,49 +12080,47 @@ namespace vmhook
             std::forward<decltype(user_detour)>(user_detour));
     }
 
-    // --- JNI helper layer --------------------------------------------------------
-    // Low-level wrappers around the JNIEnv function table.  All functions are
-    // noexcept and return nullptr / empty on failure so callers never need to
-    // catch JNI exceptions explicitly (they call jni_exception_clear() instead).
+    // --- Classloader and descriptor helpers ---------------------------------------
+    // Small noexcept utilities shared by the layers above and below: host
+    // classloader capture, Klass -> ClassLoader oop resolution, UTF-8 -> UTF-16
+    // decoding, and compile-time JVM type-descriptor generation.  All of them
+    // return nullptr / empty on failure rather than reporting errors out-of-band.
 
     namespace detail
     {
-        // (jni_value union removed — the JNI CallXxxMethodA arg-packing it fed is gone.)
-
-
         // -------------------------------------------------------------------
-        // Host context-classloader inheritance
+        // Host classloader capture
         //
-        // When the injector attaches a worker thread via JNI AttachCurrentThread*,
-        // the JVM gives the new thread the platform / application classloader
-        // as its context classloader.  That loader cannot see classes loaded by
-        // the host application's custom loader chain (Forge's LaunchClassLoader,
-        // Lunar Client's mixin chain, etc.), so any JNI work that runs through
-        // host mixins fails with UnsupportedOperationException ("Don't know how
-        // to turn ... into a string") or NullPointerException as soon as the
-        // mixin tries to resolve a class via Thread.currentThread()
-        // .getContextClassLoader().
+        // What this once did: the injector could attach a native worker thread,
+        // and such a thread is given the platform / application classloader as
+        // its context classloader.  That loader cannot see classes loaded by a
+        // host application's custom loader chain (Forge's LaunchClassLoader,
+        // Lunar Client's mixin chain, ...), so work routed through host mixins
+        // failed as soon as the mixin resolved a class via
+        // Thread.currentThread().getContextClassLoader().  The remedy was to
+        // latch the first non-bootstrap host Klass* seen by find_class, re-derive
+        // its loader, and install it onto each newly attached thread.
         //
-        // Fix: as soon as the injector finds at least one host class via
-        // vmhook::find_class, remember its Klass*.  When a new native thread
-        // attaches we read the loader out of that Klass's ClassLoaderData and
-        // call Thread.currentThread().setContextClassLoader(...) on the new
-        // thread so it inherits the host loader chain.
+        // What survives: only the latch.  Installing a context classloader means
+        // calling Thread.setContextClassLoader, i.e. running Java code, which
+        // this build cannot do — and it no longer attaches native threads either,
+        // so there is nothing to install it onto.  Nothing currently READS the
+        // latched Klass*; it is kept because it is cheap and is the obvious
+        // starting point should loader-aware resolution be restored.
         // -------------------------------------------------------------------
 
         /*
-            @brief Cached "host" Klass*.
+            @brief Cached "host" Klass*.  Currently write-only.
             @details
             Populated by capture_host_classloader_klass() the first time
             vmhook::find_class succeeds for a class whose owning ClassLoaderData
-            has a non-null _class_loader (i.e. a non-bootstrap loader).  Used by
-            inherit_host_context_classloader_for_current_thread() as the source
-            of the loader to install onto freshly-attached worker threads.
+            has a non-null _class_loader (i.e. a non-bootstrap loader).  No code
+            path reads it today — see the block comment above.
 
-            Klass* in HotSpot lives in Metaspace and is stable across GC; the
-            ClassLoader oop reachable through Klass -> ClassLoaderData ->
-            _class_loader IS heap-resident and may relocate, so we re-derive it
-            on every attach instead of caching the raw oop.
+            Klass* in HotSpot lives in Metaspace and is stable across GC, which is
+            why the Klass* is latched rather than the ClassLoader oop: the oop
+            reachable through Klass -> ClassLoaderData -> _class_loader is
+            heap-resident and may relocate, so any consumer must re-derive it.
         */
         inline std::atomic<vmhook::hotspot::klass*> host_classloader_klass{ nullptr };
 
@@ -12228,22 +12182,19 @@ namespace vmhook
             if (vmhook::detail::host_classloader_klass.compare_exchange_strong(
                     expected, candidate, std::memory_order_acq_rel))
             {
-                // We just published the first host klass — the thread doing
-                // the publish (usually the injector's bootstrap thread) may
-                // itself need the loader for follow-up JNI work, so apply it
-                // here instead of waiting for the next attach_current_native_thread
-                // round-trip.
-                // (pure-VM: host-context-classloader inheritance onto freshly
-                // attached threads was a JNI feature and has been removed.)
+                // Winning this CAS used to also install the captured loader as the
+                // publishing thread's context classloader.  That step required
+                // running Java code and has been removed (see the block comment
+                // above), so the success branch is intentionally empty: the CAS is
+                // performed for its side effect on host_classloader_klass alone.
             }
         }
 
         /*
             @brief Decodes a UTF-8 byte string into a vector of UTF-16 code units.
             @details
-            Extracted verbatim from make_java_string's original inline decoder so the
-            TLAB encode path and the GC-aware JNI NewString fallback share ONE source
-            of truth for the byte->char-unit conversion (they must agree exactly).
+            Extracted from make_java_string's original inline decoder so every
+            caller shares ONE source of truth for the byte->char-unit conversion.
             Malformed sequences yield U+FFFD; astral code points (>= U+10000) become a
             surrogate pair.
 
@@ -12251,12 +12202,8 @@ namespace vmhook
             capped the result at 4096 code units, which made make_java_string SILENTLY
             produce a SHORTER String for any input over the cap (a 5000-char input
             yielded a 4096-char String that did NOT equal the original, with no error
-            — robustness bug #9).  The length decision now lives entirely in the
-            caller: make_java_string builds inputs up to the TLAB/read_java_string
-            ceiling on the fast TLAB path, and routes longer inputs through the
-            GC-aware JNIEnv::NewString fallback (which the JVM constructs faithfully
-            at any length).  Keeping the decode lossless is what lets that fallback
-            return the full, correct String.
+            — robustness bug #9).  The length decision belongs entirely to the
+            caller, so this decode stays lossless at any input size.
 
             Complexity: O(N).  Exception safety: noexcept-equivalent (only std::vector
             growth, which the caller treats as fatal-on-throw via the noexcept callers).
@@ -12314,18 +12261,18 @@ namespace vmhook
                 i += adv;
             }
 
-            // No truncation here: return the complete decode.  make_java_string
-            // picks the build path off units.size() (TLAB fast path for inputs
-            // within the read_java_string ceiling, GC-aware JNIEnv::NewString for
-            // longer ones), so capping here would silently shorten the String the
-            // caller asked for.
+            // No truncation here: return the complete decode.  Capping would
+            // silently shorten the String the caller asked for; any length policy
+            // belongs to make_java_string, which sees units.size().
             return units;
         }
 
         /*
-            @brief Returns the JNI type descriptor character(s) for a C++ argument type.
+            @brief Returns the JVM type descriptor character(s) for a C++ argument type.
             @details
-            Maps C++ types to their JNI descriptor string at compile time.  The
+            Maps C++ types to their JVM type descriptor at compile time — the
+            class-file descriptor grammar ("I", "Ljava/lang/String;", ...), which
+            is what Method signatures are written in.  The
             integral classification mirrors method_proxy::argument_matches_descriptor
             EXACTLY (same precedence, same sizeof-based generic ladder) so the
             descriptor builder accepts the identical type domain the overload-selector
@@ -12340,12 +12287,16 @@ namespace vmhook
               float                      -> "F"
               double                     -> "D"
               unique_ptr<wrapper> / object_base-derived -> "Lpkg/Name;"
-            Used by method_proxy::call_jni() to build the JNI method descriptor string.
+            Used to build the method descriptor that overload selection matches
+            against.
+
+            @note The name is a leftover — nothing here is JNI-specific.  A
+            descriptor is a class-file construct; the rename is pending.
 
             Exception safety: noexcept — compile-time dispatch only.
 
             @tparam arg_type  The C++ argument type.
-            @return  JNI type descriptor string.
+            @return  JVM type descriptor string.
         */
         template<typename arg_type>
         inline auto jni_signature_for_arg() noexcept
@@ -12379,7 +12330,7 @@ namespace vmhook
             // used to hit the terminal dependent_false static_assert and fail to
             // compile even though argument_matches_descriptor already accepted them,
             // so a `char`/`char16_t`/`wchar_t` detour arg could be overload-matched
-            // but never have a JNI signature built.  The fixed-width aliases keep
+            // but never have a descriptor built.  The fixed-width aliases keep
             // their previous letters: int8_t/uint8_t -> "B", int16_t -> "S",
             // int32_t/uint32_t -> "I", int64_t/uint64_t -> "J".
             else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 1)
@@ -12413,9 +12364,9 @@ namespace vmhook
                               "vmhook::detail::jni_signature_for_arg: unique_ptr<T> arg's T must "
                               "derive from vmhook::object_base.  Pass a wrapper, not a raw object.");
                 // Resolve the JVM class name from the registered wrapper map so the
-                // signature reads `Lcom/example/Foo;` instead of the old silently-wrong
-                // `I` fallback that broke jni_make_unique whenever someone tried to
-                // construct an object whose constructor took another object.
+                // descriptor reads `Lcom/example/Foo;` instead of the old silently-wrong
+                // `I` fallback, which broke object construction whenever someone
+                // passed an object to a constructor that took another object.
                 const auto entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
                 if (entry == vmhook::type_to_class_map.end())
                 {
@@ -12451,9 +12402,9 @@ namespace vmhook
                 static_assert(vmhook::detail::dependent_false_v<clean_t>,
                               "vmhook::detail::jni_signature_for_arg: unsupported argument type.  "
                               "The old `else return \"I\";` fallback silently mis-encoded every "
-                              "wrapper-pointer / 64-bit / unknown-integral arg as Java `int`, "
-                              "which then made GetMethodID fail in jni_make_unique with no clear "
-                              "explanation.  Add an explicit branch above or convert the arg to one "
+                              "wrapper-pointer / 64-bit / unknown-integral arg as Java `int`, so "
+                              "method resolution then failed with no clear explanation.  "
+                              "Add an explicit branch above or convert the arg to one "
                               "of: string, c-string, unique_ptr<vmhook::object>, object_base-derived, "
                               "bool, integral (8/16/32/64-bit), float, double.");
             }
@@ -12470,38 +12421,55 @@ namespace vmhook
     // launcher loader, OSGi, app servers, any plugin host), "first by name" is
     // graph-iteration-order-dependent and routinely resolves the WRONG copy —
     // the only symptom being a ClassCastException thrown deep in host code when
-    // the result is handed back.  These helpers give the corrective half:
-    // "resolve the copy visible from an object I already hold", and "make every
-    // find_class() consumer pick up that copy".  Surfaced by the NPNOQOL
-    // deep-dive (Lunar/Forge ship duplicate net.kyori.* / com.mojang.* classes).
+    // the result is handed back.  These helpers were written to give the
+    // corrective half: "resolve the copy visible from an object I already hold",
+    // and "make every find_class() consumer pick up that copy".  Surfaced by the
+    // NPNOQOL deep-dive (Lunar/Forge ship duplicate net.kyori.* / com.mojang.*
+    // classes).
+    //
+    // CURRENT LIMITATION: only the second half still works.  Selecting a copy by
+    // an anchor's loader needed a Java-level loadClass() call, which this build
+    // cannot make, so find_class_via_oop() now validates the anchor and returns
+    // the same first-by-name result as find_class().  override_class_lookup() /
+    // evict_class_lookup() are unaffected — they remain the supported way to pin
+    // a Klass* you resolved by some other means.
     // -------------------------------------------------------------------------
 
     /*
-        @brief Resolves a class through the classloader of a live anchor object.
+        @brief Validates an anchor object, then resolves `class_name` exactly as
+        find_class() would.  It does NOT currently disambiguate by classloader.
         @details
-        Walks anchor_oop -> getClass() -> getClassLoader() -> loadClass(name),
-        forcing the copy of `class_name` visible from THAT object's loader rather
-        than whatever find_class() happens to hit first.  Use it to disambiguate
-        when the JVM has more than one class of the same name.
+        The name and the reason this function exists are loader disambiguation,
+        but that capability is gone.  Selecting the copy visible from the anchor's
+        loader required walking anchor -> getClass() -> getClassLoader() ->
+        loadClass(name), i.e. calling Java code, which this build cannot do.  What
+        remains is: reject a null or implausible anchor, then delegate to
+        vmhook::find_class(), which walks the whole ClassLoaderDataGraph and
+        returns the FIRST class of that name in graph-iteration order.
 
-        Complexity: O(JNI loadClass).  Exception safety: noexcept — clears any
-        pending JNI exception and returns nullptr on any failure (null anchor,
-        no JVM, class not visible from that loader).
+        Consequences for callers:
+          * With two loaded copies of `class_name`, the result is the same
+            arbitrary copy find_class() would have returned — passing an anchor
+            does not steer it.  The ClassCastException failure mode this helper
+            was meant to cure is not cured.
+          * The class must already be LOADED.  Nothing here triggers class
+            loading any more, so a not-yet-loaded class resolves to nullptr where
+            it previously would have been loaded on demand.
+          * The anchor is still load-bearing as a guard: a null or non-pointer
+            anchor short-circuits to nullptr without touching the graph.
 
-        @param anchor_oop   Raw decoded heap OOP of an object whose loader to use.
+        Complexity: O(ClassLoaderDataGraph walk), or O(1) on a find_class cache
+        hit.  Exception safety: noexcept — returns nullptr on any failure (null
+        or invalid anchor, no JVM, class not loaded).
+
+        @param anchor_oop   Raw decoded heap OOP; validated, but not used to
+                            select among same-named classes.
         @param class_name   Internal ('/'-separated) JVM class name.
-        @return  The Klass* of the loader-specific copy, or nullptr.
+        @return  The Klass* find_class() resolves for `class_name`, or nullptr.
     */
     inline auto find_class_via_oop(void* const anchor_oop, const std::string_view class_name) noexcept
         -> vmhook::hotspot::klass*
     {
-        // Pure-VM: the former JNI path called
-        // anchor.getClass().getClassLoader().loadClass(name), which both
-        // disambiguated the loader AND triggered class loading.  Without JNI,
-        // validate the anchor and return the class via the global
-        // ClassLoaderDataGraph walk, which finds it across every loader once it is
-        // LOADED.  Loader-specific selection among multiple loaded copies, and
-        // loadClass-triggered class loading, are not available pure-VM.
         if (!anchor_oop || !vmhook::hotspot::is_valid_pointer(anchor_oop))
         {
             return nullptr;
@@ -12560,16 +12528,22 @@ namespace vmhook
     }
 
     /*
-        @brief Convenience: anchor a set of classes to an object's loader in one call.
+        @brief Convenience: resolve a set of classes once and cache each result.
         @details
         For each name, find_class_via_oop(anchor_oop, name) then
-        override_class_lookup(name, resolved) so every later find_class() picks the
-        anchor loader's copy.  Returns true only if EVERY name resolved — callers
-        that anchor against an object which only becomes available later (e.g. once
-        a world/context is loaded) can poll until it returns true.  Names that
-        don't resolve are left un-overridden.
+        override_class_lookup(name, resolved), so every later find_class() short-
+        circuits to the cached Klass*.  Returns true only if EVERY name resolved —
+        callers that anchor against an object which only becomes available later
+        (e.g. once a world/context is loaded) can poll until it returns true.
+        Names that don't resolve are left un-overridden.
 
-        Complexity: O(N · JNI loadClass).  Exception safety: noexcept.
+        @note The anchor no longer selects a loader (see find_class_via_oop), so
+        what this caches is whichever copy find_class() returns first, not the
+        anchor loader's copy.  It still pins that choice so it stops varying
+        between calls; it does not make the choice correct under duplicate
+        classes.
+
+        Complexity: O(N · ClassLoaderDataGraph walk).  Exception safety: noexcept.
     */
     inline auto reanchor_classes_via_oop(void* const anchor_oop,
                                          std::initializer_list<std::string_view> class_names) noexcept
@@ -12633,11 +12607,11 @@ namespace vmhook
             return nullptr;
         }
 
-        // Pure-VM construction: allocate + stamp the object header via
-        // make_java_object (TLAB path), then run the wrapper's C++-side
-        // construct() for field initialisation.  The former NewObjectA (JNI)
-        // first-try that ran the Java <init> chain is gone; a wrapper that needs
-        // Java constructor effects should implement construct() to set them.
+        // Construction is allocate + stamp the object header via make_java_object
+        // (TLAB path), then run the wrapper's C++-side construct() for field
+        // initialisation.  IMPORTANT: the Java <init> chain is NOT executed —
+        // nothing here invokes a constructor — so a wrapper that depends on
+        // constructor side effects must reproduce them in construct().
         vmhook::hotspot::klass* const klass{ vmhook::find_class(map_entry->second) };
         if (!klass)
         {
@@ -13005,30 +12979,24 @@ namespace vmhook
 
         The caller is responsible for filling in the element data after this call.
 
-        Allocation strategy (in order):
-          1. TLAB fast path: make_java_object() (unchanged) — used on every call and
-             on every config where it currently succeeds.
-          2. ADDITIVE GC-aware fallback (only when step 1 returns null AND
-             allow_jni_fallback is true AND the descriptor is a PRIMITIVE array):
-             jni_new_primitive_array() routes the allocation through JNIEnv::
-             New<Type>Array, the VM's GC-aware slow path.  This recovers the case
-             where the TLAB is exhausted and the allocation needs a GC — the
-             documented make_java_object GC-slow-path gap — without touching the fast
-             path.  Reference arrays are not covered by the fallback (they stay best-
-             effort / null, exactly as before).
+        There is exactly ONE allocation path: make_java_object()'s TLAB fast path.
+        If the TLAB cannot satisfy the request — it is exhausted, or the size would
+        require a GC — this returns nullptr.  No slow path exists to recover that
+        case, so treat a null return as an ordinary, expected outcome under memory
+        pressure rather than a defect.
 
-        Complexity: O(1) on the fast TLAB path; O(N) on the fallback.
+        Complexity: O(1).
         Exception safety: noexcept — returns nullptr on any failure.
 
-        @param class_name         Internal JVM array type descriptor (e.g. "[B", "[C", "[Ljava/lang/Object;").
-        @param length             Number of elements; must be >= 0.
-        @param element_size       Size in bytes of each array element.
-        @param allow_jni_fallback When true (default), allows the GC-aware JNI
-                                  New<Type>Array fallback if the TLAB path fails.
-                                  Callers that hold an unrooted intermediate oop
-                                  across this call (e.g. make_java_string mid-encode)
-                                  pass false so a fallback GC cannot relocate it; they
-                                  supply their own rooted fallback instead.
+        @param class_name        Internal JVM array type descriptor (e.g. "[B", "[C", "[Ljava/lang/Object;").
+        @param length            Number of elements; must be >= 0.
+        @param element_size      Size in bytes of each array element.
+        @param retained_for_abi  IGNORED.  It is marked [[maybe_unused]] and read
+                                 nowhere in the body; passing true or false gives
+                                 identical behaviour.  It selected a GC-aware
+                                 allocation fallback that no longer exists, and is
+                                 kept only so existing 4-argument call sites keep
+                                 compiling.  Do not pass it in new code.
         @return  Pointer to the raw array OOP with header and length initialised, or nullptr on failure.
     */
     inline auto make_java_array(const std::string_view class_name, const std::int32_t length, const std::size_t element_size, [[maybe_unused]] const bool retained_for_abi = true) noexcept
@@ -13055,9 +13023,8 @@ namespace vmhook
         void* const array_oop{ vmhook::make_java_object(array_klass, array_header_size + static_cast<std::size_t>(length) * element_size) };
         if (!array_oop)
         {
-            // Pure-VM: no GC-aware JNI New<Type>Array fallback.  A null here means
-            // the TLAB allocation could not be satisfied (buffer exhausted / a GC
-            // would be required); report it rather than dispatching a JNI slow path.
+            // There is no second allocation tier: a null here means the TLAB could
+            // not satisfy the request (buffer exhausted, or a GC would be needed).
             VMHOOK_LOG("{} vmhook::make_java_array('{}'): make_java_object failed for {} elements "
                        "({} bytes total).",
                        vmhook::error_tag, class_name, length,
@@ -13079,22 +13046,21 @@ namespace vmhook
           - Classic:  allocates a char[] ("[C"), widens each byte to uint16.
         Sets the "value" field of the String to the encoded OOP of the backing array.
 
-        LENGTH HANDLING (no silent truncation): inputs whose decoded UTF-16 length is
-        within the TLAB / read_java_string ceiling (k_tlab_string_max_units, 4096)
-        take the fast hand-built TLAB path above.  LONGER inputs are NOT truncated —
-        they are built in full by the GC-aware JNIEnv::NewString fallback, which the
-        JVM constructs faithfully at any length, so the returned String EQUALS the
-        complete input.  (Previously the decode was capped at 4096, so a 5000-char
+        LENGTH HANDLING (no silent truncation): the decode is lossless and the TLAB
+        build path runs at ANY length, so the returned String EQUALS the complete
+        input.  (Previously the decode was capped at 4096 code units, so a 5000-char
         input silently produced a 4096-char String that did not equal the original;
-        robustness bug #9.)  Note that read_java_string still reads back at most 4096
-        chars via its fixed body buffer, so the native readback of an over-cap String
-        is a separate, documented limit — the Java-visible String itself is complete.
+        robustness bug #9.)  Longer inputs simply need a larger TLAB allocation and
+        are therefore likelier to fail outright — there is no slow path to fall back
+        on, so a null return is the failure mode, never a shortened String.  Note
+        that read_java_string still reads back at most 4096 chars via its fixed body
+        buffer, so the native readback of a long String is a separate, documented
+        limit — the Java-visible String itself is complete.
 
         Complexity: O(N) where N = length of value.
         Exception safety: noexcept — returns nullptr on any allocation failure.
 
-        @param value  UTF-8 text to encode as a Java String (any length; over-cap
-                      inputs route through the GC-aware JNI NewString fallback).
+        @param value  UTF-8 text to encode as a Java String; any length.
         @return  Raw java.lang.String OOP, or nullptr on failure.
     */
     inline auto make_java_string(const std::string_view value) noexcept
@@ -13116,8 +13082,6 @@ namespace vmhook
         // UTF-8 BYTES straight into a LATIN1 byte[] / char[], which conflated
         // byte count with char count and corrupted every non-ASCII string —
         // e.g. "é" (0xC3 0xA9) turned into the two chars U+00C3 U+00A9.
-        // Shared with the GC-aware JNI NewString fallback below so both encode
-        // the identical code units.
         const std::vector<std::uint16_t> units{ vmhook::detail::utf8_to_utf16(value) };
         const std::int32_t char_count{ static_cast<std::int32_t>(units.size()) };
 
@@ -13130,16 +13094,12 @@ namespace vmhook
             if (unit > 0xFFu) { all_latin1 = false; break; }
         }
 
-        // FAST PATH (unchanged): build the String + backing array from the TLAB.
-        // This lambda is the original encode body verbatim; the ONLY differences
-        // are (a) it returns the oop / nullptr instead of returning from the
-        // function, and (b) its internal make_java_array calls pass
-        // allow_jni_fallback=false.  That last point is critical: the String
-        // instance (string_oop) is an UNROOTED raw oop while the backing array is
-        // allocated, so letting the array allocation take a GC-triggering JNI
-        // slow path here could relocate string_oop and corrupt the write.  When
-        // the TLAB array allocation fails we instead fall through to the
-        // whole-String JNI NewString fallback (no unrooted intermediate), below.
+        // Build the String + its backing array from the TLAB.  Ordering matters:
+        // string_oop is an UNROOTED raw oop for as long as the backing array
+        // allocation is in flight, so any allocation here that could trigger a GC
+        // would risk relocating it and corrupting the subsequent field write.  The
+        // TLAB path never triggers a GC — it fails and returns null instead —
+        // which is what makes this window safe.
         const auto build_via_tlab{ [&]() -> void*
         {
             void* const string_oop{ vmhook::make_java_object(string_klass, string_klass->get_instance_size()) };
@@ -13227,27 +13187,20 @@ namespace vmhook
             return string_oop;
         } };
 
-        // The hand-built TLAB path is only attempted for inputs within the
-        // round-trippable ceiling.  For longer inputs we deliberately SKIP it (its
-        // hand-stamped backing array is validated only up to the cap, and
-        // read_java_string would not read it back past 4096) and go straight to the
-        // GC-aware JNIEnv::NewString fallback below, which builds the full String in
-        // the JVM.  The ONLY difference for an over-cap input is which path makes it
-        // — it is built completely either way, never truncated.
-        // Pure-VM: build via the TLAB path at ANY length (no JNI NewString
-        // fallback).  The former k_tlab_string_max_units cap only existed to
-        // route longer inputs to the GC-aware JNI slow path; build_via_tlab()
-        // constructs the complete String for the full input regardless of size.
+        // Build via the TLAB path at ANY length.  The former
+        // k_tlab_string_max_units cap existed only to divert longer inputs to a
+        // second, GC-aware allocation tier; with that tier gone there is nothing
+        // to divert to, and build_via_tlab() constructs the complete String for
+        // the full input regardless of size.
         if (void* const tlab_string_oop{ build_via_tlab() })
         {
             return tlab_string_oop;
         }
 
-        // Pure-VM: no GC-aware JNIEnv::NewString fallback.  If build_via_tlab()
-        // above could not allocate (heap/TLAB exhausted, GC required), report null
-        // rather than dispatching a JNI slow path.
+        // No second allocation tier: if build_via_tlab() could not allocate
+        // (heap/TLAB exhausted, or a GC would be required), the answer is null.
         VMHOOK_LOG("{} vmhook::make_java_string(): TLAB build failed ({} code units); "
-                   "no JNI fallback (pure-VM build).",
+                   "no further allocation path is available.",
                    vmhook::info_tag, char_count);
         return nullptr;
     }
@@ -14274,8 +14227,8 @@ namespace vmhook
             interned String referenced elsewhere is never corrupted.
 
             Array writes still update the existing Java array object in place
-            (element-by-element, capped at the existing length) because this
-            zero-JNI layer does not resize Java arrays.
+            (element-by-element, capped at the existing length) because this layer
+            never reallocates a Java array — array length is fixed at creation.
         */
         template<typename value_type>
         auto set(const value_type& value) const noexcept
@@ -14609,10 +14562,12 @@ namespace vmhook
 
             GC-SAFETY OF THE VALUE: the field slot is itself a GC root once the
             reference lands in it, but the window between allocating `decoded_oop`
-            and this store is not — the CALLER must keep `decoded_oop` reachable
-            (e.g. via a live JNI local reference) across this call so an
-            interleaved GC cannot collect or relocate it out from under the write.
-            store_string() below satisfies that contract.
+            and this store is NOT rooted, and this library offers no primitive that
+            can root it — see vmhook::jni::global_ref, which is not a GC root.  The
+            only available discipline is to keep that window short and free of
+            anything that could trigger a collection, so an interleaved GC cannot
+            collect or relocate the value out from under the write.  store_string()
+            below satisfies that by storing immediately after allocating.
 
             @param decoded_oop  Raw decoded heap oop to store (nullptr -> null ref).
             @return  true if the compressed OOP was written; false on any failure
@@ -14669,20 +14624,20 @@ namespace vmhook
             java.lang.String oop and rebinds the field to it as an object-reference
             store — the same semantics as a Java `field = value;` putfield/putstatic.
 
-            The String is built via the SAME length-counted UTF-16 path the method-
-            argument String injection uses (jni_new_string_utf16_local -> NewString,
-            slot 163), so it is content-exact for every code point: interior NULs are
-            preserved (counted length, not a C string), astral scalars become proper
-            surrogate pairs, and the JVM picks the LATIN1/UTF16 coder itself.  That
-            JNI call also returns a LOCAL REFERENCE, which roots the new String for
-            the whole operation — so even if encoding/storing triggers a GC, the
-            String cannot be collected or relocated out from under store_object_oop().
-            If the JNI String path is unavailable we fall back to make_java_string()
-            (the GC-aware allocator), exactly mirroring return_value::set_arg.
+            The String is built via make_java_string(), the SAME length-counted
+            UTF-16 path the method-argument String injection uses, so it is
+            content-exact for every code point: interior NULs are preserved
+            (counted length, not a C string), astral scalars become proper
+            surrogate pairs, and the coder field is set to match the content.
+
+            GC-SAFETY: the new String is NOT rooted between make_java_string() and
+            store_object_oop() — there is no rooting primitive available (see
+            store_object_oop's note).  Safety here rests on the two calls being
+            adjacent, with no allocation in between that could trigger a collection.
 
             On success the field references a full, independent String equal to
-            `value` at any length; the local reference is released afterwards (the
-            field slot is now the GC root keeping it alive).
+            `value` at any length, and the field slot is then the GC root keeping
+            it alive.
 
             @param value  UTF-8 text to encode and bind into the field.
             @return  true if a new String was built and stored; false otherwise
@@ -14691,13 +14646,11 @@ namespace vmhook
         auto store_string(const std::string_view value) const noexcept
             -> bool
         {
-            // Length-counted UTF-16 (NOT NewStringUTF): a std::string is standard
-            // UTF-8, so an interior NUL is a real U+0000 and astral bytes must
-            // decode to surrogate pairs — NewStringUTF would truncate / mangle
-            // both.  The returned handle is a JNI local ref that keeps the new
-            // String rooted across the store below (GC-safety of the value).
-            // Pure-VM: build the String oop directly via make_java_string (TLAB +
-            // UTF-16 value/coder encode).  No JNI NewString, no local reference.
+            // Length-counted UTF-16: a std::string is standard UTF-8, so an
+            // interior NUL is a real U+0000 and astral bytes must decode to
+            // surrogate pairs — a NUL-terminated modified-UTF-8 encoding would
+            // truncate / mangle both.  make_java_string builds the oop directly
+            // (TLAB allocation + UTF-16 value/coder encode).
             void* const string_oop{ vmhook::make_java_string(value) };
             if (!string_oop)
             {
@@ -14709,10 +14662,9 @@ namespace vmhook
                 return false;
             }
 
-            // Rebind the field to the new String (object-reference store).  The
-            // local ref above is still alive, so the String is a live GC root for
-            // the whole of store_object_oop(); only after it lands in the field
-            // (itself a GC root) do we release the local ref.
+            // Rebind the field to the new String (object-reference store).  Keep
+            // this immediately after the allocation above: string_oop is unrooted
+            // until it lands in the field slot, which then becomes its GC root.
             const bool stored{ this->store_object_oop(string_oop) };
             if (!stored)
             {
@@ -14753,7 +14705,391 @@ namespace vmhook
     namespace detail
     {
         /*
-            @brief Locates StubRoutines::_call_stub_entry via VMStructs.
+            @brief Runtime-resolved [low, high) address range of the HotSpot code cache.
+            @details
+            Every call-stub candidate is bounded by this range before a single
+            byte of it is read: the call stub is generated code, so a candidate
+            outside the code cache is provably not it.
+
+            Complexity: O(1) after the cached VMStructs lookups.
+            Exception safety: noexcept — a zeroed (never-containing) range on failure.
+        */
+        struct code_cache_bounds_t
+        {
+            std::uintptr_t low{ 0 };
+            std::uintptr_t high{ 0 };
+
+            /*
+                @brief True when the range resolved AND address lies inside it.
+            */
+            auto contains(const std::uintptr_t address) const noexcept
+                -> bool
+            {
+                return this->low != 0 && this->high > this->low
+                    && address >= this->low && address < this->high;
+            }
+        };
+
+        /*
+            @brief Resolves the code-cache bounds through VMStructs.
+            @details
+            Two spellings, both MEASURED on live JVMs:
+              * JDK 21 / 26 publish the statics CodeCache::_low_bound and
+                CodeCache::_high_bound directly.
+              * JDK 8 publishes neither; it publishes the static CodeCache::_heap
+                (a CodeHeap*), whose CodeHeap::_memory is an embedded
+                VirtualSpace whose _low / _high delimit the committed range.
+            Every offset comes from VMStructs — nothing here is hardcoded — and
+            every read goes through os::safe_read, because these are cold reads of
+            JVM-internal data that a not-yet-initialised (or exotic) VM can leave
+            unmapped, and the no-SEH toolchains cannot contain a fault.
+
+            Complexity: O(1) after the cached VMStructs lookups.
+            Exception safety: noexcept — a zeroed range when either spelling fails.
+        */
+        inline auto resolve_code_cache_bounds() noexcept
+            -> vmhook::detail::code_cache_bounds_t
+        {
+            vmhook::detail::code_cache_bounds_t bounds{};
+
+            // --- JDK 21 / 26: the bounds are published as plain statics.
+            static const vmhook::hotspot::vm_struct_entry_t* const low_bound_entry{
+                vmhook::hotspot::iterate_struct_entries("CodeCache", "_low_bound") };
+            static const vmhook::hotspot::vm_struct_entry_t* const high_bound_entry{
+                vmhook::hotspot::iterate_struct_entries("CodeCache", "_high_bound") };
+            if (low_bound_entry && low_bound_entry->address
+                && high_bound_entry && high_bound_entry->address)
+            {
+                void* low{ nullptr };
+                void* high{ nullptr };
+                if (vmhook::os::safe_read(&low, low_bound_entry->address, sizeof(low))
+                    && vmhook::os::safe_read(&high, high_bound_entry->address, sizeof(high)))
+                {
+                    bounds.low  = reinterpret_cast<std::uintptr_t>(low);
+                    bounds.high = reinterpret_cast<std::uintptr_t>(high);
+                    if (bounds.high > bounds.low)
+                    {
+                        return bounds;
+                    }
+                    bounds = vmhook::detail::code_cache_bounds_t{};
+                }
+            }
+
+            // --- JDK 8: CodeCache::_heap -> CodeHeap::_memory (VirtualSpace)
+            //     -> VirtualSpace::_low / _high.
+            static const vmhook::hotspot::vm_struct_entry_t* const heap_entry{
+                vmhook::hotspot::iterate_struct_entries("CodeCache", "_heap") };
+            static const vmhook::hotspot::vm_struct_entry_t* const memory_entry{
+                vmhook::hotspot::iterate_struct_entries("CodeHeap", "_memory") };
+            static const vmhook::hotspot::vm_struct_entry_t* const vs_low_entry{
+                vmhook::hotspot::iterate_struct_entries("VirtualSpace", "_low") };
+            static const vmhook::hotspot::vm_struct_entry_t* const vs_high_entry{
+                vmhook::hotspot::iterate_struct_entries("VirtualSpace", "_high") };
+            if (!heap_entry || !heap_entry->address || !memory_entry
+                || !vs_low_entry || !vs_high_entry)
+            {
+                return bounds;
+            }
+
+            void* heap{ nullptr };
+            if (!vmhook::os::safe_read(&heap, heap_entry->address, sizeof(heap))
+                || !vmhook::hotspot::is_valid_pointer(heap))
+            {
+                return bounds;
+            }
+
+            const std::uint8_t* const virtual_space{
+                static_cast<const std::uint8_t*>(heap) + memory_entry->offset };
+            void* low{ nullptr };
+            void* high{ nullptr };
+            if (!vmhook::os::safe_read(&low, virtual_space + vs_low_entry->offset, sizeof(low))
+                || !vmhook::os::safe_read(&high, virtual_space + vs_high_entry->offset, sizeof(high)))
+            {
+                return bounds;
+            }
+
+            const std::uintptr_t low_address{ reinterpret_cast<std::uintptr_t>(low) };
+            const std::uintptr_t high_address{ reinterpret_cast<std::uintptr_t>(high) };
+            if (high_address > low_address)
+            {
+                bounds.low  = low_address;
+                bounds.high = high_address;
+            }
+            return bounds;
+        }
+
+        /*
+            @brief Positively identifies a candidate address as the call stub's entry.
+            @details
+            This is a PROOF, not a guess — nothing is accepted on adjacency or
+            proximity alone.  Four independent conditions must all hold:
+
+              1. codecache_lo <= candidate < return_address.  The stub is
+                 generated code and its entry precedes its own return address.
+              2. return_address - candidate < 4096: entry and return address
+                 belong to the SAME generated stub.  The measured distance is
+                 179 (JDK 8) / 404 (JDK 21) / 175 (JDK 26) bytes — it varies with
+                 the register-save code the build emits, so it is never assumed.
+              3. The candidate begins with MacroAssembler::enter():
+                    55           push rbp
+                    48 8B EC     mov  rbp, rsp     (48 89 E5 is the same insn)
+              4. The two bytes before the return address are the `call c_rarg1`
+                 that dispatches into Java: FF D2 (`call rdx`, Win64 c_rarg1) or
+                 FF D6 (`call rsi`, SysV c_rarg1).
+
+            Both byte reads go through os::safe_read: the candidate is a DERIVED
+            address into executable memory, and a raw compare would fault
+            uncontained on the no-SEH toolchains (MinGW / clang-on-Windows) if the
+            derivation ever landed outside a mapped page.
+
+            The signatures are x86-64 encodings.  On any other architecture this
+            returns false unconditionally, so the whole derivation degrades to
+            nullptr (today's behaviour) instead of dispatching to a wrong address.
+
+            Complexity: O(1) — two small fault-safe reads.
+            Exception safety: noexcept.
+        */
+        inline auto call_stub_entry_is_valid(const std::uintptr_t candidate,
+                                             const std::uintptr_t return_address,
+                                             const vmhook::detail::code_cache_bounds_t& bounds) noexcept
+            -> bool
+        {
+#if VMHOOK_ARCH_X86_64
+            if (candidate == 0 || return_address == 0 || candidate >= return_address)
+            {
+                return false;
+            }
+            if (return_address - candidate < 8 || return_address - candidate >= 4096)
+            {
+                return false;
+            }
+            if (bounds.low != 0 && !bounds.contains(candidate))
+            {
+                return false;
+            }
+
+            std::uint8_t prologue[4]{};
+            if (!vmhook::os::safe_read(prologue,
+                                       reinterpret_cast<const void*>(candidate),
+                                       sizeof(prologue)))
+            {
+                return false;
+            }
+            const bool is_enter{
+                prologue[0] == 0x55u && prologue[1] == 0x48u
+                && ((prologue[2] == 0x8Bu && prologue[3] == 0xECu)      // mov rbp, rsp
+                    || (prologue[2] == 0x89u && prologue[3] == 0xE5u)) };
+            if (!is_enter)
+            {
+                return false;
+            }
+
+            std::uint8_t dispatch[2]{};
+            if (!vmhook::os::safe_read(dispatch,
+                                       reinterpret_cast<const void*>(return_address - 2),
+                                       sizeof(dispatch)))
+            {
+                return false;
+            }
+#if VMHOOK_OS_WINDOWS
+            return dispatch[0] == 0xFFu && dispatch[1] == 0xD2u;        // call rdx
+#else
+            return dispatch[0] == 0xFFu && dispatch[1] == 0xD6u;        // call rsi
+#endif
+#else
+            (void)candidate;
+            (void)return_address;
+            (void)bounds;
+            return false;
+#endif
+        }
+
+        /*
+            @brief Derives StubRoutines::_call_stub_entry from what VMStructs does publish.
+            @details
+            MEASURED on live JDK 8 / 21 / 26: StubRoutines::_call_stub_entry has
+            NEVER been a VMStructs entry on any version (see find_call_stub_entry).
+            StubRoutines::_call_stub_return_address, however, is published on all
+            of them — it is the marker HotSpot's own frame walker needs to
+            recognise the native-to-Java boundary, so it is the most durable field
+            in that struct.  The entry is recoverable from it, three ways, each
+            confirmed by the positive validation above before it is accepted:
+
+              tier 1  ADJACENCY.  The two statics are declared next to each other,
+                      so the entry pointer sits one slot from the published one.
+                      The DIRECTION is not stable — measured +8 on JDK 8 and 21
+                      but -8 on JDK 26 (the JDK 24 stub-generator macro refactor
+                      flipped the declaration order) — so both are tried and
+                      neither the direction nor the distance is hardcoded.
+              tier 2  DATA SCAN.  Scan the writable region that holds the
+                      published slot for the GREATEST code-cache pointer strictly
+                      below the return address.  Verified rank-0 correct on all
+                      three JDKs, and layout-independent.
+              tier 3  CODE SCAN.  Walk back from the return address (bounded by
+                      the code cache and by the 4 KiB same-stub window) for the
+                      nearest enter() prologue.  Independent of where the pointer
+                      is stored at all.
+
+            On total failure this returns nullptr, which is exactly what the
+            single VMStructs lookup returned on every JDK before — the derivation
+            can only add capability, never mis-dispatch.
+
+            Complexity: O(1) for tier 1/3; O(region bytes) for tier 2, one-off
+                        (the caller caches the result).
+            Exception safety: noexcept.
+        */
+        inline auto derive_call_stub_entry() noexcept
+            -> void*
+        {
+            static const vmhook::hotspot::vm_struct_entry_t* const return_address_entry{
+                vmhook::hotspot::iterate_struct_entries("StubRoutines", "_call_stub_return_address") };
+            if (!return_address_entry || !return_address_entry->address)
+            {
+                return nullptr;
+            }
+
+            void* raw_return_address{ nullptr };
+            if (!vmhook::os::safe_read(&raw_return_address,
+                                       return_address_entry->address,
+                                       sizeof(raw_return_address)))
+            {
+                return nullptr;
+            }
+            const std::uintptr_t return_address{ reinterpret_cast<std::uintptr_t>(raw_return_address) };
+            if (return_address == 0)
+            {
+                // StubRoutines::initialize() has not run yet — the caller retries.
+                return nullptr;
+            }
+
+            const vmhook::detail::code_cache_bounds_t bounds{ vmhook::detail::resolve_code_cache_bounds() };
+            const std::uintptr_t slot_address{ reinterpret_cast<std::uintptr_t>(return_address_entry->address) };
+
+            // --- tier 1: adjacency, both directions.
+            for (const std::intptr_t delta : { static_cast<std::intptr_t>(sizeof(void*)),
+                                               -static_cast<std::intptr_t>(sizeof(void*)) })
+            {
+                void* neighbour{ nullptr };
+                if (!vmhook::os::safe_read(&neighbour,
+                                           reinterpret_cast<const void*>(static_cast<std::intptr_t>(slot_address) + delta),
+                                           sizeof(neighbour)))
+                {
+                    continue;
+                }
+                const std::uintptr_t candidate{ reinterpret_cast<std::uintptr_t>(neighbour) };
+                if (vmhook::detail::call_stub_entry_is_valid(candidate, return_address, bounds))
+                {
+                    return reinterpret_cast<void*>(candidate);
+                }
+            }
+
+            // --- tier 2: greatest code-cache pointer below the return address,
+            //     anywhere in the writable region that holds the published slot.
+            {
+                const vmhook::os::region_info region{
+                    vmhook::os::query_region(return_address_entry->address) };
+                constexpr std::size_t max_scanned_bytes{ 8u * 1024u * 1024u };
+                if (region.base && region.committed && region.readable && !region.guarded
+                    && region.size >= sizeof(void*) && region.size <= max_scanned_bytes)
+                {
+                    // Keep the best few candidates in one pass so a rejected
+                    // rank-0 does not force a re-scan.
+                    constexpr std::size_t ranked_slots{ 8 };
+                    std::uintptr_t ranked[ranked_slots]{};
+
+                    std::uint8_t chunk[4096];
+                    const std::uintptr_t region_start{ reinterpret_cast<std::uintptr_t>(region.base) };
+                    for (std::size_t offset{ 0 }; offset + sizeof(void*) <= region.size; offset += sizeof(chunk))
+                    {
+                        const std::size_t remaining{ region.size - offset };
+                        const std::size_t to_read{ remaining < sizeof(chunk) ? remaining : sizeof(chunk) };
+                        if (!vmhook::os::safe_read(chunk,
+                                                   reinterpret_cast<const void*>(region_start + offset),
+                                                   to_read))
+                        {
+                            continue;
+                        }
+                        for (std::size_t index{ 0 }; index + sizeof(void*) <= to_read; index += sizeof(void*))
+                        {
+                            std::uintptr_t value{ 0 };
+                            std::memcpy(&value, chunk + index, sizeof(value));
+                            if (value >= return_address || !bounds.contains(value))
+                            {
+                                continue;
+                            }
+                            if (return_address - value >= 4096)
+                            {
+                                continue;
+                            }
+                            // Insertion into a descending top-N list.
+                            for (std::size_t rank{ 0 }; rank < ranked_slots; ++rank)
+                            {
+                                if (value == ranked[rank])
+                                {
+                                    break;
+                                }
+                                if (value > ranked[rank])
+                                {
+                                    for (std::size_t shift{ ranked_slots - 1 }; shift > rank; --shift)
+                                    {
+                                        ranked[shift] = ranked[shift - 1];
+                                    }
+                                    ranked[rank] = value;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    for (const std::uintptr_t candidate : ranked)
+                    {
+                        if (candidate != 0
+                            && vmhook::detail::call_stub_entry_is_valid(candidate, return_address, bounds))
+                        {
+                            return reinterpret_cast<void*>(candidate);
+                        }
+                    }
+                }
+            }
+
+            // --- tier 3: nearest enter() prologue below the return address.
+            {
+                constexpr std::size_t window{ 4096 };
+                std::uintptr_t window_start{ return_address > window ? return_address - window : 0 };
+                if (bounds.low != 0 && window_start < bounds.low)
+                {
+                    window_start = bounds.low;
+                }
+                if (window_start != 0 && window_start + 4 <= return_address)
+                {
+                    const std::size_t length{ static_cast<std::size_t>(return_address - window_start) };
+                    std::uint8_t code[window];
+                    if (vmhook::os::safe_read(code, reinterpret_cast<const void*>(window_start), length))
+                    {
+                        for (std::size_t index{ length - 4 }; ; --index)
+                        {
+                            const std::uintptr_t candidate{ window_start + index };
+                            if (code[index] == 0x55u && code[index + 1] == 0x48u
+                                && ((code[index + 2] == 0x8Bu && code[index + 3] == 0xECu)
+                                    || (code[index + 2] == 0x89u && code[index + 3] == 0xE5u))
+                                && vmhook::detail::call_stub_entry_is_valid(candidate, return_address, bounds))
+                            {
+                                return reinterpret_cast<void*>(candidate);
+                            }
+                            if (index == 0)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return nullptr;
+        }
+
+        /*
+            @brief Locates StubRoutines::_call_stub_entry (published or derived).
 
             HotSpot's official C++-to-Java call gate. Creates a properly-typed
             "entry frame" so the GC, exception handler, and frame-walker all
@@ -14762,24 +15098,65 @@ namespace vmhook
             encounters an unexpected native frame above the interpreter frame.
 
             Stub signature (Windows x64):
-              rcx  = link (1 sentinel)
+              rcx  = link (JavaCallWrapper*, NOT a sentinel — the frame walker
+                     dereferences it; see method_proxy::call)
               rdx  = intptr_t* result holder
               r8   = BasicType (T_INT=10, T_VOID=14, )
               r9   = Method*
               stk  = entry_point, parameters*, param_count, JavaThread*
+
+            @details
+            Tier 0 is the direct VMStructs lookup.  MEASURED on live JDK 8, 21 and
+            26: `StubRoutines::_call_stub_entry` is in the table on NONE of them,
+            and OpenJDK's vmStructs.cpp has never contained it on jdk8u, jdk21u or
+            jdk master — it is not a modern-JDK regression, it was never published.
+            The lookup is kept as tier 0 purely so a vendor build that DOES publish
+            it wins for free; on stock builds the answer comes from
+            derive_call_stub_entry(), which recovers the entry from the
+            `_call_stub_return_address` static that every measured version does
+            publish and proves the result byte-for-byte before returning it.
+
+            The resolved value is cached process-wide.  A FAILED resolution is
+            deliberately not cached: the earliest callers can run before
+            StubRoutines::initialize() has stored the return address, and caching
+            that transient null would disable invocation for the process lifetime.
+
+            Complexity: O(1) once resolved.
+            Exception safety: noexcept — nullptr when the stub cannot be proven.
         */
         inline auto find_call_stub_entry() noexcept
             -> void*
         {
-            static const vmhook::hotspot::vm_struct_entry_t* const entry{
-                vmhook::hotspot::iterate_struct_entries("StubRoutines", "_call_stub_entry") };
-            if (!entry || !entry->address)
+            static std::atomic<void*> cached_stub{ nullptr };
+            if (void* const already{ cached_stub.load(std::memory_order_relaxed) })
             {
-                return nullptr;
+                return already;
             }
 
-            void* const stub{ *reinterpret_cast<void**>(entry->address) };
-            return vmhook::hotspot::is_valid_pointer(stub) ? stub : nullptr;
+            void* resolved{ nullptr };
+
+            static const vmhook::hotspot::vm_struct_entry_t* const entry{
+                vmhook::hotspot::iterate_struct_entries("StubRoutines", "_call_stub_entry") };
+            if (entry && entry->address)
+            {
+                void* published{ nullptr };
+                if (vmhook::os::safe_read(&published, entry->address, sizeof(published))
+                    && vmhook::hotspot::is_valid_pointer(published))
+                {
+                    resolved = published;
+                }
+            }
+
+            if (!resolved)
+            {
+                resolved = vmhook::detail::derive_call_stub_entry();
+            }
+
+            if (resolved)
+            {
+                cached_stub.store(resolved, std::memory_order_relaxed);
+            }
+            return resolved;
         }
 
         /*
@@ -14837,6 +15214,245 @@ namespace vmhook
             default:            return 0;
             }
         }
+
+        /*
+            @brief Splits a JVM method descriptor into its parameter type letters.
+            @details
+            Writes one character per declared parameter: the primitive letter for
+            a primitive, 'L' for a class reference, '[' for an array.  The letters
+            are what decides the interpreter SLOT layout of the argument block —
+            'J' and 'D' occupy two slots, everything else one — so the packer
+            drives itself off the callee's real descriptor rather than off the
+            C++ argument type, which is the only way to get a `long` passed as an
+            int (or a `double` passed as a float) into the right slot.
+
+            @param signature  A JVM method descriptor, e.g. "(IJLjava/lang/String;)V".
+            @param out        Destination buffer for the parameter letters.
+            @param capacity   Number of characters `out` can hold.
+            @return The number of parameter letters written (0 on a malformed or
+                    empty descriptor, which makes the caller fall back to
+                    C++-type-based slot sizing).
+
+            Complexity: O(len(signature)).
+            Exception safety: noexcept.
+        */
+        inline auto parse_parameter_descriptors(const std::string_view signature,
+                                                char* const out,
+                                                const std::size_t capacity) noexcept
+            -> std::size_t
+        {
+            if (!out || capacity == 0)
+            {
+                return 0;
+            }
+            const std::size_t open{ signature.find('(') };
+            if (open == std::string_view::npos)
+            {
+                return 0;
+            }
+
+            std::size_t count{ 0 };
+            for (std::size_t index{ open + 1 }; index < signature.size(); ++index)
+            {
+                const char c{ signature[index] };
+                if (c == ')')
+                {
+                    break;
+                }
+                if (count >= capacity)
+                {
+                    break;
+                }
+                if (c == '[')
+                {
+                    out[count++] = '[';
+                    // Skip the remaining '[' of a multi-dimensional array and,
+                    // for an object element type, the whole "Lpkg/Cls;" body.
+                    while (index + 1 < signature.size() && signature[index + 1] == '[')
+                    {
+                        ++index;
+                    }
+                    if (index + 1 < signature.size() && signature[index + 1] == 'L')
+                    {
+                        const std::size_t semicolon{ signature.find(';', index + 1) };
+                        if (semicolon == std::string_view::npos)
+                        {
+                            return count;
+                        }
+                        index = semicolon;
+                    }
+                    else
+                    {
+                        ++index;
+                    }
+                    continue;
+                }
+                if (c == 'L')
+                {
+                    out[count++] = 'L';
+                    const std::size_t semicolon{ signature.find(';', index) };
+                    if (semicolon == std::string_view::npos)
+                    {
+                        return count;
+                    }
+                    index = semicolon;
+                    continue;
+                }
+                out[count++] = c;
+            }
+            return count;
+        }
+
+        /*
+            @brief The VMStructs-resolved layout every pure-VM Java call depends on.
+            @details
+            Resolved once and cached.  `usable` is the single gate method_proxy::call
+            consults: it is true only when EVERY field below resolved, because a
+            partially-resolved layout would have the call writing a synthetic
+            JavaCallWrapper the VM then reads at the wrong offsets — the exact class
+            of bug that made the previous `link = -1` argument a VM-corrupter (a GC
+            walking the entry frame dereferenced ((JavaCallWrapper*)-1)->_anchor and
+            took the process down at address 0x1f).
+
+            VMStructs publishes `JavaCallWrapper::_anchor` and the JavaCallWrapper
+            TYPE SIZE, but none of the wrapper's other fields.  Those five offsets
+            are therefore DERIVED from HotSpot's declaration order in
+            runtime/javaCalls.hpp — unchanged from JDK 8 to JDK 26:
+
+                JavaThread*     _thread          //  0
+                JNIHandleBlock* _handles         //  8
+                Method*         _callee_method   // 16
+                oop             _receiver        // 24
+                JavaFrameAnchor _anchor          // 32  (published)
+                JavaValue*      _result          // 56
+
+            and are only used once the two PUBLISHED facts corroborate them at
+            runtime: size == 64 and _anchor == 32 (both MEASURED identical on live
+            JDK 8 / 21 / 26).  If a future layout moves either one, `usable` goes
+            false and invocation reports unavailable instead of guessing.
+
+            Complexity: O(1) after the cached lookups.
+            Exception safety: noexcept.
+        */
+        struct java_call_layout_t
+        {
+            bool        usable{ false };
+
+            std::size_t wrapper_size{ 0 };
+            std::size_t wrapper_thread_offset{ 0 };
+            std::size_t wrapper_handles_offset{ 0 };
+            std::size_t wrapper_callee_offset{ 0 };
+            std::size_t wrapper_receiver_offset{ 0 };
+            std::size_t wrapper_anchor_offset{ 0 };
+            std::size_t wrapper_result_offset{ 0 };
+
+            std::size_t thread_anchor_offset{ 0 };
+            std::size_t anchor_sp_offset{ 0 };
+            std::size_t anchor_pc_offset{ 0 };
+            bool        has_anchor_fp{ false };
+            std::size_t anchor_fp_offset{ 0 };
+
+            bool        has_active_handles{ false };
+            std::size_t active_handles_offset{ 0 };
+            bool        has_handle_block_top{ false };
+            std::size_t handle_block_top_offset{ 0 };
+
+            bool        has_pending_exception{ false };
+            std::size_t pending_exception_offset{ 0 };
+        };
+
+        /*
+            @brief Resolves (once) and returns the pure-VM Java-call layout.
+
+            Complexity: O(VMStructs entries) on the first call, O(1) after.
+            Exception safety: noexcept.
+        */
+        inline auto java_call_layout() noexcept
+            -> const vmhook::detail::java_call_layout_t&
+        {
+            static const vmhook::detail::java_call_layout_t layout{ []() noexcept
+                -> vmhook::detail::java_call_layout_t
+                {
+                    vmhook::detail::java_call_layout_t resolved{};
+
+                    const auto* const wrapper_type{ vmhook::hotspot::iterate_type_entries("JavaCallWrapper") };
+                    const auto* const wrapper_anchor{ vmhook::hotspot::iterate_struct_entries("JavaCallWrapper", "_anchor") };
+                    const auto* const thread_anchor{ vmhook::hotspot::iterate_struct_entries("JavaThread", "_anchor") };
+                    const auto* const anchor_sp{ vmhook::hotspot::iterate_struct_entries("JavaFrameAnchor", "_last_Java_sp") };
+                    const auto* const anchor_pc{ vmhook::hotspot::iterate_struct_entries("JavaFrameAnchor", "_last_Java_pc") };
+                    const auto* const anchor_fp{ vmhook::hotspot::iterate_struct_entries("JavaFrameAnchor", "_last_Java_fp") };
+                    // _active_handles moved from Thread to JavaThread after JDK 8.
+                    const auto* active_handles{ vmhook::hotspot::iterate_struct_entries("JavaThread", "_active_handles") };
+                    if (!active_handles)
+                    {
+                        active_handles = vmhook::hotspot::iterate_struct_entries("Thread", "_active_handles");
+                    }
+                    const auto* const handle_block_top{ vmhook::hotspot::iterate_struct_entries("JNIHandleBlock", "_top") };
+                    // ThreadShadow is the root of Thread, so its offsets are
+                    // absolute inside a JavaThread (MEASURED 8 on JDK 8/21/26).
+                    const auto* const pending_exception{ vmhook::hotspot::iterate_struct_entries("ThreadShadow", "_pending_exception") };
+
+                    if (!wrapper_type || !wrapper_anchor || !thread_anchor || !anchor_sp || !anchor_pc)
+                    {
+                        return resolved;
+                    }
+
+                    resolved.wrapper_size          = static_cast<std::size_t>(wrapper_type->size);
+                    resolved.wrapper_anchor_offset = static_cast<std::size_t>(wrapper_anchor->offset);
+                    resolved.thread_anchor_offset  = static_cast<std::size_t>(thread_anchor->offset);
+                    resolved.anchor_sp_offset      = static_cast<std::size_t>(anchor_sp->offset);
+                    resolved.anchor_pc_offset      = static_cast<std::size_t>(anchor_pc->offset);
+                    if (anchor_fp)
+                    {
+                        resolved.has_anchor_fp    = true;
+                        resolved.anchor_fp_offset = static_cast<std::size_t>(anchor_fp->offset);
+                    }
+                    if (active_handles)
+                    {
+                        resolved.has_active_handles    = true;
+                        resolved.active_handles_offset = static_cast<std::size_t>(active_handles->offset);
+                    }
+                    if (handle_block_top)
+                    {
+                        resolved.has_handle_block_top    = true;
+                        resolved.handle_block_top_offset = static_cast<std::size_t>(handle_block_top->offset);
+                    }
+                    if (pending_exception)
+                    {
+                        resolved.has_pending_exception    = true;
+                        resolved.pending_exception_offset = static_cast<std::size_t>(pending_exception->offset);
+                    }
+
+                    // The derived sibling offsets are only trusted when the two
+                    // published facts corroborate the documented layout.
+                    if (resolved.wrapper_size != 64 || resolved.wrapper_anchor_offset != 32)
+                    {
+                        VMHOOK_LOG("{} java_call_layout(): unexpected JavaCallWrapper layout "
+                                   "(size={}, _anchor={}); pure-VM invocation disabled on this JDK.",
+                                   vmhook::warning_tag, resolved.wrapper_size, resolved.wrapper_anchor_offset);
+                        return resolved;
+                    }
+                    resolved.wrapper_thread_offset   = 0;
+                    resolved.wrapper_handles_offset  = 8;
+                    resolved.wrapper_callee_offset   = 16;
+                    resolved.wrapper_receiver_offset = 24;
+                    resolved.wrapper_result_offset   = 56;
+
+                    // The anchor sub-fields must fit inside the wrapper's anchor.
+                    const std::size_t anchor_span{ resolved.wrapper_anchor_offset + 24 };
+                    if (resolved.anchor_sp_offset >= 24 || resolved.anchor_pc_offset >= 24
+                        || (resolved.has_anchor_fp && resolved.anchor_fp_offset >= 24)
+                        || anchor_span > resolved.wrapper_size)
+                    {
+                        return resolved;
+                    }
+
+                    resolved.usable = resolved.has_active_handles;
+                    return resolved;
+                }()
+            };
+            return layout;
+        }
     }
 
     // --- Method proxy ------------------------------------------------------
@@ -14882,6 +15498,37 @@ namespace vmhook
             > data;
 
             /*
+                @brief True when the invoked Java method threw.
+                @details
+                A callee that throws leaves the exception PENDING on the
+                JavaThread and leaves the stub's result slot holding garbage.
+                call() detects that, clears the pending exception (a pure-VM
+                write to ThreadShadow::_pending_exception — no JNI involved),
+                logs it, and returns a value-initialised result for the declared
+                return type with this flag set, so "the method returned 0" and
+                "the method threw" are distinguishable.  Callers that ignore the
+                flag see a deterministic zero instead of the previous silent
+                garbage.
+            */
+            bool exception_thrown{ false };
+
+            /*
+                @brief Internal (slash-separated) class name of the thrown exception.
+                Empty when nothing was thrown, or when the class name could not be
+                read back from the exception oop.
+            */
+            std::string exception_class{};
+
+            /*
+                @brief True when the invoked Java method threw. @see exception_thrown.
+            */
+            auto threw() const noexcept
+                -> bool
+            {
+                return this->exception_thrown;
+            }
+
+            /*
                 @brief Converts the stored value to T via static_cast.
                 Falls back to a default-constructed T for variant alternatives
                 that cannot be cast to the target type (std::monostate, std::string).
@@ -14920,9 +15567,8 @@ namespace vmhook
                         // Object-returning Java method can be assigned straight
                         // into a std::unique_ptr<my_wrapper> instead of silently
                         // yielding null.  The uint32_t alternative is the
-                        // compressed OOP (the call_stub / call_jni reference paths
-                        // store encode_oop_pointer(result)); decode + validate +
-                        // wrap.
+                        // compressed OOP (the call-stub reference path stores
+                        // encode_oop_pointer(result)); decode + validate + wrap.
                         if constexpr (vmhook::detail::is_unique_ptr_v<target_type>)
                         {
                             using wrapper_type = typename vmhook::detail::is_unique_ptr<target_type>::value_type_t;
@@ -14945,8 +15591,8 @@ namespace vmhook
                             }
                         }
                         // std::string <- either the eagerly-decoded std::string
-                        // alternative (call_jni / call_stub String path) or a
-                        // compressed OOP pointing at a java.lang.String.
+                        // alternative (the call-stub String path) or a compressed
+                        // OOP pointing at a java.lang.String.
                         else if constexpr (std::is_same_v<target_type, std::string>)
                         {
                             if constexpr (std::is_same_v<stored_type, std::string>)
@@ -15049,6 +15695,46 @@ namespace vmhook
         {
         }
 
+        /*
+            @brief Invokes the Java method through HotSpot's own call stub.
+            @details
+            Pure VM: no JNI, no JVMTI.  The dispatch gate is
+            StubRoutines::_call_stub_entry, derived by
+            vmhook::detail::find_call_stub_entry(), and the call is made with a
+            synthetic JavaCallWrapper, a saved/cleared/restored JavaFrameAnchor
+            and a preserved JNIHandleBlock watermark, so the GC, the frame walker
+            and the exception machinery all see a well-formed entry frame.
+
+            Where this may be called from:
+              * INSIDE A HOOK DETOUR — the supported path.  The thread is a real
+                JavaThread already in _thread_in_Java, so no state manipulation
+                happens at all.  Nested invocation from a detour is exercised on
+                live JDK 8 / 21 / 26 including a full GC across two stacked
+                synthetic entry frames.
+              * From a JNI-native context on a JavaThread (_thread_in_native /
+                _thread_in_vm), where the thread state is flipped for the
+                duration.  HotSpot's real transition also polls the safepoint
+                mechanism, which is neither exported nor expressible through
+                VMStructs, so a safepoint armed inside that window is a narrow
+                but real race.
+              * Anywhere else — refused.  A thread that is not a JavaThread, or is
+                mid-transition / blocked, gets a logged monostate.
+
+            Arguments are packed into the interpreter's locals[] SLOT array off
+            the CALLEE's descriptor: one slot for Z B C S I F and references, two
+            for J and D with the value in the higher slot.
+
+            @return A value_t holding the decoded return value.  If the callee
+                    threw, the exception is cleared off the thread and the result
+                    carries value_t::exception_thrown / exception_class with a
+                    value-initialised payload — never the stub's garbage.
+                    A monostate result means void, or that the call was refused
+                    (every refusal is logged).
+
+            Complexity: O(arguments) plus the callee's own cost.
+            Exception safety: noexcept — every failure degrades to a logged
+                              monostate; no C++ exception crosses the stub.
+        */
         template<typename... args_t>
         auto call(args_t&&... args) const noexcept
             -> value_t
@@ -15059,32 +15745,56 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
-            // On modern JDKs (21+) StubRoutines::_call_stub_entry is
-            // often missing from VMStructs.  In that case the entire
-            // call_stub-prep block below is wasted work, so we
-            // short-circuit straight into the JNI path on *this* —
-            // which keeps the proxy's cached_method_id / class_handle
-            // warm across iterations.
+            // StubRoutines::_call_stub_entry is not a VMStructs entry on ANY JDK
+            // (MEASURED on live 8 / 21 / 26; absent from jdk8u, jdk21u and jdk
+            // master vmStructs.cpp alike) — find_call_stub_entry therefore derives
+            // it from the `_call_stub_return_address` static that every version
+            // does publish.  Resolve it FIRST: it is the only dispatch route there
+            // is, so without it the whole call-stub prep block below is wasted
+            // work and we bail immediately.
             void* const call_stub{ vmhook::detail::find_call_stub_entry() };
             if (!call_stub)
             {
-                // Pure-VM: no JNI CallXxxMethod fallback.  method_proxy::call routes
-                // through StubRoutines::_call_stub_entry (resolved via VMStructs).  On
-                // a JDK build that does not export it, invocation is unavailable rather
-                // than dispatched through JNI.
-                VMHOOK_LOG("{} method_proxy::call('{}{}'): StubRoutines::_call_stub_entry not "
-                           "resolvable via VMStructs on this JDK; pure-VM invocation unavailable.",
+                // Invocation is simply unavailable on such a build — there is no
+                // second dispatch tier to fall back to.
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): StubRoutines::_call_stub_entry could not be "
+                           "resolved or derived on this JDK; pure-VM invocation unavailable.",
+                           vmhook::error_tag, this->name(), this->signature_text);
+                return value_t{ std::monostate{} };
+            }
+
+            // The synthetic JavaCallWrapper the stub's first argument MUST point
+            // at cannot be built without these offsets, and building it wrong is
+            // worse than not calling at all (the GC dereferences it).
+            const vmhook::detail::java_call_layout_t& layout{ vmhook::detail::java_call_layout() };
+            if (!layout.usable)
+            {
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): the JavaCallWrapper / frame-anchor layout "
+                           "could not be resolved through VMStructs; pure-VM invocation unavailable.",
                            vmhook::error_tag, this->name(), this->signature_text);
                 return value_t{ std::monostate{} };
             }
 
             vmhook::hotspot::method* const selected_method{ this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
-            const std::string selected_signature{ selected_method ? selected_method->get_signature() : this->signature_text };
+            if (!selected_method || !vmhook::hotspot::is_valid_pointer(selected_method))
+            {
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): no resolvable Method* for the call.",
+                           vmhook::error_tag, this->name(), this->signature_text);
+                return value_t{ std::monostate{} };
+            }
+            std::string selected_signature{ selected_method->get_signature() };
+            if (selected_signature.empty())
+            {
+                // Unreadable descriptor (cold/relocated ConstMethod): keep the
+                // caller-supplied override, exactly as before.
+                selected_signature = this->signature_text;
+            }
 
-            // (See call_jni: a no-overload-matches fail-safe guard was removed
-            // because signature_matches_arguments() false-negatives on
-            // unique_ptr<T> / object args.  The static-overload crash is fixed by
-            // the resolve_compatible_method() hierarchy walk now covering statics.)
+            // Deliberately NO "no overload matches" fail-safe here: such a guard
+            // was removed because signature_matches_arguments() false-negatives on
+            // unique_ptr<T> / object args and would reject valid calls.  The
+            // static-overload crash it was added for is instead fixed by
+            // resolve_compatible_method()'s hierarchy walk now covering statics.
 
             if (!vmhook::hotspot::ensure_current_java_thread())
             {
@@ -15136,17 +15846,39 @@ namespace vmhook
                 valid_ret_char ? vmhook::detail::sig_char_to_basic_type(ret_char)
                                : 14 /* T_VOID: malformed/unknown return -> safe no-op */ };
 
-            //  Parameter slot array
+            //  Parameter SLOT array
             // The call_stub passes parameters[] to the interpreter as locals[].
-            // Each slot is an intptr_t: primitives are zero-extended, object
+            // Each slot is an intptr_t: primitives are zero/sign-extended, object
             // references are uncompressed decoded OOP pointers.
-            std::intptr_t params[8]{};
+            //
+            // A slot is NOT an argument.  'J' (long) and 'D' (double) occupy TWO
+            // slots each, with the value in the HIGHER-indexed one and the lower
+            // slot ignored — HotSpot's JNITypes::put_long does
+            // `*(jlong*)(to + pos + 1) = from; pos += 2;`, and it was measured
+            // directly on JDK 8 / 21 / 26 (value in slot 0 -> wrong result, value
+            // in slot 1 -> correct).  `size_of_parameters` passed to the stub is
+            // therefore the SLOT count, which is what param_idx counts.
+            // Capacity: 8 arguments (the compile-time cap below) x 2 slots + 1
+            // receiver slot = 17 worst case, so 20 can never overflow.
+            constexpr std::size_t max_param_slots{ 20 };
+            std::intptr_t params[max_param_slots]{};
             std::size_t   param_idx{ 0 };
+
+            // Per-argument JVM descriptor letters of the CALLEE, which is what
+            // decides the slot layout (see parse_parameter_descriptors).  A
+            // malformed / unavailable descriptor yields a count of 0 and the
+            // packer falls back to sizing slots off the C++ argument type.
+            char        param_descriptors[max_param_slots]{};
+            const std::size_t param_descriptor_count{
+                vmhook::detail::parse_parameter_descriptors(selected_signature,
+                                                            param_descriptors,
+                                                            max_param_slots) };
+            std::size_t argument_index{ 0 };
 
             // Instance methods receive 'this' as locals[0]; static methods take
             // no receiver slot.  Omit the receiver when the proxy has no object
             // OR the resolved Method is ACC_STATIC.  The is_static() clause
-            // mirrors the call_jni decision: a static Method resolved through an
+            // matters because a static Method resolved through an
             // INSTANCE wrapper (instance->get_method("staticX")) keeps the
             // receiver bound in this->object, and prepending it here as locals[0]
             // would shift every real argument down one slot and feed the
@@ -15165,11 +15897,27 @@ namespace vmhook
             // never invoked — silence -Wunused-but-set-variable on that path.
             [[maybe_unused]] auto pack = [&](auto&& a) noexcept
                 {
-                    if (param_idx >= 8)
+                    using clean_t = std::remove_cvref_t<decltype(a)>;
+
+                    // The callee's descriptor letter for THIS argument ('\0' when
+                    // the descriptor could not be parsed).
+                    const char descriptor{
+                        argument_index < param_descriptor_count
+                            ? param_descriptors[argument_index]
+                            : '\0' };
+                    ++argument_index;
+
+                    // Two slots for J / D, value in the HIGH slot.  With no
+                    // descriptor, fall back to the C++ type: an 8-byte arithmetic
+                    // argument is a long or a double.
+                    const bool two_slots{
+                        descriptor == 'J' || descriptor == 'D'
+                        || (descriptor == '\0' && std::is_arithmetic_v<clean_t> && sizeof(clean_t) == 8) };
+
+                    if (param_idx + (two_slots ? 2u : 1u) > max_param_slots)
                     {
                         return;
                     }
-                    using clean_t = std::remove_cvref_t<decltype(a)>;
                     if constexpr (std::is_same_v<clean_t, std::string>)
                     {
                         void* const string_oop{ vmhook::make_java_string(a) };
@@ -15213,31 +15961,67 @@ namespace vmhook
                     {
                         static_assert(sizeof(clean_t) <= 8);
                         std::intptr_t v{};
-                        std::memcpy(&v, &a, sizeof(clean_t));
-                        params[param_idx++] = v;
+                        if (two_slots)
+                        {
+                            // Widen to the JVM's 64-bit slot value FIRST, so an
+                            // `int` handed to a `J` parameter (or a `float` handed
+                            // to a `D`) reaches the interpreter as the value the
+                            // descriptor declares rather than as half of one.
+                            if (descriptor == 'D')
+                            {
+                                double d{};
+                                if constexpr (std::is_arithmetic_v<clean_t>)
+                                {
+                                    d = static_cast<double>(a);
+                                }
+                                else
+                                {
+                                    std::memcpy(&d, &a, sizeof(clean_t));
+                                }
+                                std::memcpy(&v, &d, sizeof(v));
+                            }
+                            else
+                            {
+                                std::int64_t l{};
+                                if constexpr (std::is_integral_v<clean_t>)
+                                {
+                                    l = static_cast<std::int64_t>(a);
+                                }
+                                else
+                                {
+                                    std::memcpy(&l, &a, sizeof(clean_t));
+                                }
+                                std::memcpy(&v, &l, sizeof(v));
+                            }
+                            params[param_idx++] = 0;   // low slot: ignored by the interpreter
+                            params[param_idx++] = v;   // HIGH slot carries the value
+                        }
+                        else
+                        {
+                            std::memcpy(&v, &a, sizeof(clean_t));
+                            params[param_idx++] = v;
+                        }
                     }
                 };
-            // The interpreter locals[] slot array (params[8]) caps at 8 entries,
+            // The interpreter locals[] slot array caps at max_param_slots entries,
             // and the receiver consumes locals[0] for an instance dispatch, so the
             // pack() guard above silently drops any argument past the cap.  Reject
             // an over-cap arity at COMPILE time with a clear, slot-aware diagnostic
             // anchored on the public call() entry, instead of letting those args
-            // vanish at runtime.  (The JNI fallback call_jni() already static-asserts
-            // the same <= 8 bound; this mirrors it on the call_stub fast path so the
-            // limit is reported identically regardless of which path a JDK takes.)
+            // vanish at runtime.
             // It is a constant-expression check, so the warm 8-or-fewer path is
             // byte-identical and no runtime code is emitted.
             static_assert(sizeof...(args_t) <= 8,
                           "method_proxy::call: max 8 arguments - the interpreter "
-                          "locals[] slot array caps at 8 (note: a long/double "
-                          "argument consumes two interpreter slots).");
+                          "locals[] slot array is sized for 8 arguments (note: a "
+                          "long/double argument consumes two interpreter slots).");
             (pack(std::forward<args_t>(args)), ...);
 
             //  Call the stub
             // Windows x64 calling convention  8 arguments:
-            //   rcx = link  (return address for stub frame, -1 sentinel)
+            //   rcx = link  (JavaCallWrapper* — see below; NOT a sentinel)
             //   rdx = result* (where the Java return value is written)
-            //   r8  = result_type (BasicType enum)
+            //   r8  = result_type (BasicType enum, read as 32 bits)
             //   r9  = Method*
             //   stk = entry_point, parameters*, param_count, JavaThread*
             using call_stub_fn_t = void (*)(
@@ -15251,12 +16035,129 @@ namespace vmhook
                 void*           // thread
                 );
 
-            std::intptr_t result_holder{ 0 };
+            // Refuse to touch a thread that is mid-transition or parked.  The
+            // state write below is a blunt store (HotSpot's real transition needs
+            // SafepointMechanism::process_if_requested, which is neither exported
+            // nor expressible through VMStructs), and doing that over a *_trans /
+            // blocked / new state corrupts the VM's thread state machine.  Inside
+            // a hook detour — the supported way to call — the state is already
+            // _thread_in_Java and nothing is written at all.
             const vmhook::hotspot::java_thread_state previous_state{ thread->get_thread_state() };
-            thread->set_thread_state(vmhook::hotspot::java_thread_state::_thread_in_Java);
+            if (previous_state != vmhook::hotspot::java_thread_state::_thread_in_Java
+                && previous_state != vmhook::hotspot::java_thread_state::_thread_in_native
+                && previous_state != vmhook::hotspot::java_thread_state::_thread_in_vm)
+            {
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): refusing to invoke on a JavaThread in state {}.",
+                           vmhook::error_tag, this->name(), selected_signature,
+                           static_cast<int>(previous_state));
+                return value_t{ std::monostate{} };
+            }
+
+            std::uint8_t* const thread_bytes{ reinterpret_cast<std::uint8_t*>(thread) };
+            std::uint8_t* const thread_anchor{ thread_bytes + layout.thread_anchor_offset };
+
+            // --- the synthetic JavaCallWrapper -------------------------------
+            // The stub's first argument is the caller's JavaCallWrapper, and the
+            // frame walker DEREFERENCES it: frame::sender_for_entry_frame reads
+            // entry_frame_call_wrapper()->anchor(), and frame::oops_entry_do reads
+            // ->callee_method() and ->oops_do() (which walks _receiver and the
+            // _handles block).  Passing a sentinel there is not "unused" — with
+            // the old `-1` a GC walking this thread dereferenced
+            // ((JavaCallWrapper*)-1)->_anchor._last_Java_sp and killed the JVM at
+            // address 0x1f.  HotSpot stack-allocates this struct itself, so a
+            // 64-byte C++ stack object is exactly the right shape; the offsets are
+            // validated in java_call_layout().
+            alignas(16) std::uint8_t wrapper[64]{};
+            static_assert(sizeof(wrapper) == 64,
+                          "JavaCallWrapper is 64 bytes on every measured JDK (8/21/26); "
+                          "java_call_layout() re-checks this against gHotSpotVMTypes at runtime.");
+
+            void* const receiver_oop{ (this->object && !this->is_static()) ? this->object : nullptr };
+
+            // Read the thread slots we are about to overwrite through safe_read
+            // FIRST.  Beyond returning the values to restore, a successful read is
+            // what licenses the raw writes that follow: it proves these exact
+            // bytes are mapped right now, and this is the CURRENT thread's own
+            // JavaThread, which cannot go away underneath us while it is running
+            // this code.  A blind write to an unmapped slot would fault
+            // uncontained on the no-SEH toolchains.
+            void* saved_last_java_sp{ nullptr };
+            void* saved_last_java_pc{ nullptr };
+            void* saved_last_java_fp{ nullptr };
+            void* active_handles{ nullptr };
+            if (!vmhook::os::safe_read(&saved_last_java_sp, thread_anchor + layout.anchor_sp_offset, sizeof(saved_last_java_sp))
+                || !vmhook::os::safe_read(&saved_last_java_pc, thread_anchor + layout.anchor_pc_offset, sizeof(saved_last_java_pc))
+                || (layout.has_anchor_fp
+                    && !vmhook::os::safe_read(&saved_last_java_fp, thread_anchor + layout.anchor_fp_offset, sizeof(saved_last_java_fp)))
+                || !vmhook::os::safe_read(&active_handles, thread_bytes + layout.active_handles_offset, sizeof(active_handles)))
+            {
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): JavaThread frame-anchor / handle slots are not readable.",
+                           vmhook::error_tag, this->name(), selected_signature);
+                return value_t{ std::monostate{} };
+            }
+            if (!active_handles || !vmhook::hotspot::is_valid_pointer(active_handles))
+            {
+                // JavaCallWrapper::oops_do walks _handles unconditionally; a null
+                // block would fault inside the GC, not here.
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): JavaThread has no active JNIHandleBlock.",
+                           vmhook::error_tag, this->name(), selected_signature);
+                return value_t{ std::monostate{} };
+            }
+
+            std::memcpy(wrapper + layout.wrapper_thread_offset,   &thread,          sizeof(void*));
+            std::memcpy(wrapper + layout.wrapper_handles_offset,  &active_handles,  sizeof(void*));
+            std::memcpy(wrapper + layout.wrapper_callee_offset,   &selected_method, sizeof(void*));
+            std::memcpy(wrapper + layout.wrapper_receiver_offset, &receiver_oop,    sizeof(void*));
+            std::memcpy(wrapper + layout.wrapper_anchor_offset + layout.anchor_sp_offset, &saved_last_java_sp, sizeof(void*));
+            std::memcpy(wrapper + layout.wrapper_anchor_offset + layout.anchor_pc_offset, &saved_last_java_pc, sizeof(void*));
+            if (layout.has_anchor_fp)
+            {
+                std::memcpy(wrapper + layout.wrapper_anchor_offset + layout.anchor_fp_offset, &saved_last_java_fp, sizeof(void*));
+            }
+            // _result stays null: HotSpot only reads it from the wrapper on the
+            // exception-unwind path, and the stub writes our own result_holder.
+            const void* const null_result{ nullptr };
+            std::memcpy(wrapper + layout.wrapper_result_offset, &null_result, sizeof(void*));
+
+            // --- save the JNI handle-block watermark -------------------------
+            // HotSpot's interpreter NATIVE-method entry zeroes
+            // _active_handles->_top.  Invoking a `native` Java method through the
+            // stub therefore invalidates every JNI local reference the caller (or
+            // the detour we are running inside) is holding, silently, unless the
+            // watermark is put back afterwards.  Verified necessary on 8/21/26.
+            std::int32_t saved_handle_top{ -1 };
+            std::uint8_t* const handle_top_slot{
+                layout.has_handle_block_top
+                    ? static_cast<std::uint8_t*>(active_handles) + layout.handle_block_top_offset
+                    : nullptr };
+            if (handle_top_slot
+                && !vmhook::os::safe_read(&saved_handle_top, handle_top_slot, sizeof(saved_handle_top)))
+            {
+                saved_handle_top = -1;
+            }
+
+            // --- clear the thread's anchor ------------------------------------
+            // This is what JavaCallWrapper's constructor does.  The new Java
+            // frames belong to the NEW entry frame, so the walker must not
+            // attribute them to the anchor we just copied into the wrapper;
+            // _last_Java_sp is cleared first, exactly as HotSpot does, because a
+            // null sp is what makes the anchor state legal at every instant.
+            void* const cleared{ nullptr };
+            std::memcpy(thread_anchor + layout.anchor_sp_offset, &cleared, sizeof(cleared));
+            std::memcpy(thread_anchor + layout.anchor_pc_offset, &cleared, sizeof(cleared));
+            if (layout.has_anchor_fp)
+            {
+                std::memcpy(thread_anchor + layout.anchor_fp_offset, &cleared, sizeof(cleared));
+            }
+
+            std::intptr_t result_holder{ 0 };
+            if (previous_state != vmhook::hotspot::java_thread_state::_thread_in_Java)
+            {
+                thread->set_thread_state(vmhook::hotspot::java_thread_state::_thread_in_Java);
+            }
 
             reinterpret_cast<call_stub_fn_t>(call_stub)(
-                reinterpret_cast<void*>(static_cast<std::intptr_t>(-1)),
+                wrapper,
                 &result_holder,
                 result_type,
                 reinterpret_cast<void*>(selected_method),
@@ -15266,39 +16167,82 @@ namespace vmhook
                 reinterpret_cast<void*>(thread)
                 );
 
+            //  Restore everything the call was allowed to disturb
+            if (previous_state != vmhook::hotspot::java_thread_state::_thread_in_Java)
+            {
+                thread->set_thread_state(previous_state);
+            }
+            std::memcpy(thread_anchor + layout.anchor_sp_offset, &saved_last_java_sp, sizeof(void*));
+            std::memcpy(thread_anchor + layout.anchor_pc_offset, &saved_last_java_pc, sizeof(void*));
+            if (layout.has_anchor_fp)
+            {
+                std::memcpy(thread_anchor + layout.anchor_fp_offset, &saved_last_java_fp, sizeof(void*));
+            }
+            if (handle_top_slot && saved_handle_top >= 0)
+            {
+                std::memcpy(handle_top_slot, &saved_handle_top, sizeof(saved_handle_top));
+            }
+
+            //  Pending exception
+            // A callee that throws returns through the stub normally, leaves the
+            // result slot holding GARBAGE, and parks the exception on the thread.
+            // Leaving it parked is not an option: the next Java code to run on
+            // this thread observes it and it propagates out of a frame that never
+            // made the call.  Clearing it needs no JNI — ThreadShadow is the root
+            // of Thread, so ThreadShadow::_pending_exception is an absolute
+            // JavaThread offset (MEASURED 8 on JDK 8 / 21 / 26) and a plain
+            // read-then-write-null does the whole job.
+            //
+            // The call then reports a value-initialised result for the declared
+            // return type together with value_t::exception_thrown / exception_class,
+            // so a throw is distinguishable from a real zero instead of being
+            // silently indistinguishable garbage.
+            if (layout.has_pending_exception)
+            {
+                void* pending{ nullptr };
+                if (vmhook::os::safe_read(&pending,
+                                          thread_bytes + layout.pending_exception_offset,
+                                          sizeof(pending))
+                    && pending)
+                {
+                    std::string exception_class{};
+                    if (vmhook::hotspot::klass* const exception_klass{ method_proxy::klass_from_object_header(pending) })
+                    {
+                        if (vmhook::hotspot::symbol* const class_name{ exception_klass->get_name() })
+                        {
+                            exception_class = class_name->to_string();
+                        }
+                    }
+
+                    // Clear it: the slot was just proven readable, and this is the
+                    // current thread's own JavaThread.
+                    std::memcpy(thread_bytes + layout.pending_exception_offset, &cleared, sizeof(cleared));
+
+                    VMHOOK_LOG("{} method_proxy::call('{}{}'): the callee threw {}; result discarded and the "
+                               "pending exception cleared.",
+                               vmhook::warning_tag, this->name(), selected_signature,
+                               exception_class.empty() ? std::string{ "a Java exception" } : exception_class);
+
+                    value_t thrown{};
+                    switch (ret_char)
+                    {
+                    case 'Z': thrown.data = false;                      break;
+                    case 'B': thrown.data = static_cast<std::int8_t>(0); break;
+                    case 'S': thrown.data = static_cast<std::int16_t>(0); break;
+                    case 'I': thrown.data = static_cast<std::int32_t>(0); break;
+                    case 'J': thrown.data = static_cast<std::int64_t>(0); break;
+                    case 'C': thrown.data = static_cast<std::uint16_t>(0); break;
+                    case 'F': thrown.data = 0.0f;                        break;
+                    case 'D': thrown.data = 0.0;                         break;
+                    default:  thrown.data = std::monostate{};            break;
+                    }
+                    thrown.exception_thrown = true;
+                    thrown.exception_class  = std::move(exception_class);
+                    return thrown;
+                }
+            }
+
             //  Decode result
-            thread->set_thread_state(previous_state);
-
-            // SURFACE + CLEAR a Java exception thrown by the callee.
-            //
-            // The raw call stub does NOT clear a pending exception the way the
-            // JNI call gate does: if the invoked Java method threw, the
-            // exception is parked on the JavaThread and remains PENDING after the
-            // stub returns.  The call_jni() path runs check_callee_exception()
-            // after every Call(Static)?<Type>MethodA (which ExceptionDescribe-s
-            // and clears it); the call-stub fast path historically had no such
-            // step, so a throwing call() returned to native with the exception
-            // STILL SET on the thread.  The very next JNI op on that thread (the
-            // next call()'s GetMethodID, a field read, anything) then ran in
-            // ExceptionOccurred state and misbehaved ("the method seemed to run
-            // but nothing happened"), and on -Xcheck:jni (fastdebug HotSpot) the
-            // leaked exception aborts the next JNI call; worse, it could unwind
-            // out of an interpreter frame and propagate as an uncaught exception.
-            //
-            // Mirror call_jni's check_callee_exception() here so BOTH dispatch
-            // paths leave the thread clean: ExceptionDescribe (slot 16) prints
-            // the backtrace AND clears the exception (the library's intended
-            // surfacing channel); fall back to ExceptionClear (slot 17) if
-            // Describe is unavailable.  ensure_current_java_thread() was already
-            // called before the stub (it populates current_jni_env via GetEnv),
-            // so the env is live here; the whole block is a guarded no-op when
-            // no exception is pending or the env/slots cannot be resolved.
-            // Pure-VM: no JNI ExceptionDescribe/Clear.  A throwing callee parks its
-            // exception on the JavaThread's _pending_exception; without JNI, call()
-            // does not auto-surface/clear it here (a VMStructs write to that field
-            // would).  A throwing call() therefore leaves the pending exception for
-            // the interpreter to observe on return.
-
             switch (ret_char)
             {
             case 'Z': return value_t{ (result_holder & 1) != 0 };
@@ -15334,13 +16278,11 @@ namespace vmhook
                 // above).  The previous `static_cast<std::uint32_t>(result_holder)`
                 // both TRUNCATED the 64-bit pointer to 32 bits AND mislabelled an
                 // uncompressed oop as the compressed-oop that value_t's uint32_t
-                // alternative is documented to hold - so on JDKs where the call
-                // stub IS available (JDK 8/11/17) a `Ljava/lang/String;`-returning
-                // call() silently produced "" while the JNI fallback path (JDK 21+)
-                // returned the real text.  Now: decode java.lang.String straight
-                // to UTF-8 for parity with call_jni, and re-encode any other
-                // reference to a real compressed oop so value_t round-trips
-                // through decode_oop_pointer instead of truncating.
+                // alternative is documented to hold - so a
+                // `Ljava/lang/String;`-returning call() silently produced "".
+                // Now: decode java.lang.String straight to UTF-8, and re-encode
+                // any other reference to a real compressed oop so value_t
+                // round-trips through decode_oop_pointer instead of truncating.
                 void* const result_oop{ reinterpret_cast<void*>(result_holder) };
                 if (!result_oop)
                 {
@@ -15403,8 +16345,7 @@ namespace vmhook
                 // no-SEH legs that AVs the JVM.  safe_access_flags_test routes the
                 // u4 read through os::safe_read on ALL platforms: an unreadable slot
                 // yields found=false and we report not-static (the proxy's
-                // documented fallback).  This single change covers both callers —
-                // call_jni's static-dispatch gate and call()'s receiver-slot gate.
+                // documented fallback).
                 bool found{ false };
                 return this->method->safe_access_flags_test(0x0008u, found);
             }
@@ -15627,7 +16568,7 @@ namespace vmhook
             // meant a `uint16_t` argument matched BOTH the `S` and `C`
             // descriptors — recreating the same first-match-wins overload
             // resolution bug that bit vanilla Minecraft 1.8.9
-            // EntityPlayerSP::a() before commit 1a536b7 fixed it on the JNI
+            // EntityPlayerSP::a() before commit 1a536b7 fixed it on the
             // dispatch side.
             else if constexpr (std::is_same_v<clean_type, char16_t> || std::is_same_v<clean_type, std::uint16_t>)
             {
@@ -15882,32 +16823,6 @@ namespace vmhook
         // for an explicit combo(CharSequence) request).  Name-only proxies leave
         // it false so their arg-driven overload resolution keeps working.
         bool        signature_pinned{ false };
-
-        // Lazy caches for the JNI fallback path.  Resolving
-        // jmethodID / jclass once and reusing them across calls is
-        // the single biggest speedup against pure JNI for tight
-        // call loops (GetMethodID is a hashtable lookup inside the
-        // JVM).  Both are mutable because call() is const.
-        mutable void* cached_method_id{ nullptr };
-        mutable void* cached_class_handle{ nullptr };
-        // Cached return-type char parsed from signature_text on the
-        // first call.  Skips the per-call rfind() in the hot path.
-        // Zero means "not yet computed"; the actual chars are all
-        // non-zero (`I`, `J`, `V`, ...).
-        mutable char  cached_ret_char{ 0 };
-        // When resolve_compatible_method picks a different overload than
-        // the one get_method() initially latched onto, store its descriptor
-        // here so the call_jni dispatch uses the right signature for
-        // GetMethodID / ret-type peek / return-type-string detection.
-        mutable std::string cached_effective_signature{};
-        // The effective descriptor the per-overload caches above (cached_method_id,
-        // cached_class_handle, cached_ret_char) were resolved FOR.  A reused name-only
-        // proxy can resolve a DIFFERENT overload between calls (A then B); those caches
-        // are otherwise gated only on "!= null / != 0", so they would dispatch B through
-        // A's jmethodID and decode B's return as A's type.  When the resolved
-        // effective_signature differs from this key, the caches are invalidated and
-        // re-resolved for the new overload.  Empty = no call has primed the caches yet.
-        mutable std::string cached_keyed_signature{};
     };
 
     // --- Object base class ----------------------------------------------------
@@ -15918,8 +16833,9 @@ namespace vmhook
         This is the type passed to vmhook::object constructors. Obtain it from a
         hook frame via frame->get_arguments<vmhook::oop_type_t>(), which internally calls
         vmhook::hotspot::decode_oop_pointer() to convert the 32-bit compressed OOP to a full
-        64-bit address.  It is NOT a JNI global reference - no GC handles are
-        created and the pointer remains valid only for the duration of the hook.
+        64-bit address.  It is a bare pointer, not a managed reference: nothing
+        roots it, nothing tracks relocation, and it remains valid only for the
+        duration of the hook invocation that produced it.
     */
     using oop_type_t = void*;
 
@@ -15972,7 +16888,8 @@ namespace vmhook
             int  hp  = client.get_health();   // operator int()   fires
             client.set_health(100);
 
-        @note The wrapped pointer is a raw decoded OOP, not a JNI global reference.
+        @note The wrapped pointer is a raw decoded OOP, not a managed reference —
+              nothing keeps the object alive or tracks it across a relocating GC.
               It is valid for the duration of the hook invocation only.
     */
     class object_base
@@ -17132,6 +18049,50 @@ namespace vmhook
             return nullptr;
         }
         return reinterpret_cast<vmhook::hotspot::klass*>(decoded);
+    }
+
+    /*
+        @brief Direct-memory "is `object_oop` an instance of the class named
+               `class_name`?"
+        @details
+        Reads the object's runtime klass out of its header (klass_from_oop), then
+        walks the superclass chain (Klass::_super via get_super) comparing each
+        Klass::_name (get_name()->to_string()) against class_name in JVM internal
+        '/'-separated form, e.g. "net/minecraft/item/ItemSword".  VMStructs reads
+        only; nothing is invoked.  Loader-INDEPENDENT — it matches by name, like the JVM's
+        own subtype test, so it works against a class loaded under a custom loader
+        (e.g. Lunar's) without needing the exact klass* find_class would hand back.
+
+        Covers CLASS inheritance only: interfaces live in the secondary-super
+        array, NOT on the _super chain, so an interface name is not matched.  The
+        current callers all test a concrete class (ItemSword / ItemBlock / ItemBow
+        / ItemFood / ItemPotion), for which the super-chain walk is exact.
+
+        Complexity: O(chain depth), one Symbol::to_string() per level.
+        Exception safety: noexcept — an invalid pointer stops the walk (false).
+        @param object_oop  Decoded heap OOP of the object to test (may be null).
+        @param class_name  Internal ('/'-separated) name of the target class.
+        @return true if any klass on the object's super chain is named class_name.
+    */
+    inline auto is_instance_of(void* const object_oop, const std::string_view class_name) noexcept
+        -> bool
+    {
+        if (!object_oop || class_name.empty())
+        {
+            return false;
+        }
+        for (vmhook::hotspot::klass* k{ vmhook::klass_from_oop(object_oop) };
+             k != nullptr && vmhook::hotspot::is_valid_pointer(k);
+             k = k->get_super())
+        {
+            const vmhook::hotspot::symbol* const name_symbol{ k->get_name() };
+            if (vmhook::hotspot::is_valid_pointer(name_symbol)
+                && name_symbol->to_string() == class_name)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     /*
@@ -18435,7 +19396,7 @@ namespace vmhook
         if (!string_klass)
         {
             VMHOOK_LOG("{} read_java_string(): find_class('java/lang/String') returned null - "
-                       "very early bootstrap, or VMStructs+JNI both failed.",
+                       "very early bootstrap, or the VMStructs class lookup failed.",
                        vmhook::error_tag);
             return {};
         }
@@ -19641,42 +20602,50 @@ namespace vmhook
     }
 
     // -------------------------------------------------------------------------
-    // JNI global references: keep a Java object alive across GC.
+    // Object pins: a move-only holder for a raw heap OOP.
     //
-    // Everything else in this header hands you an oop_t / object_base / wrapper
-    // whose address is valid only for the duration of the current hook
-    // invocation: HotSpot relocates objects on every (relocating) GC, so an
-    // address you captured this tick is a dangling pointer the moment a
-    // collection runs.  That makes the common "compute Java objects on one
-    // thread/tick, consume them on another" pattern a use-after-relocation by
-    // construction.  global_ref is the missing lifetime primitive: it pins the
-    // object via NewGlobalRef and its oop() always reads the object's CURRENT
-    // (post-relocation) address out of the handle slot.
+    // WARNING: this is NOT currently a lifetime primitive.  Creating a real GC
+    // root requires a call into the VM, which this pure-VM build has no way to
+    // make, so the class below stores the address you hand it and gives it back
+    // verbatim.  It does not keep the object alive and it does not track
+    // relocation.  See the class doc for the exact contract before using it.
     // -------------------------------------------------------------------------
     namespace jni
     {
         /*
-            @brief Move-only RAII pin around a JNI global reference.
+            @brief Move-only, NON-OWNING holder for a raw heap OOP.  It is NOT a
+            GC root and does NOT survive a relocating GC.
             @details
-            Construct from a raw decoded heap OOP (e.g. wrapper->get_instance(),
-            field_proxy reads, method_proxy::call() results).  The constructor
-            promotes it to a JNI global reference so the JVM cannot collect the
-            object while this handle is alive; the destructor releases it exactly
-            once.  oop() re-derives the live address every call, so it stays valid
-            across relocating GCs.  Copying is disabled (a global ref is owned
-            exactly once — double DeleteGlobalRef corrupts the handle table);
-            moving transfers ownership and nulls the source.
+            READ THIS FIRST — this type does far less than its name suggests.
+            The constructor stores the raw decoded OOP you pass it, the destructor
+            does nothing, and oop() returns the stored address unchanged.  There
+            is no VM-side registration of any kind, so:
 
-            Typical use: cache the result of a method call across ticks, own Java
-            objects inside a long-lived / cross-thread snapshot, or hold a handle
-            on a thread other than the one that produced it.
+              * the object is NOT kept alive.  Drop the last Java-side reference
+                and the collector may reclaim it while this holder is still
+                non-empty; oop() then hands back a pointer into freed heap.
+              * the address is NOT updated.  Any relocating collection that moves
+                the object between construction and oop() leaves the stored
+                address stale, and dereferencing it corrupts your program.
+
+            Safe use today is narrow: hold it only inside a single GC-quiet window
+            (typically one hook invocation), and only for objects that stay
+            reachable from live Java state for independent reasons.  Do NOT use it
+            to carry objects across ticks or between threads — that is precisely
+            the pattern it cannot support.
+
+            Copying is disabled and moving transfers the stored address, nulling
+            the source; that is ownership bookkeeping only, not a lifetime
+            guarantee.  Construction never touches the VM, so it behaves
+            identically with and without a JVM present.
 
                 vmhook::jni::global_ref pinned{ wrapper->get_instance() };
-                // ... ticks / GCs later, on any thread ...
-                if (pinned) { use(pinned.oop()); }   // live, relocated address
+                if (pinned) { use(pinned.oop()); }   // same tick, no GC in between
 
-            Requires a JVM (and an attached thread): with no JVM, construction is
-            a no-op and the handle stays empty (operator bool == false).
+            @note Scheduled for replacement.  This class is a placeholder for a
+            real pin, and both its name and its semantics are expected to change
+            once the header can root an object without a VM call.  Do not build
+            long-lived designs on it.
         */
         class global_ref final
         {
@@ -19710,16 +20679,12 @@ namespace vmhook
             }
 
             /*
-                @brief The pinned object's heap OOP, or nullptr if empty.
-                @details PURE-VM LIMITATION: creating a real GC root (what
-                JNIEnv::NewGlobalRef used to do) requires a call into the VM,
-                which is exactly the JNI dependency this build removes.  vmhook
-                therefore stores the raw OOP captured at construction and returns
-                it as-is.  It stays valid across NON-relocating collections and
-                while the object has not moved, but a relocating GC that moves the
-                object between the pin and this call leaves the address stale.
-                Hold pins only across GC-quiet windows, or keep the object
-                reachable from live Java state.
+                @brief The stored heap OOP, or nullptr if empty.
+                @details Returns the address captured at construction, unchanged
+                and unvalidated.  It is only meaningful while the object has
+                neither moved nor been collected since the holder was built (see
+                the class doc); a relocating GC in between makes it stale, and
+                dropping the last live Java reference makes it dangling.
             */
             auto oop() const noexcept -> vmhook::oop_t
             {
@@ -19727,7 +20692,9 @@ namespace vmhook
             }
 
             /*
-                @brief Releases the pin early (idempotent).  oop() returns nullptr after.
+                @brief Clears the stored OOP early (idempotent).  oop() returns
+                nullptr after.  Nothing is released — there was no VM-side
+                registration to release.
             */
             auto reset() noexcept -> void
             {
@@ -19753,8 +20720,10 @@ namespace vmhook
     }
 
     /*
-        @brief Pins a raw OOP against GC, returning an owning vmhook::jni::global_ref.
-        @details One-liner for the ubiquitous `global_ref{ oop }` pattern.
+        @brief Wraps a raw OOP in a vmhook::jni::global_ref holder.
+        @details One-liner for the `global_ref{ oop }` pattern.  This does NOT
+        protect the object from GC — see the global_ref class doc for the actual
+        (non-owning, relocation-unsafe) contract.
     */
     inline auto pin(vmhook::oop_t const oop) noexcept
         -> vmhook::jni::global_ref
@@ -19763,9 +20732,10 @@ namespace vmhook
     }
 
     /*
-        @brief Pins the Java object behind a wrapper unique_ptr against GC.
+        @brief Wraps the Java object behind a wrapper unique_ptr in a holder.
         @details `pin(wrapper)` instead of `vmhook::jni::global_ref{ wrapper->get_instance() }`.
-        Returns an empty pin for a null wrapper.
+        Returns an empty holder for a null wrapper.  No GC protection — see the
+        global_ref class doc.
     */
     template<typename wrapper_type>
     inline auto pin(const std::unique_ptr<wrapper_type>& wrapper) noexcept

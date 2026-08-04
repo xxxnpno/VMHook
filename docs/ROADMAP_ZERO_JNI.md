@@ -396,9 +396,35 @@ the very end.**
 - **0.5** Diagnose B2's 284 JVM failures. Hypothesis: they are §3.3, not 284 separate bugs.
 
 ### Phase 1 — the safety floor *(nothing here needs an open question answered)*
-- **1.1** **The relocation detector** (mechanism **E**, §4.2c). ~40 lines. Turns silent
-  use-after-relocation into a safe `nullptr`. Land it first; it makes every later phase safe to
-  build on.
+The lifetime work stages into four independently-shippable layers:
+
+| Layer | What | Coverage | Risk | Ship |
+|---|---|---|---|---|
+| **0** | **Capability gate** — collector, JDK barrier shape, compressed oops | all | none (reads only) | **first**, everything needs it |
+| **1** | **Relocation detector** — `global_ref` invalidates instead of dangling | all JDKs, all collectors | none | **first release** |
+| **2** | **Pin via a C-heap root slot** (CLD handle list / JDK 8 global handle block) | JDK 8-26, Serial/Parallel/G1 | medium (lock race, offset discovery) | opt-in, after CI |
+| **3** | Bulk `Object[]` handle table in a static field | Serial/Parallel any JDK; **G1 26+ only** | **high on G1 ≤25 — do not** | last, collector-gated |
+
+- **1.0** **Layer 0, the capability gate.** Determine the collector by walking the JVM flag
+  table (`UseSerialGC`/`UseG1GC`/`UseZGC`/…), which is exported on every JDK 8-26. Two rules
+  make it robust: take the array stride from `gHotSpotVMTypes["JVMFlag"].size`, **never
+  `sizeof`** (the `_doc` member exists only in non-product builds), and branch on the exported
+  `typeString` of `_type` rather than sniffing a JDK version — the table tells you its own
+  shape. Walk `numFlags - 1`; the last entry is an all-null sentinel. This is what the
+  Serviceability Agent does.
+  **Do not** infer the collector from VM_TYPES presence (`declare_type(ZCollectedHeap,…)` is a
+  build-time `INCLUDE_ZGC` guard, present even when ZGC is not running) or from vtable symbols
+  (not exported from `jvm.dll`). Fallbacks: `HeapRegion::GrainBytes` (zero until G1 initialises),
+  then `sun.gc.collector.0.name` from PerfMemory.
+  Also read `UseCompressedOops` here — **the flag table is the only reliable source** (`_base ==
+  0 && _shift == 0` is genuinely ambiguous between "off" and "on with an unscaled sub-4 GB
+  heap"; `heapOopSize` is exported nowhere). This is the proper fix for **L2**. Read
+  `UseCompactObjectHeaders` too (JDK 25+, **default true on master**) — it changes the header
+  and klass encoding this library decodes.
+- **1.1** **Layer 1, the relocation detector** (mechanism **E**, §4.2c). ~40 lines. Turns
+  silent use-after-relocation into a safe `nullptr`. `global_ref` records the epoch alongside
+  the oop; `oop()` returns `nullptr` when stale; add `is_stale()`. Land it first; it makes every
+  later phase safe to build on.
 - **1.2** **`dirty_card()` + oop-width detection.** Fixes latent bugs **L1** and **L2**, which
   are shipping heap-corruption risks today — *and* they are exactly the two primitives
   mechanism **P** needs. One piece of work, two payoffs.

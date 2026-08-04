@@ -2023,17 +2023,44 @@ int main()
     }
 
     // -------------------------------------------------------------------------
-    // SIZE / ALIGN static_asserts. value_t is an aggregate with a single
-    // std::variant member: its size must equal the variant's, its alignment must
-    // equal the variant's, and adding a hidden member (or changing the variant
-    // payload set) would change one of those. We pin the EXACT relation rather
-    // than a numeric size (variant size differs by STL implementation), so the
-    // check is portable across MinGW libstdc++ and MSVC STL.
+    // SIZE / ALIGN static_asserts. This block used to pin
+    // sizeof(value_t) == sizeof(value_t::data) — "no hidden state". That pin was
+    // DELIBERATELY retired when method_proxy::call() gained JNI-free exception
+    // reporting: a call that throws must be able to say so, and "the callee
+    // threw, and it was a NumberFormatException" is part of the CALL'S RESULT,
+    // not ambient state, so it lives on value_t as exception_thrown +
+    // exception_class. That is two documented members and nothing else.
+    //
+    // Note this is method_proxy::value_t only. field_proxy has its own separate
+    // value_t which is untouched and still exactly its variant, so no field read
+    // pays for this.
+    //
+    // We still pin the composition, just as an upper AND lower bound rather than
+    // an equality, so accidental growth is still caught. Sizes are expressed as
+    // relations, never numerically, because variant size differs by STL.
     // -------------------------------------------------------------------------
-    static_assert(sizeof(value_t) == sizeof(decltype(value_t::data)),
-                  "value_t is exactly its variant member (no hidden state)");
+    static_assert(sizeof(value_t) > sizeof(decltype(value_t::data)),
+                  "value_t must carry the exception fields alongside its variant");
+    static_assert(sizeof(value_t) <= sizeof(decltype(value_t::data))
+                                     + sizeof(std::string) + sizeof(bool)
+                                     + alignof(value_t),
+                  "value_t grew beyond its variant plus the two documented "
+                  "exception members - a third member crept in");
     static_assert(alignof(value_t) == alignof(decltype(value_t::data)),
                   "value_t alignment matches its variant member");
+    // The exception channel itself: present, correctly typed, and default-quiet
+    // so an aggregate-initialised value_t never claims a spurious throw.
+    static_assert(std::is_same_v<decltype(value_t::exception_thrown), bool>,
+                  "value_t::exception_thrown must be a bool");
+    static_assert(std::is_same_v<decltype(value_t::exception_class), std::string>,
+                  "value_t::exception_class must be a std::string");
+    // threw() is a plain noexcept accessor, not constexpr, so this one is a
+    // runtime check: an aggregate-initialised value_t must never claim a throw.
+    {
+        const value_t quiet{ std::int32_t{ 0 } };
+        check("value_t_default_reports_no_throw", !quiet.threw());
+        check("value_t_default_exception_class_empty", quiet.exception_class.empty());
+    }
     // The variant must accommodate at least the std::string alternative (the
     // largest payload by far on every STL). Sanity-pins that no alternative was
     // accidentally erased to something tiny.
