@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <csetjmp>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <string>
 #include <vector>
 
 // Windows is needed for BOTH the MSVC __try/__except path AND the no-SEH
@@ -286,9 +289,40 @@ namespace vmhook_test
                              return static_cast<int>(lhs.prio) < static_cast<int>(rhs.prio);
                          });
 
+        // DEBUG-ONLY SUBSET SELECTOR.  `VMHOOK_JVM_MODULES=a,b,c` restricts the
+        // run to the named modules, which is what makes bisecting a
+        // cross-module JVM crash tractable: a full cell is 80+ modules and a
+        // crash in module N destroys every result after it.  UNSET (the CI
+        // default, and the only supported way to gate a change) runs
+        // everything, so this can never silently shrink coverage.
+        std::string selection{};
+        if (const char* const requested{ std::getenv("VMHOOK_JVM_MODULES") })
+        {
+            selection = requested;
+        }
+        const auto selected{ [&selection](const char* const name) noexcept -> bool
+            {
+                if (selection.empty() || !name) { return true; }
+                const std::string needle{ name };
+                std::size_t begin{ 0 };
+                while (begin <= selection.size())
+                {
+                    const std::size_t comma{ selection.find(',', begin) };
+                    const std::size_t end{ comma == std::string::npos ? selection.size() : comma };
+                    if (selection.compare(begin, end - begin, needle) == 0) { return true; }
+                    if (comma == std::string::npos) { break; }
+                    begin = comma + 1;
+                }
+                return false;
+            } };
+
         std::size_t ran{ 0 };
         for (const entry& module_entry : registry())
         {
+            if (!selected(module_entry.name))
+            {
+                continue;
+            }
             if (ctx.record)
             {
                 ctx.record(std::string{ "[INFO] === module: " } + module_entry.name + " ===");

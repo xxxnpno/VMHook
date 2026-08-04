@@ -7556,6 +7556,81 @@ namespace vmhook
             detour returns we force the state to _thread_in_Java so the bytecode
             dispatch that follows finds the correct state.
         */
+        /*
+            @brief The Java frame a detour interrupted, in JavaFrameAnchor terms.
+            @details
+            A hook detour runs as NATIVE code on a JavaThread whose state is
+            _thread_in_Java, and in that state HotSpot keeps NO frame anchor:
+            JavaThread::_anchor._last_Java_sp is 0 (MEASURED inside a live detour on
+            Temurin 21.0.11: "sp=0x0 pc=0x0 fp=0x0 state=8").  That is normally
+            harmless -- a thread in _thread_in_Java only ever gets walked after it
+            polls its way to a safepoint, which sets the anchor from the poll site.
+
+            It stops being harmless the moment the detour calls back INTO Java
+            through method_proxy::call().  That builds a synthetic entry frame, and
+            HotSpot terminates a stack walk at an entry frame whose JavaCallWrapper
+            anchor has a null sp:
+
+                bool frame::entry_frame_is_first() const {
+                  return entry_frame_call_wrapper()->is_first_frame(); }
+                bool is_first_frame() const { return _anchor.last_Java_sp() == nullptr; }
+                inline bool StackFrameStream::is_done() {
+                  return (_is_done) ? true : (_is_done = _fr.is_first_frame(), false); }
+
+            (jdk21u @ jdk-21.0.11-ga: share/runtime/frame.cpp, share/runtime/javaCalls.hpp,
+             share/runtime/stackFrameStream.inline.hpp.)
+
+            So a collection that happens DURING the call walks the callee's frames,
+            reaches our entry frame, decides it is the bottom of the Java stack, and
+            never scans the real Java frames underneath -- the ones actually running
+            the application.  A relocating collector then moves every object those
+            frames reference without updating their oop slots, and the NEXT
+            collection dereferences the dangling oops.  MEASURED: "GC Thread#12 ...
+            jvm.dll+0xcad1 EXCEPTION_ACCESS_VIOLATION reading 0x100", which is
+            `mov rax,[r8]; mov rcx,r8; jmp [rax+0x100]` on a dead oop's zeroed class
+            word decoded to the compressed-klass base.
+
+            This structure is the fix: the trampoline knows exactly where Java was
+            when it jumped out, so the detour records that frame here and
+            method_proxy::call() copies it into the synthetic JavaCallWrapper.  The
+            walk then continues through the entry frame into the interrupted
+            interpreter frame and everything below it, exactly as it would for a
+            real JavaCalls::call.
+
+            Thread safety: thread_local; saved and restored around each detour, so
+            nested detours (a hook that fires inside an invoked method) stack.
+        */
+        struct detour_java_anchor_t
+        {
+            void* last_java_sp{ nullptr };
+            void* last_java_fp{ nullptr };
+            void* last_java_pc{ nullptr };
+            bool  valid{ false };
+        };
+
+        inline thread_local vmhook::hotspot::detour_java_anchor_t current_detour_anchor{};
+
+        /*
+            @brief Words the trampoline pushes before it takes the return_slot address.
+            @details
+            The trampoline is reached by a 5-byte JMP patched into the i2i stub, so no
+            return address is pushed and the stack pointer at the injection point is
+            recoverable exactly: it is the return_slot pointer plus everything the
+            trampoline pushed before `lea r8,[rsp]` / `mov rdx,rsp`.
+
+              Win64  : push rax,rcx,rdx,r8,r9,r10,r11,rbp        (8) + 2 slot words = 10
+              System V: push rax,rdi,rsi,rdx,rcx,r8,r9,r10,r11,rbp (10) + 2 slot words = 12
+
+            Kept next to common_detour rather than inside midi2i_hook because it is a
+            property of the SAME assembly both read; if that assembly gains or loses a
+            push, this constant moves with it.
+        */
+#if defined(_WIN32)
+        inline constexpr std::size_t trampoline_pushed_words{ 10 };
+#else
+        inline constexpr std::size_t trampoline_pushed_words{ 12 };
+#endif
+
         static auto common_detour(vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread* const thread, vmhook::hotspot::return_slot* const slot)
             -> std::int64_t
         {
@@ -7609,6 +7684,66 @@ namespace vmhook
                 {
                     if (hook.method == current_method)
                     {
+                        // Publish the interrupted Java frame for the duration of the
+                        // user detour (see detour_java_anchor_t).  Every component is
+                        // exact, none is guessed:
+                        //   sp = the interpreter's own rsp at the injection point,
+                        //        recovered from the return_slot the trampoline handed
+                        //        us plus the words it pushed to get there;
+                        //   fp = the interpreter frame base -- the SAME rbp the
+                        //        detour receives as its `frame*`, which every other
+                        //        frame accessor in this header already trusts;
+                        //   pc = Method::_i2i_entry, i.e. an address inside the very
+                        //        interpreter stub we are executing, so
+                        //        Interpreter::contains(pc) holds and HotSpot classifies
+                        //        the frame as interpreted (frame::sender_for_interpreter_frame
+                        //        then derives sender_sp / unextended_sp / link / sender_pc
+                        //        from fp alone, so the whole chain below is exact too).
+                        // pc is set explicitly rather than left null precisely because
+                        // the trampoline is JUMPED to, not CALLed: there is no return
+                        // address at sp[-1] for JavaFrameAnchor::make_walkable() to
+                        // find.  With pc non-null the anchor is already walkable() and
+                        // make_walkable() is a documented no-op.
+                        struct detour_anchor_guard
+                        {
+                            vmhook::hotspot::detour_java_anchor_t previous;
+
+                            explicit detour_anchor_guard(vmhook::hotspot::detour_java_anchor_t next) noexcept
+                                : previous{ vmhook::hotspot::current_detour_anchor }
+                            {
+                                vmhook::hotspot::current_detour_anchor = next;
+                            }
+
+                            ~detour_anchor_guard()
+                            {
+                                vmhook::hotspot::current_detour_anchor = this->previous;
+                            }
+                        };
+
+                        vmhook::hotspot::detour_java_anchor_t anchor{};
+                        if (slot && frame_pointer && current_method)
+                        {
+                            void* const sp{ reinterpret_cast<void*>(
+                                reinterpret_cast<std::uintptr_t>(slot)
+                                + (vmhook::hotspot::trampoline_pushed_words * sizeof(void*))) };
+                            void* const fp{ static_cast<void*>(frame_pointer) };
+                            void* const pc{ current_method->get_i2i_entry() };
+                            // The stack grows DOWN, so a real interpreter frame always
+                            // has fp strictly above the sp inside it; anything else means
+                            // the trampoline contract or the frame is not what we think,
+                            // and an anchor is far too dangerous to publish on a guess.
+                            if (pc
+                                && reinterpret_cast<std::uintptr_t>(fp) > reinterpret_cast<std::uintptr_t>(sp)
+                                && vmhook::hotspot::is_valid_pointer(pc))
+                            {
+                                anchor.last_java_sp = sp;
+                                anchor.last_java_fp = fp;
+                                anchor.last_java_pc = pc;
+                                anchor.valid        = true;
+                            }
+                        }
+                        const detour_anchor_guard anchor_guard{ anchor };
+
                         hook.detour(frame_pointer, thread, slot);
                         thread->set_thread_state(vmhook::hotspot::java_thread_state::_thread_in_Java);
                         // Return slot->retval so the trampoline can place it in rax/xmm0
@@ -8429,14 +8564,53 @@ namespace vmhook
         }
 
         // Array klasses ("[I", "[[J", "[Ljava/lang/String;") need their own
-        // resolution path: on JDK 8-17 a per-ClassLoaderData Dictionary holds
-        // InstanceKlasses only, so the ordinary walk below never sees them.
-        // resolve_array_klass covers both generations — the CLDG _klasses walk
-        // lists array klasses on JDK 21+, and older JDKs are served from the
-        // Universe primitive-array statics + InstanceKlass::_array_klasses.
+        // resolution path FIRST: on JDK 8 a per-ClassLoaderData Dictionary holds
+        // InstanceKlasses only, so the ordinary walk below never sees them, and
+        // resolve_array_klass serves them from the Universe primitive-array
+        // statics + InstanceKlass::_array_klasses.
+        //
+        // It is NOT a complete answer on its own, and that gap is what made
+        // make_java_string() return null on every JDK 9+.  MEASURED on live
+        // JDK 8 / 21 / 26 the two routes are exactly COMPLEMENTARY for the
+        // PRIMITIVE array klasses:
+        //
+        //   Universe::_{bool,byte,char,short,int,long,single,double}ArrayKlassObj
+        //     JDK  8  PRESENT in gHotSpotVMStructs      -> resolve_array_klass works
+        //     JDK 21  absent                            -> resolve_array_klass fails
+        //     JDK 26  absent                            -> resolve_array_klass fails
+        //
+        //   ClassLoaderDataGraph _klasses walk, find_klass("[B")
+        //     JDK  8  nullptr (dictionary lists InstanceKlasses only)
+        //     JDK 21  resolves
+        //     JDK 26  resolves
+        //
+        // ("[Ljava/lang/String;" is unaffected either way -- it comes from the
+        // component InstanceKlass::_array_klasses, which every version publishes.)
+        // So resolve_array_klass FALLS THROUGH to the ordinary walk on a miss
+        // instead of returning nullptr, and the pair covers 8 through 26.  The
+        // walk also populates the same lookup cache, so the second "[B" is free.
+        //
+        // The fall-through is GATED on the JDK generation, and that gate is a
+        // cost control, not a correctness one.  A miss that falls through pays a
+        // full ClassLoaderDataGraph walk and -- because find_class never caches a
+        // negative -- pays it AGAIN on every repeat of the same name.  On a
+        // JDK-8-generation VM that walk can never produce an array klass (its
+        // per-CLD Dictionary holds InstanceKlasses only), so falling through
+        // there would be a pure O(loaded classes) tax on every unresolvable array
+        // descriptor.  The presence of the Universe primitive-array statics is
+        // exactly the marker for that generation, and it is resolved once.
         if (class_name.front() == '[')
         {
-            return vmhook::resolve_array_klass(class_name);
+            if (vmhook::hotspot::klass* const array_klass{ vmhook::resolve_array_klass(class_name) })
+            {
+                return array_klass;
+            }
+            static const bool universe_array_statics_present{
+                vmhook::hotspot::iterate_struct_entries("Universe", "_byteArrayKlassObj") != nullptr };
+            if (universe_array_statics_present)
+            {
+                return nullptr;
+            }
         }
 
         {
@@ -15345,6 +15519,18 @@ namespace vmhook
             Complexity: O(1) after the cached lookups.
             Exception safety: noexcept.
         */
+        /*
+            @brief Upper bound on the stack buffer method_proxy::call uses for the
+                   synthetic JNIHandleBlock it hands the callee.
+            @details
+            MEASURED sizeof(JNIHandleBlock) on live JDK 8 / 21 / 26: 312 / 296 / 296
+            bytes (32 oops + the bookkeeping words).  512 leaves headroom for a
+            future layout without putting an unbounded array on the caller's stack;
+            a JDK whose block does not fit refuses invocation rather than guessing,
+            exactly like every other field in java_call_layout_t.
+        */
+        inline constexpr std::size_t max_handle_block_bytes{ 512 };
+
         struct java_call_layout_t
         {
             bool        usable{ false };
@@ -15367,6 +15553,8 @@ namespace vmhook
             std::size_t active_handles_offset{ 0 };
             bool        has_handle_block_top{ false };
             std::size_t handle_block_top_offset{ 0 };
+            bool        has_handle_block{ false };
+            std::size_t handle_block_size{ 0 };
 
             bool        has_pending_exception{ false };
             std::size_t pending_exception_offset{ 0 };
@@ -15399,6 +15587,10 @@ namespace vmhook
                         active_handles = vmhook::hotspot::iterate_struct_entries("Thread", "_active_handles");
                     }
                     const auto* const handle_block_top{ vmhook::hotspot::iterate_struct_entries("JNIHandleBlock", "_top") };
+                    // The TYPE SIZE of JNIHandleBlock is what lets method_proxy::call
+                    // hand the callee a FRESH handle block instead of letting it reset
+                    // the caller's one (see the JNI-handle-block section of call()).
+                    const auto* const handle_block_type{ vmhook::hotspot::iterate_type_entries("JNIHandleBlock") };
                     // ThreadShadow is the root of Thread, so its offsets are
                     // absolute inside a JavaThread (MEASURED 8 on JDK 8/21/26).
                     const auto* const pending_exception{ vmhook::hotspot::iterate_struct_entries("ThreadShadow", "_pending_exception") };
@@ -15427,6 +15619,13 @@ namespace vmhook
                     {
                         resolved.has_handle_block_top    = true;
                         resolved.handle_block_top_offset = static_cast<std::size_t>(handle_block_top->offset);
+                    }
+                    if (handle_block_type && handle_block_type->size > 0
+                        && static_cast<std::size_t>(handle_block_type->size)
+                               <= vmhook::detail::max_handle_block_bytes)
+                    {
+                        resolved.has_handle_block  = true;
+                        resolved.handle_block_size = static_cast<std::size_t>(handle_block_type->size);
                     }
                     if (pending_exception)
                     {
@@ -15458,7 +15657,14 @@ namespace vmhook
                         return resolved;
                     }
 
-                    resolved.usable = resolved.has_active_handles;
+                    // has_handle_block is a HARD requirement, not a nicety: without
+                    // a fresh JNIHandleBlock to hand the callee, a `native` callee's
+                    // interpreter entry resets the CALLER's block (_top = 0) and the
+                    // caller's live JNI locals stop being GC roots for the duration
+                    // of the call.  Papering over that by restoring the watermark
+                    // afterwards resurrects oops the collector no longer tracked --
+                    // a stale root that kills a LATER GC.  See call().
+                    resolved.usable = resolved.has_active_handles && resolved.has_handle_block;
                     return resolved;
                 }()
             };
@@ -15713,8 +15919,9 @@ namespace vmhook
             StubRoutines::_call_stub_entry, derived by
             vmhook::detail::find_call_stub_entry(), and the call is made with a
             synthetic JavaCallWrapper, a saved/cleared/restored JavaFrameAnchor
-            and a preserved JNIHandleBlock watermark, so the GC, the frame walker
-            and the exception machinery all see a well-formed entry frame.
+            and a fresh JNIHandleBlock installed for the callee, so the GC, the
+            frame walker and the exception machinery all see a well-formed entry
+            frame -- and the caller's JNI locals never stop being GC roots.
 
             Where this may be called from:
               * INSIDE A HOOK DETOUR — the supported path.  The thread is a real
@@ -16115,51 +16322,113 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
+            // --- the anchor the synthetic entry frame publishes ----------------
+            // Normally this is simply the thread's own anchor, saved and put back
+            // (what ~JavaCallWrapper does).  But a thread that is _thread_in_Java --
+            // which is every hook detour, the SUPPORTED way to invoke -- has NO
+            // anchor at all (MEASURED sp=0 pc=0 fp=0 in a live detour), and an entry
+            // frame whose wrapper anchor has a null sp is the BOTTOM of the Java
+            // stack as far as HotSpot is concerned:
+            //
+            //     bool JavaCallWrapper::is_first_frame() const
+            //       { return _anchor.last_Java_sp() == nullptr; }
+            //
+            // Every stack walk that reaches it stops there, so a collection during
+            // the call never scans the application's real Java frames underneath,
+            // relocates the objects they hold without fixing their oop slots, and
+            // leaves the NEXT collection walking dangling oops.  That is the
+            // "GC Thread#N ... reading 0x100" crash this code used to cause.
+            //
+            // vmhook::hotspot::current_detour_anchor is the frame the detour
+            // interrupted, recorded by common_detour from the trampoline's own
+            // (exact, not reconstructed) sp/fp plus the interpreter pc.  Publishing
+            // it here is what lets the walk continue past the entry frame into the
+            // interpreted frame we are standing on and everything below it.
+            void* entry_anchor_sp{ saved_last_java_sp };
+            void* entry_anchor_pc{ saved_last_java_pc };
+            void* entry_anchor_fp{ saved_last_java_fp };
+            if (!entry_anchor_sp && vmhook::hotspot::current_detour_anchor.valid)
+            {
+                entry_anchor_sp = vmhook::hotspot::current_detour_anchor.last_java_sp;
+                entry_anchor_pc = vmhook::hotspot::current_detour_anchor.last_java_pc;
+                entry_anchor_fp = vmhook::hotspot::current_detour_anchor.last_java_fp;
+            }
+
             std::memcpy(wrapper + layout.wrapper_thread_offset,   &thread,          sizeof(void*));
             std::memcpy(wrapper + layout.wrapper_handles_offset,  &active_handles,  sizeof(void*));
             std::memcpy(wrapper + layout.wrapper_callee_offset,   &selected_method, sizeof(void*));
             std::memcpy(wrapper + layout.wrapper_receiver_offset, &receiver_oop,    sizeof(void*));
-            std::memcpy(wrapper + layout.wrapper_anchor_offset + layout.anchor_sp_offset, &saved_last_java_sp, sizeof(void*));
-            std::memcpy(wrapper + layout.wrapper_anchor_offset + layout.anchor_pc_offset, &saved_last_java_pc, sizeof(void*));
+            std::memcpy(wrapper + layout.wrapper_anchor_offset + layout.anchor_sp_offset, &entry_anchor_sp, sizeof(void*));
+            std::memcpy(wrapper + layout.wrapper_anchor_offset + layout.anchor_pc_offset, &entry_anchor_pc, sizeof(void*));
             if (layout.has_anchor_fp)
             {
-                std::memcpy(wrapper + layout.wrapper_anchor_offset + layout.anchor_fp_offset, &saved_last_java_fp, sizeof(void*));
+                std::memcpy(wrapper + layout.wrapper_anchor_offset + layout.anchor_fp_offset, &entry_anchor_fp, sizeof(void*));
             }
             // _result stays null: HotSpot only reads it from the wrapper on the
             // exception-unwind path, and the stub writes our own result_holder.
             const void* const null_result{ nullptr };
             std::memcpy(wrapper + layout.wrapper_result_offset, &null_result, sizeof(void*));
 
-            // --- save the JNI handle-block watermark -------------------------
-            // HotSpot's interpreter NATIVE-method entry zeroes
-            // _active_handles->_top.  Invoking a `native` Java method through the
-            // stub therefore invalidates every JNI local reference the caller (or
-            // the detour we are running inside) is holding, silently, unless the
-            // watermark is put back afterwards.  Verified necessary on 8/21/26.
-            std::int32_t saved_handle_top{ -1 };
-            std::uint8_t* const handle_top_slot{
-                layout.has_handle_block_top
-                    ? static_cast<std::uint8_t*>(active_handles) + layout.handle_block_top_offset
-                    : nullptr };
-            if (handle_top_slot
-                && !vmhook::os::safe_read(&saved_handle_top, handle_top_slot, sizeof(saved_handle_top)))
-            {
-                saved_handle_top = -1;
-            }
+            // --- hand the callee a FRESH JNIHandleBlock -----------------------
+            // HotSpot's interpreter NATIVE-method entry unconditionally zeroes
+            // _active_handles->_top (TemplateInterpreterGenerator::generate_native_entry:
+            // "reset handle block" -> `movl [t + JNIHandleBlock::top_offset()], 0`).
+            // It is allowed to, because JavaCallWrapper's constructor already gave
+            // the callee a block of its own:
+            //
+            //     JNIHandleBlock* new_handles = JNIHandleBlock::allocate_block(thread);
+            //     ...
+            //     _handles = _thread->active_handles();   // save the CALLER's block
+            //     ...
+            //     _thread->set_active_handles(new_handles);
+            //
+            //   (jdk21u, jdk-21.0.11-ga, src/hotspot/share/runtime/javaCalls.cpp;
+            //    identical in jdk8u492-ga and jdk master.)
+            //
+            // Leaving the caller's block installed and putting its _top back
+            // AFTERWARDS -- what this code used to do -- is not equivalent, it is a
+            // GC-correctness bug.  Thread::oops_do_no_frames roots exactly
+            // `active_handles()->oops_do(f)` for `_top` slots, so with _top == 0 the
+            // caller's live JNI locals are UNROOTED for the whole call.  A
+            // collection inside the call (System.gc() through this very path) then
+            // moves or reclaims those objects without updating the slots, and
+            // restoring _top afterwards republishes them as roots.  The NEXT
+            // stop-the-world collection walks a dead oop, decodes its zeroed class
+            // word to the compressed-klass base, and dies on the virtual call
+            // through that non-Klass's null vtable -- MEASURED as
+            // "GC Thread#12 ... jvm.dll+0xcad1 ... reading 0x100" on Temurin 21.0.11.
+            //
+            // Pure VM: JNIHandleBlock::allocate_block is not reachable, but the block
+            // is a plain POD whose SIZE VMStructs publishes, and allocate_block's
+            // post-state for the fields the VM reads before allocate_handle rebuilds
+            // them (_top / _next / _pop_frame_link) is all-zero.  A zeroed buffer of
+            // that exact size is therefore a legal empty block.  It lives on THIS
+            // C++ frame, so nesting (a call from inside a detour that is itself
+            // inside a call) gets one block per level, exactly like HotSpot.
+            alignas(16) std::uint8_t fresh_handle_block[vmhook::detail::max_handle_block_bytes]{};
+            std::uint8_t* const handles_slot{ thread_bytes + layout.active_handles_offset };
+            void* const fresh_handles{ static_cast<void*>(fresh_handle_block) };
+            std::memcpy(handles_slot, &fresh_handles, sizeof(fresh_handles));
 
             // --- clear the thread's anchor ------------------------------------
             // This is what JavaCallWrapper's constructor does.  The new Java
             // frames belong to the NEW entry frame, so the walker must not
-            // attribute them to the anchor we just copied into the wrapper;
-            // _last_Java_sp is cleared first, exactly as HotSpot does, because a
-            // null sp is what makes the anchor state legal at every instant.
+            // attribute them to the anchor we just copied into the wrapper.
+            // JavaFrameAnchor::clear() on x86 is
+            //     _last_Java_sp = nullptr;   // "clearing _last_Java_sp must be first"
+            //     _last_Java_fp = nullptr;
+            //     _last_Java_pc = nullptr;
+            // and the order is the contract, not a style: _last_Java_sp IS
+            // has_last_Java_frame(), so retiring it first is what keeps the anchor
+            // legal at every instant for an asynchronous reader (GC worker,
+            // profiler, handshake).
             void* const cleared{ nullptr };
             std::memcpy(thread_anchor + layout.anchor_sp_offset, &cleared, sizeof(cleared));
-            std::memcpy(thread_anchor + layout.anchor_pc_offset, &cleared, sizeof(cleared));
             if (layout.has_anchor_fp)
             {
                 std::memcpy(thread_anchor + layout.anchor_fp_offset, &cleared, sizeof(cleared));
             }
+            std::memcpy(thread_anchor + layout.anchor_pc_offset, &cleared, sizeof(cleared));
 
             std::intptr_t result_holder{ 0 };
             if (previous_state != vmhook::hotspot::java_thread_state::_thread_in_Java)
@@ -16179,20 +16448,46 @@ namespace vmhook
                 );
 
             //  Restore everything the call was allowed to disturb
+            // ORDER MATTERS, and it is HotSpot's, taken from ~JavaCallWrapper():
+            // restore the handle block, then zap the anchor (sp first), then the
+            // thread state, then republish the anchor with sp LAST.
+            //
+            // The caller's block goes back untouched -- nothing wrote to it, so its
+            // _top and every handle in it are exactly what they were, and they were
+            // GC roots continuously (they never stopped being reachable through
+            // JavaThread::_active_handles ... except during the call, where the
+            // synthetic JavaCallWrapper's _handles field kept rooting them through
+            // frame::oops_entry_do -> JavaCallWrapper::oops_do -> handles()->oops_do).
+            std::memcpy(thread_bytes + layout.active_handles_offset, &active_handles, sizeof(void*));
+
+            // Retire the (now stale) anchor before touching anything else, so no
+            // asynchronous walker can pair a live sp with a half-written fp/pc.
+            std::memcpy(thread_anchor + layout.anchor_sp_offset, &cleared, sizeof(cleared));
+
             if (previous_state != vmhook::hotspot::java_thread_state::_thread_in_Java)
             {
                 thread->set_thread_state(previous_state);
             }
-            std::memcpy(thread_anchor + layout.anchor_sp_offset, &saved_last_java_sp, sizeof(void*));
-            std::memcpy(thread_anchor + layout.anchor_pc_offset, &saved_last_java_pc, sizeof(void*));
+
+            // JavaFrameAnchor::copy() on x86, verbatim:
+            //     if (_last_Java_sp != src->_last_Java_sp) _last_Java_sp = nullptr;
+            //     _last_Java_fp = src->_last_Java_fp;
+            //     _last_Java_pc = src->_last_Java_pc;
+            //     // Must be last so profiler will always see valid frame if
+            //     // has_last_frame() is true
+            //     _last_Java_sp = src->_last_Java_sp;
+            // (jdk21u jdk-21.0.11-ga src/hotspot/cpu/x86/javaFrameAnchor_x86.hpp,
+            //  byte-identical in jdk master; jdk8u492-ga the same modulo NULL.)
+            // The previous code here wrote sp FIRST, which republished
+            // has_last_Java_frame() == true while fp and pc still held the cleared
+            // values -- a GC worker sampling in that window builds
+            // frame(real_sp, nullptr, nullptr) and walks it.
             if (layout.has_anchor_fp)
             {
                 std::memcpy(thread_anchor + layout.anchor_fp_offset, &saved_last_java_fp, sizeof(void*));
             }
-            if (handle_top_slot && saved_handle_top >= 0)
-            {
-                std::memcpy(handle_top_slot, &saved_handle_top, sizeof(saved_handle_top));
-            }
+            std::memcpy(thread_anchor + layout.anchor_pc_offset, &saved_last_java_pc, sizeof(void*));
+            std::memcpy(thread_anchor + layout.anchor_sp_offset, &saved_last_java_sp, sizeof(void*));
 
             //  Pending exception
             // A callee that throws returns through the stub normally, leaves the

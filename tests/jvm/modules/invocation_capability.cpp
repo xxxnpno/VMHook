@@ -39,9 +39,13 @@
 //   * a VOID return -- is_void() plus the Java-side side effect         (HARD)
 //   * a THROWING callee -- value_t::threw(), exception_class, a zeroed payload,
 //     and NO pending exception left on the thread afterwards           (HARD)
-//   * a NATIVE callee (java.lang.System.currentTimeMillis) with the
-//     JNIHandleBlock watermark (_active_handles->_top) preserved across it
-//                                                                      (HARD)
+//   * a NATIVE callee (java.lang.System.currentTimeMillis) with the CALLER's
+//     JNIHandleBlock watermark (_active_handles->_top) unchanged across it.
+//     A native callee's interpreter entry zeroes _active_handles->_top, so the
+//     ONLY way this holds is the one HotSpot uses: hand the callee a FRESH
+//     block and put the caller's back afterwards.  Restoring the watermark on
+//     the caller's own block instead makes this assertion pass too -- and
+//     republishes oops the collector stopped tracking during the call         (HARD)
 //   * a value-returning call AFTER the throwing one still works        (HARD)
 //
 // SECTION C -- GC ACROSS A SYNTHETIC ENTRY FRAME (second probe cycle):
@@ -51,35 +55,43 @@
 //     address 0x1f, so surviving this is the whole point                (HARD)
 //   * invocation still works after that collection                     (HARD)
 //
+// SECTION C IS ALSO THE REGRESSION GUARD FOR THE STACK-WALK TRUNCATION BUG, and
+// that is why this module must run at NORMAL priority next to a module that
+// forces its own collection.  Surviving Section C in ISOLATION proves nothing:
+// the damage is silent.  A hook detour runs with JavaThread::_anchor completely
+// empty (MEASURED sp=0 pc=0 fp=0 state=_thread_in_Java on Temurin 21.0.11), and
+// a synthetic entry frame that inherits that null sp is, by
+// JavaCallWrapper::is_first_frame(), the BOTTOM of the Java stack.  Every walk
+// during the call stopped there, so the application's real Java frames below
+// were never scanned; the full GC relocated the objects they held without
+// fixing their slots, and the NEXT collection -- in whatever module ran next --
+// died on the dangling oops:
+//
+//   Current thread: WorkerThread "GC Thread#12"
+//   V [jvm.dll+0xcad1]   EXCEPTION_ACCESS_VIOLATION reading 0x100
+//   JavaThread ... was being processed
+//   j java.lang.Runtime.gc() / java.lang.System.gc() / <the next module's probe>
+//
+// (jvm.dll+0xcad1 is `mov rax,[r8]; mov rcx,r8; jmp [rax+0x100]` -- a virtual
+// call on a "Klass" that is really the compressed-klass base, i.e. a dead oop
+// whose class word had been zeroed.)  method_proxy::call() now publishes the
+// interrupted Java frame (vmhook::hotspot::current_detour_anchor, recorded by
+// common_detour from the trampoline's own sp/fp plus the interpreter pc) in the
+// synthetic wrapper, so the walk continues past the entry frame.  MEASURED
+// after the fix, this module + gc_relocation_detector at normal priority:
+// JDK 8 109/109, JDK 21 104/104, JDK 26 104/104, no hs_err.
+//
 // ARCHITECTURE GATE.  The derivation validates x86-64 instruction bytes
 // (55 48 8B EC ... FF D2 / FF D6).  call_stub_entry_is_valid() returns false
 // unconditionally on any other architecture, so on aarch64 (the macOS CI legs)
 // the whole capability is legitimately absent.  The entire module degrades to a
 // single [INFO] there rather than reporting failures for an unimplemented port.
 //
-// WHY THIS MODULE RUNS LAST (vmhook_test::priority::last).  MEASURED on live
-// JDK 21 (Temurin 21.0.11, G1, MinGW build, 2026-08-04): SECTION C's
-// System.gc()-through-a-synthetic-entry-frame call itself SUCCEEDS -- the
-// collection completes, the call returns void, and the immediately following
-// invocation still works -- but it leaves the JavaThread in a state where a
-// LATER stop-the-world collection crashes HotSpot's own GC worker while it walks
-// that thread:
-//
-//   Current thread: WorkerThread "GC Thread#11"
-//   V [jvm.dll+0xcad1]   EXCEPTION_ACCESS_VIOLATION reading 0x100
-//   JavaThread ... was being processed
-//   j java.lang.Runtime.gc() / java.lang.System.gc() / <the next module's probe>
-//
-// Isolated by bisection: this module ALONE completes (TOTAL printed);
-// gc_relocation_detector ALONE completes (55/55); the two together die inside
-// the LATER module's System.gc(); and with SECTION C disabled the same pair
-// completes cleanly (100/106).  So the poisoning is specifically the GC-across-a-
-// synthetic-entry-frame path, i.e. a live LIBRARY defect in the restored
-// invocation path, not a defect in either test.  Until that is fixed, running
-// this module last means the damage cannot swallow another module's results or
-// turn a whole CI cell into INCOMPLETE (which reports nothing at all) -- the
-// suite still reaches its TOTAL line.  When the library is fixed, drop the
-// priority back to the default and this comment with it.
+// PRIORITY: default.  This module was pinned beyond priority::last (200) while
+// the truncation bug above was open, purely so its damage could not swallow the
+// results of whatever ran next.  That containment is gone; pinning it again
+// would hide the very regression Section C exists to catch, because the crash
+// only ever appears in the module that collects AFTER this one.
 //
 // SAFETY.  Nothing here raw-dereferences JVM memory: the stub bytes are read by
 // the library through os::safe_read, and this module's own reads of
@@ -338,19 +350,10 @@ namespace
     }
 }
 
-// Runs after EVERY other module -- see the "WHY THIS MODULE RUNS LAST" note in
-// the file header.  Not a preference: SECTION C provably poisons the thread for
-// the next module's collection on today's header.
-//
-// The priority is deliberately BEYOND vmhook_test::priority::last (100) rather
-// than equal to it: hook_reinstall_after_shutdown already claims `last`, and
-// run_all()'s stable_sort keeps equal priorities in registration order -- which
-// is static-initializer order, i.e. UNSPECIFIED and reversed by GNU ld.  A value
-// of 200 makes "strictly after everything" a property of the sort key instead of
-// a link-order coincidence.  run_all() only ever compares static_cast<int>(prio),
-// so an out-of-enumerator value is well-defined here (scoped enum with a fixed
-// int underlying type).
-VMHOOK_JVM_MODULE_PRIORITY(invocation_capability, static_cast<vmhook_test::priority>(200))
+// DEFAULT priority, deliberately -- see the PRIORITY note in the file header.
+// Section C's whole value as a regression guard is that another module gets to
+// collect after it.
+VMHOOK_JVM_MODULE(invocation_capability)
 {
 #if VMHOOK_ARCH_X86_64
     // =====================================================================
@@ -897,10 +900,11 @@ VMHOOK_JVM_MODULE_PRIORITY(invocation_capability, static_cast<vmhook_test::prior
                   g_after_gc_value.load(std::memory_order_relaxed) == k_long_expected);
         ctx.record("[INFO] invocation_capability: the collection above ran THROUGH a live "
                    "synthetic entry frame and the frame walk survived it, which is what the old "
-                   "`link = -1` argument could not do.  KNOWN AFTER-EFFECT (measured on live JDK "
-                   "21 / G1): a LATER stop-the-world collection can then crash HotSpot's GC "
-                   "worker while it walks this JavaThread, so this module is pinned to "
-                   "vmhook_test::priority::last -- see the file header for the bisection.");
+                   "`link = -1` argument could not do.  It also did NOT truncate the walk at the "
+                   "entry frame: the wrapper publishes the interrupted Java frame, so the "
+                   "application frames below this detour were scanned and relocated correctly.  "
+                   "The proof of that is the NEXT module's collection completing -- this module "
+                   "runs at default priority for exactly that reason (file header).");
     }
 #else
     ctx.record("[INFO] invocation_capability: skipped -- pure-VM invocation is x86-64 only.  The "

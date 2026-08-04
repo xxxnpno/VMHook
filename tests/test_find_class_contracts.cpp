@@ -1728,16 +1728,23 @@ int main()
     };
 
     // ---------------------------------------------------------------------
-    // 30a. ARRAY-NAME branch BYPASSES the cache entirely (vmhook.hpp ~8175).
-    //      find_class checks class_name.front()=='[' BEFORE consulting
-    //      klass_lookup_cache: it routes straight to jni_find_class (null with
-    //      no JVM, via the ensure_current_java_thread gate ~11872) and returns
-    //      WITHOUT ever reading OR erasing the cache. Therefore:
-    //        * an override_class_lookup() seeded under an array name is IGNORED
-    //          by find_class on that name (returns null, not the seeded ptr),
-    //        * and the seeded entry SURVIVES the find_class call (the array
-    //          branch never erases) — unlike the non-array stale path
-    //          (section 6c / 26) which consults+evicts.
+    // 30a. ARRAY-NAME branch: RESOLVE FIRST, then fall through to the ordinary
+    //      cache + ClassLoaderDataGraph path.
+    //      find_class checks class_name.front()=='[' before consulting
+    //      klass_lookup_cache and tries resolve_array_klass (Universe primitive-
+    //      array statics + InstanceKlass::_array_klasses).  It used to RETURN
+    //      that result unconditionally, which is why this section once asserted
+    //      that an array name never touches the cache.  It no longer does:
+    //      resolve_array_klass is only half the answer (MEASURED: the Universe
+    //      statics exist on JDK 8 and are GONE on 21/26, where the CLDG _klasses
+    //      walk is what lists "[B"), so a miss now falls through to the same
+    //      cache + walk every non-array name uses.  Therefore:
+    //        * an override_class_lookup() seeded under an array name is still
+    //          IGNORED by find_class on that name (returns null, not the seeded
+    //          ptr) - the seeded klass fails is_valid_pointer, and with no JVM
+    //          the walk finds nothing, and
+    //        * that seeded entry is now EVICTED by the same stale-cache guard as
+    //          section 6c / 26, instead of surviving untouched.
     //      We seed with an is_valid_pointer-REJECTED low constant (0x2: below
     //      user_address_floor 0xFFFF) so the fake klass is NEVER dereferenced
     //      on any path. Prior cache state for the key is saved and restored.
@@ -1755,7 +1762,7 @@ int main()
             "[Ljava/lang/Object;", "[[I", "[[Ljava/lang/String;",
         };
         bool seeded_ignored_all_null{ true };
-        bool seeded_entry_survives{ true };
+        bool seeded_entry_evicted{ true };
         bool none_threw{ true };
         for (const char* n : array_names)
         {
@@ -1771,14 +1778,15 @@ int main()
             catch (...) { threw = true; }
             if (threw)              { none_threw = false; }
             if (result != nullptr)  { seeded_ignored_all_null = false; }
-            // The array branch never erased the cache, so the seeded entry is
-            // still present (proving find_class never touched the cache here).
-            if (!deepen_cache_has(key)) { seeded_entry_survives = false; }
+            // The array branch fell through to the ordinary path, which found
+            // the seeded entry, rejected it with is_valid_pointer and evicted it
+            // - the same stale-cache contract a non-array name gets.
+            if (deepen_cache_has(key)) { seeded_entry_evicted = false; }
 
             deepen_cache_restore(key, prior);
         }
         check("find_class_array_name_ignores_seeded_cache_entry", seeded_ignored_all_null);
-        check("find_class_array_name_leaves_cache_entry_intact", seeded_entry_survives);
+        check("find_class_array_name_evicts_an_invalid_cache_entry", seeded_entry_evicted);
         check("find_class_array_name_seeded_no_throw", none_threw);
     }
 

@@ -159,7 +159,21 @@ namespace
         }
         // Reads the <clinit>-set sentinel via a RAW static-field read, which does
         // NOT run <clinit> (so it can observe the pre-init state).
-        static auto get_initialized() -> bool { return static_field("initialized")->get(); }
+        //
+        // TRI-STATE, and deliberately not the usual `static_field(n)->get()`
+        // one-liner: MethodStatic$ClinitProbe is a NESTED class that nothing has
+        // referenced yet, so before the first static call on it the class is not
+        // loaded and static_field() legitimately yields std::nullopt.  Writing
+        // `->get()` there dereferences a DISENGAGED optional -- reading a
+        // field_proxy out of uninitialized storage, whose std::string member then
+        // constructs from a null pointer and takes the JVM down inside the detour.
+        // (-1 = the field did not resolve, 0/1 = the read value.)
+        static auto get_initialized() -> std::int32_t
+        {
+            const std::optional<vmhook::field_proxy> field{ static_field("initialized") };
+            if (!field.has_value()) { return -1; }
+            return field->get() ? 1 : 0;
+        }
     };
 
     // ---- raw-bit capture so NaN / Inf / -0.0 survive the atomic round-trip --
@@ -963,7 +977,7 @@ namespace
             // NOT trigger <clinit>, so on most JDKs this observes the pre-init
             // (false) state.  Recorded, not hard-asserted (load-vs-init timing is
             // JDK-sensitive and a raw field read can race a concurrent init).
-            g_clinit_pre_initialized.store(clinit_probe::get_initialized() ? 1 : 0);
+            g_clinit_pre_initialized.store(clinit_probe::get_initialized());
 
             auto p = clinit_probe::static_method("clinitValue");
             g_clinit_resolves.store(p.has_value() ? 1 : 0);
@@ -974,7 +988,7 @@ namespace
                 // the class" contract.
                 g_clinit_ret.store(static_cast<std::int32_t>(p->call()));
             }
-            g_clinit_post_initialized.store(clinit_probe::get_initialized() ? 1 : 0);
+            g_clinit_post_initialized.store(clinit_probe::get_initialized());
         }
 
         // ================================================================
