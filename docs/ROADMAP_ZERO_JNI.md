@@ -77,6 +77,19 @@ is getting back to green.
 > `warnings-as-errors` gates nothing and is Linux-only. `build-and-unit-test` gates all 41
 > JVM cells — one no-JVM ctest failure skips the entire matrix.
 
+### 3.2a Crashes woken up by making invocation real
+
+Restoring `method_proxy::call()` turned a silent no-op into actual Java execution, which has
+woken up defects that dead code could not produce. **These will redden the JVM matrix until
+fixed**, and they are the honest cost of the fix — the calls were never happening before, so
+nothing downstream of them was ever exercised.
+
+| # | Symptom | Status |
+|---|---|---|
+| **X1** | **`System.gc()` through a synthetic entry frame poisons the JavaThread for a *later* collection.** The call succeeds and the next invocation works, but a subsequent STW GC crashes HotSpot's own worker walking that thread: `WorkerThread "GC Thread#11"`, `jvm.dll+0xcad1`, `EXCEPTION_ACCESS_VIOLATION reading 0x100`. Bisected: each module passes alone, together they die in the later one's `System.gc()`. Reading `0x100` off a thread-relative walk points at the `_last_Java_frame` anchor or the `JavaCallWrapper` chain being left in a state the walker later trusts — and the wrapper lives on the **C++ stack**, which is dead memory once `call()` returns. | ⏳ being fixed; currently *contained* by a module priority, not solved |
+| **X2** | Full JVM suite crashes at `method_static` — null deref in a detour on the Java main thread. Same family: that module's calls previously no-opped and now execute. | ⏳ under diagnosis |
+| **X3** | `make_java_string()` returns **null on JDK 21/26** (works on JDK 8) — `[B` array klass reports "not loaded", then TLAB allocation fails. Already HARD-red in its own module; blocks String-argument coverage elsewhere. | ⏳ under diagnosis |
+
 ### 3.2b Four latent bugs found during the research
 
 Independent of everything else, and two of them are live heap-corruption risks:
@@ -482,15 +495,41 @@ It returned null on all of them for years and nothing noticed.
 </details>
 
 ### Phase 2 — the reference core
-- **2.1** `object_id`, `ref<T>`, `borrowed<T>`, `weak_ref<T>`, `root<T>` with mechanism **D**,
-  backed by the **E** detector so an unanchorable ref expires instead of dangling.
-- **2.2** `ref_vector<T>` / `ref_map_view<K,V>`, rooted during the walk.
+- **2.1** ✅ **DONE** *(commit `eb8e2b8`)* — `object_id`, `ref<T>`, `borrowed<T>`, `root<T>`,
+  `ref_vector<T>` with mechanism **D**, backed by the **E** detector. Additive: nothing existing
+  changed signature.
+
+  **A design correction the live JVM forced.** This roadmap specified an epoch-keyed address
+  memo. That is wrong, and the first live run proved it: a static field can be **overwritten
+  without any collection**. Replace `Minecraft.theWorld` on a world reload and a memoised ref
+  keeps returning the previous World — live, valid, and wrong — until an unrelated GC happens
+  to clear it. That is precisely the silent-staleness class this model exists to delete. **A
+  `ref` now stores no address at all**: it names a *slot*, `resolve()` is a pure function of
+  live VM state, and consequently a `ref` has no mutable state, so one can be dereferenced
+  concurrently from any number of threads with no synchronisation. Cost 1.30-1.64 µs/resolve
+  vs 0.57 with the memo — the right trade.
+
+  Axiom A4 is enforced by the type system, not by documentation: `ref_vector` is
+  `static_assert`-proven **not constructible** from `oop_t`, `void*`, `vector<void*>` or even
+  `vector<ref<T>>`, so the walk-then-pin shape is unexpressible. `detail::access<T>` has
+  deleted copy *and* move, making "bound only for this expression" a compile-time fact.
+
+  Proven on live JDK 8 (Parallel), 21 (G1), 26 (G1) + Serial/Parallel on 21: **46/46**.
+  Objects verified to physically move against a JNI oracle, then re-resolved to the **new**
+  address — including 2-hop chains where both objects relocated, and a 256-element array where
+  the array and every element moved (256/256 resolved).
+- **2.2** `ref_map_view<K,V>` — **not done.** Anchoring a HashMap/TreeMap *node* needs the
+  collection walkers to hand back `(holder, offset)` pairs rather than decoded oops.
+  `ref_vector` + `elements_of` covers the array-backed case today.
 - **2.3** `field<R>()` / `call<R>()` on `object<T>`; `try_field` / `try_call` returning
-  `std::expected`. `operator bool` and `operator==` on `object<T>`.
-- **2.4** Mechanism **P** (the Java-object-rooted handle table) behind the same API, for
-  path-less objects. Requires 1.2, plus the anchor-field policy and the no-safepoint window.
-  **Pin acquisition is only sound inside a detour** (§4.2b) — the API must enforce that, not
-  document it.
+  `std::expected`. `operator bool` and `operator==` on `object<T>`. **Not done.**
+- **2.4** Mechanism **P** (a real pin) behind the same API, for path-less objects. Requires 1.2,
+  plus the anchor policy and the no-safepoint window. **Pin acquisition is only sound inside a
+  detour** (§4.2b) — the API must enforce that, not document it. **Not done.**
+- **2.5** `weak_ref<T>` — **not done**, needs a real GC root.
+- **2.6** `detail::extract_frame_arg` is the single choke point that would turn every detour
+  argument into a `borrowed<T>`. Highest-leverage next step, and the precondition for the
+  hook-context consumer patterns.
 
 Placement: top-level `namespace vmhook`, just above the field-proxy section (~13433) — every
 primitive it needs (`decode/encode_oop_pointer`, `safe_read/write`, `get_java_mirror`) is
