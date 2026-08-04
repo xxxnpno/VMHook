@@ -131,11 +131,15 @@ namespace
     // double-freeing the handle).
     static_assert(std::is_final_v<gref>,
                   "global_ref must be final (no subclass may extend the owned-handle invariant).");
-    // The pin is a SINGLE raw void* handle and NOTHING else — this is load-bearing
-    // for the documented "lives inside std::unordered_map values" use: a fat pin
-    // (extra bookkeeping) would bloat every cached entry and break the cheap move.
-    static_assert(sizeof(gref) == sizeof(void*),
-                  "global_ref must be exactly one pointer wide (it owns only the JNI handle).");
+    // The pin is the captured address PLUS the GC epoch it was captured in, and
+    // nothing else.  The epoch member is what lets oop() report the capture stale
+    // instead of handing back an address a relocating collection has moved out
+    // from under it; it is the whole point of the type now.  Still pinned to an
+    // exact size, because the documented "lives inside std::unordered_map values"
+    // use means any FURTHER bookkeeping would bloat every cached entry and break
+    // the cheap move.
+    static_assert(sizeof(gref) == sizeof(void*) + sizeof(vmhook::gc_epoch_t),
+                  "global_ref must be exactly an address plus its capture epoch.");
     static_assert(alignof(gref) == alignof(void*),
                   "global_ref must align like a pointer (it IS a single pointer).");
     static_assert(std::is_standard_layout_v<gref>,

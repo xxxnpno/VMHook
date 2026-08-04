@@ -208,3 +208,18 @@ vmhook_add_test(deoptimize_methods_nojvm       SOURCES test_deoptimize_methods_n
 # global_ref built on a fabricated address reports stale rather than handing
 # the address back.  Live-VM behaviour is out of scope here by construction.
 vmhook_add_test(gc_relocation_detector_nojvm   SOURCES test_gc_relocation_detector_nojvm.cpp)
+
+# Layer 2 (anchored references) — vmhook::ref / root / borrowed / ref_vector /
+# object_id.  Two clusters, both no-JVM:
+#   * anchored_ref_nojvm          — anchor construction, chain depth ceiling,
+#     resolution degrading to nullptr rather than faulting, ephemeral expiry
+#     (the no-JVM spelling of "the epoch moved"), value semantics, the access
+#     binding proxy, lazy root binding.
+#   * anchored_ref_identity_nojvm — object_id derivation, hash/equality
+#     consistency, real unordered_map / map key use, and the static_asserts that
+#     pin ref_vector's "no raw address can get in" contract (axiom A4 is the
+#     ABSENCE of an API, so it can only be asserted at compile time).
+# Live relocation behaviour needs a real VM and is out of scope here by
+# construction; nothing below asserts it.
+vmhook_add_test(anchored_ref_nojvm             SOURCES test_anchored_ref_nojvm.cpp)
+vmhook_add_test(anchored_ref_identity_nojvm    SOURCES test_anchored_ref_identity_nojvm.cpp)

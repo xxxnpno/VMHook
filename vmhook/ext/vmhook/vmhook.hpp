@@ -1716,6 +1716,17 @@ namespace vmhook
     class map;
     class hash_map;
 
+    // Anchored-reference model (definitions live in the "Anchored references"
+    // section near the end of the file, after gc_epoch() - which resolve() needs
+    // - and after klass_from_oop / array_length / read_compressed_oop_at_safe,
+    // which the anchor walk needs).  Declared here so the names are visible from
+    // this point on, matching the treatment of every other public type.
+    class object_id;
+    template<typename wrapper_type = void> class ref;
+    template<typename wrapper_type = void> class root;
+    template<typename wrapper_type = void> class borrowed;
+    template<typename wrapper_type = void> class ref_vector;
+
     // Upper bound, in CHARACTERS, on the String read_java_string will decode.
     // The backing-array length is validated against this (in char units, the same
     // ceiling for the JDK 8 char[], JDK 9+ LATIN1, and JDK 9+ UTF16 layouts)
@@ -21480,6 +21491,1760 @@ namespace vmhook
         return !now.valid || now.gc_active || now.collections != recorded.collections;
     }
 
+    // --- Anchored references ---------------------------------------------------
+    //
+    // THE IDEA, IN ONE PARAGRAPH.
+    //
+    // Static field reads in this header are ALREADY relocation-proof, with no pin
+    // and no JNI.  field_proxy's static overload does not cache `mirror_oop +
+    // offset`; it stores the GC-STABLE `Klass*` plus the offset and re-derives
+    // `mirror_klass->get_java_mirror() + offset` on EVERY read (see the rationale
+    // block on field_proxy's private members and the get() body).  `Klass` is
+    // metadata the collector never moves, and `Klass::_java_mirror` is an
+    // OopHandle whose storage slot the collector UPDATES IN PLACE.  That is a
+    // GC-stable ROOT plus a PATH.  Everything below generalises that one trick
+    // from "the mirror of a class" to "any chain of field / array-element hops".
+    //
+    // A vmhook::ref<T> therefore does not remember an address at ALL.  It
+    // remembers HOW TO FIND THE ADDRESS AGAIN, and re-walks that chain on every
+    // dereference.  The only way to get a wrong answer from a raw oop is to trust
+    // a remembered address, and this design has none to trust: an address is
+    // either re-derived from a live root at the moment it is asked for, or it is
+    // refused.  A ref consequently names a SLOT, not an object -- it follows its
+    // object through a relocation AND follows the slot through an overwrite,
+    // which an address cache silently gets wrong (see resolve()).
+    //
+    // WHAT THIS IS NOT.  It is still not a GC ROOT.  Nothing here keeps a Java
+    // object alive; creating a real root requires a call into the VM this pure-VM
+    // build has no way to make (see docs/DESIGN_anchored_refs.md and the
+    // jni::global_ref doc below).  What an anchored ref DOES guarantee is that it
+    // never hands back an address a relocating collection may have invalidated:
+    // it re-derives, or it reports empty.  A ref that reports empty is a correct
+    // outcome; a stale address never is.
+    //
+    // FAULT DISCIPLINE.  Every hop of every walk reads through
+    // os::safe_read_fast / hotspot::safe_read_pointer and validates with
+    // hotspot::is_valid_pointer.  MinGW and clang-on-Windows have no working SEH,
+    // so a hardware access violation inside a detour is uncontained and kills the
+    // JVM; there is not one raw HotSpot dereference in this section.
+    //
+    // NO JVM.  With no VM in the process every klass lookup returns null, every
+    // fault-safe read fails, and every ref simply resolves to nullptr.  Nothing
+    // faults, nothing throws, nothing asserts.
+
+    /*
+        @brief How a vmhook::ref finds its object again after a collection.
+        @details
+        `static_root` is the base case and terminates every chain: a GC-stable
+        `Klass*` plus the offset of a static reference field inside that class's
+        java.lang.Class mirror.  `field_of` and `element_of` are the recursive
+        cases - they name a parent anchor plus a hop off it.  `ephemeral` is the
+        detour-scoped case: a bare address stamped with the collection epoch it
+        was captured in, which EXPIRES (resolves to nullptr) rather than dangling
+        once that epoch moves.  `empty` is the value-initialised state.
+    */
+    enum class anchor_kind : std::uint8_t
+    {
+        empty = 0,
+        static_root,
+        field_of,
+        element_of,
+        ephemeral
+    };
+
+    /*
+        @brief Human-readable name of an anchor kind, for logs and diagnostics.
+        Complexity: O(1).  Exception safety: noexcept.  Thread safety: safe.
+    */
+    inline auto anchor_kind_name(const vmhook::anchor_kind kind) noexcept
+        -> std::string_view
+    {
+        switch (kind)
+        {
+        case vmhook::anchor_kind::static_root: return "static_root";
+        case vmhook::anchor_kind::field_of:    return "field_of";
+        case vmhook::anchor_kind::element_of:  return "element_of";
+        case vmhook::anchor_kind::ephemeral:   return "ephemeral";
+        case vmhook::anchor_kind::empty:       break;
+        }
+        return "empty";
+    }
+
+    /*
+        @brief Longest anchor chain a ref may describe.
+        @details
+        Bounds the recursion in detail::resolve_anchor and rejects pathological
+        (or maliciously constructed) chains at BUILD time rather than at walk
+        time, so resolve() can never blow the stack inside a detour.  Real chains
+        are two or three hops; 32 is a ceiling, not a budget.
+    */
+    inline constexpr std::uint32_t k_max_anchor_depth{ 32 };
+
+    /*
+        @brief Stable, hashable, comparable identity usable as a map key.
+        @details
+        READ THIS BEFORE USING IT AS A KEY - it is REFERENCE identity, not object
+        identity, and the difference is deliberate.
+
+        WHAT IT IS.  A 64-bit token derived from a ref's ANCHOR: for an anchored
+        ref, from the root `Klass*` and every offset / index on the path down to
+        it; for an ephemeral ref, from the captured address paired with the
+        collection epoch it was captured in.  Nothing in an anchored token is a
+        heap address, so the token is RELOCATION-PROOF: it is bit-identical
+        before and after any number of collections, which is exactly the property
+        the raw-address map keys this type replaces did not have.
+
+        WHAT IT GUARANTEES.  Equal tokens mean the same slot, hence - while both
+        refs resolve non-null - the same object.  Within one collection epoch two
+        ephemeral tokens are equal if and only if the addresses are equal, which
+        for live objects IS object identity.  Tokens from different anchor kinds
+        live in disjoint seeded spaces and never alias each other.
+
+        WHAT IT DOES NOT GUARANTEE.  UNEQUAL tokens do NOT imply different
+        objects: the same object reached by two different paths (say a static
+        root and a detour argument) yields two different tokens.  For a
+        point-in-time "are these the same object?" test use
+        vmhook::ref::same_object_as(), which resolves both and compares live
+        addresses - it is exact, but it is not stable enough to hash.
+
+        WHY THIS DERIVATION.  The alternatives were weighed in
+        docs/research/consumer_requirements.md 3.14.  A root-slot address needs a
+        real GC root, which does not exist yet.  System.identityHashCode is exact
+        but costs a Java call and only works on a JavaThread inside a detour.  The
+        object header's identity hash is unassigned until something calls
+        hashCode(), is only 31 bits (so two distinct objects CAN collide - fatal
+        for a map key), and its layout moves under UseCompactObjectHeaders.  Path
+        identity is the cheapest derivation that is never WRONG in the direction
+        that corrupts a map: it never reports two different objects as the same
+        key.  Real object identity is on the roadmap behind a GC root.
+
+        Note the token is a 64-bit hash of the path, so two DIFFERENT paths can in
+        principle collide; the probability is that of a 64-bit hash collision and
+        the consequence is the same as any other hash-key collision.
+
+        Complexity: O(1) for every operation.  Exception safety: noexcept except
+        to_string().  Thread safety: safe - it is an immutable value.
+    */
+    class object_id final
+    {
+    public:
+        constexpr object_id() noexcept = default;
+
+        explicit constexpr object_id(const std::uint64_t token) noexcept
+            : token_{ token }
+        {
+        }
+
+        /* @brief The raw token.  Zero means "no identity" (an empty ref). */
+        constexpr auto value() const noexcept
+            -> std::uint64_t
+        {
+            return this->token_;
+        }
+
+        /* @brief True when this id came from a non-empty ref. */
+        explicit constexpr operator bool() const noexcept
+        {
+            return this->token_ != 0u;
+        }
+
+        /*
+            @brief Hex rendering, for logs.  Hand-formatted rather than routed
+            through <cstdio>, which this header only includes on POSIX.
+            Exception safety: strong (may throw std::bad_alloc building the string).
+        */
+        auto to_string() const
+            -> std::string
+        {
+            static constexpr char digits[]{ "0123456789abcdef" };
+            char buffer[20]{ 'o', 'i', 'd', ':' };
+            for (std::size_t nibble{ 0 }; nibble < 16u; ++nibble)
+            {
+                buffer[4 + nibble] = digits[(this->token_ >> ((15u - nibble) * 4u)) & 0xFull];
+            }
+            return std::string{ buffer, buffer + 20 };
+        }
+
+        friend constexpr auto operator==(const vmhook::object_id left,
+                                         const vmhook::object_id right) noexcept
+            -> bool
+        {
+            return left.token_ == right.token_;
+        }
+
+        friend constexpr auto operator!=(const vmhook::object_id left,
+                                         const vmhook::object_id right) noexcept
+            -> bool
+        {
+            return left.token_ != right.token_;
+        }
+
+        /* @brief Total order, so object_id also works in std::map / std::set. */
+        friend constexpr auto operator<(const vmhook::object_id left,
+                                        const vmhook::object_id right) noexcept
+            -> bool
+        {
+            return left.token_ < right.token_;
+        }
+
+    private:
+        std::uint64_t token_{ 0 };
+    };
+
+    namespace detail
+    {
+        /*
+            @brief One immutable link in an anchor chain.
+            @details
+            Nodes are immutable once built and are shared by std::shared_ptr, so
+            copying a ref is a refcount bump and two refs derived from the same
+            parent SHARE the parent link rather than duplicating it.  Immutability
+            is what makes a ref safely copyable and destructible on any thread
+            (axiom A7): there is no mutable shared state to race on and no
+            VM-side registration to release.
+        */
+        struct anchor_node final
+        {
+            /* Which of the five shapes this link is. */
+            vmhook::anchor_kind kind{ vmhook::anchor_kind::empty };
+            /* The link this one hangs off; null for static_root / ephemeral. */
+            std::shared_ptr<const vmhook::detail::anchor_node> parent{};
+            /* static_root: the GC-stable klass whose mirror carries the field. */
+            vmhook::hotspot::klass* declaring_klass{ nullptr };
+            /* static_root / field_of: byte offset of the reference slot. */
+            std::size_t offset{ 0 };
+            /* element_of: zero-based index into the Java object array. */
+            std::int32_t index{ 0 };
+            /* ephemeral: the captured address, valid only for `born`. */
+            vmhook::oop_t ephemeral_oop{ nullptr };
+            /* ephemeral: the collection epoch the address was captured in. */
+            vmhook::gc_epoch_t born{};
+            /* Precomputed identity token for this whole path (see object_id). */
+            std::uint64_t path_hash{ 0 };
+            /* Distance from the root, so build time can reject over-long chains. */
+            std::uint32_t depth{ 0 };
+        };
+
+        /*
+            @brief SplitMix64 finaliser - the mixing step behind object_id.
+            @details
+            Chosen because it is a well-studied bijection on 64 bits with good
+            avalanche, is four instructions, and needs no state.  Only used to
+            combine path components into an identity token; it is not a security
+            hash and is not required to be one.
+            Complexity: O(1).  Exception safety: noexcept.  Thread safety: safe.
+        */
+        inline constexpr auto mix64(std::uint64_t value) noexcept
+            -> std::uint64_t
+        {
+            value += 0x9E3779B97F4A7C15ull;
+            value  = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+            value  = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+            return value ^ (value >> 31);
+        }
+
+        /*
+            @brief True when a JVM field descriptor names a reference or array.
+            @details
+            'L' (object) and '[' (array) are the only two descriptor leaders that
+            put a heap reference in the slot; everything else is a primitive whose
+            bytes would decode to garbage if read as an oop.  Mirrors the same
+            test field_proxy::is_reference() applies.
+            Complexity: O(1).  Exception safety: noexcept.
+        */
+        inline auto is_reference_descriptor(const std::string_view descriptor) noexcept
+            -> bool
+        {
+            return !descriptor.empty() && (descriptor.front() == 'L' || descriptor.front() == '[');
+        }
+
+        /*
+            @brief True when this VM stores heap references as 32-bit narrow oops.
+            @details
+            Sourced from vm_capabilities().compressed_oops, which reads the JVM
+            flag table.  When the flag walk did NOT succeed we assume narrow,
+            because that is both the JVM default on every supported configuration
+            and the assumption the rest of this header already bakes in
+            (field_proxy stores a std::uint32_t for every 'L' / '[' field).
+            Complexity: O(1) after the first call.  Exception safety: noexcept.
+        */
+        inline auto reference_slot_is_narrow() noexcept
+            -> bool
+        {
+            const vmhook::vm_capabilities_t& capabilities{ vmhook::vm_capabilities() };
+            return !capabilities.flags_resolved || capabilities.compressed_oops;
+        }
+
+        /*
+            @brief Width in bytes of one heap reference slot on this VM.
+        */
+        inline auto reference_slot_width() noexcept
+            -> std::size_t
+        {
+            return vmhook::detail::reference_slot_is_narrow() ? std::size_t{ 4 } : std::size_t{ 8 };
+        }
+
+        /*
+            @brief Fault-safe read of ONE reference slot at `holder + offset`.
+            @details
+            The single primitive every anchor hop is built on.  Validates the
+            holder, reads the slot through os::safe_read_fast (never a raw
+            dereference - the no-SEH toolchains make that mandatory), decodes the
+            narrow oop when the VM uses compressed oops, and validates the result
+            before handing it back.  A null / unmapped / out-of-range slot yields
+            nullptr, which every caller already treats as "the chain is broken".
+            Complexity: O(1).  Exception safety: noexcept.  Thread safety: safe.
+        */
+        inline auto read_reference_slot(const void* const holder,
+                                        const std::size_t offset) noexcept
+            -> vmhook::oop_t
+        {
+            if (!holder || !vmhook::hotspot::is_valid_pointer(holder))
+            {
+                return nullptr;
+            }
+            if (vmhook::detail::reference_slot_is_narrow())
+            {
+                const std::uint32_t narrow{ vmhook::read_compressed_oop_at_safe(holder, offset) };
+                if (narrow == 0u)
+                {
+                    return nullptr;
+                }
+                void* const decoded{ vmhook::hotspot::decode_oop_pointer(narrow) };
+                return vmhook::hotspot::is_valid_pointer(decoded) ? decoded : nullptr;
+            }
+            void* wide{ nullptr };
+            if (!vmhook::os::safe_read_fast(&wide,
+                                            reinterpret_cast<const std::uint8_t*>(holder) + offset,
+                                            sizeof(wide)))
+            {
+                return nullptr;
+            }
+            return vmhook::hotspot::is_valid_pointer(wide) ? wide : nullptr;
+        }
+
+        /*
+            @brief Walks an anchor chain from its root and returns the CURRENT
+                   address of the object it names, or nullptr.
+            @details
+            This is the whole safety argument in one function.  A static_root hop
+            re-reads Klass::_java_mirror - metadata the collector never moves,
+            through an OopHandle the collector updates in place - so it yields the
+            mirror's address as of RIGHT NOW, never a remembered one.  Every
+            further hop reads a live reference slot off the address the previous
+            hop just produced.  No address is ever carried across a hop from a
+            previous walk.
+
+            Recursion is bounded by the `depth` recorded when the chain was built
+            (see k_max_anchor_depth), so a corrupted or hostile chain cannot
+            recurse without limit inside a detour.
+
+            Complexity: O(chain length), one to three fault-safe reads per hop.
+            Exception safety: noexcept.  Thread safety: safe - reads only.
+        */
+        inline auto resolve_anchor(const vmhook::detail::anchor_node* const node) noexcept
+            -> vmhook::oop_t
+        {
+            if (!node || node->depth > vmhook::k_max_anchor_depth)
+            {
+                return nullptr;
+            }
+
+            switch (node->kind)
+            {
+            case vmhook::anchor_kind::static_root:
+            {
+                if (!node->declaring_klass
+                    || !vmhook::hotspot::is_valid_pointer(node->declaring_klass))
+                {
+                    return nullptr;
+                }
+                // The GC-stable root.  get_java_mirror() reads the OopHandle
+                // indirection cell, which the collector rewrites on relocation,
+                // so this is the mirror's address NOW - never a memo.
+                void* const mirror{ node->declaring_klass->get_java_mirror() };
+                if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
+                {
+                    return nullptr;
+                }
+                return vmhook::detail::read_reference_slot(mirror, node->offset);
+            }
+
+            case vmhook::anchor_kind::field_of:
+            {
+                vmhook::oop_t const holder{ vmhook::detail::resolve_anchor(node->parent.get()) };
+                if (!holder)
+                {
+                    return nullptr;
+                }
+                return vmhook::detail::read_reference_slot(holder, node->offset);
+            }
+
+            case vmhook::anchor_kind::element_of:
+            {
+                vmhook::oop_t const array_oop{ vmhook::detail::resolve_anchor(node->parent.get()) };
+                if (!array_oop)
+                {
+                    return nullptr;
+                }
+                // array_length() is itself a fault-safe header read and returns 0
+                // for anything it cannot trust, so an out-of-range or corrupted
+                // length collapses to "no such element" rather than a wild read.
+                const std::int32_t length{ vmhook::array_length(array_oop) };
+                if (node->index < 0 || node->index >= length)
+                {
+                    return nullptr;
+                }
+                const std::size_t element_offset{
+                    std::size_t{ 16 }
+                    + static_cast<std::size_t>(node->index) * vmhook::detail::reference_slot_width() };
+                return vmhook::detail::read_reference_slot(array_oop, element_offset);
+            }
+
+            case vmhook::anchor_kind::ephemeral:
+                // No root exists for a bare address, so the epoch IS the safety
+                // mechanism here: once a collection has happened the address is
+                // refused outright.  EXPIRED, never dangling.
+                return vmhook::gc_epoch_changed(node->born) ? nullptr : node->ephemeral_oop;
+
+            case vmhook::anchor_kind::empty:
+                break;
+            }
+            return nullptr;
+        }
+
+        /*
+            @brief Builds a static_root link.  Returns null on a bad klass.
+        */
+        inline auto make_static_anchor(vmhook::hotspot::klass* const declaring_klass,
+                                       const std::size_t offset) noexcept
+            -> std::shared_ptr<const vmhook::detail::anchor_node>
+        {
+            if (!declaring_klass || !vmhook::hotspot::is_valid_pointer(declaring_klass))
+            {
+                return {};
+            }
+            try
+            {
+                auto node{ std::make_shared<vmhook::detail::anchor_node>() };
+                node->kind            = vmhook::anchor_kind::static_root;
+                node->declaring_klass = declaring_klass;
+                node->offset          = offset;
+                node->depth           = 0u;
+                node->path_hash       = vmhook::detail::mix64(
+                    vmhook::detail::mix64(0x5354'4154'4943'0001ull
+                                          ^ reinterpret_cast<std::uintptr_t>(declaring_klass))
+                    ^ static_cast<std::uint64_t>(offset));
+                return node;
+            }
+            catch (const std::exception&)
+            {
+                return {};
+            }
+        }
+
+        /*
+            @brief Builds a field_of / element_of link under `parent`.
+            @details
+            Refuses to extend a chain past k_max_anchor_depth, and refuses to
+            build on a null parent, so an over-long or rootless chain is rejected
+            at build time and simply produces an empty ref.
+        */
+        inline auto make_hop_anchor(const std::shared_ptr<const vmhook::detail::anchor_node>& parent,
+                                    const vmhook::anchor_kind kind,
+                                    const std::size_t offset,
+                                    const std::int32_t index) noexcept
+            -> std::shared_ptr<const vmhook::detail::anchor_node>
+        {
+            if (!parent || parent->depth >= vmhook::k_max_anchor_depth)
+            {
+                return {};
+            }
+            try
+            {
+                auto node{ std::make_shared<vmhook::detail::anchor_node>() };
+                node->kind   = kind;
+                node->parent = parent;
+                node->offset = offset;
+                node->index  = index;
+                node->depth  = parent->depth + 1u;
+                node->path_hash = (kind == vmhook::anchor_kind::element_of)
+                    ? vmhook::detail::mix64(parent->path_hash
+                                            ^ 0x454C'454D'0000'0002ull
+                                            ^ static_cast<std::uint64_t>(
+                                                  static_cast<std::uint32_t>(index)))
+                    : vmhook::detail::mix64(parent->path_hash
+                                            ^ 0x4649'454C'0000'0003ull
+                                            ^ static_cast<std::uint64_t>(offset));
+                return node;
+            }
+            catch (const std::exception&)
+            {
+                return {};
+            }
+        }
+
+        /*
+            @brief Identity token for a detour-scoped capture.
+            @details
+            Mixes the captured ADDRESS with the collection generation it was
+            captured in, under a seed disjoint from the anchored-path seeds.
+            Within one epoch, address equality IS object identity, so two
+            independent captures of one live object agree - which is what lets a
+            vmhook::borrowed and the vmhook::ref it was promoted from key the same
+            map entry.  Shared by both spellings so the two can never drift apart.
+            Complexity: O(1).  Exception safety: noexcept.
+        */
+        inline auto ephemeral_identity(const vmhook::oop_t address,
+                                       const std::uint32_t collections) noexcept
+            -> std::uint64_t
+        {
+            if (!address)
+            {
+                return 0u;
+            }
+            return vmhook::detail::mix64(
+                vmhook::detail::mix64(0x4550'4845'4D00'0004ull
+                                      ^ reinterpret_cast<std::uintptr_t>(address))
+                ^ static_cast<std::uint64_t>(collections));
+        }
+
+        /*
+            @brief Builds an ephemeral link around a bare address.
+            @details
+            Stamps the address with the CURRENT collection epoch, which is what
+            makes it expire rather than dangle.  A null address yields a null
+            node so an empty ref stays empty.
+        */
+        inline auto make_ephemeral_anchor(const vmhook::oop_t address) noexcept
+            -> std::shared_ptr<const vmhook::detail::anchor_node>
+        {
+            if (!address)
+            {
+                return {};
+            }
+            try
+            {
+                auto node{ std::make_shared<vmhook::detail::anchor_node>() };
+                node->kind          = vmhook::anchor_kind::ephemeral;
+                node->ephemeral_oop = address;
+                node->born          = vmhook::gc_epoch();
+                node->depth         = 0u;
+                node->path_hash     = vmhook::detail::ephemeral_identity(
+                    address, node->born.collections);
+                return node;
+            }
+            catch (const std::exception&)
+            {
+                return {};
+            }
+        }
+
+        /*
+            @brief The internal JVM class name a wrapper type was registered under,
+                   or an empty string when it was never registered.
+            Complexity: O(1) hash lookup under registration_mutex.
+            Exception safety: noexcept - returns empty on any failure.
+        */
+        template<typename wrapper_type>
+        inline auto registered_class_name() noexcept
+            -> std::string
+        {
+            if constexpr (std::is_void_v<wrapper_type>)
+            {
+                return std::string{};
+            }
+            else
+            {
+                try
+                {
+                    std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
+                    const auto entry{ vmhook::type_to_class_map.find(
+                        std::type_index{ typeid(wrapper_type) }) };
+                    return entry != vmhook::type_to_class_map.end() ? entry->second : std::string{};
+                }
+                catch (const std::exception&)
+                {
+                    return std::string{};
+                }
+            }
+        }
+
+        /*
+            @brief Short-lived proxy that binds a wrapper to a CURRENT address.
+            @details
+            This is the whole of axiom A2, and it is invisible at the call site.
+            vmhook::ref::operator-> revalidates, then returns one of these BY
+            VALUE; the language then applies operator-> again to reach the
+            wrapper.  Because it is a prvalue it lives exactly as long as the full
+            expression `player->pos_x()`, so a wrapper bound to an address can
+            never outlive the revalidation that produced it.
+
+            Copy and move are DELETED on purpose: that is what stops a user
+            hoisting the proxy into a variable and re-using it after a safepoint,
+            which would reintroduce the exact bug this type exists to remove.
+            Returning it from ref::operator-> still works because a prvalue return
+            of the same type is materialised in place (guaranteed copy elision).
+
+            Complexity: O(1).  Exception safety: noexcept if the wrapper's
+            oop constructor is.  Thread safety: it is a stack-local value.
+        */
+        template<typename wrapper_type>
+        class access final
+        {
+        public:
+            explicit access(const vmhook::oop_t address) noexcept
+                : wrapper_{ address }
+            {
+            }
+
+            access(const access&)                    = delete;
+            access(access&&)                         = delete;
+            auto operator=(const access&) -> access& = delete;
+            auto operator=(access&&) -> access&      = delete;
+            ~access()                                = default;
+
+            auto operator->() noexcept
+                -> wrapper_type*
+            {
+                return &this->wrapper_;
+            }
+
+            auto operator->() const noexcept
+                -> const wrapper_type*
+            {
+                return &this->wrapper_;
+            }
+
+            auto operator*() noexcept
+                -> wrapper_type&
+            {
+                return this->wrapper_;
+            }
+
+            auto operator*() const noexcept
+                -> const wrapper_type&
+            {
+                return this->wrapper_;
+            }
+
+        private:
+            wrapper_type wrapper_;
+        };
+    }
+
+    /*
+        @brief A rooted, revalidating, copyable reference to a live Java object.
+        @details
+        Replaces the raw oop_t / std::unique_ptr<object<T>> / jni::global_ref
+        triple in user code.  A ref stores exactly one thing: an ANCHOR - a
+        description of how to find its object again, from a root the collector
+        maintains.  It stores NO address.  Every dereference re-walks the chain
+        from that root, so the address a caller sees is always derived from live
+        VM state and can never be a remembered one.
+
+        A ref therefore names a SLOT, not an object.  Relocate the object and the
+        ref follows it; overwrite the slot (a world reload replacing
+        `Minecraft.theWorld`) and the ref follows that too.  Both are the correct
+        answer to "what is there now", and both are things a cached address gets
+        silently wrong.
+
+        An `ephemeral` ref is the exception, and it is the one shape that has no
+        root to walk: it holds a bare address stamped with the collection epoch it
+        was captured in, and refuses that address the moment the epoch moves -
+        EXPIRED, never dangling.  Detour arguments and freshly allocated objects
+        are ephemeral by nature; anchor them off a vmhook::root to make them last.
+
+        WHEN THE EPOCH CANNOT BE READ (no JVM, ZGC / Shenandoah / an undetermined
+        collector, or unresolvable VMStructs) an ANCHORED ref still re-derives and
+        still answers, which is precisely as correct as field_proxy's static path
+        is on that same VM.  An EPHEMERAL ref under the same conditions fails
+        closed and resolves to nullptr, because it has nothing to re-derive from.
+
+        That parity is NOT a support claim.  ZGC and Shenandoah relocate
+        concurrently behind load barriers and store coloured pointers in the very
+        slots this walk reads, so vmhook's whole direct-memory model - not just
+        this type - is invalid there.  On such a VM an anchored ref is exactly as
+        (un)trustworthy as every other read in this header, and no more.
+
+        WHAT IT STILL IS NOT.  Not a GC root.  Nothing here keeps the object
+        alive; if the last Java-side reference dies the object is collected and
+        the chain simply stops resolving.  That is reported as empty, which is the
+        correct answer - it is never reported as an address.
+
+        COPY / MOVE / THREADS.  A ref is one shared_ptr to an immutable node, so
+        copying is a refcount bump, destruction releases nothing VM-side, and
+        there is no mutable state at all.  It is creatable, copyable, DEREFERENCE-
+        ABLE FROM ANY NUMBER OF THREADS AT ONCE, and destructible on any thread
+        (axiom A7), with no external synchronisation of any kind.
+
+            vmhook::root<sdk::minecraft> mc{ "theMinecraft" };
+            vmhook::ref<sdk::entity_player> player{ mc.get().field<sdk::entity_player>("thePlayer") };
+            if (player) { use(player->pos_x(), player->pos_y()); }   // no re-read, no pin
+
+        Complexity: O(chain length) per dereference; chains are typically one to
+        three hops of two to four fault-safe reads each.
+        Exception safety: noexcept throughout except class_name().
+        @tparam wrapper_type  A wrapper deriving from vmhook::object_base and
+                              constructible from vmhook::oop_t, or `void` for an
+                              untyped reference.
+    */
+    template<typename wrapper_type>
+    class ref final
+    {
+    public:
+        using element_type = wrapper_type;
+
+        ref() noexcept = default;
+        ref(const ref&) = default;
+        ref(ref&&) noexcept = default;
+        auto operator=(const ref&) -> ref& = default;
+        auto operator=(ref&&) noexcept -> ref& = default;
+        ~ref() = default;
+
+        /*
+            @brief Anchors a ref at a static reference field, given a GC-stable
+                   klass and the field's offset inside that class's mirror.
+            @details The base case of every chain.  This is the exact pair
+            field_proxy's static overload already stores, promoted to a first-class
+            value.  [ADV] - prefer the (class_name, field_name) overload.
+        */
+        static auto at_static(vmhook::hotspot::klass* const declaring_klass,
+                              const std::size_t offset) noexcept
+            -> ref
+        {
+            ref result{};
+            result.anchor_ = vmhook::detail::make_static_anchor(declaring_klass, offset);
+            return result;
+        }
+
+        /*
+            @brief Anchors a ref at `class_name.field_name`, a static reference
+                   field, resolving the class and field through the normal
+                   find_class / find_field path.
+            @details
+            Returns an empty ref (never a broken one) when the class is not
+            loaded, the field does not exist, the field is not static, or the
+            field is a primitive rather than a reference.  Each failure is logged
+            once through VMHOOK_LOG, so a typo is observable rather than silent.
+        */
+        static auto at_static(const std::string_view class_name,
+                              const std::string_view field_name) noexcept
+            -> ref
+        {
+            try
+            {
+                vmhook::hotspot::klass* const target{ vmhook::find_class(class_name) };
+                if (!target)
+                {
+                    VMHOOK_LOG("{} vmhook::ref::at_static('{}', '{}'): class not loaded.",
+                               vmhook::error_tag, class_name, field_name);
+                    return ref{};
+                }
+                const auto entry{ vmhook::find_field(target, field_name) };
+                if (!entry)
+                {
+                    VMHOOK_LOG("{} vmhook::ref::at_static('{}', '{}'): field not found.",
+                               vmhook::error_tag, class_name, field_name);
+                    return ref{};
+                }
+                if (!entry->is_static)
+                {
+                    VMHOOK_LOG("{} vmhook::ref::at_static('{}', '{}'): field is not static.",
+                               vmhook::error_tag, class_name, field_name);
+                    return ref{};
+                }
+                if (!vmhook::detail::is_reference_descriptor(entry->signature))
+                {
+                    VMHOOK_LOG("{} vmhook::ref::at_static('{}', '{}'): field descriptor '{}' is a "
+                               "primitive, not a reference.",
+                               vmhook::error_tag, class_name, field_name, entry->signature);
+                    return ref{};
+                }
+                // Statics live on the mirror of the class that DECLARES them, and
+                // `offset` only indexes that one - see find_field's field_entry_t
+                // note.  Anchoring on the start klass would read a different,
+                // differently sized mirror.
+                vmhook::hotspot::klass* const mirror_klass{
+                    entry->declaring_klass ? entry->declaring_klass : target };
+                return ref::at_static(mirror_klass, static_cast<std::size_t>(entry->offset));
+            }
+            catch (const std::exception& ex)
+            {
+                VMHOOK_LOG("{} vmhook::ref::at_static('{}', '{}') failed: {}",
+                           vmhook::error_tag, class_name, field_name, ex.what());
+                return ref{};
+            }
+        }
+
+        /*
+            @brief Wraps a bare address as a DETOUR-SCOPED reference.
+            @details
+            For values that genuinely are only valid for the current call - a
+            frame argument, a receiver, a freshly allocated object.  The address
+            is stamped with the current collection epoch and is refused once that
+            epoch moves, so leaking one out of a detour fails LOUDLY (resolves
+            empty) instead of silently handing back a moved address.  Promote it
+            to something durable by re-anchoring it: see field(), element(), and
+            vmhook::root.
+        */
+        static auto ephemeral(const vmhook::oop_t address) noexcept
+            -> ref
+        {
+            ref result{};
+            result.anchor_ = vmhook::detail::make_ephemeral_anchor(address);
+            return result;
+        }
+
+        /*
+            @brief The object's CURRENT address, or nullptr when the chain is
+                   broken, the object is gone, or an ephemeral ref has expired.
+            @details
+            The one function that matters, and it does the simplest possible
+            thing: for an ANCHORED ref it re-walks the chain from the GC-stable
+            root EVERY time, so the answer is a pure function of live VM state.
+            For an EPHEMERAL ref there is no root to walk, so the recorded epoch
+            is the whole contract - the address is handed back only while that
+            epoch holds, and refused (nullptr) once it moves.
+
+            NO ADDRESS IS EVER MEMOISED, and that is a deliberate departure from
+            the original design sketch, which proposed caching the resolved
+            address until the collection epoch moved.  A live-VM run showed why
+            that is wrong: an epoch-keyed memo is invalidated by a COLLECTION,
+            but a static field's VALUE can be overwritten without one.  Replace
+            Minecraft.theWorld on a world reload and a memoised ref keeps handing
+            back the previous World - a perfectly valid, perfectly live,
+            completely wrong object - until the next GC happens to clear the
+            memo.  That is the same class of silent staleness the whole model
+            exists to remove, so the memo is gone: a ref names a SLOT, and
+            resolve() reports what is in that slot now.
+
+            The walk is two to four fault-safe reads per hop, which is exactly
+            what field_proxy's static path already pays on every single read, so
+            this is not a new cost - it is the existing, proven one.
+
+            THE RACE GUARD.  A relocating collection stops Java threads, not
+            native ones, so a native caller can be mid-walk when objects move.
+            The epoch is sampled before the walk and re-checked after it; if a
+            collection is observed to have started in between, the address just
+            derived may already be stale and is REFUSED rather than returned.
+            That does not close the window between resolve() returning and the
+            caller using the value - nothing available to a pure-VM build can -
+            but it converts the detectable half into an honest empty, and every
+            read downstream of it is fault-safe regardless.
+
+            Complexity: O(chain length), two to four fault-safe reads per hop
+            plus two epoch samples.  Exception safety: noexcept.
+            Thread safety: SAFE, unconditionally - a ref holds no mutable state,
+            so any number of threads may dereference the same ref object at once.
+        */
+        auto resolve() const noexcept
+            -> vmhook::oop_t
+        {
+            if (!this->anchor_)
+            {
+                return nullptr;
+            }
+
+            if (this->anchor_->kind == vmhook::anchor_kind::ephemeral)
+            {
+                return vmhook::detail::resolve_anchor(this->anchor_.get());
+            }
+
+            const vmhook::gc_epoch_t before{ vmhook::gc_epoch() };
+            vmhook::oop_t const address{ vmhook::detail::resolve_anchor(this->anchor_.get()) };
+            if (!address)
+            {
+                return nullptr;
+            }
+
+            // Only meaningful when the epoch is readable at all; on a collector
+            // the detector refuses to vouch for, the freshly re-derived address
+            // is returned as-is - precisely as correct as field_proxy's static
+            // path is on that same VM, and never worse.
+            if (before.valid && !before.gc_active && vmhook::gc_epoch_changed(before))
+            {
+                return nullptr;
+            }
+            return address;
+        }
+
+        /* @brief True when the ref currently names a live, reachable object. */
+        explicit operator bool() const noexcept
+        {
+            return this->resolve() != nullptr;
+        }
+
+        /*
+            @brief True when this ref no longer resolves - collected, unreachable,
+                   or (for an ephemeral ref) past its epoch.  The A6 liveness
+                   state, distinct from "was never set".
+        */
+        auto expired() const noexcept
+            -> bool
+        {
+            return this->anchor_ != nullptr && this->resolve() == nullptr;
+        }
+
+        /* @brief True when this ref was never given an anchor. */
+        auto empty() const noexcept
+            -> bool
+        {
+            return this->anchor_ == nullptr;
+        }
+
+        /* @brief True when this ref re-derives from a GC-stable root (so it can
+           survive a collection) rather than expiring at the next one. */
+        auto anchored() const noexcept
+            -> bool
+        {
+            return this->anchor_ != nullptr
+                && this->anchor_->kind != vmhook::anchor_kind::ephemeral;
+        }
+
+        /* @brief Which shape of anchor this ref carries. */
+        auto kind() const noexcept
+            -> vmhook::anchor_kind
+        {
+            return this->anchor_ ? this->anchor_->kind : vmhook::anchor_kind::empty;
+        }
+
+        /* @brief Number of hops from the root; 0 for a root or an ephemeral. */
+        auto depth() const noexcept
+            -> std::uint32_t
+        {
+            return this->anchor_ ? this->anchor_->depth : 0u;
+        }
+
+        /*
+            @brief Stable, hashable, relocation-proof identity - see object_id.
+            @details REFERENCE identity, not object identity.  Read object_id's
+            doc block before using it as a map key; use same_object_as() for a
+            point-in-time "is this the same object?" test.
+        */
+        auto id() const noexcept
+            -> vmhook::object_id
+        {
+            return this->anchor_ ? vmhook::object_id{ this->anchor_->path_hash }
+                                 : vmhook::object_id{};
+        }
+
+        /*
+            @brief Revalidates and hands back a wrapper bound to the CURRENT
+                   address, for the duration of this expression only.
+            @details
+            `player->pos_x()` resolves, binds, calls, and discards.  See
+            detail::access for why the proxy cannot be hoisted into a variable.
+            When the ref does not resolve, the proxy binds a null instance and
+            the wrapper's own accessors degrade the way they always have - so
+            check the ref (`if (!player) { ... }`) exactly once, as A6 intends,
+            rather than after every field.
+        */
+        auto operator->() const noexcept
+            -> vmhook::detail::access<wrapper_type>
+            requires (!std::is_void_v<wrapper_type>
+                      && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
+        {
+            return vmhook::detail::access<wrapper_type>{ this->resolve() };
+        }
+
+        /* @brief Same as operator->, spelled for `(*ref).member`. */
+        auto operator*() const noexcept
+            -> vmhook::detail::access<wrapper_type>
+            requires (!std::is_void_v<wrapper_type>
+                      && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
+        {
+            return vmhook::detail::access<wrapper_type>{ this->resolve() };
+        }
+
+        /*
+            @brief Revalidate once, bind once, run a block of reads.
+            @details
+            The hot-loop form of Pattern 1: one revalidation for N field reads
+            instead of N.  `visitor` receives a `wrapper_type&` bound to the
+            address that was current when read() was entered.  It MUST NOT call
+            into Java (no method calls, no allocation) - anything that can
+            safepoint invalidates the binding, which is the very thing this is
+            trading away.  Returns false without invoking the visitor when the ref
+            does not resolve.
+            Complexity: one resolve plus the visitor.  Exception safety: whatever
+            the visitor offers.
+        */
+        template<typename visitor_type>
+        auto read(visitor_type&& visitor) const
+            -> bool
+            requires (!std::is_void_v<wrapper_type>
+                      && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
+        {
+            vmhook::oop_t const address{ this->resolve() };
+            if (!address)
+            {
+                return false;
+            }
+            wrapper_type bound{ address };
+            std::forward<visitor_type>(visitor)(bound);
+            return true;
+        }
+
+        /*
+            @brief Anchors a child ref at a reference field of THIS object, by
+                   byte offset.  [ADV] - prefer the by-name overload.
+        */
+        template<typename field_wrapper = void>
+        auto field_at(const std::size_t offset) const noexcept
+            -> vmhook::ref<field_wrapper>
+        {
+            vmhook::ref<field_wrapper> result{};
+            result.anchor_ = vmhook::detail::make_hop_anchor(
+                this->anchor_, vmhook::anchor_kind::field_of, offset, 0);
+            return result;
+        }
+
+        /*
+            @brief Anchors a child ref at the named reference field of THIS object.
+            @details
+            The field's OFFSET is HotSpot metadata and never moves, so it is
+            resolved once, here, and baked into the anchor; only the addresses are
+            re-derived later.  The holder klass is read from the live object's
+            header when the object resolves (exact runtime type, so a field
+            declared on a subclass is found), falling back to the wrapper type's
+            registered class.
+
+            A field that turns out to be STATIC is anchored as a static_root on
+            its declaring class instead of as a hop off this object - strictly
+            better, since that chain no longer depends on this object at all.
+
+            Returns an empty ref on any failure, logging once.
+            Complexity: O(class-hierarchy depth) once; O(1) thereafter.
+        */
+        template<typename field_wrapper = void>
+        auto field(const std::string_view name) const noexcept
+            -> vmhook::ref<field_wrapper>
+        {
+            try
+            {
+                vmhook::hotspot::klass* holder_klass{ nullptr };
+                if (vmhook::oop_t const address{ this->resolve() })
+                {
+                    holder_klass = vmhook::klass_from_oop(address);
+                }
+                if (!holder_klass)
+                {
+                    const std::string registered{ vmhook::detail::registered_class_name<wrapper_type>() };
+                    if (!registered.empty())
+                    {
+                        holder_klass = vmhook::find_class(registered);
+                    }
+                }
+                if (!holder_klass)
+                {
+                    VMHOOK_LOG("{} vmhook::ref::field('{}'): holder class could not be resolved "
+                               "(ref did not resolve and the wrapper type is not registered).",
+                               vmhook::error_tag, name);
+                    return vmhook::ref<field_wrapper>{};
+                }
+
+                const auto entry{ vmhook::find_field(holder_klass, name) };
+                if (!entry)
+                {
+                    VMHOOK_LOG("{} vmhook::ref::field('{}'): field not found in class hierarchy.",
+                               vmhook::error_tag, name);
+                    return vmhook::ref<field_wrapper>{};
+                }
+                if (!vmhook::detail::is_reference_descriptor(entry->signature))
+                {
+                    VMHOOK_LOG("{} vmhook::ref::field('{}'): descriptor '{}' is a primitive - a ref "
+                               "can only anchor on a reference field.",
+                               vmhook::error_tag, name, entry->signature);
+                    return vmhook::ref<field_wrapper>{};
+                }
+                if (entry->is_static)
+                {
+                    vmhook::hotspot::klass* const mirror_klass{
+                        entry->declaring_klass ? entry->declaring_klass : holder_klass };
+                    return vmhook::ref<field_wrapper>::at_static(
+                        mirror_klass, static_cast<std::size_t>(entry->offset));
+                }
+
+                vmhook::ref<field_wrapper> result{};
+                result.anchor_ = vmhook::detail::make_hop_anchor(
+                    this->anchor_,
+                    vmhook::anchor_kind::field_of,
+                    static_cast<std::size_t>(entry->offset),
+                    0);
+                return result;
+            }
+            catch (const std::exception& ex)
+            {
+                VMHOOK_LOG("{} vmhook::ref::field('{}') failed: {}", vmhook::error_tag, name, ex.what());
+                return vmhook::ref<field_wrapper>{};
+            }
+        }
+
+        /*
+            @brief Anchors a child ref at element `index` of THIS object, which
+                   must be a Java object array.
+            @details
+            The index - not the element's address - is what is remembered, so the
+            element ref survives a relocation of both the array and the element.
+            Out-of-range is checked at RESOLVE time against the live length, so an
+            array that shrinks (or is replaced by a shorter one) yields an empty
+            ref rather than a wild read.
+        */
+        template<typename element_wrapper = void>
+        auto element(const std::int32_t index) const noexcept
+            -> vmhook::ref<element_wrapper>
+        {
+            vmhook::ref<element_wrapper> result{};
+            if (index < 0)
+            {
+                return result;
+            }
+            result.anchor_ = vmhook::detail::make_hop_anchor(
+                this->anchor_, vmhook::anchor_kind::element_of, 0, index);
+            return result;
+        }
+
+        /*
+            @brief Re-types this ref without re-anchoring it.  Yields an EMPTY ref
+                   when the object is not an instance of `other_wrapper`.
+            @details The instance test goes through the wrapper type's REGISTERED
+            class name, so it honours whatever name-resolution scheme the consumer
+            registered with (obfuscated / mapped names included) instead of a
+            hard-coded string.
+        */
+        template<typename other_wrapper>
+        auto as() const noexcept
+            -> vmhook::ref<other_wrapper>
+        {
+            if (!this->is<other_wrapper>())
+            {
+                return vmhook::ref<other_wrapper>{};
+            }
+            vmhook::ref<other_wrapper> result{};
+            result.anchor_ = this->anchor_;
+            return result;
+        }
+
+        /* @brief Untyped view of the same anchor - the erasure direction, which
+           always succeeds. */
+        auto erased() const noexcept
+            -> vmhook::ref<void>
+        {
+            vmhook::ref<void> result{};
+            result.anchor_ = this->anchor_;
+            return result;
+        }
+
+        /*
+            @brief Java `instanceof`, keyed on a REGISTERED wrapper type.
+            @details Resolves `other_wrapper`'s registered class name and walks the
+            live object's superclass chain.  Interfaces are NOT matched - the
+            secondary-super array is not walked (the same limitation
+            vmhook::is_instance_of documents).
+        */
+        template<typename other_wrapper>
+        auto is() const noexcept
+            -> bool
+        {
+            const std::string name{ vmhook::detail::registered_class_name<other_wrapper>() };
+            if (name.empty())
+            {
+                return false;
+            }
+            return this->instance_of(name);
+        }
+
+        /* @brief Java `instanceof` by internal ('/'-separated) class name. */
+        auto instance_of(const std::string_view class_name) const noexcept
+            -> bool
+        {
+            vmhook::oop_t const address{ this->resolve() };
+            return address != nullptr && vmhook::is_instance_of(address, class_name);
+        }
+
+        /*
+            @brief Internal name of the object's RUNTIME class, or an empty string.
+            Exception safety: strong - returns empty on any failure.
+        */
+        auto class_name() const
+            -> std::string
+        {
+            try
+            {
+                vmhook::oop_t const address{ this->resolve() };
+                if (!address)
+                {
+                    return std::string{};
+                }
+                vmhook::hotspot::klass* const runtime_klass{ vmhook::klass_from_oop(address) };
+                if (!runtime_klass)
+                {
+                    return std::string{};
+                }
+                const vmhook::hotspot::symbol* const name_symbol{ runtime_klass->get_name() };
+                if (!vmhook::hotspot::is_valid_pointer(name_symbol))
+                {
+                    return std::string{};
+                }
+                return name_symbol->to_string();
+            }
+            catch (const std::exception&)
+            {
+                return std::string{};
+            }
+        }
+
+        /*
+            @brief Point-in-time object identity: do these two refs resolve to the
+                   same live object RIGHT NOW?
+            @details
+            Exact, but deliberately NOT the basis of operator== / std::hash: the
+            answer is an address comparison and therefore changes across a
+            collection, which would break every hashed container it was used in.
+            Two refs that both fail to resolve are NOT the same object.
+        */
+        template<typename other_wrapper>
+        auto same_object_as(const vmhook::ref<other_wrapper>& other) const noexcept
+            -> bool
+        {
+            vmhook::oop_t const mine{ this->resolve() };
+            return mine != nullptr && mine == other.resolve();
+        }
+
+        /* @brief Drops the anchor; the ref becomes empty.  Releases nothing
+           VM-side, because nothing was ever registered there. */
+        auto reset() noexcept
+            -> void
+        {
+            this->anchor_.reset();
+        }
+
+        /*
+            @brief The captured address of an EPHEMERAL ref with NO staleness
+                   check; nullptr for an anchored ref, which never stores one.
+                   Diagnostics and logging only - never dereference it.
+        */
+        auto raw_unsafe() const noexcept
+            -> vmhook::oop_t
+        {
+            if (this->anchor_ && this->anchor_->kind == vmhook::anchor_kind::ephemeral)
+            {
+                return this->anchor_->ephemeral_oop;
+            }
+            return nullptr;
+        }
+
+        /* @brief Reference identity - see object_id.  Consistent with
+           std::hash<vmhook::ref<T>>, which hashes the same token. */
+        friend auto operator==(const ref& left, const ref& right) noexcept
+            -> bool
+        {
+            return left.id() == right.id();
+        }
+
+        friend auto operator!=(const ref& left, const ref& right) noexcept
+            -> bool
+        {
+            return !(left == right);
+        }
+
+    private:
+        template<typename> friend class vmhook::ref;
+        template<typename> friend class vmhook::root;
+        template<typename> friend class vmhook::borrowed;
+
+        /* The ONLY member.  Immutable once built and shared by refcount, which
+           is what makes a ref cheap to copy, safe to dereference concurrently
+           from any number of threads, and destructible on any thread with
+           nothing to release. */
+        std::shared_ptr<const vmhook::detail::anchor_node> anchor_{};
+    };
+
+    /*
+        @brief A revalidating handle onto a static field / singleton.
+        @details
+        This is what kills the "re-read theWorld four times a tick" pattern.  A
+        root names a static reference field by (class, field) and binds LAZILY -
+        the class need not be loaded when the root is constructed, which is what
+        makes `inline const vmhook::root<T>` at namespace scope work.  Once bound
+        it hands out ordinary vmhook::ref values:
+
+            inline const vmhook::root<sdk::minecraft> minecraft{
+                "net/minecraft/client/Minecraft", "theMinecraft" };
+
+            // per tick - no allocation, no wrapper churn, no static-field re-read
+            // unless a collection actually happened:
+            if (const auto player{ minecraft.get().field<sdk::entity_player>("thePlayer") })
+            {
+                observe(player->pos_x());
+            }
+
+        Binding is idempotent and serialised by an internal mutex, so a root
+        declared at namespace scope and first touched from several threads at once
+        is safe.  That mutex is also why a root is neither copyable nor movable -
+        it is meant to be a long-lived singleton, and get() already hands out
+        cheap copies of the thing you actually pass around.
+
+        Complexity: one class + field lookup on the first successful bind; O(1)
+        after.  Exception safety: noexcept apart from construction.
+        Thread safety: safe.
+        @tparam wrapper_type  Wrapper type of the field's VALUE.
+    */
+    template<typename wrapper_type>
+    class root final
+    {
+    public:
+        root() noexcept = default;
+
+        /*
+            @brief Names a static field by its declaring class and field name.
+            @param declaring_class Internal ('/'-separated) JVM class name.
+            @param field_name      Exact Java field name.
+        */
+        root(const std::string_view declaring_class, const std::string_view field_name)
+            : class_name_{ declaring_class }
+            , field_name_{ field_name }
+        {
+        }
+
+        /*
+            @brief Names a static field on the wrapper type's OWN registered class
+                   - the singleton case (`Minecraft.theMinecraft`).
+            @details The class name is looked up through register_class<T>() at
+            bind time, so registration may happen after construction.
+        */
+        explicit root(const std::string_view field_name)
+            requires (!std::is_void_v<wrapper_type>)
+            : field_name_{ field_name }
+        {
+        }
+
+        root(const root&)                    = delete;
+        root(root&&)                         = delete;
+        auto operator=(const root&) -> root& = delete;
+        auto operator=(root&&) -> root&      = delete;
+        ~root()                              = default;
+
+        /*
+            @brief A ref anchored at this root's static field.
+            @details Binds on first use and on every subsequent call until it
+            succeeds, so a class loaded late is picked up automatically.  The
+            returned ref is a COPY - dereference it, store it, hand it to another
+            thread.  It carries no address of its own - only the immutable anchor.
+        */
+        auto get() const noexcept
+            -> vmhook::ref<wrapper_type>
+        {
+            try
+            {
+                std::lock_guard<std::mutex> lock{ this->bind_mutex_ };
+                if (this->bound_.empty())
+                {
+                    std::string owner{ this->class_name_ };
+                    if (owner.empty())
+                    {
+                        owner = vmhook::detail::registered_class_name<wrapper_type>();
+                    }
+                    if (owner.empty() || this->field_name_.empty())
+                    {
+                        return vmhook::ref<wrapper_type>{};
+                    }
+                    this->bound_ = vmhook::ref<wrapper_type>::at_static(owner, this->field_name_);
+                }
+                return this->bound_;
+            }
+            catch (const std::exception&)
+            {
+                return vmhook::ref<wrapper_type>{};
+            }
+        }
+
+        /* @brief The static field's current value address, or nullptr. */
+        auto resolve() const noexcept
+            -> vmhook::oop_t
+        {
+            return this->get().resolve();
+        }
+
+        /* @brief True when the root binds AND currently holds a live object. */
+        explicit operator bool() const noexcept
+        {
+            return this->resolve() != nullptr;
+        }
+
+        /* @brief True once the (class, field) pair has resolved to a real
+           static reference field.  False before the class is loaded. */
+        auto bound() const noexcept
+            -> bool
+        {
+            return !this->get().empty();
+        }
+
+        /*
+            @brief Revalidates and binds a wrapper for this expression only -
+                   `minecraft->the_player()`.  See vmhook::detail::access.
+        */
+        auto operator->() const noexcept
+            -> vmhook::detail::access<wrapper_type>
+            requires (!std::is_void_v<wrapper_type>
+                      && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
+        {
+            return vmhook::detail::access<wrapper_type>{ this->resolve() };
+        }
+
+        /* @brief The declaring class name this root was given, if any (empty when
+           the root defers to the wrapper type's registered name). */
+        auto declaring_class() const noexcept
+            -> std::string_view
+        {
+            return this->class_name_;
+        }
+
+        /* @brief The static field name this root was given. */
+        auto field_name() const noexcept
+            -> std::string_view
+        {
+            return this->field_name_;
+        }
+
+    private:
+        std::string class_name_{};
+        std::string field_name_{};
+        mutable std::mutex                 bind_mutex_{};
+        mutable vmhook::ref<wrapper_type>  bound_{};
+    };
+
+    /*
+        @brief A detour-scoped, allocation-free reference.
+        @details
+        For hook detour arguments, receivers and visitor callbacks - values that
+        genuinely are valid only for the current call.  A borrowed holds the
+        address plus the collection epoch it was captured in and nothing else: no
+        anchor node, no shared_ptr, no allocation, trivially copyable.  Once the
+        epoch moves it resolves to nullptr - EXPIRED, never dangling - so carrying
+        one out of a detour fails loudly instead of silently.
+
+        To keep something past the current call, re-anchor it: `pin()` gives a
+        vmhook::ref with the same (ephemeral) expiry, and `field()` anchors a
+        child on it.  Durable retention needs a GC-stable root - a vmhook::root,
+        or a chain that reaches one.
+
+        Complexity: O(1).  Exception safety: noexcept.  Thread safety: it is a
+        trivially copyable value; each copy carries its own epoch stamp.
+    */
+    template<typename wrapper_type>
+    class borrowed final
+    {
+    public:
+        borrowed() noexcept = default;
+
+        explicit borrowed(const vmhook::oop_t address) noexcept
+            : address_{ address }
+            , born_{ vmhook::gc_epoch() }
+        {
+        }
+
+        /* @brief The address, or nullptr once the epoch has moved. */
+        auto resolve() const noexcept
+            -> vmhook::oop_t
+        {
+            if (!this->address_)
+            {
+                return nullptr;
+            }
+            return vmhook::gc_epoch_changed(this->born_) ? nullptr : this->address_;
+        }
+
+        explicit operator bool() const noexcept
+        {
+            return this->resolve() != nullptr;
+        }
+
+        /* @brief True when this borrow was taken but has since expired. */
+        auto expired() const noexcept
+            -> bool
+        {
+            return this->address_ != nullptr && this->resolve() == nullptr;
+        }
+
+        /* @brief The captured address with NO staleness check - diagnostics only. */
+        auto raw_unsafe() const noexcept
+            -> vmhook::oop_t
+        {
+            return this->address_;
+        }
+
+        /* @brief Reference identity for the current epoch - see object_id.  Two
+           borrows of the SAME live object in the same epoch share an id. */
+        auto id() const noexcept
+            -> vmhook::object_id
+        {
+            if (!this->address_)
+            {
+                return vmhook::object_id{};
+            }
+            return vmhook::object_id{ vmhook::detail::ephemeral_identity(
+                this->address_, this->born_.collections) };
+        }
+
+        auto operator->() const noexcept
+            -> vmhook::detail::access<wrapper_type>
+            requires (!std::is_void_v<wrapper_type>
+                      && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
+        {
+            return vmhook::detail::access<wrapper_type>{ this->resolve() };
+        }
+
+        auto operator*() const noexcept
+            -> vmhook::detail::access<wrapper_type>
+            requires (!std::is_void_v<wrapper_type>
+                      && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
+        {
+            return vmhook::detail::access<wrapper_type>{ this->resolve() };
+        }
+
+        /*
+            @brief Promotes the borrow to a vmhook::ref.
+            @details The result is an EPHEMERAL ref - same expiry, now chainable.
+            It does NOT become durable, because no GC root exists to make it so;
+            anchor it off a vmhook::root for that.
+        */
+        auto pin() const noexcept
+            -> vmhook::ref<wrapper_type>
+        {
+            return vmhook::ref<wrapper_type>::ephemeral(this->resolve());
+        }
+
+        /* @brief Anchors a child ref at the named reference field of this object. */
+        template<typename field_wrapper = void>
+        auto field(const std::string_view name) const noexcept
+            -> vmhook::ref<field_wrapper>
+        {
+            return this->pin().template field<field_wrapper>(name);
+        }
+
+        template<typename other_wrapper>
+        auto is() const noexcept
+            -> bool
+        {
+            const std::string name{ vmhook::detail::registered_class_name<other_wrapper>() };
+            return !name.empty() && this->instance_of(name);
+        }
+
+        auto instance_of(const std::string_view class_name) const noexcept
+            -> bool
+        {
+            vmhook::oop_t const address{ this->resolve() };
+            return address != nullptr && vmhook::is_instance_of(address, class_name);
+        }
+
+        friend auto operator==(const borrowed& left, const borrowed& right) noexcept
+            -> bool
+        {
+            return left.id() == right.id();
+        }
+
+        friend auto operator!=(const borrowed& left, const borrowed& right) noexcept
+            -> bool
+        {
+            return !(left == right);
+        }
+
+    private:
+        vmhook::oop_t      address_{ nullptr };
+        vmhook::gc_epoch_t born_{};
+    };
+
+    /*
+        @brief A container of refs that can only ever be built ANCHORED.
+        @details
+        Axiom A4, expressed as a type.  The dangerous shape this replaces is
+        "decode every element of a collection to a raw oop, then try to pin them
+        one by one afterwards" - each pin is itself a safepoint, so by the time
+        element N is pinned, element N+1's remembered address may already be
+        stale, and pinning it roots a STALE address into the GC root set.  That
+        pattern produced a documented class of heap corruption downstream and no
+        purely caller-side discipline closes it.
+
+        ref_vector makes it unexpressible: there is no constructor, no member and
+        no factory anywhere that accepts a raw address, a void*, or a container of
+        them.  The only ways to put something in are append(), which takes an
+        already-rooted vmhook::ref, and vmhook::elements_of(), which anchors each
+        element by INDEX as it walks - so no raw address is ever collected in the
+        first place and there is nothing left to go stale.
+
+        Complexity: O(1) amortised append; O(N) walk.  Exception safety: the
+        std::vector guarantees.  Thread safety: an ordinary value type.
+    */
+    template<typename wrapper_type>
+    class ref_vector final
+    {
+    public:
+        using value_type     = vmhook::ref<wrapper_type>;
+        using container_type = std::vector<value_type>;
+        using const_iterator = typename container_type::const_iterator;
+        using iterator       = const_iterator;
+        using size_type      = typename container_type::size_type;
+
+        ref_vector() = default;
+
+        /* @brief Appends an ALREADY-ROOTED ref.  Returns false (and appends
+           nothing) for an empty one, so a broken walk cannot smuggle a hole in. */
+        auto append(const value_type& element)
+            -> bool
+        {
+            if (element.empty())
+            {
+                return false;
+            }
+            this->elements_.push_back(element);
+            return true;
+        }
+
+        auto begin() const noexcept -> const_iterator { return this->elements_.begin(); }
+        auto end()   const noexcept -> const_iterator { return this->elements_.end(); }
+        auto cbegin() const noexcept -> const_iterator { return this->elements_.cbegin(); }
+        auto cend()   const noexcept -> const_iterator { return this->elements_.cend(); }
+
+        auto size() const noexcept
+            -> size_type
+        {
+            return this->elements_.size();
+        }
+
+        auto empty() const noexcept
+            -> bool
+        {
+            return this->elements_.empty();
+        }
+
+        auto operator[](const size_type index) const
+            -> const value_type&
+        {
+            return this->elements_[index];
+        }
+
+        /* @brief Bounds-checked element access; an out-of-range index yields an
+           EMPTY ref rather than throwing (the library never throws outward). */
+        auto at(const size_type index) const
+            -> value_type
+        {
+            return index < this->elements_.size() ? this->elements_[index] : value_type{};
+        }
+
+        auto clear() noexcept
+            -> void
+        {
+            this->elements_.clear();
+        }
+
+        auto reserve(const size_type capacity)
+            -> void
+        {
+            this->elements_.reserve(capacity);
+        }
+
+        /* @brief A plain std::vector copy of the (still anchored) elements. */
+        auto to_vector() const
+            -> container_type
+        {
+            return this->elements_;
+        }
+
+    private:
+        container_type elements_{};
+    };
+
+    /*
+        @brief Builds a ref_vector over a Java object array, anchoring EVERY
+               element by index as the walk proceeds.
+        @details
+        The A4 constructor.  Nothing here ever holds a raw element address: the
+        array itself is resolved once only to read its length, and each element is
+        recorded as `element_of(array_anchor, i)`, which is re-derived from the
+        array's own root at use time.  A collection that moves the array, the
+        elements, or both leaves every entry correct.
+
+        `max_elements` clamps the walk the same way the rest of the header clamps
+        oop-derived counts (k_max_safe_container_elems), so a corrupted length
+        cannot drive an unbounded allocation.
+
+        Complexity: O(min(length, max_elements)).  Exception safety: strong -
+        returns an empty vector on allocation failure.  Thread safety: safe.
+        @tparam element_wrapper Wrapper type for the elements.
+        @param  array_ref       Anchored (or ephemeral) ref to a Java object array.
+    */
+    template<typename element_wrapper, typename array_wrapper>
+    inline auto elements_of(const vmhook::ref<array_wrapper>& array_ref,
+                            const std::size_t max_elements = vmhook::k_max_safe_container_elems) noexcept
+        -> vmhook::ref_vector<element_wrapper>
+    {
+        vmhook::ref_vector<element_wrapper> result{};
+        try
+        {
+            vmhook::oop_t const array_oop{ array_ref.resolve() };
+            if (!array_oop)
+            {
+                return result;
+            }
+            const std::int32_t length{ vmhook::clamp_safe_container_count(
+                vmhook::array_length(array_oop)) };
+            if (length <= 0)
+            {
+                return result;
+            }
+            const std::size_t count{ std::min<std::size_t>(static_cast<std::size_t>(length),
+                                                           max_elements) };
+            result.reserve(count);
+            for (std::size_t index{ 0 }; index < count; ++index)
+            {
+                // Anchored, not decoded: the element ref names a SLOT, so the
+                // address is derived at use time and there is nothing here that
+                // could go stale between now and then.
+                result.append(array_ref.template element<element_wrapper>(
+                    static_cast<std::int32_t>(index)));
+            }
+            return result;
+        }
+        catch (const std::exception&)
+        {
+            return vmhook::ref_vector<element_wrapper>{};
+        }
+    }
+
+    /*
+        @brief Free-function spelling of vmhook::ref<T>::at_static.
+    */
+    template<typename wrapper_type>
+    inline auto static_ref(const std::string_view class_name,
+                           const std::string_view field_name) noexcept
+        -> vmhook::ref<wrapper_type>
+    {
+        return vmhook::ref<wrapper_type>::at_static(class_name, field_name);
+    }
+
+    /*
+        @brief Free-function spelling of vmhook::ref<T>::ephemeral - wraps a bare
+               detour-scoped address.
+    */
+    template<typename wrapper_type>
+    inline auto ephemeral_ref(const vmhook::oop_t address) noexcept
+        -> vmhook::ref<wrapper_type>
+    {
+        return vmhook::ref<wrapper_type>::ephemeral(address);
+    }
+
+    /*
+        @brief Free-function spelling of the vmhook::borrowed constructor.
+    */
+    template<typename wrapper_type>
+    inline auto borrow(const vmhook::oop_t address) noexcept
+        -> vmhook::borrowed<wrapper_type>
+    {
+        return vmhook::borrowed<wrapper_type>{ address };
+    }
+
     // -------------------------------------------------------------------------
     // Object pins: a move-only holder for a raw heap OOP, guarded by the
     // Layer 1 relocation detector above.
@@ -21697,4 +23462,49 @@ namespace vmhook
             ? vmhook::jni::global_ref{ wrapper->vmhook::object_base::get_instance() }
             : vmhook::jni::global_ref{};
     }
+}
+
+// ---------------------------------------------------------------------------
+// std::hash support for the anchored-reference identity types.
+//
+// These live outside `namespace vmhook` because a specialisation of a standard
+// template has to.  Both hash the SAME token vmhook::ref::operator== compares,
+// so the hash / equality pair an unordered container needs is consistent by
+// construction: equal keys always hash equal.
+//
+// The token is relocation-proof (see vmhook::object_id), which is the whole
+// point - a raw heap address used as a map key silently changes meaning after a
+// collection, and that is a documented source of cross-thread races downstream.
+// ---------------------------------------------------------------------------
+namespace std
+{
+    template<>
+    struct hash<vmhook::object_id>
+    {
+        auto operator()(const vmhook::object_id id) const noexcept
+            -> std::size_t
+        {
+            return static_cast<std::size_t>(id.value());
+        }
+    };
+
+    template<typename wrapper_type>
+    struct hash<vmhook::ref<wrapper_type>>
+    {
+        auto operator()(const vmhook::ref<wrapper_type>& value) const noexcept
+            -> std::size_t
+        {
+            return static_cast<std::size_t>(value.id().value());
+        }
+    };
+
+    template<typename wrapper_type>
+    struct hash<vmhook::borrowed<wrapper_type>>
+    {
+        auto operator()(const vmhook::borrowed<wrapper_type>& value) const noexcept
+            -> std::size_t
+        {
+            return static_cast<std::size_t>(value.id().value());
+        }
+    };
 }
