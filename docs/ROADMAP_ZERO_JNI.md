@@ -84,11 +84,62 @@ woken up defects that dead code could not produce. **These will redden the JVM m
 fixed**, and they are the honest cost of the fix — the calls were never happening before, so
 nothing downstream of them was ever exercised.
 
-| # | Symptom | Status |
+All three are **fixed** *(commit `827b238`)*. The root causes are worth recording because none was
+what the symptom suggested.
+
+**X1 — the synthetic entry frame truncated the GC's stack walk.** ✅ FIXED
+
+The symptom was a GC worker crashing on a *later* collection. The cause was not anchor teardown
+but anchor **content**. A detour runs as native code on a JavaThread already in
+`_thread_in_Java`, and in that state **HotSpot keeps no frame anchor at all** — measured from
+inside a live detour on 21.0.11: `sp=0 pc=0 fp=0 state=8`. `call()` copied that empty anchor
+into the synthetic `JavaCallWrapper`, and to HotSpot an entry frame whose wrapper anchor has a
+null sp **is the bottom of the Java stack**:
+
+```cpp
+bool frame::entry_frame_is_first() const { return entry_frame_call_wrapper()->is_first_frame(); }
+bool JavaCallWrapper::is_first_frame() const { return _anchor.last_Java_sp() == nullptr; }
+```
+
+So the forced collection **stopped at our entry frame and never scanned the application's real
+Java frames underneath**, relocating every object they held without updating their slots. The
+next collection walked the dangling oops. (`jvm.dll+0xcad1` disassembles to a virtual call on a
+klass word sitting at the compressed-klass base — an oop whose header had been zeroed.)
+
+Fixed by recording the interrupted Java frame in a thread-local from `common_detour` and
+publishing it when the thread's own anchor is empty. Two further real defects on the same path
+went with it: the caller's `JNIHandleBlock` was being reset under it (HotSpot survives that only
+because `JavaCallWrapper`'s constructor installs a *fresh* block first), and the anchor restore
+order was inverted — `JavaFrameAnchor::copy()` writes sp **last**, deliberately.
+
+**X2 — `make_java_string()` null on JDK 21/26.** ✅ FIXED. `find_class` short-circuited every
+`[` name into `resolve_array_klass()` (`Universe::_*ArrayKlassObj`) and returned that
+unconditionally. Those statics exist only on the **JDK 8 generation**; from 9 on the CLDG walk is
+the route. The two are exactly complementary, measured. `[Ljava/lang/String;` was unaffected
+because it comes from `InstanceKlass::_array_klasses`, which every version publishes — which is
+why only *primitive* arrays broke, and with them the compact-String path.
+
+**X3 — `method_static` JVM crash.** ✅ FIXED, and it was **test UB, not the library**: a
+`->get()` on a *disengaged* `std::optional`, constructing a `std::string` from a null pointer.
+Latent for a long time; it only started faulting when the stack layout shifted. The optional is
+empty for a legitimate reason, so the probe is now tri-state and the affected assertions stay
+**HARD and red** rather than being papered over.
+
+> ⚠️ **A house-convention hazard this exposed.** The documented style
+> `get_field("x")->get()` with no `has_value()` check is **unsafe for any class that may not be
+> loaded**, and several modules use it. Worth a repo-wide sweep.
+
+**Result** — whole suite, MinGW, `-Xmx4g -Xmn3g`:
+
+| | before | after |
 |---|---|---|
-| **X1** | **`System.gc()` through a synthetic entry frame poisons the JavaThread for a *later* collection.** The call succeeds and the next invocation works, but a subsequent STW GC crashes HotSpot's own worker walking that thread: `WorkerThread "GC Thread#11"`, `jvm.dll+0xcad1`, `EXCEPTION_ACCESS_VIOLATION reading 0x100`. Bisected: each module passes alone, together they die in the later one's `System.gc()`. Reading `0x100` off a thread-relative walk points at the `_last_Java_frame` anchor or the `JavaCallWrapper` chain being left in a state the walker later trusts — and the wrapper lives on the **C++ stack**, which is dead memory once `call()` returns. | ⏳ being fixed; currently *contained* by a module priority, not solved |
-| **X2** | Full JVM suite crashes at `method_static` — null deref in a detour on the Java main thread. Same family: that module's calls previously no-opped and now execute. | ⏳ under diagnosis |
-| **X3** | `make_java_string()` returns **null on JDK 21/26** (works on JDK 8) — `[B` array klass reports "not loaded", then TLAB allocation fails. Already HARD-red in its own module; blocks String-argument coverage elsewhere. | ⏳ under diagnosis |
+| JDK 21 | **crashed** at `interface_polymorphism`, hs_err, no `TOTAL` | `TOTAL 24027/24552`, completes, no hs_err |
+| JDK 26 | — | `TOTAL 24026/24551`, completes, no hs_err |
+
+The 525 remaining failures are the pre-existing B2 baseline, none in the invocation path.
+**JDK 8 whole-suite still does not complete — and did not before either** (it crashed at
+`method_call_object` at baseline; now it stalls, and the stop point moves between runs). That is
+the documented `mingw · java8` fragility, not a regression from this work.
 
 ### 3.2b Four latent bugs found during the research
 
