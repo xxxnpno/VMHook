@@ -578,9 +578,27 @@ It returned null on all of them for years and nothing noticed.
   plus the anchor policy and the no-safepoint window. **Pin acquisition is only sound inside a
   detour** (§4.2b) — the API must enforce that, not document it. **Not done.**
 - **2.5** `weak_ref<T>` — **not done**, needs a real GC root.
-- **2.6** `detail::extract_frame_arg` is the single choke point that would turn every detour
-  argument into a `borrowed<T>`. Highest-leverage next step, and the precondition for the
-  hook-context consumer patterns.
+- **2.6** `detail::extract_frame_arg` — **DONE.** The detour-argument choke point now accepts
+  `vmhook::borrowed<W>`, so a detour can declare its receiver and any object argument as a
+  lifetime-checked handle instead of a raw address. Three tables had to agree and all three
+  were wired: `extract_frame_arg` (produces the handle), `jni_signature_for_arg`
+  (`borrowed<W>` -> `Lclass;`, `borrowed<void>` -> `Ljava/lang/Object;`), and
+  `is_java_double_slot_v` (one slot — the failure mode a wrong width causes is silent, so it is
+  pinned at compile time against argument lists that interleave borrows with long/double).
+  A null slot yields an EMPTY borrow, never an expired one — "there was no object" and "the
+  object moved" stay distinguishable.
+
+  Found while adding it: `extract_frame_arg` called `frame->get_locals()` with no null check.
+  `get_locals()` survives it (it gates on `is_valid_pointer(this)`), but the member call on a
+  null pointer is already UB by then, and GCC diagnoses exactly that under `-Wnonnull` as soon
+  as a caller can be seen passing null. Guarded at the choke point.
+
+  Coverage: `tests/test_borrowed_detour_arg_nojvm.cpp` (traits, descriptor, slot table,
+  null-frame degradation) and `tests/jvm/modules/borrowed_detour_arg.cpp` (live receiver
+  identity across two instances, borrowed object arguments, Java-null arguments, and the
+  slot table behind `combine(int,long,int)` and the 8-arg `manyArgs`). The live module drives
+  `HookBasic` UNCHANGED, on the same modes hook_basic drives through `unique_ptr` — so the two
+  argument models are asserted against the same scenarios.
 
 Placement: top-level `namespace vmhook`, just above the field-proxy section (~13433) — every
 primitive it needs (`decode/encode_oop_pointer`, `safe_read/write`, `get_java_mirror`) is
@@ -590,12 +608,24 @@ disables.
 
 ### Phase 3 — retire the raw-oop surface
 80 raw-oop boundary crossings are catalogued in 7 categories. The **minimum viable intercept
-set** covering ~90% of user exposure is 6 places: `object_base` ctor + `get_instance`,
-`detail::extract_frame_arg` (the detour-argument choke point), the `field_proxy` ctors +
-`store_object_oop`, `method_proxy`'s receiver, the six collection ctors, and
-`make_java_object`/`make_java_array`/`make_java_string`.
+set** covering ~90% of user exposure is 6 places. Status:
 
-Raw accessors survive as explicitly-named escape hatches (`raw_*`), not as the default.
+| # | Intercept | Status |
+|---|---|---|
+| 1 | `detail::extract_frame_arg` — every detour argument | **DONE** (§2.6) |
+| 2 | `object_base` ctor + `get_instance` | **DONE** — `object<W>::self()` returns `borrowed<W>` |
+| 3 | `field_proxy` ctors + `store_object_oop` | **PARTIAL** — reads done (`value_t::to_borrowed<W>()`); the WRITE side (`store_object_oop`) still takes a raw oop |
+| 4 | `method_proxy`'s receiver | not done |
+| 5 | the six collection ctors | not done |
+| 6 | `make_java_object` / `make_java_array` / `make_java_string` | not done |
+
+The three that landed are the three READ paths — how an object reaches the user. What remains
+is mostly how an object goes back IN, which is the harder half: a write needs the address to
+still be valid at the instant of the store, so those intercepts want the store to happen
+THROUGH the handle rather than taking one as an argument.
+
+Raw accessors survive as explicitly-named escape hatches (`raw_*` / `get_instance`), not as the
+default.
 
 ### Phase 4 — finish Goal A
 - **4.1** `vmhook::jni::global_ref` → `vmhook::oop_pin` at `vmhook` scope; delete the `jni`

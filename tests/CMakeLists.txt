@@ -160,7 +160,7 @@ vmhook_add_test(method_call_object_nojvm       SOURCES test_method_call_object_n
 # invariance, the noexcept arity matrix, value_t's variant API, and
 # copy/move-proxy idempotence).  Re-registered under its historical name to keep
 # this change reviewable; the rename is queued for a follow-up pass.
-vmhook_add_test(method_call_jni_fallback_nojvm SOURCES test_method_call_jni_fallback_nojvm.cpp)
+vmhook_add_test(method_call_dispatch_nojvm SOURCES test_method_call_dispatch_nojvm.cpp)
 vmhook_add_test(seh_invoke_detour              SOURCES test_seh_invoke_detour.cpp)
 vmhook_add_test(dont_inline_dont_compile       SOURCES test_dont_inline_dont_compile.cpp)
 vmhook_add_test(hook_common_detour_dispatch    SOURCES test_hook_common_detour_dispatch.cpp)
@@ -223,3 +223,12 @@ vmhook_add_test(gc_relocation_detector_nojvm   SOURCES test_gc_relocation_detect
 # construction; nothing below asserts it.
 vmhook_add_test(anchored_ref_nojvm             SOURCES test_anchored_ref_nojvm.cpp)
 vmhook_add_test(anchored_ref_identity_nojvm    SOURCES test_anchored_ref_identity_nojvm.cpp)
+
+# borrowed<T> as a DETOUR ARGUMENT — detail::extract_frame_arg's borrow arm and
+# the two compile-time tables that have to agree with it (jni_signature_for_arg
+# for the descriptor, is_java_double_slot_v / java_slot_offsets for the slot
+# width).  The slot table is the reason this is its own file: a wrong width does
+# not fail to compile and does not crash — every argument AFTER the offending one
+# silently reads the wrong slot — so it is pinned at compile time against
+# argument lists that interleave borrows with long/double.
+vmhook_add_test(borrowed_detour_arg_nojvm      SOURCES test_borrowed_detour_arg_nojvm.cpp)

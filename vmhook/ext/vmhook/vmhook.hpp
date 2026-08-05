@@ -1856,6 +1856,42 @@ namespace vmhook
         inline constexpr bool is_unique_ptr_v{ is_unique_ptr<std::remove_cvref_t<type>>::value };
 
         /*
+            @brief Type trait that detects whether a type is a vmhook::borrowed<W>.
+            @details
+            The counterpart of is_unique_ptr for the anchored-reference model.  A
+            detour that declares an argument as vmhook::borrowed<Player> gets the
+            decoded oop wrapped in a lifetime-checked handle instead of a raw
+            address, so the argument expires with the frame it came from rather
+            than dangling silently once the collector moves the object.
+
+            value_type_t is the wrapper type the borrow is parameterised on
+            (`void` for an untyped borrow) - it is what the descriptor builder
+            resolves to a JVM class name.  The parameter is named `wrapped_type`
+            for the same reason is_unique_ptr's is: `value_type` would be shadowed
+            by std::true_type's own inherited typedef.
+
+            Exception safety: noexcept - compile-time trait, no runtime cost.
+        */
+        template<typename type>
+        struct is_borrowed : std::false_type {};
+
+        template<typename wrapped_type>
+        struct is_borrowed<vmhook::borrowed<wrapped_type>> : std::true_type
+        {
+            using value_type_t = wrapped_type;
+        };
+
+        /*
+            @brief Convenience bool constant for vmhook::detail::is_borrowed<T>.
+            @details
+            Strips cv-ref qualifiers first, so is_borrowed_v<const borrowed<Foo>&>
+            is true - detours normally take a borrow by value, but taking it by
+            const-ref must classify identically.
+        */
+        template<typename type>
+        inline constexpr bool is_borrowed_v{ is_borrowed<std::remove_cvref_t<type>>::value };
+
+        /*
             @brief Constrains the value_t conversion operators to their *legitimate*
                    target set, excising the spurious productions that make a class
                    target with competing constructors ambiguous on MSVC.
@@ -10231,6 +10267,20 @@ namespace vmhook
                 return base_t{};
             }
 
+            // Null-frame guard.  frame::get_locals() already survives being
+            // reached on a bad frame — it gates on is_valid_pointer(this) before
+            // touching anything — but by then the member call on a null pointer
+            // has already happened, which is formally UB no matter how careful
+            // the body is.  GCC diagnoses exactly that (-Wnonnull) as soon as a
+            // caller can be seen passing null.  Guard it here, at the choke
+            // point every detour argument passes through, so the contract is
+            // "a null frame yields a default-constructed argument" by
+            // construction rather than by the callee's good behaviour.
+            if (!frame)
+            {
+                return base_t{};
+            }
+
             void** const locals{ frame->get_locals() };
             if (!locals)
             {
@@ -10299,6 +10349,22 @@ namespace vmhook
             if constexpr (std::is_same_v<base_t, std::string>)
             {
                 return vmhook::read_java_string(decode_oop(raw_value));
+            }
+            else if constexpr (is_borrowed_v<base_t>)
+            {
+                // The zero-ceremony detour argument.  A borrowed<W> stamps the
+                // decoded oop with the collection epoch it was read in, so the
+                // handle resolves to nullptr the moment the collector moves -
+                // EXPIRED rather than dangling - and carrying it out of the
+                // detour fails loudly instead of silently reading a relocated
+                // address.  Unlike the unique_ptr<W> arm below it needs no
+                // registered factory, no allocation and no map lookup: it is two
+                // words, trivially copyable, and constructed unconditionally.
+                //
+                // A null slot yields a default-constructed (empty, never
+                // expired) borrow, which is the honest reading of a Java null -
+                // `if (arg)` is false for both, and expired() distinguishes them.
+                return base_t{ decode_oop(raw_value) };
             }
             else if constexpr (is_unique_ptr_v<base_t>)
             {
@@ -12542,6 +12608,33 @@ namespace vmhook
             {
                 return "D";
             }
+            else if constexpr (vmhook::detail::is_borrowed_v<clean_t>)
+            {
+                // borrowed<W> describes the SAME Java type as unique_ptr<W> — a
+                // reference to W's registered class — so it resolves through the
+                // same map.  The untyped borrowed<void> carries no wrapper to
+                // resolve and is therefore java/lang/Object by construction, not
+                // by fallback; it is the right descriptor for a detour that only
+                // wants identity and lifetime, not typed field access.
+                using wrapper_type = typename vmhook::detail::is_borrowed<clean_t>::value_type_t;
+                if constexpr (std::is_void_v<wrapper_type>)
+                {
+                    return "Ljava/lang/Object;";
+                }
+                else
+                {
+                    const auto entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
+                    if (entry == vmhook::type_to_class_map.end())
+                    {
+                        VMHOOK_LOG("{} vmhook::detail::jni_signature_for_arg<{}>: borrowed<T> wrapper "
+                                   "not registered via vmhook::register_class<T>(name); falling back to "
+                                   "Ljava/lang/Object;.",
+                                   vmhook::warning_tag, typeid(wrapper_type).name());
+                        return "Ljava/lang/Object;";
+                    }
+                    return std::format("L{};", entry->second);
+                }
+            }
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
                 using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
@@ -12561,10 +12654,7 @@ namespace vmhook
                                vmhook::warning_tag, typeid(wrapper_type).name());
                     return "Ljava/lang/Object;";
                 }
-                std::string sig{ "L" };
-                sig.append(entry->second);
-                sig.push_back(';');
-                return sig;
+                return std::format("L{};", entry->second);
             }
             else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
             {
@@ -12577,10 +12667,7 @@ namespace vmhook
                                vmhook::warning_tag, typeid(clean_t).name());
                     return "Ljava/lang/Object;";
                 }
-                std::string sig{ "L" };
-                sig.append(entry->second);
-                sig.push_back(';');
-                return sig;
+                return std::format("L{};", entry->second);
             }
             else
             {
@@ -14218,6 +14305,33 @@ namespace vmhook
             template<typename key_type, typename value_type>
             auto to_entries() const
                 -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<value_type>>>;
+
+            /*
+                @brief Reads a reference field as a lifetime-checked handle.
+                @details
+                The zero-ceremony counterpart of decoding the compressed OOP by
+                hand.  `get_field("target")->get().to_borrowed<player>()` yields a
+                handle stamped with the collection epoch it was read in, so it
+                resolves to nullptr once the collector moves — EXPIRED rather
+                than dangling — instead of an address the caller has to keep
+                fresh by re-reading.
+
+                A NON-reference field (any primitive alternative) yields an EMPTY
+                borrow, not a borrow of a reinterpreted primitive: reading an int
+                field as an object is a caller mistake, and inventing an address
+                from its bits is the worst possible response.  Empty is also what
+                a Java null yields, and the two are distinguishable — a null field
+                was never borrowed, so expired() is false for both.
+
+                To keep the object past the current call, anchor it: pin() gives
+                a chainable vmhook::ref, and durable retention needs a
+                vmhook::root.  Defined out-of-line, after vmhook::borrowed.
+
+                Complexity: O(1).  Exception safety: noexcept.
+            */
+            template<typename wrapper_type = void>
+            auto to_borrowed() const noexcept
+                -> vmhook::borrowed<wrapper_type>;
         };
 
         /*
@@ -18169,6 +18283,31 @@ namespace vmhook
     {
     public:
         using object_base::object_base;
+
+        /*
+            @brief This wrapper's own instance, as a lifetime-checked handle.
+            @details
+            The wrapper-side counterpart of get_instance().  Where get_instance()
+            hands back a raw address the caller then has to keep fresh, self()
+            hands back a vmhook::borrowed stamped with the collection epoch it was
+            taken in: it resolves to nullptr once the collector moves, so a
+            wrapper that outlived its object reports EXPIRED instead of quietly
+            reading a relocated address.
+
+            This is what makes a wrapper storable for the length of a call
+            without the caller re-reading the object: pass the borrow, not the
+            wrapper.  To keep it past the current call, pin() it into a
+            vmhook::ref anchored on a vmhook::root.
+
+            A wrapper built on a null instance yields an EMPTY borrow (never
+            borrowed), which is distinct from a borrow that has since expired.
+
+            Defined out-of-line, after vmhook::borrowed is complete.
+
+            Complexity: O(1).  Exception safety: noexcept.
+        */
+        auto self() const noexcept
+            -> vmhook::borrowed<derived>;
 
         // -------------------------------------------------------------------
         // Deducing-this overloads (compiled only on toolchains that support
@@ -23350,6 +23489,63 @@ namespace vmhook
         vmhook::oop_t      address_{ nullptr };
         vmhook::gc_epoch_t born_{};
     };
+
+    /*
+        @brief Out-of-line definition of object<derived>::self().
+        @details
+        Deferred for the same reason as to_borrowed below: vmhook::borrowed is
+        only complete at this point in the header.
+    */
+    template<typename derived>
+    auto object<derived>::self() const noexcept
+        -> vmhook::borrowed<derived>
+    {
+        vmhook::oop_t const instance{ this->get_instance() };
+        if (!instance)
+        {
+            return vmhook::borrowed<derived>{};
+        }
+        return vmhook::borrowed<derived>{ instance };
+    }
+
+    /*
+        @brief Out-of-line definition of field_proxy::value_t::to_borrowed<W>().
+        @details
+        Deferred to here because vmhook::borrowed is only complete at this point
+        (it needs gc_epoch(), which needs the whole hotspot layer) — the same
+        treatment to_vector / to_entries already get.
+
+        The stored alternative is the ONLY thing consulted: a compressed-OOP
+        alternative is decoded and stamped, and every primitive alternative
+        yields an empty borrow rather than a borrow of reinterpreted bits.
+    */
+    template<typename wrapper_type>
+    auto field_proxy::value_t::to_borrowed() const noexcept
+        -> vmhook::borrowed<wrapper_type>
+    {
+        return std::visit([](const auto& stored) noexcept
+            -> vmhook::borrowed<wrapper_type>
+            {
+                using stored_type = std::remove_cvref_t<decltype(stored)>;
+                if constexpr (std::is_same_v<stored_type, std::uint32_t>)
+                {
+                    // A zero narrow oop is Java null: decode would hand back
+                    // nullptr anyway, but going through the empty-borrow
+                    // constructor keeps "never borrowed" distinct from
+                    // "borrowed and since expired".
+                    if (stored == 0u)
+                    {
+                        return vmhook::borrowed<wrapper_type>{};
+                    }
+                    return vmhook::borrowed<wrapper_type>{
+                        vmhook::hotspot::decode_oop_pointer(stored) };
+                }
+                else
+                {
+                    return vmhook::borrowed<wrapper_type>{};
+                }
+            }, this->data);
+    }
 
     /*
         @brief A container of refs that can only ever be built ANCHORED.

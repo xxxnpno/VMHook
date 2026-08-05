@@ -48,7 +48,7 @@
 // (jni_decode_object), re-encodes it (encode_oop_pointer), and DeleteLocalRef's
 // the handle AFTER the decode — so a non-null reference return round-trips into a
 // usable wrapper on BOTH paths.  (An older header truncated/freed the handle;
-// that flaw is FIXED and the sibling method_call_jni_fallback module asserts the
+// that flaw is FIXED and the sibling method_call_dispatch module asserts the
 // same usable-wrapper contract unconditionally.)  This module therefore HARD-
 // asserts the full usable-wrapper contract on every JDK and only RECORDS which
 // dispatch path was taken as [INFO].

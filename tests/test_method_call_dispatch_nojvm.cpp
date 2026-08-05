@@ -1,13 +1,19 @@
-// Wave-33 no-JVM unit tests for method_proxy::call() driving the JNI INVOCATION
-// FALLBACK path (call_jni) — vmhook.hpp ~12488-13064.
+// Wave-33 no-JVM unit tests for method_proxy::call() — the COLD guard arms and
+// the value_t API, with no live HotSpot behind them.
+//
+// Written as test_method_call_jni_fallback_nojvm, when call() had a second
+// dispatcher (call_jni) that these tests were framed around.  That dispatcher is
+// gone; nothing here ever depended on it — every assertion is about the guard
+// that fires BEFORE any dispatch, and about value_t.  So the file survives the
+// de-JNI work unchanged in substance, renamed to match what it actually covers.
 //
 // LEDGER gaps closed (cold, no live HotSpot):
-//   * call_jni() reached via call() on null Method* returns monostate value_t
-//     for every primitive/Object/array return-descriptor shape (Z/B/C/S/I/J/F/D/
-//     L.../[...) — pin that the guard arm is RETURN-TYPE-INVARIANT.
+//   * call() on a null Method* returns a monostate value_t for every
+//     primitive/Object/array return-descriptor shape (Z/B/C/S/I/J/F/D/L.../[...)
+//     — pin that the guard arm is RETURN-TYPE-INVARIANT.
 //   * call() is noexcept across a far wider arity/type matrix than the existing
 //     string-cold module (static_assert on 0..16 args, J+D two-slot args mixed
-//     with refs, const char*, pointers — all that the JNI fallback marshalls).
+//     with refs, const char*, pointers — every shape call() marshals).
 //   * value_t variant API exhaustively static_asserted (every is_* / as_* slot
 //     is noexcept and returns the documented type).
 //   * Idempotence of cold call() across copy- and move-constructed proxies:
@@ -16,7 +22,7 @@
 //     (observable via re-reads of the same proxy across many calls).
 //
 // All HARD asserts — no platform variance: nothing here decodes oops, walks
-// JNI, or touches HotSpot. Cross-compiler clean (no constexpr-lambda capture,
+// a thread, or touches HotSpot. Cross-compiler clean (no constexpr-lambda capture,
 // no long==int64_t assumptions, no noexcept on libc++ string_view).
 
 #include <vmhook/vmhook.hpp>
@@ -40,7 +46,7 @@ auto check(const char* name, bool ok) -> void
 using proxy_t = vmhook::method_proxy;
 using value_t = vmhook::method_proxy::value_t;
 
-// ---------- compile-time pins on call() across the JNI-fallback arg matrix ----
+// ---------- compile-time pins on call() across the whole arg matrix ---------
 
 static_assert(std::is_same_v<decltype(std::declval<const proxy_t&>().call()), value_t>,
               "call() return type pinned");
@@ -63,8 +69,8 @@ static_assert(noexcept(std::declval<const proxy_t&>().call(true)),
 static_assert(noexcept(std::declval<const proxy_t&>().call(static_cast<const char*>("k"))),
               "call(const char*) noexcept");
 
-// Two-slot J + D mixed with refs — these are the precise shapes the JNI
-// fallback's jvalue[] marshaller has to lay out without slot drift.
+// Two-slot J + D mixed with refs — the precise shapes the argument marshaller
+// has to lay out without slot drift.
 static_assert(noexcept(std::declval<const proxy_t&>().call(
                   std::int64_t{1}, 1.0, std::int64_t{2}, 1.0f)),
               "call(J,D,J,F) noexcept");
@@ -85,8 +91,8 @@ int main()
     check("static_asserts_compiled", true);
 
     // --------------------------------------------------------------------
-    // Guard arm is RETURN-TYPE-INVARIANT — every JNI slot the fallback can
-    // dispatch into (Z/B/C/S/I/J/F/D/L../[..) reaches the same monostate.
+    // Guard arm is RETURN-TYPE-INVARIANT — every return descriptor call() can
+    // dispatch (Z/B/C/S/I/J/F/D/L../[..) reaches the same monostate.
     // --------------------------------------------------------------------
     const char* sigs[] = {
         "()Z", "()B", "()C", "()S", "()I", "()J", "()F", "()D", "()V",
@@ -103,7 +109,7 @@ int main()
     // --------------------------------------------------------------------
     // Two-slot args (J, D) interleaved with refs in the SAME call: pin
     // runtime safety of the perfect-forward-then-early-return path for
-    // the trickiest shape the fallback marshaller has to handle.
+    // the trickiest shape the argument marshaller has to handle.
     // --------------------------------------------------------------------
     {
         const proxy_t p{ nullptr, nullptr,
@@ -118,8 +124,8 @@ int main()
     }
 
     // --------------------------------------------------------------------
-    // 16-arg shape — the upper end of what the JNI fallback's stack-laid
-    // jvalue[] has to cope with. Guard arm fires regardless of arity.
+    // 16-arg shape — the upper end of what the stack-laid argument buffer has
+    // to cope with. Guard arm fires regardless of arity.
     // --------------------------------------------------------------------
     {
         const proxy_t p{ nullptr, nullptr,
@@ -163,7 +169,7 @@ int main()
     // --------------------------------------------------------------------
     // Many distinct const char* literals — every one taking the perfect-
     // forward arm without aborting. Belt-and-suspenders on the const-char*
-    // overload the JNI fallback would marshal as a String arg.
+    // overload that call() marshals as a String arg.
     // --------------------------------------------------------------------
     {
         const proxy_t p{ nullptr, nullptr,

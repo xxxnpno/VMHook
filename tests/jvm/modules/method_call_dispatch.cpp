@@ -1,41 +1,43 @@
-// method_call_jni_fallback — exhaustive JVM tests for the JNI INVOCATION
-// FALLBACK path of vmhook::method_proxy::call(), i.e. method_proxy::call_jni()
-// (vmhook.hpp ~12488-13064).
+// method_call_dispatch — exhaustive JVM tests for vmhook::method_proxy::call().
 //
-// WHEN THE FALLBACK IS TAKEN: call() probes detail::find_call_stub_entry()
-// (StubRoutines::_call_stub_entry).  Present (typ. JDK 8..20) -> interpreter
-// call-stub fast path; ABSENT (JDK 21+, and on every JDK where the entry is not
-// exported via VMStructs — which is what CI exercises) -> call() short-circuits
-// straight into call_jni(), which marshals args into a jvalue[] and dispatches
-// via Call(Static)?<Type>MethodA.  This module RECORDS which path is live
-// (find_call_stub_entry) and asserts the converted value_t, which must be
-// identical on either dispatcher.  So the module is a thorough exercise of
-// call() that NATURALLY drives call_jni on the modern JDKs while staying correct
-// (not skipped) on the legacy call-stub JDKs.
+// HISTORY, because it explains the shape of this file and the mcj_ prefix.  The
+// module was written as method_call_jni_fallback, to cover a SECOND dispatcher:
+// call() probed detail::find_call_stub_entry(), and when the entry was absent it
+// short-circuited into call_jni(), which marshalled args into a jvalue[] and
+// dispatched via Call(Static)?<Type>MethodA.  The module was built on the belief
+// that the entry is absent on JDK 21+ and so CI naturally exercised the fallback.
 //
-// WHAT IT STRESSES (the audit's JNI-fallback concerns):
-//   * every return type   : void Z B C S I J F D String Object  (instance+static)
+// Both halves of that were wrong.  StubRoutines::_call_stub_entry was never
+// published through VMStructs on ANY JDK, so find_call_stub_entry() returned null
+// everywhere and call() was a silent no-op — the "fallback" was not a fallback,
+// it was the only thing that ever ran.  The entry is now DERIVED from
+// StubRoutines::_call_stub_return_address, resolves on 8/21/26 alike, and the JNI
+// dispatcher has been deleted with it.  There is exactly one dispatch path.
+//
+// So this module is now what it was always really worth: the deepest single
+// exercise of call() semantics in the suite.  Assertion names keep the mcj_
+// prefix deliberately — several thousand of them are directly comparable against
+// historical CI runs, which is how regressions in this area get bisected.
+//
+// WHAT IT STRESSES:
+//   * every return type    : void Z B C S I J F D String Object (instance+static)
 //   * every arg shape      : no-arg, single primitive, String, Object,
 //                            multi-arg incl. long(J) + double(D) two-slot args
-//   * local-ref discipline : tight loops of String-RETURN, String-ARG, and
-//                            long+double MULTI-ARG primitive calls.  HotSpot's
-//                            default local-ref table holds 16 entries and our
-//                            long-lived attached detour threads never pop a JNI
-//                            frame, so a leak (one un-released NewStringUTF /
-//                            GetStringUTFChars ref per call) starves the table
-//                            within ~16 iterations and later calls return ""
-//                            (or wrong values).  The loops assert the result is
-//                            STABLE across all iterations — the observable
-//                            characterization of "no local-ref leak".  The
-//                            primitive-arg loop also pins the union-aliasing
-//                            footgun the audit flagged: a primitive jvalue cell
-//                            must never be handed to DeleteLocalRef (would
-//                            corrupt / crash) — proven by the loop staying
-//                            stable and the post-loop calls remaining correct.
-//   * cache warm-up        : repeated calls on the SAME proxy reuse
-//                            cached_method_id / cached_class_handle with no
-//                            state corruption.
-//   * instance vs static   : both Call*MethodA and CallStatic*MethodA, interleaved.
+//   * repeat-call stability: tight loops of String-RETURN, String-ARG, and
+//                            long+double MULTI-ARG primitive calls, asserting the
+//                            result is STABLE across all 256 iterations.  These
+//                            began as local-ref-leak guards for the JNI
+//                            dispatcher; they are kept because they are the
+//                            sharpest available characterization of "call()
+//                            accumulates no per-call state", which the call-stub
+//                            path has to satisfy just as much.
+//   * exception discipline : a throwing callee is REPORTED through value_t
+//                            (threw() + exception_class), its pending exception
+//                            is cleared off the JavaThread, and the result is
+//                            value-initialised rather than garbage.
+//   * cache warm-up        : repeated calls on the SAME proxy reuse the resolved
+//                            method with no state corruption.
+//   * instance vs static   : both dispatch kinds, interleaved.
 //
 // call() must run where current_java_thread is set, i.e. inside a hook detour.
 // So we hook MethodCallJni.trigger(int); the probe calls trigger() on a real
@@ -332,18 +334,25 @@ namespace
     std::atomic<int> g_ctor_call_is_void{ -1 };
     std::atomic<int> g_ctor_no_pending_exc{ -1 };
 
-    // ── EXCEPTION discipline (callee throws -> observed + cleared, no escape) ─
-    // For each throwing call we record whether a JNI exception was pending
-    // IMMEDIATELY AFTER call() returned.  On the JNI fallback path call_jni's
-    // check_callee_exception ran ExceptionDescribe (which clears), so the library
-    // leaves NO pending exception — pending==0 is the discipline proof.  After
-    // recording, run_all unconditionally clears (idempotent) so neither path can
-    // poison what follows.  A clean follow-up call then proves recovery.
-    std::atomic<int>          g_exc_void_pending_after{ -1 };
-    std::atomic<int>          g_exc_int_pending_after{ -1 };
-    std::atomic<int>          g_exc_static_pending_after{ -1 };
-    std::atomic<int>          g_exc_recovery_ok{ -1 };       // echoInt after throws == sentinel
-    std::atomic<int>          g_exc_seen_at_least_one{ -1 }; // a throw WAS observed pending pre-clear
+    // ── EXCEPTION discipline (callee throws -> reported + cleared, no escape) ─
+    // call() detects the callee's throw, clears ThreadShadow::_pending_exception
+    // with a pure-VM write (no JNI), and reports the throw back through the
+    // returned value_t: threw() is set and exception_class carries the internal
+    // class name.  So the observation is the RETURN VALUE, not a thread probe —
+    // we record threw()/exception_class per throwing call.  The library having
+    // cleared the exception is what lets the follow-up recovery call succeed.
+    std::atomic<int>          g_exc_void_threw{ -1 };        // throwVoid() -> threw()
+    std::atomic<int>          g_exc_int_threw{ -1 };         // throwReturningInt() -> threw()
+    std::atomic<int>          g_exc_static_threw{ -1 };      // sThrowVoid() -> threw()
+    std::string               g_exc_void_class{};            // internal name of each throw
+    std::string               g_exc_int_class{};
+    std::string               g_exc_static_class{};
+    // The documented contract for a value-returning callee that throws: the
+    // result is VALUE-INITIALISED for the declared return type, never the stub's
+    // garbage result slot.  throwReturningInt is int -> exactly 0.
+    std::atomic<int>          g_exc_int_result_is_zero{ -1 };
+    std::atomic<int>          g_exc_recovery_ok{ -1 };       // echoLong after throws == sentinel
+    std::atomic<int>          g_exc_seen_at_least_one{ -1 }; // at least one throw WAS reported
     constexpr std::int32_t    k_exc_recovery = 0x33EC0DE5;   // recovery echo sentinel
 
     // ── float / double SPECIAL-VALUE RETURNS (IEEE-754 fidelity decode) ─────
@@ -1447,62 +1456,63 @@ namespace
                 const auto v{ p_ctor->call() };
                 g_ctor_call_is_void.store(v.is_void() ? 1 : 0);
                 g_ctor_calls_after.store(method_call_jni::ctor_calls());
-                g_ctor_no_pending_exc.store(
-                    false ? 0 : 1);
-                // Defensive: never let a stray pending exception (e.g. on the
-                // legacy call_stub path) leak past this point.
-                ((void)0);
+                // call() reports a callee throw through the returned value_t, so
+                // "the constructor dispatch left the thread clean" is a real
+                // readback of that flag — not an assumption.
+                g_ctor_no_pending_exc.store(v.threw() ? 0 : 1);
             }
         }
 
-        // ═════════ EXCEPTION DISCIPLINE: callee throws -> observed + cleared ════
-        // A Java method that throws must NOT let the pending JNI exception escape
-        // to poison the thread (which previously let a sibling module's exception
-        // crash the JVM).  On the JNI fallback path call_jni's
-        // check_callee_exception runs ExceptionDescribe (which clears), so AFTER
-        // call() returns there is NO pending exception — pending==0 is the proof
-        // of discipline.  We record that for instance-void, instance-int (value
-        // path) and static-void throwers, then UNCONDITIONALLY clear (idempotent;
-        // also protects the legacy call_stub path, which does not auto-clear) so a
-        // clean follow-up call can prove the thread recovered.  Run LAST so even a
-        // legacy-path lingering exception (cleared here) cannot affect any earlier
-        // assertion.
+        // ═════════ EXCEPTION DISCIPLINE: callee throws -> reported + cleared ════
+        // A Java method that throws must NOT leave the exception parked on the
+        // JavaThread, where the next Java code to run observes it and it
+        // propagates out of a frame that never made the call (that is what let a
+        // sibling module's exception crash the JVM).  call() reads
+        // ThreadShadow::_pending_exception, names the exception klass, clears the
+        // slot with a plain pure-VM write, and hands the throw back through the
+        // returned value_t: threw() set, exception_class populated, and the
+        // result VALUE-INITIALISED for the declared return type rather than the
+        // stub's garbage result slot.
+        //
+        // So the whole discipline is observable from the RETURN VALUE — no
+        // ExceptionCheck, no thread probe, no defensive clear of our own.  We
+        // record it for instance-void, instance-int (the value path, where the
+        // zeroed result is the interesting part) and static-void throwers.  Run
+        // LAST so a mis-handled throw cannot affect any earlier assertion.
         {
-            int seen_pending{ 0 };
+            int seen_thrown{ 0 };
 
             auto p_tv{ s.get_method("throwVoid") };
             if (p_tv.has_value())
             {
-                p_tv->call();
-                // Capture the discipline observation, then clear for safety.
-                const bool pend{ false };
-                g_exc_void_pending_after.store(pend ? 1 : 0);
-                if (pend) { ++seen_pending; }
-                ((void)0);
+                const auto v{ p_tv->call() };
+                g_exc_void_threw.store(v.threw() ? 1 : 0);
+                g_exc_void_class = v.exception_class;
+                if (v.threw()) { ++seen_thrown; }
             }
 
             auto p_ti{ s.get_method("throwReturningInt") };
             if (p_ti.has_value())
             {
                 const auto v{ p_ti->call() };
-                (void)v; // JNI returns 0 on a pending exception; value is moot.
-                const bool pend{ false };
-                g_exc_int_pending_after.store(pend ? 1 : 0);
-                if (pend) { ++seen_pending; }
-                ((void)0);
+                g_exc_int_threw.store(v.threw() ? 1 : 0);
+                g_exc_int_class = v.exception_class;
+                // The value-initialised-on-throw contract: int -> exactly 0.
+                g_exc_int_result_is_zero.store(
+                    static_cast<std::int32_t>(v) == 0 ? 1 : 0);
+                if (v.threw()) { ++seen_thrown; }
             }
 
             auto p_ts{ method_call_jni::static_method("sThrowVoid") };
             if (p_ts.has_value())
             {
-                p_ts->call();
-                const bool pend{ false };
-                g_exc_static_pending_after.store(pend ? 1 : 0);
-                if (pend) { ++seen_pending; }
-                ((void)0);
+                const auto v{ p_ts->call() };
+                g_exc_static_threw.store(v.threw() ? 1 : 0);
+                g_exc_static_class = v.exception_class;
+                if (v.threw()) { ++seen_thrown; }
             }
 
-            g_exc_seen_at_least_one.store(seen_pending > 0 ? 1 : 0);
+            g_exc_seen_at_least_one.store(seen_thrown > 0 ? 1 : 0);
 
             // Hard recovery proof: a normal value-returning call after all the
             // throws must still deliver its argument intact — the throwing calls
@@ -1510,7 +1520,7 @@ namespace
             // echoLong (returns its long arg, NO lastEchoArg side effect) so this
             // recovery call cannot clobber the field the sibling
             // mcj_echo_int_side_effect assertion reads (same discipline as the
-            // static-via-instance follow-up above).  Belt-and-braces clear after.
+            // static-via-instance follow-up above).
             auto p_rec{ s.get_method("echoLong") };
             if (p_rec.has_value())
             {
@@ -1525,7 +1535,7 @@ namespace
     }
 }
 
-VMHOOK_JVM_MODULE(method_call_jni_fallback)
+VMHOOK_JVM_MODULE(method_call_dispatch)
 {
     vmhook::register_class<method_call_jni>("vmhook/fixtures/MethodCallJni");
 
@@ -1559,23 +1569,21 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
         ctx.check("mcj_trigger_count_advanced", method_call_jni::get_trigger_count() >= 1);
 
         const bool stub{ g_call_stub_present.load(std::memory_order_relaxed) };
-        ctx.record(std::string{ "[INFO] method_call_jni_fallback dispatch path: " }
-                   + (stub ? "call_stub fast path (StubRoutines::_call_stub_entry present) - "
-                             "JNI fallback NOT exercised on this JDK; assertions still valid"
-                           : "JNI fallback (call_jni: Call(Static)?<Type>MethodA) - "
-                             "this module's target path"));
+        ctx.record(std::string{ "[INFO] method_call_dispatch path: " }
+                   + (stub ? "call_stub (find_call_stub_entry resolved)"
+                           : "NONE - find_call_stub_entry returned null, call() cannot dispatch"));
 
-        // HARD assertion that the JNI fallback is the path actually taken.  Every
-        // JDK the CI exercises does NOT export StubRoutines::_call_stub_entry via
-        // VMStructs (see the module header), so find_call_stub_entry() is absent
-        // and call() short-circuits into call_jni — exactly the path this module
-        // is here to exercise.  Asserting it HARD makes "we really ran call_jni,
-        // not the call-stub fast path" a first-class, non-skippable guarantee on
-        // CI rather than a passive INFO line.  (All the VALUE assertions below
-        // remain dual-path-correct, so a hypothetical future JDK that DOES export
-        // the entry would only flip THIS one check, never silently mis-test the
-        // converted value_t.)
-        ctx.check("mcj_jni_fallback_is_the_live_path", !stub);
+        // HARD assertion that call() has a live dispatcher.  This check used to
+        // assert the OPPOSITE (`!stub`) on the premise that no JDK exports
+        // StubRoutines::_call_stub_entry via VMStructs, so call() must be running
+        // the JNI fallback.  The premise was wrong in both halves: _call_stub_entry
+        // was never published on ANY JDK, and the entry is now DERIVED from
+        // StubRoutines::_call_stub_return_address instead — so it resolves on 8,
+        // 21 and 26 alike.  The JNI fallback it was guarding no longer exists.
+        // What is worth asserting HARD is the same thing it was really protecting:
+        // that every value assertion below ran through a real dispatcher rather
+        // than a silently no-op call().
+        ctx.check("mcj_call_stub_is_the_live_path", stub);
 
         // ═════════════════════ INSTANCE primitive returns ═════════════════════
         ctx.check("mcj_bool_true_instance",  g_bool_true.load()  == 1);
@@ -1857,18 +1865,16 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
         ctx.check("mcj_echo_str_captured", g_echo_str_captured.load());
         ctx.check("mcj_echo_str_ascii_exact", g_echo_str_ascii == "round-trip-jni-987");
         ctx.check("mcj_echo_str_empty_exact", g_echo_str_empty.empty());
-        // Latin-1 café round-trips byte-for-byte on the call_jni path (modified
-        // UTF-8 both directions).  On the call_stub path make_java_string copies
-        // the raw bytes into LATIN1 and read_java_string maps the two high bytes
-        // to '?', so the round trip is "caf??" there.  Assert per path.
-        if (stub)
-        {
-            ctx.check("mcj_echo_str_unicode_call_stub", g_echo_str_unicode == "caf??");
-        }
-        else
-        {
-            ctx.check("mcj_echo_str_unicode_call_jni", g_echo_str_unicode == "caf\xC3\xA9");
-        }
+        // Latin-1 café round-trips BYTE-FOR-BYTE, and on every layout.  This was
+        // previously asserted per dispatch path — "caf??" on the call_stub path —
+        // against two lossy behaviours that no longer exist: make_java_string used
+        // to copy the raw UTF-8 bytes into a LATIN1 array (turning U+00E9 into the
+        // two chars U+00C3 U+00A9), and read_java_string used to substitute '?'
+        // for every char >= 0x80.  Both were fixed: make_java_string UTF-8-decodes
+        // to UTF-16 code units and picks the LATIN1/UTF16 coder from the units,
+        // and read_java_string re-encodes code points as real UTF-8.  So "café"
+        // survives the round trip intact — one assertion, no path split.
+        ctx.check("mcj_echo_str_unicode_round_trips", g_echo_str_unicode == "caf\xC3\xA9");
 
         // ═════════════════════ String/Object arg -> void body ═════════════════
         ctx.check("mcj_consume_string_is_void", g_consume_str_is_void.load() == 1);
@@ -1970,55 +1976,46 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
                   g_ctor_no_pending_exc.load() == 1);
 
         // ═════════════════════ EXCEPTION discipline ═══════════════════════════
-        // A callee that throws must leave NO pending exception after call() on the
-        // JNI fallback path (check_callee_exception -> ExceptionDescribe clears),
-        // and a follow-up call must still work.  The library cleared it: the
-        // suite continues, nothing escapes.  On the legacy call_stub path the
-        // call stub does not auto-clear, so the strict "pending==cleared" checks
-        // are gated to the fallback path; the recovery + no-escape guarantees
-        // (which we enforce with our own unconditional clears) hold on BOTH.
-        if (!stub)
-        {
-            // The library observed AND cleared each thrown exception: pending==0.
-            ctx.check("mcj_exc_instance_void_cleared_by_library",
-                      g_exc_void_pending_after.load() == 0);
-            ctx.check("mcj_exc_instance_int_cleared_by_library",
-                      g_exc_int_pending_after.load() == 0);
-            ctx.check("mcj_exc_static_void_cleared_by_library",
-                      g_exc_static_pending_after.load() == 0);
-        }
-        else
-        {
-            ctx.record("[INFO] method_call_jni_fallback: exception auto-clear "
-                       "discipline asserted only on the JNI fallback path; the "
-                       "call_stub path does not run check_callee_exception, so the "
-                       "module clears pending exceptions itself for suite safety.");
-        }
-        // Recovery + no-escape hold on every path (we cleared unconditionally):
-        // a normal value-returning call after the throws delivered its argument
-        // intact, so the throwing calls did not corrupt the thread's JNI state and
-        // nothing escaped to poison a sibling module.
+        // call() must REPORT a callee's throw and CLEAR it off the JavaThread, so
+        // nothing escapes to poison a sibling module and a follow-up call still
+        // works.  Every assertion here reads the returned value_t, so all of them
+        // hold unconditionally — there is one dispatcher now, and it reports the
+        // throw itself rather than leaving the module to probe the thread.
+        //
+        // (This block used to be split by dispatch path and to read observations
+        // hard-coded to `false` — the de-JNI removal took out the ExceptionCheck
+        // that produced them and left the literal behind, which made the liveness
+        // check unsatisfiable.  Reading threw() is both pure-VM and stronger: it
+        // pins WHICH exception each call reported.)
+        ctx.check("mcj_exc_instance_void_reported", g_exc_void_threw.load() == 1);
+        ctx.check("mcj_exc_instance_int_reported", g_exc_int_threw.load() == 1);
+        ctx.check("mcj_exc_static_void_reported", g_exc_static_threw.load() == 1);
+
+        // The reported class is the exact one the fixture threw (internal form).
+        ctx.check("mcj_exc_instance_void_class_is_illegal_state",
+                  g_exc_void_class == "java/lang/IllegalStateException");
+        ctx.check("mcj_exc_instance_int_class_is_arithmetic",
+                  g_exc_int_class == "java/lang/ArithmeticException");
+        ctx.check("mcj_exc_static_void_class_is_illegal_state",
+                  g_exc_static_class == "java/lang/IllegalStateException");
+
+        // A throwing value-returning callee yields a VALUE-INITIALISED result for
+        // the declared return type, never the stub's garbage result slot.
+        ctx.check("mcj_exc_int_result_value_initialised",
+                  g_exc_int_result_is_zero.load() == 1);
+
+        // Recovery + no-escape: a normal value-returning call after the throws
+        // delivered its argument intact, so the throwing calls left the thread
+        // clean and nothing escaped to poison a sibling module.
         ctx.check("mcj_exc_recovery_call_intact", g_exc_recovery_ok.load() == 1);
-        // Liveness: the throw mechanism genuinely fired (at least one call left a
-        // pending exception pre-clear), so the discipline checks are not vacuous.
-        // On the fallback path the library clears DURING call_jni, so this is read
-        // on the call_stub path; on the fallback path it may be 0 (already cleared)
-        // — guard so it can never be a false negative.
-        if (stub)
-        {
-            ctx.check("mcj_exc_throw_mechanism_fired_call_stub",
-                      g_exc_seen_at_least_one.load() == 1);
-        }
-        else
-        {
-            ctx.record("[INFO] method_call_jni_fallback: throw liveness is implicit "
-                       "on the fallback path (call_jni clears the pending exception "
-                       "before run_all can observe it); the recovery check proves "
-                       "the throwing dispatch ran and the thread stayed usable.");
-        }
+        // Liveness: at least one throw was genuinely reported, so the discipline
+        // checks above are not vacuous.
+        ctx.check("mcj_exc_throw_mechanism_fired", g_exc_seen_at_least_one.load() == 1);
 
         // ═════════════════════ TIGHT LOOP characterization ════════════════════
-        // These are the JNI-fallback local-ref-leak guards the audit flagged.
+        // Repeat-call stability guards: a dispatcher that accumulated per-call
+        // state (the JNI fallback's un-released local refs were the original
+        // concern) shows up as values drifting or emptying out across iterations.
 
         // String-RETURN loop: stable single value across 256 iterations.
         ctx.check("mcj_string_return_loop_ran", g_ret_loop_iters.load() == 256);

@@ -17,7 +17,7 @@
 // gap.  The VALUE-correctness of the reads/writes (the right bytes toggle, the
 // adjacent field is never clobbered) requires a populated gHotSpotVMStructs and
 // a live Method, so it is exercised by the live-JVM modules
-// (dont_inline_dont_compile, method_static_portability, method_call_jni_fallback)
+// (dont_inline_dont_compile, method_static_portability, method_call_dispatch)
 // and is OUT OF SCOPE for this pure no-JVM file — a fabricated in-process
 // VMStructs array cannot be driven through the real accessors because they read
 // the JVM-exported global symbol, not an array parameter.
