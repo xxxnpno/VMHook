@@ -375,6 +375,30 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// VMHOOK_AUTO_ATTACH_THREADS - call Java from any thread, not just a detour.
+//
+// ON by default.  A native thread that calls into Java without being known to
+// the VM has no frame anchor for a GC to walk and no state for a safepoint to
+// read; the heap corruption that follows surfaces long afterwards and nowhere
+// near the call.  With this on, vmhook asks the VM to attach such a thread
+// (as a daemon) the first time it needs one, and detaches it when it exits.
+//
+// Reading is unaffected either way: field gets and metadata walks are plain
+// memory reads and have always worked from any thread.
+//
+// Set to 0 to require that every call happen on a thread that is already a
+// JavaThread, which is what a detour gives you.  Then a call from anywhere else
+// fails cleanly instead of attaching.
+//
+// NOTE: attaching makes a call safe for the VM.  It says nothing about whether
+// the Java code you are calling is safe to run off its usual thread -- most UI
+// and game state is not.  See vmhook::hotspot::attach_current_thread.
+// ---------------------------------------------------------------------------
+#ifndef VMHOOK_AUTO_ATTACH_THREADS
+    #define VMHOOK_AUTO_ATTACH_THREADS 1
+#endif
+
+// ---------------------------------------------------------------------------
 // VMHOOK_LOG_FILE - opt-in file logging.
 //
 // Define VMHOOK_LOG_FILE before including this header (or via the build system,
@@ -5839,14 +5863,329 @@ namespace vmhook
 
 
         /*
-            @brief Adopts the calling thread's HotSpot JavaThread* if it has one.
+            ===================================================================
+            ATTACHING A NATIVE THREAD
+            ===================================================================
+            Reading Java state needs no permission from the VM.  A field get is a
+            load from an address; class, method and field introspection are walks
+            over metadata.  All of that works from any thread in the process, and
+            always has.
+
+            CALLING a Java method is different, and the difference is not
+            arbitrary.  A call needs a JavaThread: a VM-side object holding the
+            frame anchor a GC stack-walk follows, the thread state a safepoint
+            reads, and the handle area a call unwinds through.  A native thread
+            HotSpot has never seen has none of that.  Calling on one does not
+            "usually work" -- it corrupts the heap the first time a GC runs while
+            the call is in flight, which is why the failure shows up minutes
+            later and somewhere else.
+
+            The old answer was "so only call from inside a detour", where the
+            thread is already a JavaThread.  That is true but far too small a
+            rule to build on: it makes every call site the VM's business and
+            pushes users into hand-written work queues.
+
+            The real answer is to ATTACH the thread, and the honest reason that
+            was not done sooner is that there is no way to do it from outside the
+            VM.  A JavaThread cannot be manufactured: it must be constructed,
+            registered in the Threads list under the Threads_lock, given a
+            java.lang.Thread oop and a thread-local slot.  VMStructs publishes
+            field OFFSETS and static ADDRESSES, not the functions that do any of
+            that -- so a "pure" attach would mean reimplementing HotSpot's
+            thread constructor per JDK, and being 99% right there still means
+            heap corruption.
+
+            So vmhook asks the VM to do it, through the one entry point the VM
+            publishes for exactly this purpose: JNI_GetCreatedJavaVMs, and the
+            JavaVM invocation table's AttachCurrentThreadAsDaemon.
+
+            On the no-JNI promise, precisely: this resolves two symbols by name
+            from the JVM module and calls through a function table by index.  It
+            includes no jni.h, defines no JNI types, and never calls a single JNI
+            *function* -- the JNIEnv* the VM hands back is received and dropped
+            unread.  Introspection and invocation remain pure VMStructs work.
+            What is borrowed is thread LIFECYCLE, which is the VM's to grant and
+            nobody else's, and the alternative to borrowing it is not a purer
+            implementation but a broken one.
+
+            -------------------------------------------------------------------
+            WHAT ATTACHING DOES NOT FIX
+            -------------------------------------------------------------------
+            An attached thread parks in _thread_in_native, and the call path has
+            to move it to _thread_in_Java.  HotSpot's own transition is
+
+                set_thread_state(_thread_in_native_trans);
+                SafepointMechanism::process_if_requested(thread);  // may block
+                set_thread_state(_thread_in_Java);
+
+            and the middle line is the one that matters: it parks the thread if a
+            safepoint is starting.  vmhook cannot make that call -- it is not
+            exported and not expressible through VMStructs -- so the transition
+            is a blunt store, and there is a window in which a safepoint could
+            begin while this thread believes it may run Java.
+
+            The obvious mitigation is to read the safepoint state and wait, and
+            it is not available: gHotSpotVMStructs publishes NO SafepointSynchronize
+            entry and no polling-page field.  MEASURED by walking the exported
+            table on JDK 21.0.11 (813 entries) and JDK 26.0.1 (572 entries) --
+            the only Thread-ish state fields published are JavaThread::_thread_state
+            and OSThread::_state, neither of which says whether a safepoint is in
+            progress.  So the window cannot be closed from outside the VM.
+
+            In proportion:
+              * Calling on an UNATTACHED native thread is broken unconditionally
+                -- no anchor, no state, corruption on the first GC that walks it.
+                Attaching is strictly and substantially better than that.
+              * Calling INSIDE A DETOUR remains the only fully safe path.  There
+                the thread is already _thread_in_Java, no state is written at all,
+                and it polls safepoints as HotSpot intends.
+              * Calling on an attached thread is in between: correct except for a
+                microseconds-wide race per call against a starting safepoint.
+
+            So: attach freely for occasional work off the game thread.  For a hot
+            loop, or for anything touching state another thread owns, marshal
+            onto a detour instead -- which you want anyway, because thread-safety
+            in the Java code you are calling is a separate problem from all of
+            the above and this fixes none of it.
+        */
+        namespace attach
+        {
+            /* The JNI invocation table, by index.  Specified since JNI 1.2 and
+               unchanged since; these slots are contract, not layout guesswork.
+                 3 DestroyJavaVM   4 AttachCurrentThread   5 DetachCurrentThread
+                 6 GetEnv          7 AttachCurrentThreadAsDaemon                */
+            inline constexpr std::size_t slot_attach_current_thread{ 4 };
+            inline constexpr std::size_t slot_detach_current_thread{ 5 };
+            inline constexpr std::size_t slot_get_env{ 6 };
+            inline constexpr std::size_t slot_attach_as_daemon{ 7 };
+
+            /* JNI_VERSION_1_6, spelled out rather than included. */
+            inline constexpr std::int32_t jni_version_1_6{ 0x00010006 };
+
+            // JNICALL.  On x86-64 (and every non-Windows target) there is only
+            // one convention and this expands to nothing; it matters only for a
+            // 32-bit Windows build, where getting it wrong corrupts the stack
+            // rather than failing to link.
+#if defined(_WIN32) && !defined(_WIN64)
+    #define VMHOOK_JNICALL __stdcall
+#else
+    #define VMHOOK_JNICALL
+#endif
+
+            using vm_table_t   = void**;
+            using vm_handle_t  = vm_table_t*;
+            // Not declared noexcept: these are the VM's C functions, and calling
+            // through a noexcept pointer would be a promise vmhook is not the one
+            // keeping.  They do not throw; that is the VM's guarantee, not a cast's.
+            using attach_fn_t  = std::int32_t(VMHOOK_JNICALL*)(vm_handle_t, void**, void*);
+            using detach_fn_t  = std::int32_t(VMHOOK_JNICALL*)(vm_handle_t);
+            using get_env_fn_t = std::int32_t(VMHOOK_JNICALL*)(vm_handle_t, void**, std::int32_t);
+
+            /*
+                @brief The process's JavaVM, or nullptr when there is not exactly one.
+                @details
+                Resolved once.  JNI_GetCreatedJavaVMs reports every VM in the
+                process; a count other than 1 means either no VM (vmhook loaded
+                somewhere it does not belong) or several, and with several there
+                is no way to know which one the caller means.  Refusing is the
+                only correct answer to that, and it does not occur in practice.
+            */
+            inline auto java_vm() noexcept
+                -> vm_handle_t
+            {
+                static vm_handle_t const cached{ []() noexcept -> vm_handle_t
+                {
+                    using get_created_fn_t = std::int32_t(VMHOOK_JNICALL*)(vm_handle_t*,
+                                                                          std::int32_t,
+                                                                          std::int32_t*);
+
+                    void* const symbol{ vmhook::os::get_proc_address(
+                        vmhook::hotspot::get_jvm_module(), "JNI_GetCreatedJavaVMs") };
+                    if (!symbol)
+                    {
+                        VMHOOK_LOG("{} attach: the JVM module does not export "
+                                   "JNI_GetCreatedJavaVMs; native threads cannot be attached.",
+                                   vmhook::error_tag);
+                        return nullptr;
+                    }
+
+                    vm_handle_t   vm{ nullptr };
+                    std::int32_t  found{ 0 };
+                    const auto    get_created{ reinterpret_cast<get_created_fn_t>(symbol) };
+                    if (get_created(&vm, 1, &found) != 0 || found != 1 || !vm)
+                    {
+                        VMHOOK_LOG("{} attach: JNI_GetCreatedJavaVMs reported {} VM(s); "
+                                   "expected exactly 1.", vmhook::error_tag, found);
+                        return nullptr;
+                    }
+                    return vm;
+                }() };
+                return cached;
+            }
+
+            /* @brief Whether this thread was attached BY vmhook, and so is ours to detach. */
+            inline thread_local bool attached_by_us{ false };
+
+            inline auto detach_current_thread() noexcept -> void;
+
+            /*
+                @brief Detaches at thread exit, for a thread vmhook attached.
+                @details
+                A thread that dies while attached leaves the VM holding a
+                JavaThread for a thread that no longer exists -- a leak at best.
+                The destructor of a thread_local runs on the way out of every
+                thread that touched it, which is exactly the hook needed, and
+                needs no cooperation from the code that did the attaching.
+            */
+            struct exit_detacher
+            {
+                exit_detacher() noexcept = default;
+                exit_detacher(const exit_detacher&) = delete;
+                auto operator=(const exit_detacher&) -> exit_detacher& = delete;
+
+                ~exit_detacher()
+                {
+                    if (attached_by_us) { detach_current_thread(); }
+                }
+            };
+        }
+
+        /*
+            @brief Attaches the calling native thread to the VM as a daemon thread.
+            @details
+            After this returns true the thread is a genuine JavaThread: HotSpot
+            knows about it, safepoints wait for it, and a GC walks its stack.
+            vmhook's own machinery then works on it unchanged, because
+            ensure_current_java_thread() finds it in the thread list like any
+            other.
+
+            DAEMON, deliberately.  A non-daemon attached thread keeps the JVM
+            alive: attach one to a game and the game will not exit when the
+            player quits, and the process hangs around with a black window.  A
+            daemon thread does not hold shutdown up.
+
+            Attaching a thread that is ALREADY a JavaThread is a no-op that
+            returns true -- including a detour thread, so callers never have to
+            know which kind of thread they are on.
+
+            Idempotent, and self-cleaning: a thread vmhook attaches is detached
+            automatically when it exits.
+
+            @return true when the calling thread is a JavaThread afterwards.
+        */
+        inline auto attach_current_thread() noexcept
+            -> bool
+        {
+            if (vmhook::hotspot::current_java_thread
+                && vmhook::hotspot::is_valid_pointer(vmhook::hotspot::current_java_thread))
+            {
+                return true;
+            }
+
+            const vmhook::os::thread_id_t os_thread_id{ vmhook::os::current_thread_id() };
+            if (vmhook::hotspot::java_thread* const existing{
+                    vmhook::hotspot::find_java_thread_by_os_thread_id(os_thread_id) })
+            {
+                // Already a JavaThread -- a detour thread, or one attached
+                // earlier.  Adopt it; it is emphatically NOT ours to detach.
+                vmhook::hotspot::current_java_thread = existing;
+                vmhook::hotspot::last_java_thread.store(existing, std::memory_order_relaxed);
+                return true;
+            }
+
+            const vmhook::hotspot::attach::vm_handle_t vm{ vmhook::hotspot::attach::java_vm() };
+            if (!vm || !*vm) { return false; }
+
+            void* const slot{ (*vm)[vmhook::hotspot::attach::slot_attach_as_daemon] };
+            if (!slot)
+            {
+                VMHOOK_LOG("{} attach_current_thread(): the JavaVM table has no "
+                           "AttachCurrentThreadAsDaemon.", vmhook::error_tag);
+                return false;
+            }
+
+            void* environment{ nullptr };
+            const auto attach_as_daemon{
+                reinterpret_cast<vmhook::hotspot::attach::attach_fn_t>(slot) };
+            if (attach_as_daemon(vm, &environment, nullptr) != 0)
+            {
+                VMHOOK_LOG("{} attach_current_thread(): the VM refused to attach OS thread {}.",
+                           vmhook::error_tag, os_thread_id);
+                return false;
+            }
+            // `environment` is a JNIEnv*.  It is deliberately not used for
+            // anything: every operation past this point is VMStructs work on the
+            // JavaThread the VM has just created for us.
+
+            vmhook::hotspot::java_thread* const attached{
+                vmhook::hotspot::find_java_thread_by_os_thread_id(os_thread_id) };
+            if (!attached)
+            {
+                // Attached, but not findable -- something is wrong enough that
+                // proceeding would be guessing.  Undo it rather than leave the
+                // thread half-joined to the VM.
+                VMHOOK_LOG("{} attach_current_thread(): OS thread {} attached but is not in "
+                           "the thread list; detaching again.", vmhook::error_tag, os_thread_id);
+                if (void* const undo{ (*vm)[vmhook::hotspot::attach::slot_detach_current_thread] })
+                {
+                    (void)reinterpret_cast<vmhook::hotspot::attach::detach_fn_t>(undo)(vm);
+                }
+                return false;
+            }
+
+            vmhook::hotspot::attach::attached_by_us = true;
+
+            // Instantiating the thread_local here is what arms its destructor for
+            // this thread; referencing it is the whole point of the statement.
+            static thread_local vmhook::hotspot::attach::exit_detacher detacher{};
+            (void)detacher;
+
+            vmhook::hotspot::current_java_thread = attached;
+            vmhook::hotspot::last_java_thread.store(attached, std::memory_order_relaxed);
+            VMHOOK_LOG("{} attach_current_thread(): attached OS thread {} as JavaThread 0x{:016X}",
+                       vmhook::info_tag, os_thread_id, reinterpret_cast<std::uintptr_t>(attached));
+            return true;
+        }
+
+        /*
+            @brief Detaches a thread vmhook attached.  Safe to call on any thread.
+            @details
+            Does nothing on a thread vmhook did not attach -- detaching a detour
+            thread would tear down one of the VM's own threads mid-call.  Called
+            automatically at thread exit, so most users never call it.
+        */
+        namespace attach
+        {
+            inline auto detach_current_thread() noexcept
+                -> void
+            {
+                if (!vmhook::hotspot::attach::attached_by_us) { return; }
+
+                const vm_handle_t vm{ vmhook::hotspot::attach::java_vm() };
+                if (vm && *vm)
+                {
+                    if (void* const slot{ (*vm)[slot_detach_current_thread] })
+                    {
+                        (void)reinterpret_cast<detach_fn_t>(slot)(vm);
+                    }
+                }
+
+                vmhook::hotspot::attach::attached_by_us = false;
+                vmhook::hotspot::current_java_thread    = nullptr;
+            }
+        }
+
+        /*
+            @brief Adopts the calling thread's HotSpot JavaThread*, attaching if needed.
             @details
             Resolution order:
               1. Thread-local current_java_thread is already set — fast return.
               2. Search the HotSpot thread list for the current OS thread ID.
-              3. Not a JavaThread — return false.  There is no attach step: the
-                 library cannot register a fresh native thread with the VM, and a
-                 detour always runs on a thread that is already a JavaThread.
+              3. Ask the VM to attach this thread (see attach_current_thread).
+
+            Step 3 is what lets calls happen off a detour.  It used to be absent,
+            and its absence is why the rule "only call Java from inside a hook"
+            existed.  A detour thread never reaches it: it is found at step 2.
 
             Complexity: O(N) worst case on first call, where N = number of live Java threads.
             Exception safety: noexcept — returns false on failure.
@@ -5871,14 +6210,12 @@ namespace vmhook
                 return true;
             }
 
-            // Inside a detour / hooked method the calling thread is ALWAYS a HotSpot
-            // JavaThread and is adopted above.  A native thread that HotSpot has never
-            // seen cannot be registered without a call into the VM, so report false
-            // here; operations that only need SOME JavaThread (TLAB allocation walks
-            // the whole thread list) do not depend on this.
-            VMHOOK_LOG("{} ensure_current_java_thread(): OS thread {} is not a HotSpot JavaThread; "
-                       "this library cannot register a native thread with the VM.",
-                       vmhook::info_tag, current_os_thread_id);
+#if VMHOOK_AUTO_ATTACH_THREADS
+            if (vmhook::hotspot::attach_current_thread()) { return true; }
+#endif
+
+            VMHOOK_LOG("{} ensure_current_java_thread(): OS thread {} is not a HotSpot JavaThread "
+                       "and could not be attached.", vmhook::info_tag, current_os_thread_id);
             return false;
         }
 
@@ -9002,6 +9339,112 @@ namespace vmhook
     // which it calls for the component type of object arrays).
     inline auto resolve_array_klass(std::string_view descriptor) noexcept
         -> vmhook::hotspot::klass*;
+
+    // --- Calling Java from your own threads ---------------------------------
+
+    /*
+        @brief Makes the calling thread able to call Java.  Any thread, anywhere.
+        @details
+        Reading never needed this -- field gets and class/method/field walks are
+        memory reads and work from any thread.  CALLING does: a call needs a
+        JavaThread, the VM-side object a GC walks and a safepoint reads, and a
+        native thread the VM has never seen has none.
+
+        This asks the VM to attach the calling thread as a daemon.  Afterwards
+        call(), field writes and allocation all work from that thread exactly as
+        they do inside a detour.  Attaching a thread that is already a JavaThread
+        -- a detour thread, say -- succeeds and does nothing.
+
+        With VMHOOK_AUTO_ATTACH_THREADS on (the default) this happens by itself
+        the first time a call needs it, and calling this directly is only useful
+        to pay the cost up front or to check that it CAN be done.
+
+        The thread is detached automatically when it exits.
+
+        @warning VM-safe is not the same as safe.  This makes the call legal as
+                 far as HotSpot is concerned; it does not make the Java code you
+                 are calling thread-safe.  Most game and UI state is owned by one
+                 thread and will corrupt if touched from another -- Minecraft's
+                 certainly is.  For that, marshal onto the owning thread (see the
+                 detour-pump pattern) and use this for the rest.
+
+        @return true when the calling thread can call Java afterwards.
+    */
+    [[nodiscard]] inline auto attach_current_thread() noexcept
+        -> bool
+    {
+        return vmhook::hotspot::attach_current_thread();
+    }
+
+    /*
+        @brief Detaches a thread vmhook attached.  A no-op on any other thread.
+        @details
+        Rarely needed: an attached thread detaches itself when it exits.  Useful
+        for a long-lived thread that is done with Java and should stop being one
+        of the VM's, and before unloading a library whose threads outlive it.
+    */
+    inline auto detach_current_thread() noexcept
+        -> void
+    {
+        vmhook::hotspot::attach::detach_current_thread();
+    }
+
+    /*
+        @brief RAII attach: a scope in which this thread can call Java.
+        @details
+            void worker()                     // an ordinary std::thread
+            {
+                const vmhook::java_thread_scope java{};
+                if (!java) { return; }
+
+                player->get_field("health")->set(20.0f);
+                minecraft->call<void>("sendChatMessage", "hi");
+            }
+
+        Detaches on the way out ONLY if this scope is what attached the thread,
+        so nesting one inside a detour, or inside another scope, is harmless.
+    */
+    class java_thread_scope
+    {
+    public:
+        java_thread_scope() noexcept
+            // Ownership is a TRANSITION, not a state.  Asking "is this thread
+            // vmhook-attached?" after the fact says yes for a thread some outer
+            // scope attached, and then both scopes believe they own it: the
+            // inner one detaches on the way out and the outer is left holding a
+            // thread that is no longer a JavaThread.  So the question asked is
+            // "did I turn it from false to true?", which exactly one scope can
+            // ever answer yes to.
+            : was_attached_{ vmhook::hotspot::attach::attached_by_us }
+            , attached_{ vmhook::hotspot::attach_current_thread() }
+            , owns_{ attached_ && !was_attached_
+                     && vmhook::hotspot::attach::attached_by_us }
+        {
+        }
+
+        ~java_thread_scope()
+        {
+            if (this->owns_) { vmhook::hotspot::attach::detach_current_thread(); }
+        }
+
+        java_thread_scope(const java_thread_scope&)                    = delete;
+        auto operator=(const java_thread_scope&) -> java_thread_scope& = delete;
+        java_thread_scope(java_thread_scope&&)                         = delete;
+        auto operator=(java_thread_scope&&) -> java_thread_scope&      = delete;
+
+        /* @brief Whether this thread can call Java.  Check it before you do. */
+        [[nodiscard]] explicit operator bool() const noexcept { return this->attached_; }
+
+        /* @brief Whether THIS scope did the attaching, rather than finding it done. */
+        [[nodiscard]] auto owns_attachment() const noexcept -> bool { return this->owns_; }
+
+    private:
+        // Declaration order IS the initialisation order, and it matters here:
+        // was_attached_ must be sampled BEFORE attached_ runs the attach.
+        bool was_attached_;
+        bool attached_;
+        bool owns_;
+    };
 
     /*
         @brief Finds a loaded Java class by its internal name using HotSpot internals only.
@@ -17549,6 +17992,17 @@ namespace vmhook
                             VMHOOK_LOG("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
                         }
                         params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
+                    }
+                    else if constexpr (vmhook::detail::is_borrowed_v<clean_t>)
+                    {
+                        // A borrow is a legal OUTGOING argument for the same
+                        // reason it is a legal incoming one: it names an object.
+                        // resolve() rather than raw_unsafe() is the whole point
+                        // -- an expired handle passes null instead of an address
+                        // the collector has already moved, so a stale reference
+                        // becomes a NullPointerException in Java rather than
+                        // heap corruption in the VM.
+                        params[param_idx++] = reinterpret_cast<std::intptr_t>(a.resolve());
                     }
                     else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
                     {

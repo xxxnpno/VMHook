@@ -1,4 +1,0 @@
-# Force LF in the auto-generated vault so the CI drift check
-# (`git diff --quiet -- audit/graph` after re-running the generator)
-# stays stable across Windows / Linux contributors.
-* text=auto eol=lf

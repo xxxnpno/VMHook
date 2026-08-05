@@ -1,3 +1,0 @@
-# Local Python cache from running generate.py / validate.py.
-__pycache__/
-*.pyc
