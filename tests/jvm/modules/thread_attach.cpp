@@ -125,6 +125,12 @@ namespace
         std::atomic<int>          alloc_calls_made{ -1 };
         std::atomic<int>          alloc_calls_decoded{ -1 };
         std::atomic<int>          alloc_calls_total{ -1 };
+        std::atomic<int>          made_string{ -1 };
+        std::atomic<int>          string_roundtrip{ -1 };
+        std::atomic<int>          made_array{ -1 };
+        std::atomic<int>          array_length_ok{ -1 };
+        std::atomic<int>          made_object{ -1 };
+        std::atomic<int>          object_field_roundtrip{ -1 };
         std::atomic<int>          gone_after_detach{ -1 };
         std::atomic<int>          reached_end{ 0 };
     };
@@ -226,6 +232,52 @@ namespace
                     // decode gap look like an attach failure.  Recorded, not
                     // asserted.
                     out.alloc_calls_decoded.store(decoded);
+                }
+                // ---- 5. CREATE Java objects from this thread -----------------
+                // Calling and allocating are separate questions and deserve
+                // separate answers: make_java_string/make_java_array allocate
+                // through find_allocation_thread() and never needed an attach,
+                // while make_unique gates on ensure_current_java_thread() and so
+                // was blocked off a detour exactly like call() was.  All three
+                // are exercised here so "can vmhook create objects off a detour"
+                // has a measured answer rather than an inferred one.
+                {
+                    void* const text{ vmhook::make_java_string(
+                        "chatwire attach probe") };
+                    out.made_string.store(text != nullptr ? 1 : 0);
+                    if (text)
+                    {
+                        const std::string back{ vmhook::read_java_string(text) };
+                        out.string_roundtrip.store(
+                            back == "chatwire attach probe" ? 1 : 0);
+                    }
+
+                    void* const array{ vmhook::make_java_array(
+                        "java/lang/Object", 8, sizeof(void*)) };
+                    out.made_array.store(array != nullptr ? 1 : 0);
+                    if (array)
+                    {
+                        out.array_length_ok.store(
+                            vmhook::array_length(array) == 8 ? 1 : 0);
+                    }
+
+                    auto boxed{ vmhook::make_unique<java_integer>() };
+                    out.made_object.store(boxed ? 1 : 0);
+                    if (boxed)
+                    {
+                        // A bare allocation: header stamped, no Java constructor
+                        // run.  Writing and reading its own field proves the
+                        // object is a real, usable heap object.
+                        if (const auto field{ boxed->get_field("value") })
+                        {
+                            field->set(static_cast<std::int32_t>(1337));
+                            const auto read_back{ boxed->get_field("value") };
+                            out.object_field_roundtrip.store(
+                                (read_back
+                                 && static_cast<std::int32_t>(read_back->get()) == 1337)
+                                    ? 1 : 0);
+                        }
+                    }
                 }
             }   // scope ends -> detach
 
@@ -331,6 +383,19 @@ VMHOOK_JVM_MODULE(thread_attach)
                      "thread; " + std::to_string(alloc_decoded)
                    + " returned a decodable String OOP (object-return decoding is "
                      "JDK/call-path dependent and not asserted here)");
+
+        ctx.check("thread_attach.make_java_string_from_a_native_thread",
+                  result.made_string.load() == 1);
+        ctx.check("thread_attach.make_java_string_round_trips",
+                  result.string_roundtrip.load() == 1);
+        ctx.check("thread_attach.make_java_array_from_a_native_thread",
+                  result.made_array.load() == 1);
+        ctx.check("thread_attach.make_java_array_has_the_right_length",
+                  result.array_length_ok.load() == 1);
+        ctx.check("thread_attach.make_unique_from_a_native_thread",
+                  result.made_object.load() == 1);
+        ctx.check("thread_attach.new_object_field_round_trips",
+                  result.object_field_roundtrip.load() == 1);
 
         ctx.check("thread_attach.detached_thread_leaves_the_vm_thread_list",
                   result.gone_after_detach.load() == 1);
