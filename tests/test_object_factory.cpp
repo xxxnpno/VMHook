@@ -399,7 +399,7 @@ static auto factory_for_name(const std::string& name) -> vmhook::type_factory_fu
 }
 
 // The compile-time JNI descriptor the library derives for a given C++ arg type
-// (the same builder used by method_proxy::call_jni()).  Reads type_to_class_map
+// (the same builder used by method_proxy::invoke_packed()).  Reads type_to_class_map
 // with no JVM dependency.
 template<typename arg_t>
 static auto sig() -> std::string

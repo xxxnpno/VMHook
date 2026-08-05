@@ -647,13 +647,23 @@ where the address is consumed immediately inside a documented no-safepoint windo
 - **4.2 DONE** `detail::jni_signature_for_arg` → `jvm_descriptor_for_arg`, 711 references
   across 14 files, one mechanical pass.
 - **4.3 DONE** (earlier session) Method invocation restored pure-VM.
-- **4.4 NOT DONE** Rebuild `viewer/payload` on a **detour pump**: stop entering Java from
-  native; hook a method the JVM already calls and let the detour drain a native work queue.
-  Thread promotion, detour triggering and allocation all dissolve — they run on a real
-  JavaThread with a valid anchor and TLAB. Then delete `<jni.h>`.
-  **This is the last real JNI in the project.** Two of its three JNI uses are now trivially
-  replaceable (`NewStringUTF` → `make_java_string`; `invoke_jni`'s ~120 lines →
-  `method_proxy::call()`, which works now); only thread promotion needs the pump.
+- **4.4 DONE** `viewer/payload` rebuilt on a **detour pump**; `<jni.h>` is deleted. There is
+  now no JNI anywhere in the project.
+
+  The old design attached the serve thread with `AttachCurrentThreadAsDaemon` and then FIRED
+  the detour with a JNI `CallStaticObjectMethod` — JNI used purely as a doorbell. The doorbell
+  was unnecessary: a running JVM rings it constantly on its own. The payload now hooks five
+  methods the JVM's own threads already call (`Thread.currentThread`, `System.nanoTime`,
+  `System.currentTimeMillis`, `Object.hashCode`, `Runtime.getRuntime`) and drains a work queue
+  from whichever fires first. Several targets rather than one because any single choice is a
+  bet on the target app's behaviour. The cost is latency — the task runs on the next natural
+  call rather than immediately — which a viewer does not care about.
+
+  The other two uses collapsed: `NewStringUTF` → `vmhook::make_java_string`, and `invoke_jni`'s
+  ~145 lines (GetMethodID + a `Call*MethodA` switch over every return type + local-ref
+  bookkeeping + a `NewObjectArray` trick to manufacture jobjects from raw oops) →
+  `method_proxy::call_packed()`. All of that existed for one reason: `call()` used to be a
+  silent no-op.
 - **4.5** Fix the two regressions currently hidden by their own docs: `find_class_via_oop` no
   longer disambiguates by classloader, and `call()` leaves thrown exceptions pending on the
   JavaThread. *(The second is stale — `call()` clears `ThreadShadow::_pending_exception` and
@@ -705,11 +715,65 @@ header used essentially none — **zero** `[[nodiscard]]`, `std::expected`, `std
 
 - **`[[nodiscard]]`** on the API added this session.
 
+- **COMPILE-TIME DESCRIPTORS.** `detail::descriptor_of_v<T>` is a `consteval` `string_view`,
+  and `detail::descriptor_for<Ret, Args...>::view()` assembles a whole method descriptor —
+  `"(IJLjava/lang/String;)V"` — into a `static constexpr std::array` at compile time. This is
+  where reflection actually pays: an ANNOTATED wrapper's class name is a compile-time constant,
+  so its descriptor never touches the runtime registry at all. `descriptor_of_v` is deliberately
+  EMPTY for an unannotated wrapper, and that empty piece disqualifies the whole signature from
+  compile-time assembly — one unknown piece is enough. `jvm_descriptor_for_arg()` now returns
+  the constant when there is one, so the common case stops re-deriving it at runtime.
+
+- **`= delete("reason")` (P2573)** behind `VMHOOK_DELETED`. Several of this header's design
+  rules ARE deletions — a `root` that cannot move because every ref beneath it resolves through
+  it, an `access` proxy that cannot be hoisted out of its expression, an `oop_pin` that cannot
+  be copied because it carries an epoch stamp. Deleting the operation is what makes the rule
+  unbreakable; the reason string is what makes the compiler explain which invariant you hit
+  instead of emitting a bare "use of deleted function". Verified on GCC 15 in C++26 mode: the
+  reason appears in the actual error text.
+
+  The language-mode check in that gate is not redundant — Clang defines
+  `__cpp_deleted_function` in C++23 mode too, accepts the syntax as an extension, and then
+  warns about it, which is an error under `-Werror`.
+
 **Not done, deliberately:** a blanket `[[nodiscard]]` sweep over the existing surface. Every
 existing call site that legitimately discards a result would become a `-Werror` failure, and
-that is not a change to make without a compiler. Same for replacing the `static_assert(
-is_base_of_v<object_base, T>)` pattern with concepts — better diagnostics, but it touches
-overload resolution at existing call sites.
+the value does not justify auditing ~200 call sites. Same for replacing the
+`static_assert(is_base_of_v<object_base, T>)` pattern with concepts — better diagnostics, but
+it changes overload resolution at existing call sites.
+
+### Phase 4c — the runtime-typed call path, and the module
+
+**`method_proxy::call_packed()`** — `call()` picks its overload from C++ argument TYPES, which
+a caller holding runtime values cannot do: a script, a viewer, or an RPC that received a
+descriptor and a list of strings knows every argument as data. `call_packed(method, span<java_arg>)`
+is that entry point.
+
+Making it share `call()`'s implementation meant extracting **`invoke_packed()`** — the
+type-independent half (call-stub resolve, JavaThread transition, JNIHandleBlock swap, stub
+invocation, result decode). Both entries now funnel through one body, so the delicate part has
+one implementation rather than a copy that drifts. `invoke_packed` is declared BEFORE `call()`
+deliberately: GCC does first-phase lookup for non-dependent names in template bodies, and the
+header already works around that rule three other times.
+
+**`vmhook.ixx`** — a C++20 named module, so consumers can `import vmhook;`. It does not
+duplicate the header: it includes it in the global module fragment and re-exports the public
+surface with `export using`, which is the only shape that keeps `import` and `#include` naming
+the SAME entities rather than two sets of them.
+
+Getting there required fixing a real latent problem: the header declared **47 namespace-scope
+functions `static`**, which in a header-only library means internal linkage — a separate copy
+of each function, and of any function-local state, in every translation unit. It also makes
+them unexportable, and makes any exported inline that calls one ill-formed ("exposes TU-local
+entity"). All 47 are now `inline`, which is what a header-only library should have used
+throughout. Verified: 102/102 tests pass, including the two-TU ODR test.
+
+Macros are NOT exported — that is a language rule. A consumer needing `VMHOOK_LOG` or a
+`VMHOOK_HAS_*` capability macro includes the header, which costs nothing extra because both
+spellings name the same entities.
+
+Caveat found while validating: GCC 15 ICEs if a consumer writes `#include <cstdio>` AFTER
+`import vmhook;`. Includes-before-import works. That is a GCC modules bug, not a defect here.
 
 ### Phase 5 — prove it
 - **5.1** Un-gate `tests/jvm/modules/global_ref.cpp` from `[INFO]` to `HARD`: force a

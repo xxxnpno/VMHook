@@ -3,7 +3,7 @@
 // HISTORY, because it explains the shape of this file and the mcj_ prefix.  The
 // module was written as method_call_jni_fallback, to cover a SECOND dispatcher:
 // call() probed detail::find_call_stub_entry(), and when the entry was absent it
-// short-circuited into call_jni(), which marshalled args into a jvalue[] and
+// short-circuited into the call stub, which marshalled args into a jvalue[] and
 // dispatched via Call(Static)?<Type>MethodA.  The module was built on the belief
 // that the entry is absent on JDK 21+ and so CI naturally exercised the fallback.
 //

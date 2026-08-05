@@ -103,6 +103,7 @@
 #include <tuple>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <variant>
 #include <functional>
 #include <limits>
@@ -271,6 +272,33 @@
     #define VMHOOK_HAS_STD_EXPECTED 0
 #endif
 
+// C++26 `= delete("reason")` (P2573).  Several of this header's design rules are
+// expressed as DELETIONS -- a ref_vector that cannot be built from raw addresses,
+// an access proxy that cannot be hoisted out of its expression, a hook_handle
+// that cannot be copied.  Deleting the operation is what makes the rule
+// unbreakable; the reason string is what makes the compiler explain it instead
+// of emitting a bare "use of deleted function" and leaving the user to guess
+// which invariant they just hit.
+//
+// GCC 15+ and Clang 19+ accept it in C++26 mode; everything else gets the plain
+// deletion, which enforces exactly the same rule with a worse message.
+// The language-mode check is NOT redundant.  Clang defines
+// __cpp_deleted_function even in C++23 mode, where it accepts the syntax as an
+// EXTENSION and then warns about it -- which is an error under the project's
+// -Werror.  Requiring C++26 proper is what keeps the feature genuinely opt-in.
+// MSVC reports the mode in _MSVC_LANG rather than __cplusplus.
+#if defined(_MSVC_LANG)
+    #define VMHOOK_CPLUSPLUS _MSVC_LANG
+#else
+    #define VMHOOK_CPLUSPLUS __cplusplus
+#endif
+
+#if VMHOOK_CPLUSPLUS > 202302L     && defined(__cpp_deleted_function) && __cpp_deleted_function >= 202403L
+    #define VMHOOK_DELETED(reason) = delete(reason)
+#else
+    #define VMHOOK_DELETED(reason) = delete
+#endif
+
 // ---------------------------------------------------------------------------
 // C++26 static reflection (P2996) — OPTIONAL, and additive wherever it is used.
 //
@@ -292,7 +320,7 @@
 //
 // Gate on BOTH feature-test macros plus the header: the language macro alone is
 // true in some in-progress builds where <meta> is absent or incomplete.
-#if defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202506L     && defined(__cpp_lib_reflection) && __cpp_lib_reflection >= 202506L     && __has_include(<meta>)
+#if VMHOOK_CPLUSPLUS > 202302L     && defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202506L     && defined(__cpp_lib_reflection) && __cpp_lib_reflection >= 202506L     && __has_include(<meta>)
     #include <meta>
     #define VMHOOK_HAS_REFLECTION 1
 #else
@@ -1641,7 +1669,7 @@ namespace vmhook
             Complexity: O(1).
             Exception safety: noexcept.
         */
-        static auto decode_oop_pointer(std::uint32_t compressed) noexcept
+        inline auto decode_oop_pointer(std::uint32_t compressed) noexcept
             -> void*;
 
         /*
@@ -1654,7 +1682,7 @@ namespace vmhook
             Complexity: O(1).
             Exception safety: noexcept.
         */
-        static auto encode_oop_pointer(void* decoded) noexcept
+        inline auto encode_oop_pointer(void* decoded) noexcept
             -> std::uint32_t;
 
         /*
@@ -1670,7 +1698,7 @@ namespace vmhook
             Complexity: O(N) where N = number of active Java threads (thread-list walk).
             Exception safety: noexcept — returns false when the thread is not a JavaThread.
         */
-        static auto ensure_current_java_thread() noexcept
+        inline auto ensure_current_java_thread() noexcept
             -> bool;
     }
 
@@ -1741,7 +1769,7 @@ namespace vmhook
     inline std::unordered_map<std::string, type_factory_function_t> g_type_factory_map{};
 
     template<class wrapper_type>
-    static auto register_class(std::string_view class_name) noexcept
+    inline auto register_class(std::string_view class_name) noexcept
         -> bool;
 
     /*
@@ -2085,6 +2113,36 @@ namespace vmhook
             !vmhook::detail::annotated_class_name<wrapper_type>().empty() };
 
         /*
+            @brief "Lcom/example/Foo;" for an annotated wrapper, at compile time.
+            @details
+            The annotation gives the bare internal name; a descriptor needs it
+            wrapped in L...;.  Doing that in a constexpr array rather than with
+            std::format is what keeps the whole thing usable in a consteval
+            context -- and what lets a wrapper's descriptor cost nothing at all
+            at runtime.
+        */
+        template<typename wrapper_type>
+        struct class_descriptor_storage
+        {
+            static constexpr auto build() noexcept
+            {
+                constexpr std::string_view name{
+                    vmhook::detail::annotated_class_name<wrapper_type>() };
+                std::array<char, name.size() + 2u> out{};
+                out[0] = 'L';
+                for (std::size_t i{ 0 }; i < name.size(); ++i) { out[i + 1u] = name[i]; }
+                out[name.size() + 1u] = ';';
+                return out;
+            }
+            static constexpr auto value{ build() };
+        };
+
+        template<typename wrapper_type>
+        inline constexpr std::string_view class_descriptor_v{
+            class_descriptor_storage<wrapper_type>::value.data(),
+            class_descriptor_storage<wrapper_type>::value.size() };
+
+        /*
             @brief Type trait that detects whether a type is a vmhook::borrowed<W>.
             @details
             The counterpart of is_unique_ptr for the anchored-reference model.  A
@@ -2119,6 +2177,150 @@ namespace vmhook
         */
         template<typename type>
         inline constexpr bool is_borrowed_v{ is_borrowed<std::remove_cvref_t<type>>::value };
+
+        /*
+            @brief The JVM descriptor for a C++ type, as a COMPILE-TIME constant.
+            @details
+            jvm_descriptor_for_arg() returns std::string: it allocates, it runs at
+            runtime, and for a wrapper it consults a runtime map.  For the vast
+            majority of types none of that is necessary -- "I" is "I" at compile
+            time -- and for a wrapper carrying a vmhook::java_class annotation the
+            class name is a compile-time constant too.
+
+            descriptor_of_v is that constant.  It is EMPTY for a type whose
+            descriptor genuinely cannot be known until runtime (an unannotated
+            wrapper, whose name lives only in the registry), which is the signal
+            callers use to fall back.
+
+            Why this matters beyond tidiness: a method descriptor is built by
+            concatenating one of these per argument, on every hook install and
+            every overload resolution.  With the pieces constant, the whole
+            descriptor can be assembled at compile time (see descriptor_for below)
+            and the install path stops touching the allocator at all.
+        */
+        template<typename type>
+        consteval auto descriptor_of() noexcept
+            -> std::string_view
+        {
+            using clean_t = std::remove_cvref_t<type>;
+
+            if constexpr (std::is_same_v<clean_t, void>)                      { return "V"; }
+            else if constexpr (std::is_same_v<clean_t, bool>)                 { return "Z"; }
+            else if constexpr (std::is_same_v<clean_t, std::string>
+                               || std::is_same_v<clean_t, std::string_view>
+                               || std::is_same_v<clean_t, const char*>
+                               || std::is_same_v<clean_t, char*>)             { return "Ljava/lang/String;"; }
+            else if constexpr (std::is_same_v<clean_t, char16_t>
+                               || std::is_same_v<clean_t, std::uint16_t>)     { return "C"; }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 1) { return "B"; }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 2) { return "S"; }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 4) { return "I"; }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 8) { return "J"; }
+            else if constexpr (std::is_same_v<clean_t, float>)                { return "F"; }
+            else if constexpr (std::is_same_v<clean_t, double>)               { return "D"; }
+            else if constexpr (vmhook::detail::is_borrowed_v<clean_t>)
+            {
+                using wrapper_type = typename vmhook::detail::is_borrowed<clean_t>::value_type_t;
+                if constexpr (std::is_void_v<wrapper_type>) { return "Ljava/lang/Object;"; }
+                else if constexpr (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
+                {
+                    // The reflection payoff: an annotated wrapper's descriptor is
+                    // known here, so it never reaches the registry at all.
+                    return vmhook::detail::class_descriptor_v<wrapper_type>;
+                }
+                else { return {}; }   // runtime lookup required
+            }
+            else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
+            {
+                using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
+                if constexpr (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
+                {
+                    return vmhook::detail::class_descriptor_v<wrapper_type>;
+                }
+                else { return {}; }
+            }
+            else if constexpr (vmhook::detail::has_annotated_class_name_v<clean_t>)
+            {
+                return vmhook::detail::class_descriptor_v<clean_t>;
+            }
+            else { return {}; }
+        }
+
+        /*
+            @brief descriptor_of<T>() as a variable template, for use in requires
+                   clauses and static_asserts.
+        */
+        template<typename type>
+        inline constexpr std::string_view descriptor_of_v{ vmhook::detail::descriptor_of<type>() };
+
+        /*
+            @brief True when every one of `types` has a compile-time descriptor.
+            @details The gate for the compile-time descriptor assembly below: one
+            unannotated wrapper anywhere in the signature and the whole thing has
+            to be built at runtime, because that one piece is only in the registry.
+        */
+        template<typename... types>
+        inline constexpr bool all_descriptors_static_v{
+            (!vmhook::detail::descriptor_of_v<types>.empty() && ...) };
+
+        /*
+            @brief A whole method descriptor -- "(IJLjava/lang/String;)V" -- built
+                   at COMPILE TIME.
+            @details
+            Storage is a std::array sized exactly to the descriptor, filled by a
+            consteval loop; view() hands back a string_view into it.  The array is
+            a static constexpr member, so the bytes live in rodata and the
+            string_view is a pointer-and-length to them -- no allocation, no
+            static initialiser, nothing to run at start-up.
+
+            Requires every piece to be compile-time known (see
+            all_descriptors_static_v); a signature mentioning an unannotated
+            wrapper simply does not instantiate this, and the caller keeps using
+            the runtime builder.
+
+                using sig = descriptor_for<void, std::int32_t, std::int64_t>;
+                static_assert(sig::view() == "(IJ)V");
+        */
+        template<typename return_type, typename... arg_types>
+            requires (vmhook::detail::all_descriptors_static_v<return_type, arg_types...>)
+        struct descriptor_for
+        {
+        private:
+            static consteval auto total_size() noexcept
+                -> std::size_t
+            {
+                // '(' + args + ')' + return
+                return 2u
+                       + (vmhook::detail::descriptor_of_v<arg_types>.size() + ... + 0u)
+                       + vmhook::detail::descriptor_of_v<return_type>.size();
+            }
+
+            static consteval auto build() noexcept
+                -> std::array<char, total_size()>
+            {
+                std::array<char, total_size()> out{};
+                std::size_t at{ 0 };
+                const auto append{ [&out, &at](const std::string_view piece) constexpr
+                {
+                    for (const char c : piece) { out[at++] = c; }
+                } };
+                append("(");
+                (append(vmhook::detail::descriptor_of_v<arg_types>), ...);
+                append(")");
+                append(vmhook::detail::descriptor_of_v<return_type>);
+                return out;
+            }
+
+        public:
+            static constexpr std::array<char, total_size()> storage{ build() };
+
+            /* @brief The descriptor, as a view into this type's rodata. */
+            static constexpr auto view() noexcept
+                -> std::string_view
+            {
+                return std::string_view{ storage.data(), storage.size() };
+            }
+        };
 
         /*
             @brief Constrains the value_t conversion operators to their *legitimate*
@@ -2269,7 +2471,7 @@ namespace vmhook
         /*
             @brief Searches the gHotSpotVMTypes array for a type entry by name.
         */
-        static auto iterate_type_entries(const char* const type_name) noexcept
+        inline auto iterate_type_entries(const char* const type_name) noexcept
             -> vmhook::hotspot::vm_type_entry_t*
         {
             if (!type_name)
@@ -2295,7 +2497,7 @@ namespace vmhook
             and field_name is null.  Without the guard, strcmp(nullptr, x) is UB and
             crashes the host process on the first lookup that walks past such an entry.
         */
-        static auto iterate_struct_entries(const char* const type_name, const char* const field_name) noexcept
+        inline auto iterate_struct_entries(const char* const type_name, const char* const field_name) noexcept
             -> vmhook::hotspot::vm_struct_entry_t*
         {
             if (!type_name || !field_name)
@@ -2323,7 +2525,7 @@ namespace vmhook
             region containing pointer is actually committed and readable.  Implementation
             uses VirtualQuery on Windows and /proc/self/maps on Linux via os::query_region.
         */
-        static auto is_readable_pointer(const void* const pointer) noexcept
+        inline auto is_readable_pointer(const void* const pointer) noexcept
             -> bool
         {
             const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(pointer) };
@@ -2353,7 +2555,7 @@ namespace vmhook
             Pointers are also required to be at least 2-byte aligned; HotSpot
             never produces odd-address Klass / Method / oop pointers.
         */
-        inline static auto is_valid_pointer(const void* const pointer) noexcept
+        inline auto is_valid_pointer(const void* const pointer) noexcept
             -> bool
         {
             const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(pointer) };
@@ -2398,7 +2600,7 @@ namespace vmhook
             Masking with user_address_ceiling strips high GC tag bits and recovers the
             underlying canonical user-space address.
         */
-        inline static auto untag_pointer(const void* const pointer) noexcept
+        inline auto untag_pointer(const void* const pointer) noexcept
             -> const void*
         {
             return reinterpret_cast<const void*>(
@@ -2412,7 +2614,7 @@ namespace vmhook
             fault-safe path on Linux.  Pre-checks filter out null, low, non-canonical,
             and unaligned addresses before crossing the OS boundary.
         */
-        static auto safe_read_pointer(const void* const pointer) noexcept
+        inline auto safe_read_pointer(const void* const pointer) noexcept
             -> const void*
         {
             if (!pointer)
@@ -2470,7 +2672,7 @@ namespace vmhook
             is_valid_pointer(); this helper only adds the mapped-page guarantee on
             Windows.
         */
-        inline static auto cold_read_frame_pointer(const void* const slot) noexcept
+        inline auto cold_read_frame_pointer(const void* const slot) noexcept
             -> void*
         {
 #if defined(_WIN32)
@@ -2518,7 +2720,7 @@ namespace vmhook
             is_valid_pointer(); this helper adds the mapped-page guarantee
             everywhere, returning nullptr on an unreadable slot.
         */
-        inline static auto cold_read_metadata_pointer(const void* const slot) noexcept
+        inline auto cold_read_metadata_pointer(const void* const slot) noexcept
             -> void*
         {
             void* value{ nullptr };
@@ -5527,7 +5729,7 @@ namespace vmhook
 
             @return Pointer to the head JavaThread, or nullptr on failure.
         */
-        static auto find_any_java_thread() noexcept
+        inline auto find_any_java_thread() noexcept
             -> vmhook::hotspot::java_thread*
         {
             static const vmhook::hotspot::vm_struct_entry_t* const thread_list_entry{
@@ -5563,7 +5765,7 @@ namespace vmhook
             @param os_thread_id  OS thread ID (Win32 thread ID on Windows, kernel TID on Linux).
             @return Matching JavaThread*, or nullptr if not found.
         */
-        static auto find_java_thread_by_os_thread_id(const vmhook::os::thread_id_t os_thread_id) noexcept
+        inline auto find_java_thread_by_os_thread_id(const vmhook::os::thread_id_t os_thread_id) noexcept
             -> vmhook::hotspot::java_thread*
         {
             if (os_thread_id == 0)
@@ -5652,7 +5854,7 @@ namespace vmhook
 
             @return true if current_java_thread is valid after the call, false otherwise.
         */
-        static auto ensure_current_java_thread() noexcept
+        inline auto ensure_current_java_thread() noexcept
             -> bool
         {
             if (vmhook::hotspot::current_java_thread && vmhook::hotspot::is_valid_pointer(vmhook::hotspot::current_java_thread))
@@ -5695,7 +5897,7 @@ namespace vmhook
 
             @return A valid JavaThread*, or nullptr if none is available.
         */
-        static auto find_allocation_thread() noexcept
+        inline auto find_allocation_thread() noexcept
             -> vmhook::hotspot::java_thread*
         {
             if (vmhook::hotspot::current_java_thread && vmhook::hotspot::is_valid_pointer(vmhook::hotspot::current_java_thread))
@@ -5732,7 +5934,7 @@ namespace vmhook
             @param byte_size  Number of bytes requested; must be > 0.
             @return Pointer to the allocated memory, or nullptr on failure.
         */
-        static auto allocate_from_threads_list(const std::size_t byte_size) noexcept
+        inline auto allocate_from_threads_list(const std::size_t byte_size) noexcept
             -> void*
         {
             static const vmhook::hotspot::vm_struct_entry_t* const list_entry{
@@ -5819,7 +6021,7 @@ namespace vmhook
             once-per-call-site resolution semantics (the static initializer runs the
             lookup exactly once on the first call and reuses it thereafter).
         */
-        static auto resolve_struct_entry(const vmhook::hotspot::struct_entry_candidate_t* const candidates,
+        inline auto resolve_struct_entry(const vmhook::hotspot::struct_entry_candidate_t* const candidates,
                                          const std::size_t count) noexcept
             -> const vmhook::hotspot::vm_struct_entry_t*
         {
@@ -5847,7 +6049,7 @@ namespace vmhook
             responsible for the compressed==0 -> nullptr short-circuit and the
             missing-entry handling; this performs only the unsigned widening shift-add.
         */
-        static auto narrow_decode(const std::uint64_t base, const std::uint32_t shift,
+        inline auto narrow_decode(const std::uint64_t base, const std::uint32_t shift,
                                   const std::uint32_t compressed) noexcept
             -> void*
         {
@@ -5868,7 +6070,7 @@ namespace vmhook
             handling, and the addr<base -> 0 underflow guard; this performs only the
             subtract-shift-narrow.
         */
-        static auto narrow_encode(const std::uint64_t base, const std::uint32_t shift,
+        inline auto narrow_encode(const std::uint64_t base, const std::uint32_t shift,
                                   const std::uint64_t addr) noexcept
             -> std::uint32_t
         {
@@ -5892,7 +6094,7 @@ namespace vmhook
             Both values are read from CompressedOops::_narrow_oop.{_base,_shift} via
             gHotSpotVMStructs so this works across all JDK versions.
         */
-        static auto decode_oop_pointer(const std::uint32_t compressed) noexcept
+        inline auto decode_oop_pointer(const std::uint32_t compressed) noexcept
             -> void*
         {
             if (!compressed)
@@ -5938,7 +6140,7 @@ namespace vmhook
             This is the inverse of decode_oop_pointer() and is used when assigning
             object wrapper fields through field_proxy::set().
         */
-        static auto encode_oop_pointer(void* const decoded) noexcept
+        inline auto encode_oop_pointer(void* const decoded) noexcept
             -> std::uint32_t
         {
             if (!decoded)
@@ -6009,7 +6211,7 @@ namespace vmhook
             stored in CompressedKlassPointers::_narrow_klass.{_base,_shift}.
             The decoding formula is identical: real_address = base + (compressed << shift).
         */
-        static auto decode_klass_pointer(const std::uint32_t compressed) noexcept
+        inline auto decode_klass_pointer(const std::uint32_t compressed) noexcept
             -> void*
         {
             if (!compressed)
@@ -6081,7 +6283,7 @@ namespace vmhook
             uncompressed-class-pointer config.
             Exception safety: noexcept — pure pointer arithmetic + decode_klass_pointer.
         */
-        inline static auto read_klass_from_header_buffer(const void* const header) noexcept
+        inline auto read_klass_from_header_buffer(const void* const header) noexcept
             -> vmhook::hotspot::klass*
         {
             static const vmhook::hotspot::vm_struct_entry_t* const compressed_klass_entry{
@@ -6126,7 +6328,7 @@ namespace vmhook
             @param decoded  Full 64-bit Klass pointer to compress.
             @return 32-bit compressed Klass pointer, or 0 on failure.
         */
-        static auto encode_klass_pointer(void* const decoded) noexcept
+        inline auto encode_klass_pointer(void* const decoded) noexcept
             -> std::uint32_t
         {
             if (!decoded)
@@ -6173,7 +6375,7 @@ namespace vmhook
             @details
             A pattern byte of 0x00 acts as a wildcard and always matches.
         */
-        inline static auto match_pattern(const std::uint8_t* const address, const std::uint8_t* const pattern, const std::size_t size)
+        inline auto match_pattern(const std::uint8_t* const address, const std::uint8_t* const pattern, const std::size_t size)
             -> bool
         {
             for (std::size_t byte_index{ 0 }; byte_index < size; ++byte_index)
@@ -6195,7 +6397,7 @@ namespace vmhook
             @details
             A pattern byte of 0x00 acts as a wildcard and always matches.
         */
-        inline static auto scan(const std::uint8_t* const start, const std::size_t range, const std::uint8_t* pattern, const std::size_t size)
+        inline auto scan(const std::uint8_t* const start, const std::size_t range, const std::uint8_t* pattern, const std::size_t size)
             -> std::uint8_t*
         {
             for (std::size_t scan_offset{ 0 }; scan_offset < range; ++scan_offset)
@@ -6215,7 +6417,7 @@ namespace vmhook
             Uses VirtualQuery to retrieve the memory region information and computes
             how many bytes remain from start to the end of the region, capped at 0x2000.
         */
-        static auto find_stub_size(const std::uint8_t* start)
+        inline auto find_stub_size(const std::uint8_t* start)
             -> std::size_t
         {
             const vmhook::os::region_info info{ vmhook::os::query_region(start) };
@@ -6255,7 +6457,7 @@ namespace vmhook
                   2. Fallback (JDK 21 release / JDK 22+): just mov BYTE PTR [r15+??],??
                      Hook injected at the start of that instruction directly.
         */
-        static auto find_hook_location(const void* i2i_entry)
+        inline auto find_hook_location(const void* i2i_entry)
             -> void*
         {
             /*
@@ -6354,7 +6556,7 @@ namespace vmhook
             nearby free region exists.  The implementation uses the platform-specific
             primitives wrapped behind vmhook::os::query_region / vmhook::os::allocate_rwx.
         */
-        static auto allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size) noexcept
+        inline auto allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size) noexcept
             -> std::uint8_t*
         {
             if (!nearby_addr || size == 0)
@@ -7896,7 +8098,7 @@ namespace vmhook
         inline constexpr std::size_t trampoline_pushed_words{ 12 };
 #endif
 
-        static auto common_detour(vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread* const thread, vmhook::hotspot::return_slot* const slot)
+        inline auto common_detour(vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread* const thread, vmhook::hotspot::return_slot* const slot)
             -> std::int64_t
         {
             // Race-free shutdown: shutdown_hooks() flips this BEFORE acquiring
@@ -8186,7 +8388,7 @@ namespace vmhook
             any layout the pure decision cannot confidently place — a wrong write
             corrupts a live Method, so refusing is strictly safer than guessing.
         */
-        static auto resolve_method_flags_slot(const vmhook::hotspot::method* const method_pointer) noexcept
+        inline auto resolve_method_flags_slot(const vmhook::hotspot::method* const method_pointer) noexcept
             -> vmhook::hotspot::method_flags_slot
         {
             if (!method_pointer || !vmhook::hotspot::is_valid_pointer(method_pointer))
@@ -8320,7 +8522,7 @@ namespace vmhook
             up front (and again inside the resolver) so we never form `this + offset`
             from a wild base.
         */
-        static auto set_dont_inline(const vmhook::hotspot::method* const method_pointer, const bool enabled) noexcept
+        inline auto set_dont_inline(const vmhook::hotspot::method* const method_pointer, const bool enabled) noexcept
             -> void
         {
             if (!method_pointer || !vmhook::hotspot::is_valid_pointer(method_pointer))
@@ -8446,7 +8648,7 @@ namespace vmhook
             AdapterHandlerEntry._c2i_entry is exported via gHotSpotVMStructs on all
             supported JDK versions (8 through 26).
         */
-        static auto get_c2i_entry_from_adapter(void* const adapter) noexcept
+        inline auto get_c2i_entry_from_adapter(void* const adapter) noexcept
             -> void*
         {
             if (!adapter || !vmhook::hotspot::is_valid_pointer(adapter))
@@ -8499,7 +8701,7 @@ namespace vmhook
             @param method_count  Out: clamped [1,65535] method count, 0 on failure.
             @return true iff BOTH the array pointer and a sane length were readable.
         */
-        static auto safe_klass_methods(vmhook::hotspot::klass* const k,
+        inline auto safe_klass_methods(vmhook::hotspot::klass* const k,
                                        vmhook::hotspot::method**&    methods_data,
                                        std::int32_t&                 method_count) noexcept
             -> bool
@@ -8559,7 +8761,7 @@ namespace vmhook
             @param out     Out: the read pointer value, nullptr on any failure.
             @return true iff the field offset was known AND the slot read succeeded.
         */
-        static auto safe_method_pointer_field(vmhook::hotspot::method* const           m,
+        inline auto safe_method_pointer_field(vmhook::hotspot::method* const           m,
                                               const vmhook::hotspot::vm_struct_entry_t* const entry,
                                               void*&                                    out) noexcept
             -> bool
@@ -8798,7 +9000,7 @@ namespace vmhook
 
     // Pure-VM array-klass resolution by JVM descriptor (defined after find_class,
     // which it calls for the component type of object arrays).
-    static auto resolve_array_klass(std::string_view descriptor) noexcept
+    inline auto resolve_array_klass(std::string_view descriptor) noexcept
         -> vmhook::hotspot::klass*;
 
     /*
@@ -8815,7 +9017,7 @@ namespace vmhook
         klass_lookup_cache_mutex.  The HotSpot walk itself is safe to run
         concurrently — it only reads exported VMStructs.
     */
-    static auto find_class(const std::string_view class_name)
+    inline auto find_class(const std::string_view class_name)
         -> vmhook::hotspot::klass*
     {
         // Empty-name fast-reject.  An empty internal class name can never name a
@@ -8969,7 +9171,7 @@ namespace vmhook
         All reads go through os::safe_read / VMStructs; returns nullptr if a
         required field is not exported on the running JDK.
     */
-    static auto resolve_array_klass(const std::string_view descriptor) noexcept
+    inline auto resolve_array_klass(const std::string_view descriptor) noexcept
         -> vmhook::hotspot::klass*
     {
         if (descriptor.size() < 2 || descriptor.front() != '[')
@@ -9833,7 +10035,7 @@ namespace vmhook
         Registration is required before calling hook<T>().
     */
     template<class wrapper_type>
-    static auto register_class(const std::string_view class_name) noexcept
+    inline auto register_class(const std::string_view class_name) noexcept
         -> bool
     {
         vmhook::hotspot::klass* const verified_klass{ vmhook::find_class(class_name) };
@@ -9911,7 +10113,7 @@ namespace vmhook
 #if VMHOOK_HAS_REFLECTION
     template<typename wrapper_type>
         requires (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
-    static auto register_class() noexcept
+    inline auto register_class() noexcept
         -> bool
     {
         constexpr std::string_view annotated{
@@ -10112,8 +10314,12 @@ namespace vmhook
         {
         }
 
-        watch_handle(const watch_handle&) = delete;
-        auto operator=(const watch_handle&) -> watch_handle & = delete;
+        watch_handle(const watch_handle&) VMHOOK_DELETED(
+            "a watch_handle OWNS the installed watcher; copying it would arm two "
+            "owners for one watcher and uninstall it twice.  Move it instead.");
+        auto operator=(const watch_handle&) -> watch_handle & VMHOOK_DELETED(
+            "a watch_handle OWNS the installed watcher; copying it would arm two "
+            "owners for one watcher and uninstall it twice.  Move it instead.");
 
         watch_handle(watch_handle&& other) noexcept
             : block{ std::move(other.block) }
@@ -10212,8 +10418,12 @@ namespace vmhook
         {
         }
 
-        hook_handle(const hook_handle&) = delete;
-        auto operator=(const hook_handle&) -> hook_handle& = delete;
+        hook_handle(const hook_handle&) VMHOOK_DELETED(
+            "a hook_handle OWNS the installed detour; copying it would leave two "
+            "owners for one hook and unhook it twice.  Move it instead.");
+        auto operator=(const hook_handle&) -> hook_handle& VMHOOK_DELETED(
+            "a hook_handle OWNS the installed detour; copying it would leave two "
+            "owners for one hook and unhook it twice.  Move it instead.");
 
         hook_handle(hook_handle&& other) noexcept
             : method{ other.method }
@@ -11201,7 +11411,12 @@ namespace vmhook
     // alongside shutdown_hooks() further down because the worker_loop body
     // depends on verify_hooks() being defined first.  Declaring it here
     // makes it visible to GCC's first-phase name lookup inside the template.
-    namespace detail::auto_repair { static auto ensure_started() noexcept -> void; }
+    // Forward-declared here and defined below (see roadmap 5.3: GCC's
+    // first-phase lookup in template bodies needs the name visible early).
+    // `inline`, NOT `static`: the definition is inline, and a static
+    // declaration would give the two different linkage - which a named module
+    // rejects outright as an exported function exposing a TU-local entity.
+    namespace detail::auto_repair { inline auto ensure_started() noexcept -> void; }
 
     // The trailing `bool* already_hooked` out-parameter (defaulted to
     // nullptr) lets scoped_hook<T>() distinguish a fresh install from the
@@ -11212,13 +11427,13 @@ namespace vmhook
     // if installed or already active").  See scoped_hook<T>() and the
     // short-circuit inside the definition for the honest-handle contract.
     template<class wrapper_type>
-    static auto hook(const std::string_view method_name,
+    inline auto hook(const std::string_view method_name,
                      const std::string_view method_signature,
                      auto&& user_detour,
                      bool* already_hooked = nullptr) -> bool;
 
     template<class wrapper_type>
-    static auto hook(const std::string_view method_name, auto&& user_detour)
+    inline auto hook(const std::string_view method_name, auto&& user_detour)
         -> bool
     {
         return vmhook::hook<wrapper_type>(method_name, std::string_view{}, std::forward<decltype(user_detour)>(user_detour));
@@ -11233,7 +11448,7 @@ namespace vmhook
         five `defineClass` variants).
     */
     template<class wrapper_type>
-    static auto hook(const std::string_view method_name,
+    inline auto hook(const std::string_view method_name,
                      const std::string_view method_signature,
                      auto&& user_detour,
                      bool* already_hooked) -> bool
@@ -11385,7 +11600,10 @@ namespace vmhook
                     // detail::java_slot_offsets for the table.
                     auto invoke = [&]<std::size_t... indexes>(std::index_sequence<indexes...>)
                     {
-                        constexpr auto slot_offsets{
+                        // [[maybe_unused]]: a detour that takes NO Java arguments
+                        // expands the fold below to nothing, so the table is
+                        // legitimately never read.
+                        [[maybe_unused]] constexpr auto slot_offsets{
                             vmhook::detail::java_slot_offsets<method_arg_tuple_t>::value };
                         detour(retval,
                             vmhook::detail::extract_frame_arg<std::tuple_element_t<indexes, method_arg_tuple_t>>(
@@ -11663,7 +11881,7 @@ namespace vmhook
         the same bytes simultaneously, in which case you're already in
         a war and tearing is the least of your problems.
     */
-    static auto verify_hooks() noexcept
+    inline auto verify_hooks() noexcept
         -> std::size_t
     {
         std::size_t repaired{ 0 };
@@ -12016,7 +12234,7 @@ namespace vmhook
         // unaffected by this flag — only the detached self-healing thread is.
         inline std::atomic<bool>        g_auto_repair_enabled{ true };
 
-        static auto worker_loop() noexcept -> void
+        inline auto worker_loop() noexcept -> void
         {
             constexpr auto interval{ std::chrono::milliseconds{
 #ifdef VMHOOK_AUTO_REPAIR_INTERVAL_MS
@@ -12056,7 +12274,7 @@ namespace vmhook
         // Bounded wait for the watchdog to exit after a shutdown request.  MUST
         // run WITHOUT g_hooked_methods_mutex held — the watchdog may be in
         // verify_hooks() (which takes that mutex), so waiting under it deadlocks.
-        static auto wait_for_exit() noexcept -> void
+        inline auto wait_for_exit() noexcept -> void
         {
             for (int spins{ 0 };
                  g_watchdog_running.load(std::memory_order_acquire) && spins < 2000;
@@ -12066,7 +12284,7 @@ namespace vmhook
             }
         }
 
-        static auto ensure_started() noexcept -> void
+        inline auto ensure_started() noexcept -> void
         {
 #ifndef VMHOOK_DISABLE_AUTO_REPAIR
             // Run-time opt-out.  Checked BEFORE the g_started CAS so the CAS
@@ -12101,7 +12319,7 @@ namespace vmhook
 #endif
         }
 
-        static auto notify_shutdown() noexcept -> void
+        inline auto notify_shutdown() noexcept -> void
         {
 #ifndef VMHOOK_DISABLE_AUTO_REPAIR
             try
@@ -12216,9 +12434,10 @@ namespace vmhook
     // detail::exception_* which are declared only there (vmhook.hpp:~16341 /
     // ~16506).  Declaring it here makes it visible to GCC's first-phase name
     // lookup inside shutdown_hooks().
-    namespace detail { static auto reset_watcher_latches() noexcept -> void; }
+    // Same shape, same reason, as auto_repair::ensure_started above.
+    namespace detail { inline auto reset_watcher_latches() noexcept -> void; }
 
-    static auto shutdown_hooks() noexcept
+    inline auto shutdown_hooks() noexcept
         -> void
     {
         // Flip the shutdown flag BEFORE taking the install mutex.  Any
@@ -12823,6 +13042,19 @@ namespace vmhook
         {
             using clean_t = std::decay_t<arg_type>;
 
+            // Compile-time fast path.  descriptor_of_v is non-empty for every
+            // type whose descriptor is knowable without the registry -- which is
+            // all of them except an UNannotated wrapper.  Taking it here means
+            // the common case stops re-deriving a constant through a chain of
+            // if-constexpr at runtime; the ladder below survives for the one case
+            // that genuinely needs a map lookup.
+            if constexpr (!vmhook::detail::descriptor_of_v<clean_t>.empty())
+            {
+                return std::string{ vmhook::detail::descriptor_of_v<clean_t> };
+            }
+            else
+            {
+
             if constexpr (std::is_same_v<clean_t, std::string> || std::is_same_v<clean_t, std::string_view> || std::is_same_v<clean_t, const char*> || std::is_same_v<clean_t, char*>)
             {
                 return "Ljava/lang/String;";
@@ -12972,6 +13204,7 @@ namespace vmhook
                               "of: string, c-string, borrowed<vmhook::object>, "
                               "unique_ptr<vmhook::object>, object_base-derived, "
                               "bool, integral (8/16/32/64-bit), float, double.");
+            }
             }
         }
     } // namespace detail
@@ -13156,7 +13389,7 @@ namespace vmhook
               parsing method descriptors and setting up interpreter frames.
     */
     template<typename wrapper_type, typename... args_t>
-    static auto make_unique(args_t&&... args)
+    inline auto make_unique(args_t&&... args)
         -> std::unique_ptr<wrapper_type>
     {
         if (!vmhook::hotspot::ensure_current_java_thread())
@@ -13255,7 +13488,7 @@ namespace vmhook
         immutable HotSpot metadata) so the lock is only held for the
         find / insert.
     */
-    static auto find_field(vmhook::hotspot::klass* const target_klass, const std::string_view name)
+    inline auto find_field(vmhook::hotspot::klass* const target_klass, const std::string_view name)
         -> std::optional<vmhook::hotspot::field_entry_t>
     {
         if (!target_klass || !vmhook::hotspot::is_valid_pointer(target_klass))
@@ -13320,7 +13553,7 @@ namespace vmhook
               compressed OOP, then pass it to vmhook::hotspot::decode_oop_pointer() yourself.
     */
     template<typename value_type>
-    static auto get_field(void* const object, vmhook::hotspot::klass* const target_klass, const std::string_view name)
+    inline auto get_field(void* const object, vmhook::hotspot::klass* const target_klass, const std::string_view name)
         -> value_type
     {
         static_assert(std::is_trivially_copyable_v<value_type>, "get_field<value_type>: value_type must be trivially copyable.");
@@ -13379,7 +13612,7 @@ namespace vmhook
               Encoding is: (real_address - narrow_oop_base) >> narrow_oop_shift.
     */
     template<typename value_type>
-    static auto set_field(void* const object, vmhook::hotspot::klass* const target_klass, const std::string_view name, const value_type value)
+    inline auto set_field(void* const object, vmhook::hotspot::klass* const target_klass, const std::string_view name, const value_type value)
         -> void
     {
         static_assert(std::is_trivially_copyable_v<value_type>, "set_field<value_type>: value_type must be trivially copyable.");
@@ -13848,7 +14081,7 @@ namespace vmhook
           +12 _length   (int)
           +16 _data[0]
     */
-    inline static auto array_length(void* const array_oop) noexcept
+    inline auto array_length(void* const array_oop) noexcept
         -> std::int32_t
     {
         if (!array_oop || !vmhook::hotspot::is_valid_pointer(array_oop))
@@ -13885,7 +14118,7 @@ namespace vmhook
         Bounds checking is performed against the array length.
     */
     template<typename element_type>
-    static auto get_array_element(void* const array_oop, const std::int32_t index)
+    inline auto get_array_element(void* const array_oop, const std::int32_t index)
         -> element_type
     {
         static_assert(std::is_trivially_copyable_v<element_type>, "get_array_element<element_type>: element_type must be trivially copyable.");
@@ -13930,7 +14163,7 @@ namespace vmhook
         @param value The value to write.
     */
     template<typename element_type>
-    static auto set_array_element(void* const array_oop, const std::int32_t index, const element_type value)
+    inline auto set_array_element(void* const array_oop, const std::int32_t index, const element_type value)
         -> void
     {
         static_assert(std::is_trivially_copyable_v<element_type>, "set_array_element<element_type>: element_type must be trivially copyable.");
@@ -16398,56 +16631,291 @@ namespace vmhook
         }
 
         /*
-            @brief Invokes the Java method through HotSpot's own call stub.
+            @brief One argument whose TYPE is known only at runtime.
             @details
-            Pure VM: no JNI, no JVMTI.  The dispatch gate is
-            StubRoutines::_call_stub_entry, derived by
-            vmhook::detail::find_call_stub_entry(), and the call is made with a
-            synthetic JavaCallWrapper, a saved/cleared/restored JavaFrameAnchor
-            and a fresh JNIHandleBlock installed for the callee, so the GC, the
-            frame walker and the exception machinery all see a well-formed entry
-            frame -- and the caller's JNI locals never stop being GC roots.
+            call() selects its overload from C++ argument types, which works
+            beautifully when the call site is C++ and hopelessly when it is not.
+            A script, a debugger UI, or an RPC that arrived carrying a descriptor
+            and a list of strings knows every argument as DATA -- there is no
+            pack to expand and no type to deduce.
 
-            Where this may be called from:
-              * INSIDE A HOOK DETOUR — the supported path.  The thread is a real
-                JavaThread already in _thread_in_Java, so no state manipulation
-                happens at all.  Nested invocation from a detour is exercised on
-                live JDK 8 / 21 / 26 including a full GC across two stacked
-                synthetic entry frames.
-              * From a JNI-native context on a JavaThread (_thread_in_native /
-                _thread_in_vm), where the thread state is flipped for the
-                duration.  HotSpot's real transition also polls the safepoint
-                mechanism, which is neither exported nor expressible through
-                VMStructs, so a safepoint armed inside that window is a narrow
-                but real race.
-              * Anywhere else — refused.  A thread that is not a JavaThread, or is
-                mid-transition / blocked, gets a logged monostate.
-
-            Arguments are packed into the interpreter's locals[] SLOT array off
-            the CALLEE's descriptor: one slot for Z B C S I F and references, two
-            for J and D with the value in the higher slot.
-
-            @return A value_t holding the decoded return value.  If the callee
-                    threw, the exception is cleared off the thread and the result
-                    carries value_t::exception_thrown / exception_class with a
-                    value-initialised payload — never the stub's garbage.
-                    A monostate result means void, or that the call was refused
-                    (every refusal is logged).
-
-            Complexity: O(arguments) plus the callee's own cost.
-            Exception safety: noexcept — every failure degrades to a logged
-                              monostate; no C++ exception crosses the stub.
+            java_arg is that data: a value plus, for reference arguments, the
+            distinction between "here is an object I already have" and "here is
+            text, make me a String".  The alternatives deliberately mirror the
+            JVM's own slot classes rather than C++'s type zoo, because the slot
+            layout is what the interpreter actually cares about.
         */
-        template<typename... args_t>
-        auto call(args_t&&... args) const noexcept
+        struct java_arg
+        {
+            /* @brief Which JVM slot class this argument occupies. */
+            enum class kind : std::uint8_t
+            {
+                boolean_,   // Z - one slot
+                byte_,      // B - one slot
+                char_,      // C - one slot
+                short_,     // S - one slot
+                int_,       // I - one slot
+                long_,      // J - TWO slots, value in the high one
+                float_,     // F - one slot
+                double_,    // D - TWO slots, value in the high one
+                object_,    // L/[ - one slot, a decoded oop (may be null)
+                string_,    // L/[ - one slot, TEXT to be allocated as a String
+            };
+
+            kind             type{ kind::int_ };
+            std::int64_t     integral{ 0 };       // Z B C S I J
+            double           floating{ 0.0 };     // F D
+            // vmhook::oop_t is not declared until the object-base section far
+            // below, so spell its underlying type; they are the same thing.
+            void*            oop{ nullptr };       // object_
+            std::string      text{};              // string_
+
+            /* @brief Builders, so call sites read as data rather than as setup. */
+            static auto of_bool(const bool v) noexcept -> java_arg
+            { java_arg a; a.type = kind::boolean_; a.integral = v ? 1 : 0; return a; }
+            static auto of_byte(const std::int8_t v) noexcept -> java_arg
+            { java_arg a; a.type = kind::byte_; a.integral = v; return a; }
+            static auto of_char(const std::uint16_t v) noexcept -> java_arg
+            { java_arg a; a.type = kind::char_; a.integral = v; return a; }
+            static auto of_short(const std::int16_t v) noexcept -> java_arg
+            { java_arg a; a.type = kind::short_; a.integral = v; return a; }
+            static auto of_int(const std::int32_t v) noexcept -> java_arg
+            { java_arg a; a.type = kind::int_; a.integral = v; return a; }
+            static auto of_long(const std::int64_t v) noexcept -> java_arg
+            { java_arg a; a.type = kind::long_; a.integral = v; return a; }
+            static auto of_float(const float v) noexcept -> java_arg
+            { java_arg a; a.type = kind::float_; a.floating = static_cast<double>(v); return a; }
+            static auto of_double(const double v) noexcept -> java_arg
+            { java_arg a; a.type = kind::double_; a.floating = v; return a; }
+            static auto of_object(void* const v) noexcept -> java_arg
+            { java_arg a; a.type = kind::object_; a.oop = v; return a; }
+            static auto of_string(std::string v) -> java_arg
+            { java_arg a; a.type = kind::string_; a.text = std::move(v); return a; }
+
+            /*
+                @brief Builds an argument of the kind a JVM descriptor letter names.
+                @details
+                The bridge from "I parsed a descriptor" to a packed argument.
+                `literal` is read per the letter: a numeric literal for a
+                primitive, the text of a String for L/[.  Returns nullopt for a
+                letter this cannot represent, so a malformed descriptor is a
+                refusal rather than a silently wrong slot.
+
+                Integers are parsed DECIMAL unless explicitly 0x-prefixed.  Base-0
+                auto-detection would read a leading-zero decimal as OCTAL, so a
+                user typing "09" would get 0 -- a real footgun for a field editor
+                or a scripted call.
+            */
+            static auto from_descriptor(const char letter, const std::string_view literal) noexcept
+                -> std::optional<java_arg>
+            {
+                const auto as_int{ [&]() noexcept -> std::int64_t
+                {
+                    const std::string owned{ literal };
+                    const char* text{ owned.c_str() };
+                    bool negative{ false };
+                    if (*text == '+') { ++text; }
+                    else if (*text == '-') { negative = true; ++text; }
+                    int base{ 10 };
+                    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) { base = 16; text += 2; }
+                    const auto magnitude{ std::strtoull(text, nullptr, base) };
+                    const auto value{ static_cast<std::int64_t>(magnitude) };
+                    return negative ? -value : value;
+                } };
+
+                switch (letter)
+                {
+                case 'Z': return of_bool(literal == "true" || literal == "TRUE" || literal == "1");
+                case 'B': return of_byte(static_cast<std::int8_t>(as_int()));
+                case 'S': return of_short(static_cast<std::int16_t>(as_int()));
+                case 'C': return literal.size() == 1
+                                 ? of_char(static_cast<std::uint16_t>(static_cast<unsigned char>(literal[0])))
+                                 : of_char(static_cast<std::uint16_t>(as_int()));
+                case 'I': return of_int(static_cast<std::int32_t>(as_int()));
+                case 'J': return of_long(as_int());
+                case 'F': return of_float(std::strtof(std::string{ literal }.c_str(), nullptr));
+                case 'D': return of_double(std::strtod(std::string{ literal }.c_str(), nullptr));
+                case 'L':
+                case '[': return of_string(std::string{ literal });
+                default:  return std::nullopt;
+                }
+            }
+        };
+
+        /*
+            @brief call() for arguments whose types are known only at runtime.
+            @details
+            Same dispatch, same guarantees, same value_t -- the only difference
+            is how the arguments arrive.  Where call() deduces the overload from
+            C++ types, this takes the Method already resolved (the caller knows
+            which overload it means, because it has the descriptor) plus a list
+            of java_args to lay out.
+
+            The slot rules are the interpreter's, not C++'s: long and double take
+            TWO slots with the value in the HIGH one, everything else takes one,
+            and an instance dispatch puts the receiver in locals[0].  Getting
+            that wrong does not crash -- it silently feeds the callee the wrong
+            arguments -- which is why it is implemented once, here, right next to
+            the packer call() uses.
+
+            A `string_` argument ALLOCATES a Java String.  That allocation is
+            unrooted until the call consumes it, which is exactly as safe (and as
+            unsafe) as call()'s own std::string argument: fine inside a detour,
+            which is where this is meant to run.
+
+            @param selected_method  Method* to invoke; the caller resolved it.
+            @param args             Arguments in declaration order.
+            @return  Decoded result, or monostate on refusal (all logged).
+
+            Complexity: O(args) plus the callee's own cost.
+            Exception safety: noexcept.
+        */
+        auto call_packed(vmhook::hotspot::method* const selected_method,
+                         const std::span<const java_arg> args) const noexcept
             -> value_t
         {
-            if (!this->method || !vmhook::hotspot::is_valid_pointer(this->method))
+            if (!selected_method || !vmhook::hotspot::is_valid_pointer(selected_method))
             {
-                VMHOOK_LOG("{} method_proxy::call(): method pointer is null or invalid.", vmhook::error_tag);
+                VMHOOK_LOG("{} method_proxy::call_packed(): method pointer is null or invalid.",
+                           vmhook::error_tag);
                 return value_t{ std::monostate{} };
             }
 
+            std::string selected_signature{ selected_method->get_signature() };
+            if (selected_signature.empty())
+            {
+                selected_signature = this->signature_text;
+            }
+
+            // Same cap and same layout as call(): 20 slots covers 8 arguments at
+            // two slots each plus a receiver.
+            constexpr std::size_t max_param_slots{ 20 };
+            std::intptr_t params[max_param_slots]{};
+            std::size_t   param_idx{ 0 };
+
+            if (args.size() > 8u)
+            {
+                VMHOOK_LOG("{} method_proxy::call_packed('{}{}'): {} arguments exceeds the 8 the "
+                           "interpreter locals[] array is sized for.",
+                           vmhook::error_tag, this->name(), selected_signature, args.size());
+                return value_t{ std::monostate{} };
+            }
+
+            // Receiver in locals[0] for an instance dispatch ONLY.  A static
+            // Method reached through an instance wrapper keeps this->object
+            // bound, and prepending it would shift every real argument down one
+            // slot and hand the callee the receiver as its first parameter.
+            if (this->object && !this->is_static())
+            {
+                params[param_idx++] = reinterpret_cast<std::intptr_t>(this->object);
+            }
+
+            for (const java_arg& argument : args)
+            {
+                const bool two_slots{ argument.type == java_arg::kind::long_
+                                      || argument.type == java_arg::kind::double_ };
+                if (param_idx + (two_slots ? 2u : 1u) > max_param_slots)
+                {
+                    VMHOOK_LOG("{} method_proxy::call_packed('{}{}'): argument list overflows the "
+                               "interpreter locals[] array; refusing rather than truncating.",
+                               vmhook::error_tag, this->name(), selected_signature);
+                    return value_t{ std::monostate{} };
+                }
+
+                switch (argument.type)
+                {
+                case java_arg::kind::boolean_:
+                case java_arg::kind::byte_:
+                case java_arg::kind::char_:
+                case java_arg::kind::short_:
+                case java_arg::kind::int_:
+                    params[param_idx++] = static_cast<std::intptr_t>(argument.integral);
+                    break;
+
+                case java_arg::kind::long_:
+                    params[param_idx++] = 0;   // low slot: ignored by the interpreter
+                    params[param_idx++] = static_cast<std::intptr_t>(argument.integral);
+                    break;
+
+                case java_arg::kind::float_:
+                {
+                    const float narrowed{ static_cast<float>(argument.floating) };
+                    std::uint32_t bits{ 0 };
+                    std::memcpy(&bits, &narrowed, sizeof(bits));
+                    params[param_idx++] = static_cast<std::intptr_t>(bits);
+                    break;
+                }
+
+                case java_arg::kind::double_:
+                {
+                    std::uint64_t bits{ 0 };
+                    std::memcpy(&bits, &argument.floating, sizeof(bits));
+                    params[param_idx++] = 0;
+                    params[param_idx++] = static_cast<std::intptr_t>(bits);
+                    break;
+                }
+
+                case java_arg::kind::object_:
+                    params[param_idx++] = reinterpret_cast<std::intptr_t>(argument.oop);
+                    break;
+
+                case java_arg::kind::string_:
+                {
+                    void* const string_oop{ vmhook::make_java_string(argument.text) };
+                    if (!string_oop)
+                    {
+                        VMHOOK_LOG("{} method_proxy::call_packed('{}{}'): failed to allocate a Java "
+                                   "String argument.",
+                                   vmhook::error_tag, this->name(), selected_signature);
+                    }
+                    params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
+                    break;
+                }
+                }
+            }
+
+            return this->invoke_packed(selected_method, selected_signature, params, param_idx);
+        }
+
+        /*
+            @brief Invokes a resolved Method with an ALREADY-PACKED locals array.
+            @details
+            The type-independent half of call().  Resolving the call stub, the
+            JavaThread transition, the JNIHandleBlock swap, the stub invocation
+            and the result decode all live here; the only things a caller has to
+            do for itself are SELECT the Method and LAY OUT the interpreter
+            locals.
+
+            Extracted so call() is not the only way in.  call() picks its
+            overload from C++ argument TYPES, which a caller holding runtime
+            values cannot do -- a script, a debugger UI, or an RPC that received
+            a descriptor and a list of strings knows the types only as data.
+            call_packed() below is that entry point, and both funnel through
+            this one body, so the delicate part has exactly one implementation
+            rather than a copy that drifts.
+
+            Declared BEFORE call() deliberately: GCC does first-phase lookup for
+            non-dependent names in a template body, so a member template calling
+            a member declared later in the class fails there.  The header already
+            works around the same rule three other times.
+
+            @param selected_method     Resolved Method* to invoke.
+            @param selected_signature  Its descriptor, for the return decode.
+            @param params              locals[] laid out per the JVM slot rules:
+                                       receiver first for an instance dispatch,
+                                       long/double values in the HIGH slot.
+            @param param_idx           Number of SLOTS used in params.
+            @return  Decoded result, or monostate on any refusal (all logged).
+
+            Complexity: O(1) plus the callee's own cost.
+            Exception safety: noexcept.
+        */
+        auto invoke_packed(vmhook::hotspot::method* const selected_method,
+                           const std::string& selected_signature,
+                           std::intptr_t* const params,
+                           const std::size_t param_idx) const noexcept
+            -> value_t
+        {
             // StubRoutines::_call_stub_entry is not a VMStructs entry on ANY JDK
             // (MEASURED on live 8 / 21 / 26; absent from jdk8u, jdk21u and jdk
             // master vmStructs.cpp alike) — find_call_stub_entry therefore derives
@@ -16478,20 +16946,6 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
-            vmhook::hotspot::method* const selected_method{ this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
-            if (!selected_method || !vmhook::hotspot::is_valid_pointer(selected_method))
-            {
-                VMHOOK_LOG("{} method_proxy::call('{}{}'): no resolvable Method* for the call.",
-                           vmhook::error_tag, this->name(), this->signature_text);
-                return value_t{ std::monostate{} };
-            }
-            std::string selected_signature{ selected_method->get_signature() };
-            if (selected_signature.empty())
-            {
-                // Unreadable descriptor (cold/relocated ConstMethod): keep the
-                // caller-supplied override, exactly as before.
-                selected_signature = this->signature_text;
-            }
 
             // Deliberately NO "no overload matches" fail-safe here: such a guard
             // was removed because signature_matches_arguments() false-negatives on
@@ -16550,175 +17004,6 @@ namespace vmhook
                                : 14 /* T_VOID: malformed/unknown return -> safe no-op */ };
 
             //  Parameter SLOT array
-            // The call_stub passes parameters[] to the interpreter as locals[].
-            // Each slot is an intptr_t: primitives are zero/sign-extended, object
-            // references are uncompressed decoded OOP pointers.
-            //
-            // A slot is NOT an argument.  'J' (long) and 'D' (double) occupy TWO
-            // slots each, with the value in the HIGHER-indexed one and the lower
-            // slot ignored — HotSpot's JNITypes::put_long does
-            // `*(jlong*)(to + pos + 1) = from; pos += 2;`, and it was measured
-            // directly on JDK 8 / 21 / 26 (value in slot 0 -> wrong result, value
-            // in slot 1 -> correct).  `size_of_parameters` passed to the stub is
-            // therefore the SLOT count, which is what param_idx counts.
-            // Capacity: 8 arguments (the compile-time cap below) x 2 slots + 1
-            // receiver slot = 17 worst case, so 20 can never overflow.
-            constexpr std::size_t max_param_slots{ 20 };
-            std::intptr_t params[max_param_slots]{};
-            std::size_t   param_idx{ 0 };
-
-            // Per-argument JVM descriptor letters of the CALLEE, which is what
-            // decides the slot layout (see parse_parameter_descriptors).  A
-            // malformed / unavailable descriptor yields a count of 0 and the
-            // packer falls back to sizing slots off the C++ argument type.
-            char        param_descriptors[max_param_slots]{};
-            const std::size_t param_descriptor_count{
-                vmhook::detail::parse_parameter_descriptors(selected_signature,
-                                                            param_descriptors,
-                                                            max_param_slots) };
-            std::size_t argument_index{ 0 };
-
-            // Instance methods receive 'this' as locals[0]; static methods take
-            // no receiver slot.  Omit the receiver when the proxy has no object
-            // OR the resolved Method is ACC_STATIC.  The is_static() clause
-            // matters because a static Method resolved through an
-            // INSTANCE wrapper (instance->get_method("staticX")) keeps the
-            // receiver bound in this->object, and prepending it here as locals[0]
-            // would shift every real argument down one slot and feed the
-            // interpreter the instance as the static method's first parameter.
-            // is_static() is noexcept (false if _access_flags is unresolvable) and
-            // reads the width-independent JVM_ACC_STATIC bit, so an instance method
-            // still takes the receiver slot byte-identically and a null-receiver
-            // static still omits it; only the static-via-instance case changes.
-            if (this->object && !this->is_static())
-            {
-                params[param_idx++] = reinterpret_cast<std::intptr_t>(this->object);
-            }
-
-            // [[maybe_unused]]: with zero call arguments the fold below
-            // `(pack(args), ...)` expands to nothing, so `pack` is legitimately
-            // never invoked — silence -Wunused-but-set-variable on that path.
-            [[maybe_unused]] auto pack = [&](auto&& a) noexcept
-                {
-                    using clean_t = std::remove_cvref_t<decltype(a)>;
-
-                    // The callee's descriptor letter for THIS argument ('\0' when
-                    // the descriptor could not be parsed).
-                    const char descriptor{
-                        argument_index < param_descriptor_count
-                            ? param_descriptors[argument_index]
-                            : '\0' };
-                    ++argument_index;
-
-                    // Two slots for J / D, value in the HIGH slot.  With no
-                    // descriptor, fall back to the C++ type: an 8-byte arithmetic
-                    // argument is a long or a double.
-                    const bool two_slots{
-                        descriptor == 'J' || descriptor == 'D'
-                        || (descriptor == '\0' && std::is_arithmetic_v<clean_t> && sizeof(clean_t) == 8) };
-
-                    if (param_idx + (two_slots ? 2u : 1u) > max_param_slots)
-                    {
-                        return;
-                    }
-                    if constexpr (std::is_same_v<clean_t, std::string>)
-                    {
-                        void* const string_oop{ vmhook::make_java_string(a) };
-                        if (!string_oop)
-                        {
-                            VMHOOK_LOG("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
-                        }
-                        params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
-                    }
-                    else if constexpr (std::is_same_v<clean_t, std::string_view>)
-                    {
-                        void* const string_oop{ vmhook::make_java_string(a) };
-                        if (!string_oop)
-                        {
-                            VMHOOK_LOG("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
-                        }
-                        params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
-                    }
-                    else if constexpr (std::is_same_v<clean_t, const char*> || std::is_same_v<clean_t, char*>)
-                    {
-                        void* const string_oop{ vmhook::make_java_string(a ? std::string_view{ a } : std::string_view{}) };
-                        if (!string_oop)
-                        {
-                            VMHOOK_LOG("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
-                        }
-                        params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
-                    }
-                    else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
-                    {
-                        using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
-                        if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
-                        {
-                            params[param_idx++] = reinterpret_cast<std::intptr_t>(a ? a->get_instance() : nullptr);
-                        }
-                    }
-                    else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
-                    {
-                        params[param_idx++] = reinterpret_cast<std::intptr_t>(a.get_instance());
-                    }
-                    else
-                    {
-                        static_assert(sizeof(clean_t) <= 8);
-                        std::intptr_t v{};
-                        if (two_slots)
-                        {
-                            // Widen to the JVM's 64-bit slot value FIRST, so an
-                            // `int` handed to a `J` parameter (or a `float` handed
-                            // to a `D`) reaches the interpreter as the value the
-                            // descriptor declares rather than as half of one.
-                            if (descriptor == 'D')
-                            {
-                                double d{};
-                                if constexpr (std::is_arithmetic_v<clean_t>)
-                                {
-                                    d = static_cast<double>(a);
-                                }
-                                else
-                                {
-                                    std::memcpy(&d, &a, sizeof(clean_t));
-                                }
-                                std::memcpy(&v, &d, sizeof(v));
-                            }
-                            else
-                            {
-                                std::int64_t l{};
-                                if constexpr (std::is_integral_v<clean_t>)
-                                {
-                                    l = static_cast<std::int64_t>(a);
-                                }
-                                else
-                                {
-                                    std::memcpy(&l, &a, sizeof(clean_t));
-                                }
-                                std::memcpy(&v, &l, sizeof(v));
-                            }
-                            params[param_idx++] = 0;   // low slot: ignored by the interpreter
-                            params[param_idx++] = v;   // HIGH slot carries the value
-                        }
-                        else
-                        {
-                            std::memcpy(&v, &a, sizeof(clean_t));
-                            params[param_idx++] = v;
-                        }
-                    }
-                };
-            // The interpreter locals[] slot array caps at max_param_slots entries,
-            // and the receiver consumes locals[0] for an instance dispatch, so the
-            // pack() guard above silently drops any argument past the cap.  Reject
-            // an over-cap arity at COMPILE time with a clear, slot-aware diagnostic
-            // anchored on the public call() entry, instead of letting those args
-            // vanish at runtime.
-            // It is a constant-expression check, so the warm 8-or-fewer path is
-            // byte-identical and no runtime code is emitted.
-            static_assert(sizeof...(args_t) <= 8,
-                          "method_proxy::call: max 8 arguments - the interpreter "
-                          "locals[] slot array is sized for 8 arguments (note: a "
-                          "long/double argument consumes two interpreter slots).");
-            (pack(std::forward<args_t>(args)), ...);
 
             //  Call the stub
             // Windows x64 calling convention  8 arguments:
@@ -17087,6 +17372,257 @@ namespace vmhook
                 return value_t{ vmhook::hotspot::encode_oop_pointer(result_oop) };
             }
             }
+        }
+
+        /*
+            @brief Invokes the Java method through HotSpot's own call stub.
+            @details
+            Pure VM: no JNI, no JVMTI.  The dispatch gate is
+            StubRoutines::_call_stub_entry, derived by
+            vmhook::detail::find_call_stub_entry(), and the call is made with a
+            synthetic JavaCallWrapper, a saved/cleared/restored JavaFrameAnchor
+            and a fresh JNIHandleBlock installed for the callee, so the GC, the
+            frame walker and the exception machinery all see a well-formed entry
+            frame -- and the caller's JNI locals never stop being GC roots.
+
+            Where this may be called from:
+              * INSIDE A HOOK DETOUR — the supported path.  The thread is a real
+                JavaThread already in _thread_in_Java, so no state manipulation
+                happens at all.  Nested invocation from a detour is exercised on
+                live JDK 8 / 21 / 26 including a full GC across two stacked
+                synthetic entry frames.
+              * From a JNI-native context on a JavaThread (_thread_in_native /
+                _thread_in_vm), where the thread state is flipped for the
+                duration.  HotSpot's real transition also polls the safepoint
+                mechanism, which is neither exported nor expressible through
+                VMStructs, so a safepoint armed inside that window is a narrow
+                but real race.
+              * Anywhere else — refused.  A thread that is not a JavaThread, or is
+                mid-transition / blocked, gets a logged monostate.
+
+            Arguments are packed into the interpreter's locals[] SLOT array off
+            the CALLEE's descriptor: one slot for Z B C S I F and references, two
+            for J and D with the value in the higher slot.
+
+            @return A value_t holding the decoded return value.  If the callee
+                    threw, the exception is cleared off the thread and the result
+                    carries value_t::exception_thrown / exception_class with a
+                    value-initialised payload — never the stub's garbage.
+                    A monostate result means void, or that the call was refused
+                    (every refusal is logged).
+
+            Complexity: O(arguments) plus the callee's own cost.
+            Exception safety: noexcept — every failure degrades to a logged
+                              monostate; no C++ exception crosses the stub.
+        */
+        template<typename... args_t>
+        auto call(args_t&&... args) const noexcept
+            -> value_t
+        {
+            if (!this->method || !vmhook::hotspot::is_valid_pointer(this->method))
+            {
+                VMHOOK_LOG("{} method_proxy::call(): method pointer is null or invalid.", vmhook::error_tag);
+                return value_t{ std::monostate{} };
+            }
+
+
+            // Cheap presence probe BEFORE any packing.  Packing a String argument
+            // ALLOCATES a Java object; doing that only to discover there is no
+            // dispatcher would strand it.  find_call_stub_entry() caches, so the
+            // authoritative resolve inside invoke_packed() costs nothing extra.
+            if (!vmhook::detail::find_call_stub_entry())
+            {
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): no call stub could be derived; "
+                           "invocation is unavailable on this VM.",
+                           vmhook::error_tag, this->name(), this->signature_text);
+                return value_t{ std::monostate{} };
+            }
+
+            vmhook::hotspot::method* const selected_method{ this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
+            if (!selected_method || !vmhook::hotspot::is_valid_pointer(selected_method))
+            {
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): no resolvable Method* for the call.",
+                           vmhook::error_tag, this->name(), this->signature_text);
+                return value_t{ std::monostate{} };
+            }
+            std::string selected_signature{ selected_method->get_signature() };
+            if (selected_signature.empty())
+            {
+                // Unreadable descriptor (cold/relocated ConstMethod): keep the
+                // caller-supplied override, exactly as before.
+                selected_signature = this->signature_text;
+            }
+            // The call_stub passes parameters[] to the interpreter as locals[].
+            // Each slot is an intptr_t: primitives are zero/sign-extended, object
+            // references are uncompressed decoded OOP pointers.
+            //
+            // A slot is NOT an argument.  'J' (long) and 'D' (double) occupy TWO
+            // slots each, with the value in the HIGHER-indexed one and the lower
+            // slot ignored — HotSpot's JNITypes::put_long does
+            // `*(jlong*)(to + pos + 1) = from; pos += 2;`, and it was measured
+            // directly on JDK 8 / 21 / 26 (value in slot 0 -> wrong result, value
+            // in slot 1 -> correct).  `size_of_parameters` passed to the stub is
+            // therefore the SLOT count, which is what param_idx counts.
+            // Capacity: 8 arguments (the compile-time cap below) x 2 slots + 1
+            // receiver slot = 17 worst case, so 20 can never overflow.
+            constexpr std::size_t max_param_slots{ 20 };
+            std::intptr_t params[max_param_slots]{};
+            std::size_t   param_idx{ 0 };
+
+            // Per-argument JVM descriptor letters of the CALLEE, which is what
+            // decides the slot layout (see parse_parameter_descriptors).  A
+            // malformed / unavailable descriptor yields a count of 0 and the
+            // packer falls back to sizing slots off the C++ argument type.
+            char        param_descriptors[max_param_slots]{};
+            const std::size_t param_descriptor_count{
+                vmhook::detail::parse_parameter_descriptors(selected_signature,
+                                                            param_descriptors,
+                                                            max_param_slots) };
+            std::size_t argument_index{ 0 };
+
+            // Instance methods receive 'this' as locals[0]; static methods take
+            // no receiver slot.  Omit the receiver when the proxy has no object
+            // OR the resolved Method is ACC_STATIC.  The is_static() clause
+            // matters because a static Method resolved through an
+            // INSTANCE wrapper (instance->get_method("staticX")) keeps the
+            // receiver bound in this->object, and prepending it here as locals[0]
+            // would shift every real argument down one slot and feed the
+            // interpreter the instance as the static method's first parameter.
+            // is_static() is noexcept (false if _access_flags is unresolvable) and
+            // reads the width-independent JVM_ACC_STATIC bit, so an instance method
+            // still takes the receiver slot byte-identically and a null-receiver
+            // static still omits it; only the static-via-instance case changes.
+            if (this->object && !this->is_static())
+            {
+                params[param_idx++] = reinterpret_cast<std::intptr_t>(this->object);
+            }
+
+            // [[maybe_unused]]: with zero call arguments the fold below
+            // `(pack(args), ...)` expands to nothing, so `pack` is legitimately
+            // never invoked — silence -Wunused-but-set-variable on that path.
+            [[maybe_unused]] auto pack = [&](auto&& a) noexcept
+                {
+                    using clean_t = std::remove_cvref_t<decltype(a)>;
+
+                    // The callee's descriptor letter for THIS argument ('\0' when
+                    // the descriptor could not be parsed).
+                    const char descriptor{
+                        argument_index < param_descriptor_count
+                            ? param_descriptors[argument_index]
+                            : '\0' };
+                    ++argument_index;
+
+                    // Two slots for J / D, value in the HIGH slot.  With no
+                    // descriptor, fall back to the C++ type: an 8-byte arithmetic
+                    // argument is a long or a double.
+                    const bool two_slots{
+                        descriptor == 'J' || descriptor == 'D'
+                        || (descriptor == '\0' && std::is_arithmetic_v<clean_t> && sizeof(clean_t) == 8) };
+
+                    if (param_idx + (two_slots ? 2u : 1u) > max_param_slots)
+                    {
+                        return;
+                    }
+                    if constexpr (std::is_same_v<clean_t, std::string>)
+                    {
+                        void* const string_oop{ vmhook::make_java_string(a) };
+                        if (!string_oop)
+                        {
+                            VMHOOK_LOG("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
+                        }
+                        params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
+                    }
+                    else if constexpr (std::is_same_v<clean_t, std::string_view>)
+                    {
+                        void* const string_oop{ vmhook::make_java_string(a) };
+                        if (!string_oop)
+                        {
+                            VMHOOK_LOG("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
+                        }
+                        params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
+                    }
+                    else if constexpr (std::is_same_v<clean_t, const char*> || std::is_same_v<clean_t, char*>)
+                    {
+                        void* const string_oop{ vmhook::make_java_string(a ? std::string_view{ a } : std::string_view{}) };
+                        if (!string_oop)
+                        {
+                            VMHOOK_LOG("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
+                        }
+                        params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
+                    }
+                    else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
+                    {
+                        using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
+                        if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
+                        {
+                            params[param_idx++] = reinterpret_cast<std::intptr_t>(a ? a->get_instance() : nullptr);
+                        }
+                    }
+                    else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
+                    {
+                        params[param_idx++] = reinterpret_cast<std::intptr_t>(a.get_instance());
+                    }
+                    else
+                    {
+                        static_assert(sizeof(clean_t) <= 8);
+                        std::intptr_t v{};
+                        if (two_slots)
+                        {
+                            // Widen to the JVM's 64-bit slot value FIRST, so an
+                            // `int` handed to a `J` parameter (or a `float` handed
+                            // to a `D`) reaches the interpreter as the value the
+                            // descriptor declares rather than as half of one.
+                            if (descriptor == 'D')
+                            {
+                                double d{};
+                                if constexpr (std::is_arithmetic_v<clean_t>)
+                                {
+                                    d = static_cast<double>(a);
+                                }
+                                else
+                                {
+                                    std::memcpy(&d, &a, sizeof(clean_t));
+                                }
+                                std::memcpy(&v, &d, sizeof(v));
+                            }
+                            else
+                            {
+                                std::int64_t l{};
+                                if constexpr (std::is_integral_v<clean_t>)
+                                {
+                                    l = static_cast<std::int64_t>(a);
+                                }
+                                else
+                                {
+                                    std::memcpy(&l, &a, sizeof(clean_t));
+                                }
+                                std::memcpy(&v, &l, sizeof(v));
+                            }
+                            params[param_idx++] = 0;   // low slot: ignored by the interpreter
+                            params[param_idx++] = v;   // HIGH slot carries the value
+                        }
+                        else
+                        {
+                            std::memcpy(&v, &a, sizeof(clean_t));
+                            params[param_idx++] = v;
+                        }
+                    }
+                };
+            // The interpreter locals[] slot array caps at max_param_slots entries,
+            // and the receiver consumes locals[0] for an instance dispatch, so the
+            // pack() guard above silently drops any argument past the cap.  Reject
+            // an over-cap arity at COMPILE time with a clear, slot-aware diagnostic
+            // anchored on the public call() entry, instead of letting those args
+            // vanish at runtime.
+            // It is a constant-expression check, so the warm 8-or-fewer path is
+            // byte-identical and no runtime code is emitted.
+            static_assert(sizeof...(args_t) <= 8,
+                          "method_proxy::call: max 8 arguments - the interpreter "
+                          "locals[] slot array is sized for 8 arguments (note: a "
+                          "long/double argument consumes two interpreter slots).");
+            (pack(std::forward<args_t>(args)), ...);
+
+            return this->invoke_packed(selected_method, selected_signature, params, param_idx);
         }
 
         /*
@@ -17664,7 +18200,7 @@ namespace vmhook
                 auto get_timeout()  -> int { return static_cast<int>(get_field("timeout")->get()); }
 
                 // Static field - get_field resolves through the registered class.
-                static auto get_version() -> std::string { return get_field("VERSION")->get(); }
+                inline auto get_version() -> std::string { return get_field("VERSION")->get(); }
 
                 // Writing a field
                 auto set_health(int hp) -> void { get_field("health")->set(hp); }
@@ -18759,7 +19295,7 @@ namespace vmhook
                 auto get_health()       -> int { return get_field("health")->get(); }
 
                 // Portable static accessor (works on MSVC, Clang, GCC):
-                static auto get_count() -> int { return static_field("entityCount")->get(); }
+                inline auto get_count() -> int { return static_field("entityCount")->get(); }
 
                 // MSVC/Clang only — deducing-this resolves to the static fallback:
                 // static auto get_count() -> int { return get_field("entityCount")->get(); }
@@ -21604,7 +22140,7 @@ namespace vmhook
         // drops the stale callback lists, so the first on_class_loaded() /
         // on_exception() AFTER a shutdown_hooks() re-installs a live detour
         // instead of trusting a latch left true while the detour was torn down.
-        static auto reset_watcher_latches() noexcept -> void
+        inline auto reset_watcher_latches() noexcept -> void
         {
             {
                 std::lock_guard<std::mutex> guard{ class_load_mutex };
@@ -23105,10 +23641,20 @@ namespace vmhook
             {
             }
 
-            access(const access&)                    = delete;
-            access(access&&)                         = delete;
-            auto operator=(const access&) -> access& = delete;
-            auto operator=(access&&) -> access&      = delete;
+            // Axiom: an access binds its wrapper for ONE expression.  Making it
+            // immovable is what turns "do not hoist this" from a comment into a
+            // compile error -- a hoisted access outlives the resolve that
+            // produced it and reads a possibly-relocated object.
+            access(const access&) VMHOOK_DELETED(
+                "an access proxy is bound for ONE expression and cannot be stored.  "
+                "Keep the ref or borrowed it came from, and re-bind at each use.");
+            access(access&&) VMHOOK_DELETED(
+                "an access proxy is bound for ONE expression and cannot be stored.  "
+                "Keep the ref or borrowed it came from, and re-bind at each use.");
+            auto operator=(const access&) -> access& VMHOOK_DELETED(
+                "an access proxy is bound for ONE expression and cannot be reseated.");
+            auto operator=(access&&) -> access& VMHOOK_DELETED(
+                "an access proxy is bound for ONE expression and cannot be reseated.");
             ~access()                                = default;
 
             auto operator->() noexcept
@@ -23827,10 +24373,17 @@ namespace vmhook
         {
         }
 
-        root(const root&)                    = delete;
-        root(root&&)                         = delete;
-        auto operator=(const root&) -> root& = delete;
-        auto operator=(root&&) -> root&      = delete;
+        root(const root&) VMHOOK_DELETED(
+            "a root IS the anchor every ref beneath it resolves through, so it has "
+            "to stay put.  Hold it where it lives (a static, a member) and hand out "
+            "refs anchored on it.");
+        root(root&&) VMHOOK_DELETED(
+            "a root IS the anchor every ref beneath it resolves through, so it has "
+            "to stay put.  Hold it where it lives and hand out refs anchored on it.");
+        auto operator=(const root&) -> root& VMHOOK_DELETED(
+            "a root cannot be reseated; construct the one you want.");
+        auto operator=(root&&) -> root& VMHOOK_DELETED(
+            "a root cannot be reseated; construct the one you want.");
         ~root()                              = default;
 
         /*
@@ -24518,8 +25071,13 @@ namespace vmhook
 
         ~oop_pin() noexcept = default;
 
-        oop_pin(const oop_pin&)                    = delete;
-        auto operator=(const oop_pin&) -> oop_pin& = delete;
+        oop_pin(const oop_pin&) VMHOOK_DELETED(
+            "an oop_pin carries the collection epoch its address was captured in.  "
+            "Copying it would duplicate that stamp and let a stale copy outlive the "
+            "check.  Move it, or take a fresh pin.");
+        auto operator=(const oop_pin&) -> oop_pin& VMHOOK_DELETED(
+            "an oop_pin carries the collection epoch its address was captured in; "
+            "copying it would duplicate that stamp.  Move it instead.");
 
         oop_pin(oop_pin&& other) noexcept
             : oop_{ other.oop_ }

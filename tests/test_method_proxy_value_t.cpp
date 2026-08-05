@@ -9,7 +9,7 @@
 //     no VMStructs: it returns nullptr instead of crashing, see vmhook.hpp:4229
 //     and 4280-4283).
 // Anything that needs a live oop or a running JVM (method_proxy::call(),
-// call_jni(), real String/object/array decode, slot dispatch) is OUT OF SCOPE
+// the call stub, real String/object/array decode, slot dispatch) is OUT OF SCOPE
 // here and is covered by JVM integration in example.cpp.
 //
 // value_t alternatives (vmhook.hpp:11519-11531):
@@ -1016,7 +1016,7 @@ int main()
     // The earlier blocks only ever assert the *converted-out* value of a freshly
     // brace-initialised temporary; none of them pin which variant slot is live,
     // nor that value_t survives being copied / moved / reassigned (the holder is
-    // handed around by call()/call_jni() return, stored, and re-bound by callers).
+    // handed around by call()/the call stub return, stored, and re-bound by callers).
     // value_t is an aggregate over a single std::variant, so it inherits the
     // variant's regular-type semantics; these checks lock that contract in.
     // =========================================================================

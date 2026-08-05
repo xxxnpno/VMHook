@@ -1417,7 +1417,7 @@ static auto run_runtime_noop_checks() -> void
     }
 
     // --- method_proxy over a null owner + null method pointer: every accessor
-    // is a safe default and call()/call_jni() yield a void (monostate) value_t,
+    // is a safe default and call()/the call stub yield a void (monostate) value_t,
     // never dereferencing.  (Constructed directly so the test does not depend
     // on object_base::get_method resolution.)
     {

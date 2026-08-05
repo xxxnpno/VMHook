@@ -43,7 +43,7 @@
 // _call_stub_entry when present (JDK 8-20), where a non-String reference return
 // is stored as a real compressed OOP (encode_oop_pointer, vmhook.hpp ~15955).
 // On JDK 21+ that VMStruct is absent (and CI exercises NO JDK that exports it),
-// so call() falls back to call_jni(); its 'L'/'[' branch (vmhook.hpp ~15660-15666)
+// so call() falls back to the call stub; its 'L'/'[' branch (vmhook.hpp ~15660-15666)
 // now DECODES the JNI local-ref handle to the underlying heap OOP
 // (jni_decode_object), re-encodes it (encode_oop_pointer), and DeleteLocalRef's
 // the handle AFTER the decode — so a non-null reference return round-trips into a

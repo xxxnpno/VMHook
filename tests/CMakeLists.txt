@@ -232,3 +232,12 @@ vmhook_add_test(anchored_ref_identity_nojvm    SOURCES test_anchored_ref_identit
 # silently reads the wrong slot — so it is pinned at compile time against
 # argument lists that interleave borrows with long/double.
 vmhook_add_test(borrowed_detour_arg_nojvm      SOURCES test_borrowed_detour_arg_nojvm.cpp)
+
+# The modern-C++ surface added in v0.6.0: COMPILE-TIME descriptors
+# (descriptor_of / descriptor_for), std::expected-based try_* error reporting,
+# the runtime-typed call path (java_arg / call_packed), the C++26 feature gates,
+# and the handle-returning allocation helpers.  Most of the descriptor contract
+# is static_asserted -- these are compile-time constants, so a runtime check
+# would be strictly weaker -- and the rest verifies the cold path degrades to an
+# honest empty/error rather than to a plausible wrong answer.
+vmhook_add_test(modern_cpp_surface_nojvm       SOURCES test_modern_cpp_surface_nojvm.cpp)

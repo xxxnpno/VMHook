@@ -5,7 +5,7 @@
 //   * value_t + its templated conversion operator  : 11956-12111
 //   * call() interpreter fast path + result decode  : 12726-12938
 //       - primitive decode switch                   : 12889-12937
-//   * call_jni() JNI fallback + per-type slots      : 12141-12695
+//   * the call stub JNI fallback + per-type slots      : 12141-12695
 //       - primitive dispatch slots                  : 12564-12643
 //   * sig_char_to_basic_type (return BasicType id)  : 11877-11894
 //

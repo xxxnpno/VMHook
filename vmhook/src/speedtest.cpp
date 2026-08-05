@@ -1,9 +1,12 @@
 // speedtest.cpp — pure-JNI vs vmhook microbench.
 //
-// Built only when CMake's find_package(JNI) succeeded.  vmhook.hpp itself
-// stays jni-header-free; the JNI side lives here in its own translation
-// unit and reuses the JNIEnv* that vmhook::hotspot::current_jni_env
-// stores after attach_current_native_thread().
+// Built only when CMake's find_package(JNI) succeeded.
+//
+// This is the ONE file in the project that includes <jni.h>, and deliberately
+// so: JNI is the BASELINE being measured, not a dependency.  Deleting it to
+// claim "zero JNI" would delete the measurement that shows the pure-VM path is
+// worth having.  vmhook.hpp itself is JNI-free and no longer caches a JNIEnv,
+// so this TU resolves JNI_GetCreatedJavaVMs and obtains its own.
 //
 // The bench calls vmhook/fixtures/MethodStatic.sEchoInt(int) in a tight loop
 // through three paths:

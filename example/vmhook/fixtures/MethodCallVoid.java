@@ -466,7 +466,7 @@ public final class MethodCallVoid extends MethodCallVoidBase
     // 'J','F','D', and a 'Ljava/lang/String;' reference), so the native side
     // can prove is_void() is false for ALL of them and is_string() is true for
     // exactly the String one.  Each returns a distinct, exactly-representable
-    // sentinel so the decoded value is path-independent (call_stub == call_jni).
+    // sentinel so the decoded value is path-independent (a single dispatch path).
     public boolean retBool()   { return true; }
     public byte    retByte()   { return (byte)  -128;   }   // Byte.MIN_VALUE
     public short   retShort()  { return (short) -32768; }   // Short.MIN_VALUE

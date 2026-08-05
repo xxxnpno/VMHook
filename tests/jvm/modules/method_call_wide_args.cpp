@@ -21,7 +21,7 @@
 //     so a long/double fills ALL 8 bytes of ONE slot (the zero-init guarantees a
 //     narrow arg leaves no stale high bits), and the hand-written stub expands
 //     wide values into interpreter locals.  param_idx counts ONE per C++ arg.
-//   * call_jni() fallback: write_jni_arg_to_slot (10200-10273) zeroes the union
+//   * the call stub fallback: write_jni_arg_to_slot (10200-10273) zeroes the union
 //     cell (value.j = 0) then sets value.j for a 64-bit integral / value.d for a
 //     double; JNI's Call*MethodA expands the jvalue into the two locals.
 //   * overload selection: resolve_compatible_method<args_t...> (13781-13869) maps

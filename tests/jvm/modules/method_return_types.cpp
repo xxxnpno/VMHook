@@ -1781,7 +1781,7 @@ namespace
         //  3a-quinquies. batch-19 deepening (hard-asserted, path-independent).  All
         //      of these decode primitives / void / std::string alternatives, whose
         //      width/sign/alternative-routing is independent of compressed-oops, so
-        //      they hold on BOTH the call_stub and the call_jni dispatch paths.
+        //      they hold on the call_stub dispatch paths.
         // =====================================================================
         // Widened signed extremes: a narrow MIN/MAX read into a wider int sign-extends
         // across the full width (a single mis-masked high bit would show).  byte MIN

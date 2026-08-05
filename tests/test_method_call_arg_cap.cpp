@@ -11,7 +11,7 @@
 //                   "method_proxy::call: max 8 arguments ...");
 //
 // placed just before the pack() fold, mirroring the static_assert the JNI
-// fallback call_jni() already carries.  Because it is a constant-expression
+// fallback the call stub already carries.  Because it is a constant-expression
 // check the warm <=8-arg path is byte-identical and no runtime code is emitted.
 //
 // WHY A static_assert AND NOT A RUNTIME LOG: call() always references

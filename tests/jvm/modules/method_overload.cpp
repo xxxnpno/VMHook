@@ -16,7 +16,7 @@
 //   * signature_matches_arguments<...>(sig)  : 13258-13282  (whole param list)
 //   * resolve_compatible_method<...>()       : 13303-13345  (the picker)
 //   * call() picks via resolve + dispatches  : 12726-12938  (call_stub fast path)
-//   * call_jni() picks via resolve + JNI     : 12141-12695  (JDK21+ fallback)
+//   * the call stub picks via resolve + JNI     : 12141-12695  (JDK21+ fallback)
 //   * get_method("name")  (FIRST by name)    : 13626-13662
 //   * get_method("name","sig")  (exact)      : 13678-13720
 //   * static_method("name") / (...,"sig")    : 14026-14039 -> object_base 13735 / 13788

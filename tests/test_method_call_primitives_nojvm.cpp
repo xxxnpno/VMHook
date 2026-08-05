@@ -193,7 +193,7 @@ static auto run_cold_call_returns_t_default() -> void
     // pointer is null - call() short-circuits at the top with the monostate
     // value_t.  Variant index 0 == monostate.
     //
-    // We pass NO live JavaThread / NO HotSpot, so call_jni()'s env probe
+    // We pass NO live JavaThread / NO HotSpot, so the call stub's env probe
     // (the other early-out) would also hit, but the method-null check fires
     // FIRST and is the contract we want to pin.
     {

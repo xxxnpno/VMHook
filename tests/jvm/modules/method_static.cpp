@@ -12,7 +12,7 @@
 //   * method_proxy::is_static()          (reads JVM_ACC_STATIC from the live Method)
 //   * method_proxy::get_compressed_oop() (receiver OOP; 0 when object==nullptr)
 //   * method_proxy::call()      (interpreter call-stub fast path + return decode)
-//   * method_proxy::call_jni()  (JNI fallback; is_static_call = object==nullptr || is_static();
+//   * method_proxy::invoke_packed()  (removed in v0.6.0; is_static_call = object==nullptr || is_static();
 //        static JNI dispatch slots 116/119/122/125/128/131/134/137/140/143)
 //   * value_t::is_void() / is_string() / as_string()
 //   * vmhook::array_length / get_array_element (array-return element walks)
@@ -828,7 +828,7 @@ namespace
             // through the library's make_java_array (the canonical native-array
             // path, mirrors method_overload), wrap the oop, and pass it to
             // sArrayLen(int[]).  An object/array ARGUMENT is sent as a raw oop and
-            // consumed correctly on BOTH the call_stub and call_jni paths (only
+            // consumed correctly on the call_stub path (only
             // object RETURNS are call-path dependent), so this is hard-asserted —
             // guarded only on allocation success (never faults, never false-fails).
             {
@@ -1212,7 +1212,7 @@ namespace
         //  mstat4_* — DEEPER INPUT COVERAGE (all path-INDEPENDENT, HARD).
         //  Every call below returns a primitive / int / String or only probes a
         //  resolution / is_static() / get_compressed_oop() accessor, so the
-        //  capture is bit-identical on the call_stub and call_jni paths.  Every
+        //  capture is bit-identical on the call_stub path.  Every
         //  fixture method used here already exists.
         // ##################################################################
 

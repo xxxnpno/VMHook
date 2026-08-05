@@ -20,7 +20,7 @@
 //   * method_proxy::is_static() (reads JVM_ACC_STATIC live)            : 13352-13363
 //   * method_proxy::get_compressed_oop() (receiver OOP, 0 for static)  : 13397-13407
 //   * method_proxy::call()  (call_stub fast path + decode)             : 13095-13313
-//   * method_proxy::call_jni()  (CallStatic<T>MethodA slots 116..143)  : 12489-12695
+//   * method_proxy::invoke_packed()  (CallStatic<T>MethodA slots 116..143)  : 12489-12695
 //   * value_t::as_string()/is_string()/is_void()                      : 12410-12455
 //
 // WHAT THIS MODULE PROVES (the static-portability contract), each as ctx.check():

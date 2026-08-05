@@ -9,7 +9,7 @@ import vmhook.Harness;
  * HISTORY, because it explains the shape of this file.  It was written as
  * MethodCallJni, to drive a SECOND dispatcher: call() probed
  * detail::find_call_stub_entry(), and when the entry was absent it
- * short-circuited into call_jni(), which marshalled args into a jvalue[] and
+ * short-circuited into the call stub, which marshalled args into a jvalue[] and
  * dispatched via Call(Static)?&lt;Type&gt;MethodA.  The fixture was built on the
  * belief that the entry is absent on JDK 21+, so CI naturally drove that path.
  *

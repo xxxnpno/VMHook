@@ -411,7 +411,7 @@ namespace
 
     // Contrast-return sentinels -- must match the fixture's ret* bodies exactly.
     // All exactly representable so the decoded value is byte-identical on the
-    // call_stub and call_jni paths.
+    // call_stub paths.
     constexpr bool          k_ret_bool   = true;
     constexpr std::int8_t   k_ret_byte   = static_cast<std::int8_t>(-128);    // Byte.MIN
     constexpr std::int16_t  k_ret_short  = static_cast<std::int16_t>(-32768); // Short.MIN
@@ -1079,7 +1079,7 @@ VMHOOK_JVM_MODULE(method_call_return_void)
         ctx.check("mcrv_void_string_called", method_call_void::string_arg_called());
         // The String must have been delivered non-null with the exact length.
         // (k_string_arg is pure ASCII, so its String.length() equals its byte
-        // count identically on the call_stub and call_jni argument paths.)
+        // count identically on the call_stub argument paths.)
         ctx.check("mcrv_void_string_non_null", method_call_void::string_arg_len() >= 0);
         ctx.check("mcrv_void_string_len_exact",
                   static_cast<std::size_t>(method_call_void::string_arg_len())

@@ -101,6 +101,17 @@ option(VMHOOK_BUILD_TESTS    "Build the standalone unit-test suite (no JVM neede
 option(VMHOOK_WARNINGS_AS_ERRORS "Treat warnings as errors for first-party code"
        OFF)
 
+# The C++20 named-module interface (vmhook.ixx), letting consumers write
+# `import vmhook;` instead of including the 24k-line header in every TU.
+#
+# OFF by default, and deliberately so: building a named module needs CMake 3.28+,
+# a generator that scans for module dependencies (Ninja or VS), and a toolchain
+# whose module support is solid.  None of that is required to USE vmhook -- the
+# header remains the primary interface and the module is a thin re-export of it
+# -- so making it opt-in keeps every existing consumer and CI cell unaffected.
+option(VMHOOK_BUILD_MODULE   "Build the C++20 named module (import vmhook;)"
+       OFF)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT GENERATOR_IS_MULTI_CONFIG)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build configuration" FORCE)
 endif()
@@ -179,6 +190,37 @@ function(vmhook_apply_warnings target)
         endif()
     endif()
 endfunction()
+
+# ---------------------------------------------------------------------------
+# Optional: the C++20 named module.
+#
+# `vmhook_module` is a real library target whose sole source is a CXX_MODULES
+# file set holding vmhook.ixx.  It links the INTERFACE header target, because
+# the module's global module fragment includes vmhook.hpp -- the module does not
+# duplicate the library, it re-exports it.
+#
+# Requires CMake 3.28+ for stable CXX_MODULES support.  We check rather than
+# raise the project-wide minimum, so a consumer on an older CMake still gets the
+# header-only library and simply cannot opt into the module.
+# ---------------------------------------------------------------------------
+if(VMHOOK_BUILD_MODULE)
+    if(CMAKE_VERSION VERSION_LESS "3.28")
+        message(WARNING
+            "VMHOOK_BUILD_MODULE requires CMake 3.28+ for C++20 module support "
+            "(found ${CMAKE_VERSION}); skipping the module target.  The "
+            "header-only vmhook::vmhook target is unaffected.")
+    else()
+        add_library(vmhook_module)
+        add_library(vmhook::module ALIAS vmhook_module)
+        target_sources(vmhook_module
+            PUBLIC FILE_SET CXX_MODULES FILES
+                "${CMAKE_CURRENT_SOURCE_DIR}/vmhook/ext/vmhook/vmhook.ixx")
+        target_link_libraries(vmhook_module PUBLIC vmhook::vmhook)
+        target_compile_features(vmhook_module PUBLIC cxx_std_23)
+        set_target_properties(vmhook_module PROPERTIES CXX_SCAN_FOR_MODULES ON)
+        vmhook_apply_warnings(vmhook_module)
+    endif()
+endif()
 
 # ── Self-contained MinGW binaries ───────────────────────────────────────────
 # Statically link the GCC / libstdc++ / winpthread runtime into MinGW-built

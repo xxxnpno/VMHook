@@ -61,7 +61,6 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <jni.h>
 
 #include <algorithm>
 #include <atomic>
@@ -87,109 +86,156 @@ namespace
 
     // ── running Java from the native serve thread, SAFELY ─────────────────────
     // method_proxy::call() and make_java_string() only work on a real JavaThread
-    // that is *inside an interpreter detour* — that is the library's documented
-    // contract (current_java_thread set, a valid last_Java_frame anchor, a
-    // safepoint-safe transition).  Calling the raw call_stub from a plain attached
-    // thread crashes the VM (no anchor -> a GC stack-walk faults).
+    // that is *inside an interpreter detour* — the library's documented contract
+    // (current_java_thread set, a valid last_Java_frame anchor, a safepoint-safe
+    // transition).  Calling the raw call stub from a plain native thread crashes
+    // the VM (no anchor -> a GC stack-walk faults).
     //
-    // So we (1) promote the serve thread to a JavaThread via the JVM's own JNI
-    // (AttachCurrentThreadAsDaemon — the only safe native->Java entry, it sets up
-    // all the machinery), and (2) run every VM-executing task INSIDE a hook detour
-    // by hooking a tiny static JDK method (java.lang.Runtime.getRuntime) and
-    // firing it with a real JNI call.  The detour runs on a genuine JavaThread in
-    // a valid Java context, so the queued task (a method call, or a String alloc)
-    // executes on the proven path.  The hook is gated by a pending-task flag, so
-    // any collateral getRuntime() caller just no-ops.
+    // THE PUMP.  So we do not enter Java from native at all.  We hook methods the
+    // JVM's own threads already call, and let the detour drain a work queue:
+    //
+    //     serve thread            some Java thread
+    //     ------------            ----------------
+    //     enqueue(task)   ---->   ...calls Thread.currentThread()...
+    //     wait                    detour fires, dequeues, RUNS THE TASK on a
+    //                             genuine JavaThread inside a valid Java frame
+    //     <-- signalled            signals completion
+    //
+    // This is why the payload no longer needs <jni.h>.  The previous design
+    // attached the serve thread with AttachCurrentThreadAsDaemon and then FIRED
+    // the detour with a JNI CallStaticObjectMethod — JNI used purely as a
+    // doorbell.  The doorbell is unnecessary: a running JVM rings it constantly
+    // on its own.  What we pay instead is latency — the task runs on the next
+    // natural call to one of the pump methods rather than immediately — and a
+    // viewer does not care.
+    //
+    // WHY SEVERAL PUMP METHODS.  Any single choice is a bet on the target app's
+    // behaviour.  Thread.currentThread() and System.nanoTime() are called by
+    // essentially every non-trivial workload (and by the JDK's own machinery);
+    // Object.hashCode() and Runtime.getRuntime() are the backstops.  We install
+    // on all of them and any one firing drains the queue, so an idle-ish app is
+    // far less likely to leave a task stranded than with a single hook.
+    //
+    // The detour body is deliberately trivial and gated on a pending-task flag,
+    // so the overwhelmingly common case — a collateral caller with no work
+    // queued — is one relaxed atomic load and a return.
 
-    JavaVM*                g_jvm{ nullptr };
-    std::once_flag         g_jvm_once;
-    thread_local JNIEnv*   t_env{ nullptr };
-
-    auto ensure_java_attached() -> JNIEnv*
+    struct pump_target
     {
-        if (t_env) { return t_env; }
-        std::call_once(g_jvm_once, []
-        {
-            HMODULE jvm{ GetModuleHandleW(L"jvm.dll") };
-            if (!jvm) { return; }
-            using get_created_fn = jint (JNICALL*)(JavaVM**, jsize, jsize*);
-            auto* const get_created{ reinterpret_cast<get_created_fn>(
-                reinterpret_cast<void*>(GetProcAddress(jvm, "JNI_GetCreatedJavaVMs"))) };
-            if (!get_created) { return; }
-            JavaVM* vm{ nullptr };
-            jsize   count{ 0 };
-            if (get_created(&vm, 1, &count) == JNI_OK && count > 0 && vm) { g_jvm = vm; }
-        });
-        if (!g_jvm) { return nullptr; }
-        JNIEnv* env{ nullptr };
-        if (g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK && env) { t_env = env; return env; }
-        JavaVMAttachArgs args{ JNI_VERSION_1_6, const_cast<char*>("vmhook-viewer"), nullptr };
-        if (g_jvm->AttachCurrentThreadAsDaemon(reinterpret_cast<void**>(&env), &args) == JNI_OK && env) { t_env = env; return env; }
-        return nullptr;
-    }
-
-    // Wrapper so vmhook::hook can target java.lang.Runtime.getRuntime() — our
-    // detour trigger.  Not otherwise used.
-    class runtime_trigger : public vmhook::object<runtime_trigger>
-    {
-    public:
-        explicit runtime_trigger(vmhook::oop_t o) noexcept : vmhook::object<runtime_trigger>{ o } {}
+        const char* class_name;
+        const char* method_name;
+        const char* descriptor;
     };
+
+    // Ordered most- to least-frequently-called in a typical workload.
+    constexpr pump_target k_pump_targets[]{
+        { "java/lang/Thread", "currentThread", "()Ljava/lang/Thread;" },
+        { "java/lang/System", "nanoTime",      "()J"                  },
+        { "java/lang/System", "currentTimeMillis", "()J"              },
+        { "java/lang/Object", "hashCode",      "()I"                  },
+        { "java/lang/Runtime", "getRuntime",   "()Ljava/lang/Runtime;" },
+    };
+
+    // One wrapper per pump class.  vmhook::hook<T> keys the target class off the
+    // registered wrapper type, so each distinct class needs its own type.
+    class pump_thread  : public vmhook::object<pump_thread>
+    { public: explicit pump_thread(vmhook::oop_t o) noexcept  : vmhook::object<pump_thread>{ o } {} };
+    class pump_system  : public vmhook::object<pump_system>
+    { public: explicit pump_system(vmhook::oop_t o) noexcept  : vmhook::object<pump_system>{ o } {} };
+    class pump_object  : public vmhook::object<pump_object>
+    { public: explicit pump_object(vmhook::oop_t o) noexcept  : vmhook::object<pump_object>{ o } {} };
+    class pump_runtime : public vmhook::object<pump_runtime>
+    { public: explicit pump_runtime(vmhook::oop_t o) noexcept : vmhook::object<pump_runtime>{ o } {} };
 
     std::mutex                          g_task_mtx;
     std::condition_variable             g_task_cv;
     std::function<void()>               g_task;
     std::atomic<bool>                   g_task_pending{ false };
     bool                                g_task_done{ false };  // guarded by g_task_mtx
-    std::optional<vmhook::hook_handle>  g_trigger_hook;
-    std::once_flag                      g_trigger_once;
-    bool                                g_trigger_ok{ false };
+    std::vector<vmhook::hook_handle>    g_pump_hooks;
+    std::once_flag                      g_pump_once;
+    std::atomic<int>                    g_pump_installed{ 0 };
 
-    void ensure_trigger_hook()
+    // Drain one queued task.  Runs INSIDE a detour, on a real JavaThread, in a
+    // valid Java frame — the only context where call() / make_java_string() are
+    // defined to work.
+    void drain_one_task() noexcept
     {
-        std::call_once(g_trigger_once, []
+        if (!g_task_pending.load(std::memory_order_relaxed))
         {
-            if (vmhook::type_to_class_map.find(std::type_index{ typeid(runtime_trigger) }) == vmhook::type_to_class_map.end())
-            {
-                vmhook::register_class<runtime_trigger>("java/lang/Runtime");
-            }
-            // getRuntime() is hot/JIT-compiled; deopt so our i2i detour fires.
-            vmhook::deoptimize_methods_if([](const std::string& cn, vmhook::hotspot::method* m)
-            { return cn == "java/lang/Runtime" && m && m->get_name() == "getRuntime"; });
+            return;   // the common case: a collateral caller, no work queued
+        }
+        std::function<void()> job;
+        {
+            std::lock_guard<std::mutex> lk{ g_task_mtx };
+            if (!g_task_pending.load()) { return; }
+            job = std::move(g_task);
+            g_task = nullptr;
+            g_task_pending.store(false);
+        }
+        if (!job) { return; }
+        try { job(); } catch (...) { /* never let a task kill the VM */ }
+        { std::lock_guard<std::mutex> lk{ g_task_mtx }; g_task_done = true; }
+        g_task_cv.notify_all();
+    }
 
-            auto detour = [](vmhook::return_value&)
+    // Install the pump on `target` using wrapper W.  Returns true if armed.
+    template<typename wrapper_type>
+    auto install_pump(const pump_target& target) -> bool
+    {
+        if (vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) })
+            == vmhook::type_to_class_map.end())
+        {
+            if (!vmhook::register_class<wrapper_type>(target.class_name)) { return false; }
+        }
+
+        // These are the hottest methods in the JVM and are certainly JIT-compiled
+        // (and inlined) already, so the i2i interpreter detour we install would be
+        // bypassed.  Deoptimise the specific method back to the interpreter first
+        // — the same discipline the JVM test suite uses — and accept that HotSpot
+        // will recompile it; vmhook holds NO_COMPILE on a hooked Method, so the
+        // route stays put once established.
+        vmhook::deoptimize_methods_if(
+            [&target](const std::string& class_name, vmhook::hotspot::method* m)
             {
-                std::function<void()> job;
-                {
-                    std::lock_guard<std::mutex> lk{ g_task_mtx };
-                    if (g_task_pending.load()) { job = std::move(g_task); g_task = nullptr; g_task_pending.store(false); }
-                }
-                if (job)
-                {
-                    try { job(); } catch (...) { /* keep the VM alive */ }
-                    { std::lock_guard<std::mutex> lk{ g_task_mtx }; g_task_done = true; }
-                    g_task_cv.notify_all();
-                }
-            };
-            auto handle{ vmhook::scoped_hook<runtime_trigger>("getRuntime", "()Ljava/lang/Runtime;", detour) };
-            if (handle.installed())
-            {
-                g_trigger_ok = true;
-                g_trigger_hook.emplace(std::move(handle));  // keep installed
-            }
+                return class_name == target.class_name
+                       && m && m->get_name() == target.method_name;
+            });
+
+        // scoped_hook, not hook: hook() returns a bare bool and leaves the detour
+        // installed forever with no way to reach it.  The handle is what lets the
+        // payload keep the pump alive deliberately (moved into g_pump_hooks) and
+        // uninstall it on teardown.
+        auto handle{ vmhook::scoped_hook<wrapper_type>(target.method_name, target.descriptor,
+                                                       [](vmhook::return_value&) { drain_one_task(); }) };
+        if (!handle.installed()) { return false; }
+        g_pump_hooks.emplace_back(std::move(handle));   // keep installed
+        return true;
+    }
+
+    void ensure_pump()
+    {
+        std::call_once(g_pump_once, []
+        {
+            int armed{ 0 };
+            armed += install_pump<pump_thread>(k_pump_targets[0]) ? 1 : 0;
+            armed += install_pump<pump_system>(k_pump_targets[1]) ? 1 : 0;
+            // System has two pump methods; the wrapper is already registered, so
+            // this second install reuses it.
+            armed += install_pump<pump_system>(k_pump_targets[2]) ? 1 : 0;
+            armed += install_pump<pump_object>(k_pump_targets[3]) ? 1 : 0;
+            armed += install_pump<pump_runtime>(k_pump_targets[4]) ? 1 : 0;
+            g_pump_installed.store(armed, std::memory_order_release);
         });
     }
 
-    // Run `fn` on a real JavaThread inside the trigger detour (the only safe
-    // context for method_proxy::call / make_java_string).  Blocks until it runs
-    // or times out.  Returns false if the JVM is unreachable or the detour never
-    // fired.
+    // Run `fn` on a real JavaThread inside a pump detour — the only safe context
+    // for method_proxy::call / make_java_string.  Blocks until it runs or times
+    // out.  Returns false if no pump could be armed or nothing rang it in time.
     auto run_on_java_thread(std::function<void()> fn) -> bool
     {
-        JNIEnv* const env{ ensure_java_attached() };
-        if (!env) { return false; }
-        ensure_trigger_hook();
-        if (!g_trigger_ok) { return false; }
+        ensure_pump();
+        if (g_pump_installed.load(std::memory_order_acquire) == 0) { return false; }
 
         {
             std::lock_guard<std::mutex> lk{ g_task_mtx };
@@ -198,30 +244,20 @@ namespace
             g_task_pending.store(true);
         }
 
-        static jclass    s_cls{ nullptr };
-        static jmethodID s_mid{ nullptr };
-        if (!s_cls)
-        {
-            if (jclass c{ env->FindClass("java/lang/Runtime") })
-            { s_cls = static_cast<jclass>(env->NewGlobalRef(c)); env->DeleteLocalRef(c); }
-        }
-        if (s_cls && !s_mid) { s_mid = env->GetStaticMethodID(s_cls, "getRuntime", "()Ljava/lang/Runtime;"); }
-        if (env->ExceptionCheck()) { env->ExceptionClear(); }
-        if (s_cls && s_mid)
-        {
-            jobject r{ env->CallStaticObjectMethod(s_cls, s_mid) };  // fires the detour
-            if (env->ExceptionCheck()) { env->ExceptionClear(); }
-            if (r) { env->DeleteLocalRef(r); }
-        }
-
+        // We no longer ring the doorbell ourselves, so the wait is longer than the
+        // old JNI-triggered 5 s: we are waiting for the target app to call one of
+        // the pump methods on its own.  Any live workload does so within
+        // milliseconds; a fully idle JVM may take longer, and a completely
+        // quiescent one will time out, which is the honest answer.
         std::unique_lock<std::mutex> lk{ g_task_mtx };
-        if (!g_task_cv.wait_for(lk, std::chrono::seconds(5), [] { return g_task_done; }))
+        if (!g_task_cv.wait_for(lk, std::chrono::seconds(15), [] { return g_task_done; }))
         {
             // Timed out.  If the job was never dequeued, nobody holds our closure —
             // abandon it safely.  But if it was ALREADY dequeued (pending cleared),
             // some JavaThread is running it right now with references into THIS
             // caller's stack; we must NOT return and let the caller unwind, or the
-            // late write faults.  Wait it out (bounded) so the closure outlives the job.
+            // late write faults.  Wait it out (bounded) so the closure outlives the
+            // job.
             if (g_task_pending.load())
             {
                 g_task = nullptr;
@@ -233,31 +269,19 @@ namespace
         return g_task_done;
     }
 
-    // Allocate a java.lang.String on a real JavaThread (via the trigger detour)
-    // and return its heap oop.  Uses JNI NewStringUTF (robust on every JDK, unlike
-    // the pure-VM make_java_string which fails to allocate from this context) and
-    // pins it with a global ref so it survives GC after the detour's frame pops
-    // (the value is about to be written into / held by a field).  GC caveat: a
-    // relocating collection moves the pinned object, so the RAW address returned
-    // can go stale — best-effort, like every raw-oop path here.
+    // Allocate a java.lang.String on a real JavaThread (inside a pump detour) and
+    // return its heap oop.  Pure VM — vmhook::make_java_string allocates from the
+    // running thread's TLAB, which is exactly why it has to run in this context.
+    //
+    // GC caveat, unchanged from the JNI version and inherent to handing back a raw
+    // address: the String is NOT rooted by anything here, so a relocating
+    // collection between this returning and the caller storing it invalidates the
+    // address.  The window is short (the caller stores it into a field
+    // immediately) and this is best-effort, like every raw-oop path in the viewer.
     auto alloc_java_string(const std::string& text) -> void*
     {
         void* out{ nullptr };
-        run_on_java_thread([&]
-        {
-            JNIEnv* env{ nullptr };
-            if (!g_jvm || g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env) { return; }
-            jstring js{ env->NewStringUTF(text.c_str()) };
-            if (env->ExceptionCheck()) { env->ExceptionClear(); }
-            if (!js) { return; }
-            // Read the oop from the LOCAL ref (untagged; a raw deref is valid).  A
-            // JNI GLOBAL ref is tag-bit-encoded in HotSpot, so we must NOT deref it
-            // as a raw pointer — we only create one to PIN the object alive past
-            // this frame, and keep using the address read from the local ref.
-            out = *reinterpret_cast<void**>(js);
-            env->NewGlobalRef(js);  // pin (kept alive; intentionally not released)
-            env->DeleteLocalRef(js);
-        });
+        run_on_java_thread([&] { out = vmhook::make_java_string(text); });
         return out;
     }
 
@@ -452,6 +476,44 @@ namespace
         return s;
     }
 
+    // Parse a user-typed integer the way a field editor should: DECIMAL by
+    // default, so "010" is ten and "09" is nine.  std::strtoll(.., 0) auto-detects
+    // the base, which silently reads a leading-zero decimal as OCTAL ("010" -> 8,
+    // "09" -> 0) — a real footgun for anyone typing a normal number.  An explicit
+    // "0x"/"0X" prefix is still honoured as hex.  Leading sign / spaces tolerated.
+    auto parse_ll(const std::string& v) -> long long
+    {
+        const char* s{ v.c_str() };
+        while (*s == ' ' || *s == '\t') { ++s; }
+        long long sign{ 1 };
+        if (*s == '+') { ++s; }
+        else if (*s == '-') { sign = -1; ++s; }
+        int base{ 10 };
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
+        return sign * static_cast<long long>(std::strtoull(s, nullptr, base));
+    }
+
+    auto parse_ull(const std::string& v) -> unsigned long long
+    {
+        const char* s{ v.c_str() };
+        while (*s == ' ' || *s == '\t') { ++s; }
+        int base{ 10 };
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
+        return std::strtoull(s, nullptr, base);
+    }
+
+    // Clean float/double formatting for display.  std::to_string uses "%f" — a
+    // fixed 6 decimal PLACES — so 1.5 prints "1.500000" and large/small magnitudes
+    // lose or pad digits.  "%.*g" gives significant digits and strips trailing
+    // zeros: 1.5 -> "1.5", 3.14159 -> "3.14159".  sig = enough to round-trip the
+    // type without the noise of full 17-digit precision.
+    auto fmt_g(double d, int sig) -> std::string
+    {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.*g", sig, d);
+        return buf;
+    }
+
     // Read one instance field's value and format it for display.  All reads go
     // through the fault-safe vmhook accessors (get_field returns a default on any
     // failure), so a stale/garbage oop from the conservative scan can't fault.
@@ -479,9 +541,9 @@ namespace
         }
         case 'S': return std::to_string(static_cast<int>(vmhook::get_field<std::int16_t>(oop, k, name)));
         case 'I': return std::to_string(vmhook::get_field<std::int32_t>(oop, k, name));
-        case 'F': return std::to_string(vmhook::get_field<float>(oop, k, name));
+        case 'F': return fmt_g(static_cast<double>(vmhook::get_field<float>(oop, k, name)), 7);
         case 'J': return std::to_string(vmhook::get_field<std::int64_t>(oop, k, name));
-        case 'D': return std::to_string(vmhook::get_field<double>(oop, k, name));
+        case 'D': return fmt_g(vmhook::get_field<double>(oop, k, name), 15);
         case 'L':
         case '[':
         {
@@ -1208,205 +1270,181 @@ namespace
         return out;
     }
 
-    // Wrap a raw heap oop as a JNI local ref so it can be passed to JNI Call*
-    // methods.  JNI has no oop->jobject, but NewObjectArray returns a real ref; we
-    // store the oop into element 0 (a raw compressed-oop write) and read it back
-    // out as a proper local ref.  Runs inside the trigger detour (valid env).
-    auto oop_to_jobject(JNIEnv* const env, void* const oop) -> jobject
+    // Locate a Method* by name+descriptor on a klass, walking its InstanceKlass
+    // _methods array.  Pointer-validated throughout; nullptr means "no such
+    // method", which the caller reports rather than guessing.
+    auto find_method_on(vmhook::hotspot::klass* const k,
+                        const std::string& name, const std::string& desc)
+        -> vmhook::hotspot::method*
     {
-        if (!oop) { return nullptr; }
-        static jclass s_object{ nullptr };
-        if (!s_object)
+        if (!k || !vmhook::hotspot::is_valid_pointer(k)) { return nullptr; }
+        const std::int32_t count{ k->get_methods_count() };
+        vmhook::hotspot::method** const methods{ k->get_methods_ptr() };
+        if (!methods || count <= 0) { return nullptr; }
+        for (std::int32_t i{ 0 }; i < count; ++i)
         {
-            if (jclass c{ env->FindClass("java/lang/Object") })
-            { s_object = static_cast<jclass>(env->NewGlobalRef(c)); env->DeleteLocalRef(c); }
+            vmhook::hotspot::method* const m{ methods[i] };
+            if (!m || !vmhook::hotspot::is_valid_pointer(m)) { continue; }
+            const std::string mn = m->get_name();
+            const std::string ms = m->get_signature();
+            if (mn == name && ms == desc) { return m; }
         }
-        if (!s_object) { return nullptr; }
-        jobjectArray arr{ env->NewObjectArray(1, s_object, nullptr) };
-        if (env->ExceptionCheck()) { env->ExceptionClear(); }
-        if (!arr) { return nullptr; }
-        if (void* const arr_oop{ *reinterpret_cast<void**>(arr) };
-            arr_oop && vmhook::hotspot::is_valid_pointer(arr_oop))
-        {
-            vmhook::set_array_element<std::uint32_t>(arr_oop, 0, vmhook::hotspot::encode_oop_pointer(oop));
-        }
-        jobject r{ env->GetObjectArrayElement(arr, 0) };
-        if (env->ExceptionCheck()) { env->ExceptionClear(); }
-        env->DeleteLocalRef(arr);
-        return r;
+        return nullptr;
     }
 
-    // Read the raw heap oop out of a JNI ref (local refs store the oop directly).
-    auto jobject_to_oop(jobject o) -> void*
+    // Invoke a method PURE-VM, from INSIDE a pump detour (a real JavaThread).
+    //
+    // This replaced ~145 lines of JNI (GetMethodID + a Call*MethodA switch over
+    // every return type + local-ref bookkeeping + a NewObjectArray trick to
+    // manufacture jobjects from raw oops).  All of it existed for one reason:
+    // method_proxy::call() used to be a silent no-op, because
+    // find_call_stub_entry() looked for a VMStructs entry that no JDK has ever
+    // published.  It is now derived from _call_stub_return_address and works on
+    // 8 / 21 / 26 alike, so the library does the whole job and the descriptor
+    // switch collapses into value_t.
+    //
+    // k = target klass; receiver is the raw oop (ignored for statics).
+    auto invoke_vm(void* const receiver, vmhook::hotspot::klass* const k, const bool is_static,
+                   const std::string& name, const std::string& sig, const std::vector<std::string>& argtoks,
+                   std::string& kind, std::string& disp, std::string& raddr, std::string& rclass) -> std::string
     {
-        return o ? *reinterpret_cast<void**>(o) : nullptr;
-    }
-
-    // Invoke a method via JNI, from INSIDE the trigger detour (a real JavaThread).
-    // This works on every JDK — unlike the pure-VM call_stub, which JDK 21+ no
-    // longer exposes through VMStructs.  k = the target klass (its mirror gives the
-    // jclass, and the method id); receiver is the raw oop (ignored for statics).
-    auto invoke_jni(void* const receiver, vmhook::hotspot::klass* const k, const bool is_static,
-                    const std::string& name, const std::string& sig, const std::vector<std::string>& argtoks,
-                    std::string& kind, std::string& disp, std::string& raddr, std::string& rclass) -> std::string
-    {
-        JNIEnv* env{ nullptr };
-        if (!g_jvm || g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env)
-        { return "no JNIEnv on the invoking thread"; }
-
-        void* const mirror{ k->get_java_mirror() };
-        if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror)) { return "could not resolve the class mirror"; }
-        jclass cls{ static_cast<jclass>(oop_to_jobject(env, mirror)) };
-        if (!cls) { return "could not obtain a jclass for the target"; }
-
-        std::vector<jobject> locals;  // JNI local refs to release
-        const auto done{ [&](const std::string& e) -> std::string
-        {
-            for (jobject l : locals) if (l) env->DeleteLocalRef(l);
-            if (cls) env->DeleteLocalRef(cls);
-            return e;
-        } };
-
-        const jmethodID mid{ is_static ? env->GetStaticMethodID(cls, name.c_str(), sig.c_str())
-                                       : env->GetMethodID(cls, name.c_str(), sig.c_str()) };
-        if (env->ExceptionCheck()) { env->ExceptionClear(); }
-        if (!mid) { return done("no method id for " + name + sig); }
+        vmhook::hotspot::method* const m{ find_method_on(k, name, sig) };
+        if (!m) { return "no method " + name + sig + " on the target class"; }
 
         const std::vector<std::string> pds{ parse_param_descriptors(sig) };
-        if (argtoks.size() != pds.size()) { return done("argument count mismatch (expected " + std::to_string(pds.size()) + ")"); }
+        if (argtoks.size() != pds.size())
+        {
+            return "argument count mismatch (expected " + std::to_string(pds.size()) + ")";
+        }
 
-        std::vector<jvalue> jargs(pds.size());
+        // Build the runtime argument list.  A reference parameter accepts either
+        // "@0xADDR" / "0xADDR" (an object the user already has, e.g. dragged from
+        // the clipboard) or "#text" / bare text, which becomes a new String.
+        std::vector<vmhook::method_proxy::java_arg> args;
+        args.reserve(pds.size());
         for (std::size_t a = 0; a < pds.size(); ++a)
         {
             const std::string& pd{ pds[a] };
             const std::string& tok{ argtoks[a] };
-            const auto to_ll{ [&] { return std::strtoll(tok.c_str(), nullptr, 0); } };
-            switch (pd.empty() ? '?' : pd[0])
+            const char letter{ pd.empty() ? '?' : pd[0] };
+
+            if (letter == 'L' || letter == '[')
             {
-            case 'Z': jargs[a].z = (tok == "true" || tok == "TRUE" || tok == "1") ? JNI_TRUE : JNI_FALSE; break;
-            case 'B': jargs[a].b = static_cast<jbyte>(to_ll()); break;
-            case 'S': jargs[a].s = static_cast<jshort>(to_ll()); break;
-            case 'C': jargs[a].c = tok.size() == 1 ? static_cast<jchar>(static_cast<unsigned char>(tok[0]))
-                                                   : static_cast<jchar>(std::strtoul(tok.c_str(), nullptr, 0)); break;
-            case 'I': jargs[a].i = static_cast<jint>(to_ll()); break;
-            case 'J': jargs[a].j = static_cast<jlong>(to_ll()); break;
-            case 'F': jargs[a].f = std::strtof(tok.c_str(), nullptr); break;
-            case 'D': jargs[a].d = std::strtod(tok.c_str(), nullptr); break;
-            case 'L':
-            case '[':
-            {
-                jobject o{ nullptr };
-                if (tok == "@null" || tok == "null" || tok.empty()) { o = nullptr; }
-                else if (tok.rfind("@0x", 0) == 0 || tok.rfind("@0X", 0) == 0 || tok.rfind("0x", 0) == 0 || tok.rfind("0X", 0) == 0)
+                if (tok == "@null" || tok == "null" || tok.empty())
+                {
+                    args.push_back(vmhook::method_proxy::java_arg::of_object(nullptr));
+                }
+                else if (tok.rfind("@0x", 0) == 0 || tok.rfind("@0X", 0) == 0
+                         || tok.rfind("0x", 0) == 0 || tok.rfind("0X", 0) == 0)
                 {
                     const char* hex{ tok.c_str() + (tok[0] == '@' ? 1 : 0) };
-                    void* const ref{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(std::strtoull(hex, nullptr, 16))) };
-                    if (ref && !vmhook::hotspot::is_valid_pointer(ref)) { return done("argument oop is not readable: " + tok); }
-                    o = oop_to_jobject(env, ref);
-                    if (ref && !o) { return done("could not wrap the argument object"); }
+                    void* const ref{ reinterpret_cast<void*>(
+                        static_cast<std::uintptr_t>(std::strtoull(hex, nullptr, 16))) };
+                    if (ref && !vmhook::hotspot::is_valid_pointer(ref))
+                    {
+                        return "argument oop is not readable: " + tok;
+                    }
+                    args.push_back(vmhook::method_proxy::java_arg::of_object(ref));
                 }
-                else  // "#text" or a bare literal for a String/Object parameter -> new String
+                else
                 {
-                    const std::string text{ tok.rfind('#', 0) == 0 ? tok.substr(1) : tok };
-                    o = env->NewStringUTF(text.c_str());
-                    if (!o) { if (env->ExceptionCheck()) env->ExceptionClear(); return done("failed to allocate a String argument"); }
+                    args.push_back(vmhook::method_proxy::java_arg::of_string(
+                        tok.rfind('#', 0) == 0 ? tok.substr(1) : tok));
                 }
-                jargs[a].l = o;
-                if (o) { locals.push_back(o); }
-                break;
+                continue;
             }
-            default: return done("unsupported parameter type: " + pd);
-            }
+
+            auto built{ vmhook::method_proxy::java_arg::from_descriptor(letter, tok) };
+            if (!built) { return std::string{ "unsupported parameter type: " } + pd; }
+            args.push_back(*std::move(built));
         }
 
+        // A constructor is dispatched on a freshly allocated, UNINITIALISED
+        // object: allocate, then run <init> on it as an instance call.  This is
+        // what JNI's NewObjectA does internally, and doing it explicitly keeps
+        // the whole path inside the library's one dispatcher.
         const bool is_ctor{ name == "<init>" };
-        jobject receiverObj{ nullptr };
-        if (!is_static && !is_ctor)
+        void* target_receiver{ receiver };
+        if (is_ctor)
         {
-            receiverObj = oop_to_jobject(env, receiver);
-            if (!receiverObj) { return done("could not wrap the receiver object"); }
-            locals.push_back(receiverObj);
+            target_receiver = vmhook::make_java_object(k, k->get_instance_size());
+            if (!target_receiver) { return "failed to allocate the object to construct"; }
+        }
+
+        const vmhook::method_proxy proxy{ is_static ? nullptr : target_receiver, m, sig };
+        const auto result{ proxy.call_packed(m, args) };
+
+        if (result.threw())
+        {
+            return "the method threw "
+                   + (result.exception_class.empty() ? std::string{ "an exception" }
+                                                     : result.exception_class);
         }
 
         const std::size_t rparen{ sig.rfind(')') };
-        const char ret{ (rparen != std::string::npos && rparen + 1 < sig.size()) ? sig[rparen + 1] : 'V' };
-        const jvalue* const av{ jargs.empty() ? nullptr : jargs.data() };
+        const char ret{ (rparen != std::string::npos && rparen + 1 < sig.size())
+                            ? sig[rparen + 1] : 'V' };
 
-        const auto threw{ [&]() -> bool
-        {
-            if (!env->ExceptionCheck()) { return false; }
-            env->ExceptionDescribe();  // to JVM stderr
-            env->ExceptionClear();
-            return true;
-        } };
-
-        // A constructor CREATES an object (NewObjectA) rather than returning a value.
+        // A constructor "returns" the object it initialised.
         if (is_ctor)
         {
-            jobject o{ env->NewObjectA(cls, mid, av) };
-            if (threw()) { return done("the constructor threw an exception (see the JVM's stderr)"); }
-            if (!o) { kind = "null"; disp = "null"; return done(""); }
-            void* const oop{ jobject_to_oop(o) };
-            char rb[32]; std::snprintf(rb, sizeof(rb), "0x%llX", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(oop)));
+            char rb[32];
+            std::snprintf(rb, sizeof(rb), "0x%llX",
+                          static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(target_receiver)));
             raddr = rb; kind = "ref";
-            if (const vmhook::hotspot::symbol* const kn{ k->get_name() }; kn && vmhook::hotspot::is_valid_pointer(kn))
+            if (const vmhook::hotspot::symbol* const kn{ k->get_name() };
+                kn && vmhook::hotspot::is_valid_pointer(kn))
             { rclass = kn->to_string(); disp = std::string{ "<" } + rclass + ">"; }
             else { disp = "<object>"; }
-            env->DeleteLocalRef(o);
-            return done("");
+            return "";
         }
 
         switch (ret)
         {
-        case 'V': is_static ? env->CallStaticVoidMethodA(cls, mid, av) : env->CallVoidMethodA(receiverObj, mid, av);
-                  if (threw()) return done("the method threw an exception (see the JVM's stderr)");
-                  kind = "void"; disp = "(void)"; break;
-        case 'Z': { const jboolean v{ is_static ? env->CallStaticBooleanMethodA(cls, mid, av) : env->CallBooleanMethodA(receiverObj, mid, av) };
-                    if (threw()) return done("the method threw an exception (see the JVM's stderr)");
-                    kind = "bool"; disp = v ? "true" : "false"; break; }
-        case 'B': { const jbyte v{ is_static ? env->CallStaticByteMethodA(cls, mid, av) : env->CallByteMethodA(receiverObj, mid, av) };
-                    if (threw()) return done("the method threw an exception (see the JVM's stderr)");
-                    kind = "byte"; disp = std::to_string(static_cast<int>(v)); break; }
-        case 'S': { const jshort v{ is_static ? env->CallStaticShortMethodA(cls, mid, av) : env->CallShortMethodA(receiverObj, mid, av) };
-                    if (threw()) return done("the method threw an exception (see the JVM's stderr)");
-                    kind = "short"; disp = std::to_string(static_cast<int>(v)); break; }
-        case 'C': { const jchar v{ is_static ? env->CallStaticCharMethodA(cls, mid, av) : env->CallCharMethodA(receiverObj, mid, av) };
-                    if (threw()) return done("the method threw an exception (see the JVM's stderr)");
-                    kind = "char"; disp = (v >= 32 && v < 127) ? (std::string{ "'" } + static_cast<char>(v) + "'") : std::to_string(static_cast<unsigned>(v)); break; }
-        case 'I': { const jint v{ is_static ? env->CallStaticIntMethodA(cls, mid, av) : env->CallIntMethodA(receiverObj, mid, av) };
-                    if (threw()) return done("the method threw an exception (see the JVM's stderr)");
-                    kind = "int"; disp = std::to_string(v); break; }
-        case 'J': { const jlong v{ is_static ? env->CallStaticLongMethodA(cls, mid, av) : env->CallLongMethodA(receiverObj, mid, av) };
-                    if (threw()) return done("the method threw an exception (see the JVM's stderr)");
-                    kind = "long"; disp = std::to_string(static_cast<long long>(v)); break; }
-        case 'F': { const jfloat v{ is_static ? env->CallStaticFloatMethodA(cls, mid, av) : env->CallFloatMethodA(receiverObj, mid, av) };
-                    if (threw()) return done("the method threw an exception (see the JVM's stderr)");
-                    kind = "float"; disp = std::to_string(v); break; }
-        case 'D': { const jdouble v{ is_static ? env->CallStaticDoubleMethodA(cls, mid, av) : env->CallDoubleMethodA(receiverObj, mid, av) };
-                    if (threw()) return done("the method threw an exception (see the JVM's stderr)");
-                    kind = "double"; disp = std::to_string(v); break; }
+        case 'V': kind = "void";   disp = "(void)"; break;
+        case 'Z': kind = "bool";   disp = static_cast<bool>(result) ? "true" : "false"; break;
+        case 'B': kind = "byte";   disp = std::to_string(static_cast<int>(static_cast<std::int8_t>(result))); break;
+        case 'S': kind = "short";  disp = std::to_string(static_cast<int>(static_cast<std::int16_t>(result))); break;
+        case 'C':
+        {
+            const auto c{ static_cast<std::uint16_t>(result) };
+            kind = "char";
+            disp = (c >= 32 && c < 127) ? (std::string{ "'" } + static_cast<char>(c) + "'")
+                                        : std::to_string(static_cast<unsigned>(c));
+            break;
+        }
+        case 'I': kind = "int";    disp = std::to_string(static_cast<std::int32_t>(result)); break;
+        case 'J': kind = "long";   disp = std::to_string(static_cast<long long>(static_cast<std::int64_t>(result))); break;
+        case 'F': kind = "float";  disp = fmt_g(static_cast<double>(static_cast<float>(result)), 7); break;
+        case 'D': kind = "double"; disp = fmt_g(static_cast<double>(result), 15); break;
         default:  // 'L' / '[' — object / array
         {
-            jobject v{ is_static ? env->CallStaticObjectMethodA(cls, mid, av) : env->CallObjectMethodA(receiverObj, mid, av) };
-            if (threw()) return done("the method threw an exception (see the JVM's stderr)");
-            if (!v) { kind = "null"; disp = "null"; break; }
-            void* const oop{ jobject_to_oop(v) };
-            char rb[32]; std::snprintf(rb, sizeof(rb), "0x%llX", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(oop)));
-            raddr = rb;
-            if (rparen != std::string::npos && sig.substr(rparen + 1) == "Ljava/lang/String;")
-            { kind = "string"; disp = std::string{ "\"" } + vmhook::read_java_string(oop) + "\""; rclass = "java/lang/String"; }
-            else if (vmhook::hotspot::klass* const rk{ vmhook::klass_from_oop(oop) }; rk && vmhook::hotspot::is_valid_pointer(rk))
+            if (result.is_string())
             {
-                if (const vmhook::hotspot::symbol* const rn{ rk->get_name() }; rn && vmhook::hotspot::is_valid_pointer(rn))
-                { kind = "ref"; rclass = rn->to_string(); disp = std::string{ "<" } + rclass + ">"; }
-                else { kind = "ref"; disp = "<object>"; }
+                kind = "string"; rclass = "java/lang/String";
+                disp = std::string{ "\"" } + result.as_string() + "\"";
+                break;
             }
-            else { kind = "ref"; disp = "<object>"; }
-            env->DeleteLocalRef(v);
+            const auto handle{ result.to_borrowed<>() };
+            void* const oop{ handle.raw_unsafe() };
+            if (!oop) { kind = "null"; disp = "null"; break; }
+            char rb[32];
+            std::snprintf(rb, sizeof(rb), "0x%llX",
+                          static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(oop)));
+            raddr = rb; kind = "ref";
+            if (vmhook::hotspot::klass* const rk{ vmhook::klass_from_oop(oop) };
+                rk && vmhook::hotspot::is_valid_pointer(rk))
+            {
+                if (const vmhook::hotspot::symbol* const rn{ rk->get_name() };
+                    rn && vmhook::hotspot::is_valid_pointer(rn))
+                { rclass = rn->to_string(); disp = std::string{ "<" } + rclass + ">"; }
+                else { disp = "<object>"; }
+            }
+            else { disp = "<object>"; }
             break;
         }
         }
-        return done("");
+        return "";
     }
 
     // CALL: invoke a method and reply R + DONE (or E).
@@ -1459,7 +1497,7 @@ namespace
         // Call* path sets up the proper Java frame there).  run_on_java_thread
         // fires the trigger hook and runs the task in its detour.
         std::string kind, disp, raddr, rclass, err;
-        const bool ran{ run_on_java_thread([&] { err = invoke_jni(receiver, k, is_static, mname, desc, args, kind, disp, raddr, rclass); }) };
+        const bool ran{ run_on_java_thread([&] { err = invoke_vm(receiver, k, is_static, mname, desc, args, kind, disp, raddr, rclass); }) };
         if (!ran) { bail("could not enter a Java thread to invoke (trigger hook unavailable on this JVM)"); return; }
         if (!err.empty()) { bail(err); return; }
 
