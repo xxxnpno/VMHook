@@ -606,42 +606,110 @@ complete by then and all consumers follow. **Do not redefine `oop_t` as a class*
 `cast_for_variant` has an `is_same_v<target, void*>` branch that a class type silently
 disables.
 
-### Phase 3 — retire the raw-oop surface
+### Phase 3 — retire the raw-oop surface — **ALL SIX INTERCEPTS DONE**
 80 raw-oop boundary crossings are catalogued in 7 categories. The **minimum viable intercept
-set** covering ~90% of user exposure is 6 places. Status:
+set** covering ~90% of user exposure is 6 places. Every one now has a handle form:
 
-| # | Intercept | Status |
+| # | Intercept | Handle form |
 |---|---|---|
-| 1 | `detail::extract_frame_arg` — every detour argument | **DONE** (§2.6) |
-| 2 | `object_base` ctor + `get_instance` | **DONE** — `object<W>::self()` returns `borrowed<W>` |
-| 3 | `field_proxy` ctors + `store_object_oop` | **PARTIAL** — reads done (`value_t::to_borrowed<W>()`); the WRITE side (`store_object_oop`) still takes a raw oop |
-| 4 | `method_proxy`'s receiver | not done |
-| 5 | the six collection ctors | not done |
-| 6 | `make_java_object` / `make_java_array` / `make_java_string` | not done |
+| 1 | every detour argument | `detail::extract_frame_arg` accepts `borrowed<W>` |
+| 2 | `object_base` ctor + `get_instance` | `object<W>::self()` → `borrowed<W>` |
+| 3 | `field_proxy` read + write | `value_t::to_borrowed<W>()` · `store_object(borrowed<W>)` |
+| 4 | `method_proxy` result | `value_t::to_borrowed<W>()` |
+| 5 | the six collection ctors | each takes `const borrowed<W>&` |
+| 6 | `make_java_*` | `new_object` / `new_array` / `new_string` return `borrowed<W>` |
 
-The three that landed are the three READ paths — how an object reaches the user. What remains
-is mostly how an object goes back IN, which is the harder half: a write needs the address to
-still be valid at the instant of the store, so those intercepts want the store to happen
-THROUGH the handle rather than taking one as an argument.
+Two of these are more than ergonomics:
 
-Raw accessors survive as explicitly-named escape hatches (`raw_*` / `get_instance`), not as the
-default.
+- **`store_object`** resolves the handle immediately before the write and REFUSES an expired
+  one. A raw `store_object_oop(addr)` cannot tell whether `addr` survived the gap between the
+  caller reading it and the store; if it did not, the field ends up holding a pointer into
+  relocated space and the corruption surfaces arbitrarily later. This closes that window as
+  far as a pure-VM build can. What it cannot close is a collection landing between the resolve
+  and the `safe_write` a few instructions later — that needs Layer 2.
+- **`new_*`** exists because a fresh address is the most dangerous shape in the API: it *looks*
+  trustworthy and is completely unrooted, so the next allocation can move it. The handle at
+  least reports EXPIRED afterwards instead of reading as valid.
+
+Throughout: an EMPTY handle (Java null, or a failed allocation) is never an EXPIRED one. The
+caller's recovery differs, so the two states stay distinct at every intercept.
+
+Raw accessors survive as explicitly-named escape hatches (`get_instance`, `make_java_*`,
+`store_object_oop`), not as the default. The header itself still uses the raw forms internally,
+where the address is consumed immediately inside a documented no-safepoint window.
 
 ### Phase 4 — finish Goal A
-- **4.1** `vmhook::jni::global_ref` → `vmhook::oop_pin` at `vmhook` scope; delete the `jni`
-  namespace; deprecated alias for one version.
-- **4.2** `detail::jni_signature_for_arg` → `jvm_descriptor_for_arg` (~629 references across
-  12 test files — one mechanical pass).
-- **4.3** Restore method invocation per the Phase 1 verdict. **This is what makes zero-JNI
-  honest** rather than achieved-by-amputation.
-- **4.4** Rebuild `viewer/payload` on a **detour pump**: stop entering Java from native; hook a
-  method the JVM already calls and let the detour drain a native work queue. Thread promotion,
-  detour triggering, and allocation all dissolve — they run on a real JavaThread with a valid
-  anchor and TLAB, where `make_java_string` / `make_java_object` already work. Cost is
-  next-frame latency, which a viewer does not care about. Then delete `<jni.h>`.
+- **4.1 DONE** `vmhook::jni::global_ref` → `vmhook::oop_pin` at `vmhook` scope; the `jni`
+  namespace is **deleted**, no alias. Both halves of the old name were wrong: there is no JNI
+  in the header, and the type was never a global reference in the JNI sense — it registers
+  nothing with the VM. A `pin(borrowed<W>)` overload bridges the handle model back to an
+  address for code that still needs one, resolving first so an expired handle cannot be pinned.
+- **4.2 DONE** `detail::jni_signature_for_arg` → `jvm_descriptor_for_arg`, 711 references
+  across 14 files, one mechanical pass.
+- **4.3 DONE** (earlier session) Method invocation restored pure-VM.
+- **4.4 NOT DONE** Rebuild `viewer/payload` on a **detour pump**: stop entering Java from
+  native; hook a method the JVM already calls and let the detour drain a native work queue.
+  Thread promotion, detour triggering and allocation all dissolve — they run on a real
+  JavaThread with a valid anchor and TLAB. Then delete `<jni.h>`.
+  **This is the last real JNI in the project.** Two of its three JNI uses are now trivially
+  replaceable (`NewStringUTF` → `make_java_string`; `invoke_jni`'s ~120 lines →
+  `method_proxy::call()`, which works now); only thread promotion needs the pump.
 - **4.5** Fix the two regressions currently hidden by their own docs: `find_class_via_oop` no
   longer disambiguates by classloader, and `call()` leaves thrown exceptions pending on the
-  JavaThread.
+  JavaThread. *(The second is stale — `call()` clears `ThreadShadow::_pending_exception` and
+  reports the throw through `value_t::threw()`.)*
+- **4.6 PARTIAL** Test-suite naming and prose. Done: the `method_call_jni_fallback` module and
+  its `MethodCallJni` fixture → `method_call_dispatch` / `MethodCallDispatch`;
+  `jni_local_ref_hygiene` / `JniLocalRef` → `repeat_call_stability` / `RepeatCallProbe`; both
+  fixture doc blocks rewritten to say what they now prove and why the loops were kept.
+  **Not done:** ~200 further `call_jni` / "JNI fallback" / "JNI local ref" mentions in test
+  comments across ~50 files. These are prose, not names — each needs a real edit, not a sed,
+  because a blind substitution turns explanations into nonsense. Two more symbols named in
+  comments no longer exist at all: `jni::find_class_with_context_loader` and
+  `jni_delete_local_ref`.
+
+### Phase 4b — modern C++ in the header
+
+Requested 2026-08-05: use current language features to improve `vmhook.hpp`. Before this the
+header used essentially none — **zero** `[[nodiscard]]`, `std::expected`, `std::span`,
+`std::bit_cast`, `consteval`, or concepts; the only C++20+ feature in use was `requires`.
+
+**Landed:**
+
+- **`VMHOOK_HAS_REFLECTION`** (P2996 + P3394 annotations). Gated exactly like
+  `VMHOOK_HAS_DEDUCING_THIS`: every use is additive with a C++23 fallback that behaves the
+  same, only with a worse diagnostic. Shipping reality — Clang 21+ has it behind
+  `-freflection`, GCC has not merged it, MSVC has not shipped it, and vmhook's CI is
+  `-std=c++23` on all three, so nothing may depend on it.
+  - `detail::type_name<T>()` — `std::meta::display_string_of` when available, `typeid().name()`
+    otherwise. **Wired into all 33 diagnostics that previously emitted mangled names.** A user
+    who forgot `register_class<player>()` was being told about `"6playerE"` and had to read
+    Itanium mangling to understand their own error. MSVC happened to return `"class player"`,
+    which is why this survived so long — it was invisible to anyone testing only on Windows.
+  - **`vmhook::java_class` annotation** + a no-string `register_class<T>()`. The name travels
+    with the type instead of being a runtime argument, which kills a real silent bug: a
+    copy-pasted `register_class<item>("com/example/Player")` binds `item` to Player's klass and
+    every field read after it is nonsense at a plausible offset.
+  - `jvm_descriptor_for_arg` **short-circuits on the annotation at compile time**, so an
+    annotated wrapper's descriptor is a constant that cannot disagree with the registry and can
+    never degrade to `Ljava/lang/Object;` because someone forgot to register.
+
+- **`std::expected` (C++23)** — roadmap 2.3's `try_*`, previously "not done".
+  `object_base::try_field` / `try_method` return `std::expected<T, access_error>`.
+  The point is not style: `get_field` collapses four different causes into one empty optional,
+  and those four want different responses — "not loaded yet" is retryable, "not registered" is
+  a setup bug, "no such member" is a typo or an obfuscated rename, "null receiver" is ordinary
+  Java. Conflating them is *why* the house one-liner `get_field("x")->get()` became common and
+  why it has taken the whole JVM suite down. `try_*` deliberately does not log — the caller has
+  the reason in hand, and probing whether a class is loaded yet is a legitimate loop.
+
+- **`[[nodiscard]]`** on the API added this session.
+
+**Not done, deliberately:** a blanket `[[nodiscard]]` sweep over the existing surface. Every
+existing call site that legitimately discards a result would become a `-Werror` failure, and
+that is not a change to make without a compiler. Same for replacing the `static_assert(
+is_base_of_v<object_base, T>)` pattern with concepts — better diagnostics, but it touches
+overload resolution at existing call sites.
 
 ### Phase 5 — prove it
 - **5.1** Un-gate `tests/jvm/modules/global_ref.cpp` from `[INFO]` to `HARD`: force a

@@ -1,6 +1,6 @@
-// global_ref JVM test module — exhaustive coverage of vmhook::jni::global_ref.
+// oop_pin JVM test module — exhaustive coverage of vmhook::oop_pin.
 //
-// global_ref (vmhook.hpp:16707) is the move-only RAII pin that keeps a Java
+// oop_pin (vmhook.hpp:16707) is the move-only RAII pin that keeps a Java
 // object alive across a relocating garbage collection.  Its constructor promotes
 // a raw decoded OOP to a JNI global reference (NewGlobalRef, slot 21); its
 // destructor / reset() release it exactly once (DeleteGlobalRef, slot 22); and
@@ -55,7 +55,7 @@
 // GUARDED with hotspot::is_valid_pointer before any field read: if oop() ever
 // returned garbage we record a FAIL rather than access-violate and take the
 // whole suite down (NEVER crash the JVM).  The surviving pin lives in a
-// file-scope global_ref so it persists across the phase-1 / phase-2 probe
+// file-scope oop_pin so it persists across the phase-1 / phase-2 probe
 // boundary; on the non-Windows path it is released explicitly inside the phase-2
 // detour (on a live JNIEnv) so the real DeleteGlobalRef path is exercised —
 // EXCEPT when the post-GC pin is not safely attainable (relocating G1), in which
@@ -78,59 +78,59 @@
 
 namespace
 {
-    // ── Compile-time contract: global_ref is move-only and trivially releasable.
-    using gref = vmhook::jni::global_ref;
+    // ── Compile-time contract: oop_pin is move-only and trivially releasable.
+    using gref = vmhook::oop_pin;
     static_assert(!std::is_copy_constructible_v<gref>,
-                  "global_ref must NOT be copy-constructible (a global ref is owned exactly once).");
+                  "oop_pin must NOT be copy-constructible (a global ref is owned exactly once).");
     static_assert(!std::is_copy_assignable_v<gref>,
-                  "global_ref must NOT be copy-assignable (double DeleteGlobalRef corrupts the handle table).");
+                  "oop_pin must NOT be copy-assignable (double DeleteGlobalRef corrupts the handle table).");
     static_assert(std::is_move_constructible_v<gref>,
-                  "global_ref must be move-constructible (ownership transfers into snapshots/maps).");
+                  "oop_pin must be move-constructible (ownership transfers into snapshots/maps).");
     static_assert(std::is_move_assignable_v<gref>,
-                  "global_ref must be move-assignable (build-outside-lock, then move-into-map).");
+                  "oop_pin must be move-assignable (build-outside-lock, then move-into-map).");
     static_assert(std::is_nothrow_destructible_v<gref>,
-                  "global_ref destructor must be noexcept.");
+                  "oop_pin destructor must be noexcept.");
     static_assert(std::is_nothrow_move_constructible_v<gref>,
-                  "global_ref move ctor must be noexcept (lives inside std::unordered_map values).");
+                  "oop_pin move ctor must be noexcept (lives inside std::unordered_map values).");
     static_assert(std::is_nothrow_move_assignable_v<gref>,
-                  "global_ref move-assign must be noexcept (rebind-in-map without an exception window).");
+                  "oop_pin move-assign must be noexcept (rebind-in-map without an exception window).");
     static_assert(std::is_nothrow_default_constructible_v<gref>,
-                  "global_ref default ctor must be noexcept (an empty pin is a no-op).");
+                  "oop_pin default ctor must be noexcept (an empty pin is a no-op).");
     // The OOP ctor is `explicit`, so a raw oop must NOT implicitly convert to a pin
     // (that would let a bare address silently become an owned NewGlobalRef).
     static_assert(!std::is_convertible_v<vmhook::oop_t, gref>,
-                  "global_ref(oop_t) must be explicit — no implicit oop -> owned-pin conversion.");
+                  "oop_pin(oop_t) must be explicit — no implicit oop -> owned-pin conversion.");
     static_assert(std::is_constructible_v<gref, vmhook::oop_t>,
-                  "global_ref must be EXPLICITLY constructible from a raw oop.");
+                  "oop_pin must be EXPLICITLY constructible from a raw oop.");
     // A pin must NOT be construct/assignable from an int (would mask an oop typo).
     static_assert(!std::is_constructible_v<gref, int>,
-                  "global_ref must NOT be constructible from an int.");
+                  "oop_pin must NOT be constructible from an int.");
     // The pin(oop_t) free function hands back an owning pin BY VALUE (move, never
     // copy).  The pin(unique_ptr<T>&) overload's by-value contract is asserted just
-    // after global_ref_fixture is declared (it names that wrapper type).
+    // after oop_pin_fixture is declared (it names that wrapper type).
     static_assert(std::is_same_v<decltype(vmhook::pin(std::declval<vmhook::oop_t>())), gref>,
-                  "vmhook::pin(oop_t) must return a global_ref by value.");
+                  "vmhook::pin(oop_t) must return a oop_pin by value.");
     // .oop() / .handle() / operator bool are const + noexcept observers (callable on
     // a const pin from any thread without a throw window).
     static_assert(noexcept(std::declval<const gref&>().oop()),
-                  "global_ref::oop() must be a noexcept observer.");
+                  "oop_pin::oop() must be a noexcept observer.");
     static_assert(noexcept(std::declval<const gref&>().handle()),
-                  "global_ref::handle() must be a noexcept observer.");
+                  "oop_pin::handle() must be a noexcept observer.");
     static_assert(noexcept(static_cast<bool>(std::declval<const gref&>())),
-                  "global_ref::operator bool must be a noexcept observer.");
+                  "oop_pin::operator bool must be a noexcept observer.");
     static_assert(noexcept(std::declval<gref&>().reset()),
-                  "global_ref::reset() must be noexcept.");
+                  "oop_pin::reset() must be noexcept.");
     static_assert(std::is_same_v<decltype(std::declval<const gref&>().oop()), vmhook::oop_t>,
-                  "global_ref::oop() must yield a vmhook::oop_t.");
+                  "oop_pin::oop() must yield a vmhook::oop_t.");
     static_assert(std::is_same_v<decltype(std::declval<const gref&>().handle()), void*>,
-                  "global_ref::handle() must yield the raw void* JNI handle.");
+                  "oop_pin::handle() must yield the raw void* JNI handle.");
 
     // ── batch-DW3 deepening: structural / layout invariants of the pin handle ────
-    // global_ref is `final` (vmhook.hpp:21650) — a JNI pin must not be subclassed
+    // oop_pin is `final` (vmhook.hpp:21650) — a JNI pin must not be subclassed
     // (a subclass could add state the move/dtor never accounts for, leaking or
     // double-freeing the handle).
     static_assert(std::is_final_v<gref>,
-                  "global_ref must be final (no subclass may extend the owned-handle invariant).");
+                  "oop_pin must be final (no subclass may extend the owned-handle invariant).");
     // The pin is the captured address PLUS the GC epoch it was captured in, and
     // nothing else.  The epoch member is what lets oop() report the capture stale
     // instead of handing back an address a relocating collection has moved out
@@ -139,30 +139,30 @@ namespace
     // use means any FURTHER bookkeeping would bloat every cached entry and break
     // the cheap move.
     static_assert(sizeof(gref) == sizeof(void*) + sizeof(vmhook::gc_epoch_t),
-                  "global_ref must be exactly an address plus its capture epoch.");
+                  "oop_pin must be exactly an address plus its capture epoch.");
     static_assert(alignof(gref) == alignof(void*),
-                  "global_ref must align like a pointer (it IS a single pointer).");
+                  "oop_pin must align like a pointer (it IS a single pointer).");
     static_assert(std::is_standard_layout_v<gref>,
-                  "global_ref must be standard-layout (a single private void* handle).");
+                  "oop_pin must be standard-layout (a single private void* handle).");
     // A pin owns a JNI handle, so it canNOT be trivially copyable / trivial — it
     // has a user-declared destructor + move that issue NewGlobalRef/DeleteGlobalRef.
     static_assert(!std::is_trivially_copyable_v<gref>,
-                  "global_ref must NOT be trivially copyable (owns a JNI handle with a real dtor).");
+                  "oop_pin must NOT be trivially copyable (owns a JNI handle with a real dtor).");
     static_assert(!std::is_trivial_v<gref>,
-                  "global_ref must NOT be trivial (the OOP ctor issues NewGlobalRef).");
+                  "oop_pin must NOT be trivial (the OOP ctor issues NewGlobalRef).");
     // Move-only RAII must be swappable (std::swap routes through the move ctor +
     // two move-assigns) and that swap must not throw — snapshots/maps rely on it.
     static_assert(std::is_swappable_v<gref>,
-                  "global_ref must be swappable (rebind two pins via std::swap).");
+                  "oop_pin must be swappable (rebind two pins via std::swap).");
     static_assert(std::is_nothrow_swappable_v<gref>,
-                  "global_ref swap must be noexcept (move ctor + move-assign are both noexcept).");
+                  "oop_pin swap must be noexcept (move ctor + move-assign are both noexcept).");
     // The pin(oop_t) free-function overload is a noexcept observer handing back a
     // pin by value (the by-value contract is asserted above; this pins noexcept).
     // The pin(unique_ptr<T>&) overload's noexcept is asserted just after
-    // global_ref_fixture is declared (it names that wrapper type).
+    // oop_pin_fixture is declared (it names that wrapper type).
     static_assert(noexcept(vmhook::pin(std::declval<vmhook::oop_t>())),
                   "vmhook::pin(oop_t) must be noexcept.");
-    // NOTE: oop_t IS a raw pointer alias, so global_ref(oop_t) is constructible from
+    // NOTE: oop_t IS a raw pointer alias, so oop_pin(oop_t) is constructible from
     // a void* — there is no distinct strong-type barrier to assert here.
 
     // Sentinel value stamped into the pinned object's (I)V constructor and read
@@ -171,11 +171,11 @@ namespace
     constexpr std::int32_t k_sentinel{ 0x5A5A };
 
     // Wrapper for vmhook.fixtures.GlobalRefProbe.
-    class global_ref_fixture : public vmhook::object<global_ref_fixture>
+    class oop_pin_fixture : public vmhook::object<oop_pin_fixture>
     {
     public:
-        explicit global_ref_fixture(vmhook::oop_t instance) noexcept
-            : vmhook::object<global_ref_fixture>{ instance }
+        explicit oop_pin_fixture(vmhook::oop_t instance) noexcept
+            : vmhook::object<oop_pin_fixture>{ instance }
         {
         }
 
@@ -222,10 +222,10 @@ namespace
     // pin(unique_ptr<T>&) hands back an owning pin BY VALUE (named here because it
     // references the wrapper type declared just above).
     static_assert(
-        std::is_same_v<decltype(vmhook::pin(std::declval<const std::unique_ptr<global_ref_fixture>&>())), gref>,
-        "vmhook::pin(unique_ptr<T>&) must return a global_ref by value.");
+        std::is_same_v<decltype(vmhook::pin(std::declval<const std::unique_ptr<oop_pin_fixture>&>())), gref>,
+        "vmhook::pin(unique_ptr<T>&) must return a oop_pin by value.");
     static_assert(
-        noexcept(vmhook::pin(std::declval<const std::unique_ptr<global_ref_fixture>&>())),
+        noexcept(vmhook::pin(std::declval<const std::unique_ptr<oop_pin_fixture>&>())),
         "vmhook::pin(unique_ptr<T>&) must be noexcept.");
 
     // ── Hook observation ─────────────────────────────────────────────────────────
@@ -238,7 +238,7 @@ namespace
 
     // The single pin under test, surviving from phase 1 into phase 2.  Built and
     // released inside the trigger() detour (where a JNIEnv is live).
-    vmhook::jni::global_ref g_pinned{};
+    vmhook::oop_pin g_pinned{};
 
     // ── Phase-1 (build + pin) observations ───────────────────────────────────────
     std::atomic<bool> g_made_ok{ false };
@@ -447,11 +447,11 @@ namespace
     std::atomic<int>  g_many_unique_handle_count{ 0 };
 
     // Resolves a pin's CURRENT address WITHOUT risking an access violation: the
-    // library global_ref::oop() does a raw `*(void**)slot` dereference of the
+    // library oop_pin::oop() does a raw `*(void**)slot` dereference of the
     // handle storage, so we first reject a handle that isn't itself a valid,
     // mapped pointer, then validate the resolved oop before returning it.  Returns
     // nullptr (never faults) when the handle or the resolved oop is unusable.
-    auto resolve_oop_guarded(const vmhook::jni::global_ref& pin) -> vmhook::oop_t
+    auto resolve_oop_guarded(const vmhook::oop_pin& pin) -> vmhook::oop_t
     {
         if (!pin || !vmhook::hotspot::is_valid_pointer(pin.handle()))
         {
@@ -471,26 +471,26 @@ namespace
         {
             return false;
         }
-        global_ref_fixture via{ live };
+        oop_pin_fixture via{ live };
         out = via.get_sentinel();
         return true;
     }
 }
 
-VMHOOK_JVM_MODULE(global_ref)
+VMHOOK_JVM_MODULE(oop_pin)
 {
-    vmhook::register_class<global_ref_fixture>("vmhook/fixtures/GlobalRefProbe");
+    vmhook::register_class<oop_pin_fixture>("vmhook/fixtures/GlobalRefProbe");
 
     {
-        // scoped_hook on trigger(): every JNI-touching global_ref operation below
+        // scoped_hook on trigger(): every JNI-touching oop_pin operation below
         // runs INSIDE this detour, so a JavaThread (and an attached JNIEnv) is
         // live for make_unique / NewGlobalRef / DeleteGlobalRef.  Never call
         // shutdown_hooks() — the handle uninstalls on scope exit, isolating this
         // module.
-        auto handle{ vmhook::scoped_hook<global_ref_fixture>(
+        auto handle{ vmhook::scoped_hook<oop_pin_fixture>(
             "trigger",
             [](vmhook::return_value&,
-               const std::unique_ptr<global_ref_fixture>& self)
+               const std::unique_ptr<oop_pin_fixture>& self)
             {
                 g_trigger_calls.fetch_add(1, std::memory_order_relaxed);
                 g_hook_saw_self.store(self != nullptr, std::memory_order_relaxed);
@@ -503,7 +503,7 @@ VMHOOK_JVM_MODULE(global_ref)
                 if (phase == 1)
                 {
                     // ── Allocate a fresh GlobalRefProbe with a known sentinel ────
-                    auto made{ vmhook::make_unique<global_ref_fixture>(k_sentinel) };
+                    auto made{ vmhook::make_unique<oop_pin_fixture>(k_sentinel) };
                     if (!made)
                     {
                         return;  // module body records the FAIL via g_made_ok==false
@@ -563,19 +563,19 @@ VMHOOK_JVM_MODULE(global_ref)
                     // not just a primitive field.
                     if (pin_oop && vmhook::hotspot::is_valid_pointer(pin_oop))
                     {
-                        global_ref_fixture via{ pin_oop };
+                        oop_pin_fixture via{ pin_oop };
                         const std::string tag{ via.get_tag() };
                         g_tag_read_ok.store(!tag.empty(), std::memory_order_relaxed);
-                        g_tag_value_ok.store(tag == global_ref_fixture::k_tag_value,
+                        g_tag_value_ok.store(tag == oop_pin_fixture::k_tag_value,
                                              std::memory_order_relaxed);
                     }
 
                     // ── Move-only semantics (genuine NewGlobalRef-backed pins) ───
                     // Use a SEPARATE freshly-pinned object so the move tests never
                     // disturb g_pinned (the one that must survive into phase 2).
-                    if (auto made_mc{ vmhook::make_unique<global_ref_fixture>(0x1111) })
+                    if (auto made_mc{ vmhook::make_unique<oop_pin_fixture>(0x1111) })
                     {
-                        vmhook::jni::global_ref src{ vmhook::pin(made_mc) };
+                        vmhook::oop_pin src{ vmhook::pin(made_mc) };
                         g_mc_built.store(static_cast<bool>(src), std::memory_order_relaxed);
 
                         // Snapshot the source's handle/oop BEFORE the move so we can
@@ -585,7 +585,7 @@ VMHOOK_JVM_MODULE(global_ref)
                         const vmhook::oop_t src_oop_pre{ resolve_oop_guarded(src) };
 
                         // move-CONSTRUCT
-                        vmhook::jni::global_ref dst{ std::move(src) };
+                        vmhook::oop_pin dst{ std::move(src) };
                         g_mc_src_emptied.store(
                             !static_cast<bool>(src) && src.oop() == nullptr,
                             std::memory_order_relaxed);
@@ -617,9 +617,9 @@ VMHOOK_JVM_MODULE(global_ref)
                         // over dst's.  Build a third pin to be the assignment
                         // target so its prior handle's DeleteGlobalRef runs here
                         // on the live JNIEnv.
-                        if (auto made_ma_target{ vmhook::make_unique<global_ref_fixture>(0x2222) })
+                        if (auto made_ma_target{ vmhook::make_unique<oop_pin_fixture>(0x2222) })
                         {
-                            vmhook::jni::global_ref target{ vmhook::pin(made_ma_target) };
+                            vmhook::oop_pin target{ vmhook::pin(made_ma_target) };
                             void* const dst_handle_pre{ dst.handle() };
                             target = std::move(dst);  // releases target's 0x2222 pin, adopts dst's 0x1111
                             // Handle IDENTITY: target adopted dst's exact handle (and
@@ -642,7 +642,7 @@ VMHOOK_JVM_MODULE(global_ref)
                             // the handle must remain intact and still readable.
                             // (Routed through a reference to dodge a -Wself-move
                             // diagnostic on a literal `x = std::move(x)`.)
-                            vmhook::jni::global_ref& alias{ target };
+                            vmhook::oop_pin& alias{ target };
                             target = std::move(alias);
                             std::int32_t self_val{ -1 };
                             if (static_cast<bool>(target)
@@ -660,8 +660,8 @@ VMHOOK_JVM_MODULE(global_ref)
                     // move-CONSTRUCT from an empty source: both ends end falsy and
                     // no NewGlobalRef/DeleteGlobalRef is touched.
                     {
-                        vmhook::jni::global_ref empty_src{};
-                        vmhook::jni::global_ref dst{ std::move(empty_src) };
+                        vmhook::oop_pin empty_src{};
+                        vmhook::oop_pin dst{ std::move(empty_src) };
                         g_mc_from_empty_both_falsy.store(
                             !static_cast<bool>(empty_src) && !static_cast<bool>(dst)
                                 && dst.oop() == nullptr,
@@ -669,10 +669,10 @@ VMHOOK_JVM_MODULE(global_ref)
                     }
                     // move-ASSIGN a held pin ONTO an empty target: target adopts the
                     // handle (no DeleteGlobalRef on its null), source is emptied.
-                    if (auto made_e{ vmhook::make_unique<global_ref_fixture>(0x3333) })
+                    if (auto made_e{ vmhook::make_unique<oop_pin_fixture>(0x3333) })
                     {
-                        vmhook::jni::global_ref held{ vmhook::pin(made_e) };
-                        vmhook::jni::global_ref empty_target{};
+                        vmhook::oop_pin held{ vmhook::pin(made_e) };
+                        vmhook::oop_pin empty_target{};
                         empty_target = std::move(held);
                         g_ma_onto_empty_dst_holds.store(static_cast<bool>(empty_target),
                                                         std::memory_order_relaxed);
@@ -688,10 +688,10 @@ VMHOOK_JVM_MODULE(global_ref)
                     }
                     // move-ASSIGN an empty source ONTO a held target: the target's
                     // own handle must be RELEASED (no leak) and both end empty.
-                    if (auto made_f{ vmhook::make_unique<global_ref_fixture>(0x4444) })
+                    if (auto made_f{ vmhook::make_unique<oop_pin_fixture>(0x4444) })
                     {
-                        vmhook::jni::global_ref held{ vmhook::pin(made_f) };
-                        vmhook::jni::global_ref empty_src{};
+                        vmhook::oop_pin held{ vmhook::pin(made_f) };
+                        vmhook::oop_pin empty_src{};
                         held = std::move(empty_src);   // releases held's 0x4444 handle
                         g_ma_from_empty_releases.store(
                             !static_cast<bool>(held) && held.oop() == nullptr,
@@ -701,11 +701,11 @@ VMHOOK_JVM_MODULE(global_ref)
                     }
 
                     // ── 3-way rotate: chained move-assign never corrupts / leaks ──
-                    if (auto made_r{ vmhook::make_unique<global_ref_fixture>(0x5151) })
+                    if (auto made_r{ vmhook::make_unique<oop_pin_fixture>(0x5151) })
                     {
-                        vmhook::jni::global_ref a{ vmhook::pin(made_r) };
-                        vmhook::jni::global_ref b{};
-                        vmhook::jni::global_ref c{};
+                        vmhook::oop_pin a{ vmhook::pin(made_r) };
+                        vmhook::oop_pin b{};
+                        vmhook::oop_pin c{};
                         b = std::move(a);   // a -> b
                         c = std::move(b);   // b -> c
                         a = std::move(c);   // c -> a (back home)
@@ -724,9 +724,9 @@ VMHOOK_JVM_MODULE(global_ref)
                     // Runs on EVERY toolchain (no GC involved), so the release path
                     // and reset() idempotency are exercised even where phase 2 is
                     // skipped (Windows / JDK 8).
-                    if (auto made_lr{ vmhook::make_unique<global_ref_fixture>(0x6262) })
+                    if (auto made_lr{ vmhook::make_unique<oop_pin_fixture>(0x6262) })
                     {
-                        vmhook::jni::global_ref lr{ vmhook::pin(made_lr) };
+                        vmhook::oop_pin lr{ vmhook::pin(made_lr) };
                         g_live_reset_built.store(static_cast<bool>(lr), std::memory_order_relaxed);
                         std::int32_t before{ -1 };
                         if (read_sentinel_guarded(resolve_oop_guarded(lr), before))
@@ -747,11 +747,11 @@ VMHOOK_JVM_MODULE(global_ref)
                     // ── two INDEPENDENT pins to the SAME object ──────────────────
                     // Distinct NewGlobalRef handles, both resolving to the same live
                     // oop; releasing ONE leaves the other (and the object) valid.
-                    if (auto made_d{ vmhook::make_unique<global_ref_fixture>(0x7373) })
+                    if (auto made_d{ vmhook::make_unique<oop_pin_fixture>(0x7373) })
                     {
                         const vmhook::oop_t inst{ made_d->vmhook::object_base::get_instance() };
-                        vmhook::jni::global_ref p1{ vmhook::pin(inst) };
-                        vmhook::jni::global_ref p2{ vmhook::pin(inst) };
+                        vmhook::oop_pin p1{ vmhook::pin(inst) };
+                        vmhook::oop_pin p2{ vmhook::pin(inst) };
                         g_dual_both_hold.store(static_cast<bool>(p1) && static_cast<bool>(p2),
                                                std::memory_order_relaxed);
                         g_dual_distinct_handles.store(
@@ -783,10 +783,10 @@ VMHOOK_JVM_MODULE(global_ref)
                     // eight distinct NewGlobalRef handles to ONE object, released in
                     // an INTERLEAVED order, must never double-free, and the last
                     // survivor must still resolve + read the live object.
-                    if (auto made_m{ vmhook::make_unique<global_ref_fixture>(0x8484) })
+                    if (auto made_m{ vmhook::make_unique<oop_pin_fixture>(0x8484) })
                     {
                         const vmhook::oop_t inst{ made_m->vmhook::object_base::get_instance() };
-                        std::array<vmhook::jni::global_ref, k_many_pins> pins{};
+                        std::array<vmhook::oop_pin, k_many_pins> pins{};
                         int held{ 0 };
                         bool all_distinct{ true };
                         bool all_same_oop{ true };
@@ -846,11 +846,11 @@ VMHOOK_JVM_MODULE(global_ref)
                     // handles (each its own NewGlobalRef) but the SAME live oop, and
                     // both read the same sentinel.  Exercises the pin(oop_t) overload
                     // on a real fixture object (elsewhere it only feeds String/array).
-                    if (auto made_o{ vmhook::make_unique<global_ref_fixture>(0x9595) })
+                    if (auto made_o{ vmhook::make_unique<oop_pin_fixture>(0x9595) })
                     {
                         const vmhook::oop_t inst{ made_o->vmhook::object_base::get_instance() };
-                        vmhook::jni::global_ref via_oop{ vmhook::pin(inst) };
-                        vmhook::jni::global_ref via_wrapper{ vmhook::pin(made_o) };
+                        vmhook::oop_pin via_oop{ vmhook::pin(inst) };
+                        vmhook::oop_pin via_wrapper{ vmhook::pin(made_o) };
                         const vmhook::oop_t a{ resolve_oop_guarded(via_oop) };
                         const vmhook::oop_t b{ resolve_oop_guarded(via_wrapper) };
                         g_pin_overloads_same_oop.store(
@@ -874,8 +874,8 @@ VMHOOK_JVM_MODULE(global_ref)
                     // stable, so this is HARD: a leaked/aliased handle would surface a
                     // different object's payload after the intervening allocations.
                     {
-                        vmhook::jni::global_ref outliver{};
-                        if (auto made_ol{ vmhook::make_unique<global_ref_fixture>(0xC3C3) })
+                        vmhook::oop_pin outliver{};
+                        if (auto made_ol{ vmhook::make_unique<oop_pin_fixture>(0xC3C3) })
                         {
                             outliver = vmhook::pin(made_ol);
                             made_ol.reset();  // drop the local wrapper: pin is the only keep-alive
@@ -884,7 +884,7 @@ VMHOOK_JVM_MODULE(global_ref)
                         // freed storage a reused slot would now read wrong.
                         for (int i = 0; i < 4; ++i)
                         {
-                            auto churn{ vmhook::make_unique<global_ref_fixture>(0x0BAD + i) };
+                            auto churn{ vmhook::make_unique<oop_pin_fixture>(0x0BAD + i) };
                             if (churn)
                             {
                                 (void)churn->get_sentinel();
@@ -906,13 +906,13 @@ VMHOOK_JVM_MODULE(global_ref)
                     // call, then re-read it through a wrapper rebuilt from a SECOND
                     // .oop() call of the SAME pin: the writer's change must be visible
                     // to the reader, proving .oop() is not a one-shot snapshot.
-                    if (auto made_w{ vmhook::make_unique<global_ref_fixture>(0x1010) })
+                    if (auto made_w{ vmhook::make_unique<oop_pin_fixture>(0x1010) })
                     {
-                        vmhook::jni::global_ref wpin{ vmhook::pin(made_w) };
+                        vmhook::oop_pin wpin{ vmhook::pin(made_w) };
                         const vmhook::oop_t w1{ resolve_oop_guarded(wpin) };
                         if (w1 && vmhook::hotspot::is_valid_pointer(w1))
                         {
-                            global_ref_fixture writer{ w1 };
+                            oop_pin_fixture writer{ w1 };
                             writer.set_sentinel(0x2020);
                             std::int32_t back{ -1 };
                             // Re-resolve through a SEPARATE .oop() call -> fresh wrapper.
@@ -930,12 +930,12 @@ VMHOOK_JVM_MODULE(global_ref)
                     // two move-assigns; swapping two DISTINCT held pins must cross
                     // their handles over wholesale, so each ends up reading the
                     // OTHER's sentinel.  No GC => HARD.
-                    if (auto made_sa{ vmhook::make_unique<global_ref_fixture>(0x0A0A) })
+                    if (auto made_sa{ vmhook::make_unique<oop_pin_fixture>(0x0A0A) })
                     {
-                        if (auto made_sb{ vmhook::make_unique<global_ref_fixture>(0x0B0B) })
+                        if (auto made_sb{ vmhook::make_unique<oop_pin_fixture>(0x0B0B) })
                         {
-                            vmhook::jni::global_ref sa{ vmhook::pin(made_sa) };
-                            vmhook::jni::global_ref sb{ vmhook::pin(made_sb) };
+                            vmhook::oop_pin sa{ vmhook::pin(made_sa) };
+                            vmhook::oop_pin sb{ vmhook::pin(made_sb) };
                             void* const ha_pre{ sa.handle() };
                             void* const hb_pre{ sb.handle() };
                             std::swap(sa, sb);
@@ -981,12 +981,12 @@ VMHOOK_JVM_MODULE(global_ref)
                         int matched{ 0 };
                         for (const std::int32_t want : boundary)
                         {
-                            auto made_bv{ vmhook::make_unique<global_ref_fixture>(want) };
+                            auto made_bv{ vmhook::make_unique<oop_pin_fixture>(want) };
                             if (!made_bv)
                             {
                                 continue;
                             }
-                            vmhook::jni::global_ref bp{ vmhook::pin(made_bv) };
+                            vmhook::oop_pin bp{ vmhook::pin(made_bv) };
                             made_bv.reset();  // pin is the only keep-alive (no GC)
                             std::int32_t got{ 0 };
                             if (read_sentinel_guarded(resolve_oop_guarded(bp), got))
@@ -1009,10 +1009,10 @@ VMHOOK_JVM_MODULE(global_ref)
                     // freshly-decoded wrapper instance oop (a genuine cross-check
                     // against object_base::get_instance(), not a self-comparison).
                     // Guarded with is_valid_pointer before the hand deref.
-                    if (auto made_mk{ vmhook::make_unique<global_ref_fixture>(0x4D4B) })
+                    if (auto made_mk{ vmhook::make_unique<oop_pin_fixture>(0x4D4B) })
                     {
                         const vmhook::oop_t inst{ made_mk->vmhook::object_base::get_instance() };
-                        vmhook::jni::global_ref mk{ vmhook::pin(made_mk) };
+                        vmhook::oop_pin mk{ vmhook::pin(made_mk) };
                         void* const h{ mk.handle() };
                         if (h != nullptr && vmhook::hotspot::is_valid_pointer(h))
                         {
@@ -1038,11 +1038,11 @@ VMHOOK_JVM_MODULE(global_ref)
                     // Cardinality cross-check (count == size): 8 independent pins to
                     // 8 fresh objects must yield 8 UNIQUE handle values.  No GC.
                     {
-                        std::array<vmhook::jni::global_ref, k_many_pins> upins{};
+                        std::array<vmhook::oop_pin, k_many_pins> upins{};
                         std::array<void*, k_many_pins> uhandles{};
                         for (int i = 0; i < k_many_pins; ++i)
                         {
-                            if (auto m{ vmhook::make_unique<global_ref_fixture>(0xD000 + i) })
+                            if (auto m{ vmhook::make_unique<oop_pin_fixture>(0xD000 + i) })
                             {
                                 upins[static_cast<std::size_t>(i)] = vmhook::pin(m);
                             }
@@ -1075,12 +1075,12 @@ VMHOOK_JVM_MODULE(global_ref)
                     }
 
                     // ── distinct OBJECTS -> distinct identity, each reads its own ─
-                    if (auto made_a{ vmhook::make_unique<global_ref_fixture>(0xAAAA) })
+                    if (auto made_a{ vmhook::make_unique<oop_pin_fixture>(0xAAAA) })
                     {
-                        if (auto made_b{ vmhook::make_unique<global_ref_fixture>(0xBBBB) })
+                        if (auto made_b{ vmhook::make_unique<oop_pin_fixture>(0xBBBB) })
                         {
-                            vmhook::jni::global_ref pa{ vmhook::pin(made_a) };
-                            vmhook::jni::global_ref pb{ vmhook::pin(made_b) };
+                            vmhook::oop_pin pa{ vmhook::pin(made_a) };
+                            vmhook::oop_pin pb{ vmhook::pin(made_b) };
                             g_distinct_handles.store(
                                 pa.handle() != nullptr && pb.handle() != nullptr
                                     && pa.handle() != pb.handle(),
@@ -1107,7 +1107,7 @@ VMHOOK_JVM_MODULE(global_ref)
                     // ── varied-type pins: java.lang.String (read back via decode) ─
                     if (void* const str_oop{ vmhook::make_java_string("gref-str-payload") })
                     {
-                        vmhook::jni::global_ref str_pin{ vmhook::pin(vmhook::oop_t{ str_oop }) };
+                        vmhook::oop_pin str_pin{ vmhook::pin(vmhook::oop_t{ str_oop }) };
                         g_str_pin_held.store(static_cast<bool>(str_pin), std::memory_order_relaxed);
                         const vmhook::oop_t live{ resolve_oop_guarded(str_pin) };
                         g_str_pin_oop_nonnull.store(live != nullptr, std::memory_order_relaxed);
@@ -1123,7 +1123,7 @@ VMHOOK_JVM_MODULE(global_ref)
                     // ── varied-type pins: a small primitive int[] array ──────────
                     if (void* const arr_oop{ vmhook::make_java_array("[I", 4, sizeof(std::int32_t)) })
                     {
-                        vmhook::jni::global_ref arr_pin{ vmhook::pin(vmhook::oop_t{ arr_oop }) };
+                        vmhook::oop_pin arr_pin{ vmhook::pin(vmhook::oop_t{ arr_oop }) };
                         g_arr_pin_held.store(static_cast<bool>(arr_pin), std::memory_order_relaxed);
                         g_arr_pin_oop_nonnull.store(resolve_oop_guarded(arr_pin) != nullptr,
                                                     std::memory_order_relaxed);
@@ -1131,14 +1131,14 @@ VMHOOK_JVM_MODULE(global_ref)
                     }
 
                     // ── varied-type pins: the no-arg ()V object (sentinel 0, tag "") ─
-                    if (auto made_na{ vmhook::make_unique<global_ref_fixture>() })
+                    if (auto made_na{ vmhook::make_unique<oop_pin_fixture>() })
                     {
-                        vmhook::jni::global_ref na_pin{ vmhook::pin(made_na) };
+                        vmhook::oop_pin na_pin{ vmhook::pin(made_na) };
                         g_noarg_pin_held.store(static_cast<bool>(na_pin), std::memory_order_relaxed);
                         const vmhook::oop_t live{ resolve_oop_guarded(na_pin) };
                         if (live && vmhook::hotspot::is_valid_pointer(live))
                         {
-                            global_ref_fixture via{ live };
+                            oop_pin_fixture via{ live };
                             g_noarg_sentinel_zero.store(via.get_sentinel() == 0,
                                                         std::memory_order_relaxed);
                             g_noarg_tag_empty.store(via.get_tag().empty(),
@@ -1149,7 +1149,7 @@ VMHOOK_JVM_MODULE(global_ref)
 
                     // ── Null / empty pins are safe (no JNI calls issued) ─────────
                     {
-                        vmhook::jni::global_ref empty{};
+                        vmhook::oop_pin empty{};
                         g_empty_falsy.store(!static_cast<bool>(empty), std::memory_order_relaxed);
                         g_empty_oop_null.store(empty.oop() == nullptr, std::memory_order_relaxed);
                         g_empty_handle_null.store(empty.handle() == nullptr, std::memory_order_relaxed);
@@ -1163,15 +1163,15 @@ VMHOOK_JVM_MODULE(global_ref)
                             std::memory_order_relaxed);
                     }
                     {
-                        vmhook::jni::global_ref null_pin{ vmhook::pin(vmhook::oop_t{ nullptr }) };
+                        vmhook::oop_pin null_pin{ vmhook::pin(vmhook::oop_t{ nullptr }) };
                         g_pin_nulloop_falsy.store(!static_cast<bool>(null_pin), std::memory_order_relaxed);
                         g_pin_nulloop_oop_null.store(null_pin.oop() == nullptr, std::memory_order_relaxed);
                         g_pin_nulloop_handle_null.store(null_pin.handle() == nullptr,
                                                         std::memory_order_relaxed);
                     }
                     {
-                        const std::unique_ptr<global_ref_fixture> null_wrapper{};
-                        vmhook::jni::global_ref from_null{ vmhook::pin(null_wrapper) };
+                        const std::unique_ptr<oop_pin_fixture> null_wrapper{};
+                        vmhook::oop_pin from_null{ vmhook::pin(null_wrapper) };
                         g_pin_null_wrapper_falsy.store(!static_cast<bool>(from_null), std::memory_order_relaxed);
                         g_pin_null_wrapper_oop_null.store(from_null.oop() == nullptr,
                                                           std::memory_order_relaxed);
@@ -1240,8 +1240,8 @@ VMHOOK_JVM_MODULE(global_ref)
                     // a primitive) — gated on the SAME attainability as the sentinel.
                     if (attainable && vmhook::hotspot::is_valid_pointer(live))
                     {
-                        global_ref_fixture via{ live };
-                        g_survive_tag_ok.store(via.get_tag() == global_ref_fixture::k_tag_value,
+                        oop_pin_fixture via{ live };
+                        g_survive_tag_ok.store(via.get_tag() == oop_pin_fixture::k_tag_value,
                                                std::memory_order_relaxed);
                     }
 
@@ -1275,7 +1275,7 @@ VMHOOK_JVM_MODULE(global_ref)
 #endif
             }) };
 
-        ctx.check("global_ref_hook_installed", handle.installed());
+        ctx.check("oop_pin_hook_installed", handle.installed());
 
         // ── PHASE 1: build + pin + move-only + null/empty ────────────────────────
         g_phase.store(1, std::memory_order_relaxed);
@@ -1284,169 +1284,169 @@ VMHOOK_JVM_MODULE(global_ref)
             {
                 if (value)
                 {
-                    global_ref_fixture::set_done(false);
-                    global_ref_fixture::set_mode(1);
+                    oop_pin_fixture::set_done(false);
+                    oop_pin_fixture::set_mode(1);
                 }
-                global_ref_fixture::set_go(value);
+                oop_pin_fixture::set_go(value);
             },
-            []() { return global_ref_fixture::get_done(); }) };
+            []() { return oop_pin_fixture::get_done(); }) };
 
-        ctx.check("global_ref_phase1_probe_completed", done1);
-        ctx.check("global_ref_hook_fired",
+        ctx.check("oop_pin_phase1_probe_completed", done1);
+        ctx.check("oop_pin_hook_fired",
                   g_trigger_calls.load(std::memory_order_relaxed) >= 1);
-        ctx.check("global_ref_hook_saw_self",
+        ctx.check("oop_pin_hook_saw_self",
                   g_hook_saw_self.load(std::memory_order_relaxed));
 
         // make_unique + initial sentinel
-        ctx.check("global_ref_object_allocated", g_made_ok.load(std::memory_order_relaxed));
-        ctx.check("global_ref_initial_sentinel_is_5A5A",
+        ctx.check("oop_pin_object_allocated", g_made_ok.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_initial_sentinel_is_5A5A",
                   g_made_sentinel.load(std::memory_order_relaxed) == k_sentinel);
 
         // pin held + functional read through oop() BEFORE any GC
-        ctx.check("global_ref_pin_is_held", g_pin_held.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_oop_nonnull", g_pin_oop_nonnull.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_reads_field_initially",
+        ctx.check("oop_pin_pin_is_held", g_pin_held.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_pin_oop_nonnull", g_pin_oop_nonnull.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_pin_reads_field_initially",
                   g_pin_read_initial_ok.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_initial_field_is_5A5A",
+        ctx.check("oop_pin_pin_initial_field_is_5A5A",
                   g_pin_read_initial_val.load(std::memory_order_relaxed) == k_sentinel);
 
         // move-construct
-        ctx.check("global_ref_move_src_built", g_mc_built.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_construct_empties_source",
+        ctx.check("oop_pin_move_src_built", g_mc_built.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_move_construct_empties_source",
                   g_mc_src_emptied.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_construct_dest_holds",
+        ctx.check("oop_pin_move_construct_dest_holds",
                   g_mc_dst_holds.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_construct_dest_reads_field",
+        ctx.check("oop_pin_move_construct_dest_reads_field",
                   g_mc_dst_reads_ok.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_construct_dest_field_is_1111",
+        ctx.check("oop_pin_move_construct_dest_field_is_1111",
                   g_mc_dst_val.load(std::memory_order_relaxed) == 0x1111);
         // move STEALS the raw handle (no fresh NewGlobalRef) and resolves identically.
-        ctx.check("global_ref_move_construct_transfers_same_handle",
+        ctx.check("oop_pin_move_construct_transfers_same_handle",
                   g_mc_handle_transferred.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_construct_oop_identity_no_gc",
+        ctx.check("oop_pin_move_construct_oop_identity_no_gc",
                   g_mc_oop_identity.load(std::memory_order_relaxed));
-        ctx.check("global_ref_moved_from_source_reset_is_safe",
+        ctx.check("oop_pin_moved_from_source_reset_is_safe",
                   g_moved_from_reset_safe.load(std::memory_order_relaxed));
 
         // move-assign
-        ctx.check("global_ref_move_assign_empties_source",
+        ctx.check("oop_pin_move_assign_empties_source",
                   g_ma_src_emptied.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_assign_dest_holds",
+        ctx.check("oop_pin_move_assign_dest_holds",
                   g_ma_dst_holds.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_assign_dest_reads_field",
+        ctx.check("oop_pin_move_assign_dest_reads_field",
                   g_ma_dst_reads_ok.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_assign_dest_field_is_1111",
+        ctx.check("oop_pin_move_assign_dest_field_is_1111",
                   g_ma_dst_val.load(std::memory_order_relaxed) == 0x1111);
-        ctx.check("global_ref_move_assign_transfers_same_handle",
+        ctx.check("oop_pin_move_assign_transfers_same_handle",
                   g_ma_handle_transferred.load(std::memory_order_relaxed));
 
         // self-move
-        ctx.check("global_ref_self_move_keeps_handle",
+        ctx.check("oop_pin_self_move_keeps_handle",
                   g_selfmove_intact.load(std::memory_order_relaxed));
-        ctx.check("global_ref_self_move_field_is_1111",
+        ctx.check("oop_pin_self_move_field_is_1111",
                   g_selfmove_val.load(std::memory_order_relaxed) == 0x1111);
 
         // handle()/oop() observer stability + JDK 9+ tag-bit masking
-        ctx.check("global_ref_handle_is_nonnull", g_handle_nonnull.load(std::memory_order_relaxed));
-        ctx.check("global_ref_handle_is_stable", g_handle_eq_self.load(std::memory_order_relaxed));
-        ctx.check("global_ref_oop_is_stable_no_gc", g_oop_eq_self.load(std::memory_order_relaxed));
-        ctx.check("global_ref_masked_slot_is_8_aligned",
+        ctx.check("oop_pin_handle_is_nonnull", g_handle_nonnull.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_handle_is_stable", g_handle_eq_self.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_oop_is_stable_no_gc", g_oop_eq_self.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_masked_slot_is_8_aligned",
                   g_slot_masked_aligned.load(std::memory_order_relaxed));
 
         // reference-typed read-back: the `tag` String field through .oop()
-        ctx.check("global_ref_pin_reads_object_field_tag", g_tag_read_ok.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_tag_field_is_expected", g_tag_value_ok.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_pin_reads_object_field_tag", g_tag_read_ok.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_pin_tag_field_is_expected", g_tag_value_ok.load(std::memory_order_relaxed));
 
         // move onto/from EMPTY pins (no DeleteGlobalRef on a null handle)
-        ctx.check("global_ref_move_construct_from_empty_both_falsy",
+        ctx.check("oop_pin_move_construct_from_empty_both_falsy",
                   g_mc_from_empty_both_falsy.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_assign_onto_empty_dest_holds",
+        ctx.check("oop_pin_move_assign_onto_empty_dest_holds",
                   g_ma_onto_empty_dst_holds.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_assign_onto_empty_empties_source",
+        ctx.check("oop_pin_move_assign_onto_empty_empties_source",
                   g_ma_onto_empty_src_emptied.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_assign_onto_empty_reads_3333",
+        ctx.check("oop_pin_move_assign_onto_empty_reads_3333",
                   g_ma_onto_empty_reads_ok.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_assign_from_empty_releases_target",
+        ctx.check("oop_pin_move_assign_from_empty_releases_target",
                   g_ma_from_empty_releases.load(std::memory_order_relaxed));
-        ctx.check("global_ref_move_assign_from_empty_source_falsy",
+        ctx.check("oop_pin_move_assign_from_empty_source_falsy",
                   g_ma_from_empty_src_falsy.load(std::memory_order_relaxed));
 
         // 3-way rotate (chained move-assign never corrupts / leaks)
-        ctx.check("global_ref_rotate_final_holds_only_one",
+        ctx.check("oop_pin_rotate_final_holds_only_one",
                   g_rotate_final_holds.load(std::memory_order_relaxed));
-        ctx.check("global_ref_rotate_final_reads_field",
+        ctx.check("oop_pin_rotate_final_reads_field",
                   g_rotate_final_reads_ok.load(std::memory_order_relaxed));
-        ctx.check("global_ref_rotate_final_field_is_5151",
+        ctx.check("oop_pin_rotate_final_field_is_5151",
                   g_rotate_final_val.load(std::memory_order_relaxed) == 0x5151);
 
         // reset() on a LIVE (non-relocated) pin — real DeleteGlobalRef, every toolchain
-        ctx.check("global_ref_live_reset_pin_built",
+        ctx.check("oop_pin_live_reset_pin_built",
                   g_live_reset_built.load(std::memory_order_relaxed));
-        ctx.check("global_ref_live_reset_read_field_before",
+        ctx.check("oop_pin_live_reset_read_field_before",
                   g_live_reset_read_before.load(std::memory_order_relaxed));
-        ctx.check("global_ref_live_reset_falsy_after",
+        ctx.check("oop_pin_live_reset_falsy_after",
                   g_live_reset_falsy_after.load(std::memory_order_relaxed));
-        ctx.check("global_ref_live_reset_oop_null_after",
+        ctx.check("oop_pin_live_reset_oop_null_after",
                   g_live_reset_oop_null_after.load(std::memory_order_relaxed));
-        ctx.check("global_ref_live_reset_handle_null_after",
+        ctx.check("oop_pin_live_reset_handle_null_after",
                   g_live_reset_handle_null_after.load(std::memory_order_relaxed));
-        ctx.check("global_ref_live_double_reset_safe",
+        ctx.check("oop_pin_live_double_reset_safe",
                   g_live_double_reset_safe.load(std::memory_order_relaxed));
 
         // two INDEPENDENT pins to the SAME object
-        ctx.check("global_ref_dual_pins_both_hold", g_dual_both_hold.load(std::memory_order_relaxed));
-        ctx.check("global_ref_dual_pins_distinct_handles",
+        ctx.check("oop_pin_dual_pins_both_hold", g_dual_both_hold.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_dual_pins_distinct_handles",
                   g_dual_distinct_handles.load(std::memory_order_relaxed));
-        ctx.check("global_ref_dual_pins_same_oop", g_dual_same_oop.load(std::memory_order_relaxed));
-        ctx.check("global_ref_dual_pins_both_read_7373",
+        ctx.check("oop_pin_dual_pins_same_oop", g_dual_same_oop.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_dual_pins_both_read_7373",
                   g_dual_both_read.load(std::memory_order_relaxed));
-        ctx.check("global_ref_dual_survivor_valid_after_one_reset",
+        ctx.check("oop_pin_dual_survivor_valid_after_one_reset",
                   g_dual_survivor_reads_after_one_reset.load(std::memory_order_relaxed));
 
         // MANY (N=8) independent pins to ONE object, interleaved release
-        ctx.check("global_ref_many_pins_all_hold",
+        ctx.check("oop_pin_many_pins_all_hold",
                   g_many_all_hold.load(std::memory_order_relaxed) == k_many_pins);
-        ctx.check("global_ref_many_pins_distinct_handles",
+        ctx.check("oop_pin_many_pins_distinct_handles",
                   g_many_distinct_handles.load(std::memory_order_relaxed));
-        ctx.check("global_ref_many_pins_all_same_oop",
+        ctx.check("oop_pin_many_pins_all_same_oop",
                   g_many_all_same_oop.load(std::memory_order_relaxed));
-        ctx.check("global_ref_many_pins_survivor_reads_8484",
+        ctx.check("oop_pin_many_pins_survivor_reads_8484",
                   g_many_survivor_reads.load(std::memory_order_relaxed));
 
         // pin(oop_t) and pin(unique_ptr) overloads agree on the same object
-        ctx.check("global_ref_pin_overloads_same_oop_distinct_handles",
+        ctx.check("oop_pin_pin_overloads_same_oop_distinct_handles",
                   g_pin_overloads_same_oop.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_overloads_both_read_9595",
+        ctx.check("oop_pin_pin_overloads_both_read_9595",
                   g_pin_overloads_both_read.load(std::memory_order_relaxed));
 
         // pin OUTLIVES its local wrapper under allocation pressure (no GC)
-        ctx.check("global_ref_pin_outlives_local_reads_C3C3",
+        ctx.check("oop_pin_pin_outlives_local_reads_C3C3",
                   g_outlive_local_reads_ok.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_outlives_local_value_is_C3C3",
+        ctx.check("oop_pin_pin_outlives_local_value_is_C3C3",
                   g_outlive_local_val.load(std::memory_order_relaxed)
                       == static_cast<std::int32_t>(0xC3C3));
 
         // .oop() resolves the live, MUTABLE object every call (write-through)
-        ctx.check("global_ref_oop_tracks_write_through_pin",
+        ctx.check("oop_pin_oop_tracks_write_through_pin",
                   g_write_through_oop_ok.load(std::memory_order_relaxed));
-        ctx.check("global_ref_oop_write_through_value_is_2020",
+        ctx.check("oop_pin_oop_write_through_value_is_2020",
                   g_write_through_val.load(std::memory_order_relaxed) == 0x2020);
 
         // std::swap exchanges ownership wholesale (move value-semantics)
-        ctx.check("global_ref_swap_exchanges_handles",
+        ctx.check("oop_pin_swap_exchanges_handles",
                   g_swap_exchanged_handles.load(std::memory_order_relaxed));
-        ctx.check("global_ref_swap_a_reads_b_0B0B",
+        ctx.check("oop_pin_swap_a_reads_b_0B0B",
                   g_swap_a_reads_b.load(std::memory_order_relaxed));
-        ctx.check("global_ref_swap_b_reads_a_0A0A",
+        ctx.check("oop_pin_swap_b_reads_a_0A0A",
                   g_swap_b_reads_a.load(std::memory_order_relaxed));
-        ctx.check("global_ref_swap_self_is_noop",
+        ctx.check("oop_pin_swap_self_is_noop",
                   g_swap_self_intact.load(std::memory_order_relaxed));
 
         // BOUNDARY sentinel values (0,1,-1,INT32_MIN,INT32_MAX) round-trip through .oop()
         // count == size: every boundary value resolved AND matched exactly.
-        ctx.check("global_ref_boundary_all_resolved",
+        ctx.check("oop_pin_boundary_all_resolved",
                   g_boundary_reads_ok.load(std::memory_order_relaxed) == k_boundary_count);
-        ctx.check("global_ref_boundary_all_match",
+        ctx.check("oop_pin_boundary_all_match",
                   g_boundary_values_matched.load(std::memory_order_relaxed) == k_boundary_count);
 
         // .oop()'s low-3-bit mask recovers the REAL slot: a hand-recomputed
@@ -1457,57 +1457,57 @@ VMHOOK_JVM_MODULE(global_ref)
         // matches the existing oop_eq_instance_pre diagnostic, which the module has
         // never hard-asserted (NewGlobalRef's stored oop form is not guaranteed by
         // the library source to be byte-identical to get_instance() on every JDK).
-        ctx.check("global_ref_mask_matches_oop",
+        ctx.check("oop_pin_mask_matches_oop",
                   g_mask_matches_oop.load(std::memory_order_relaxed));
-        ctx.record(std::string{ "[INFO] global_ref: masked-slot deref == wrapper "
+        ctx.record(std::string{ "[INFO] oop_pin: masked-slot deref == wrapper "
                                 "get_instance() oop (pre-GC) observed=" }
                    + (g_mask_slot_eq_instance.load(std::memory_order_relaxed) ? "true" : "false"));
 
         // N distinct pins => EXACTLY N unique handle values (count == size cardinality)
-        ctx.check("global_ref_many_unique_handle_count_is_8",
+        ctx.check("oop_pin_many_unique_handle_count_is_8",
                   g_many_unique_handle_count.load(std::memory_order_relaxed) == k_many_pins);
 
         // distinct OBJECTS -> distinct identity, each reads its OWN sentinel
-        ctx.check("global_ref_distinct_objects_distinct_handles",
+        ctx.check("oop_pin_distinct_objects_distinct_handles",
                   g_distinct_handles.load(std::memory_order_relaxed));
-        ctx.check("global_ref_distinct_objects_distinct_oops",
+        ctx.check("oop_pin_distinct_objects_distinct_oops",
                   g_distinct_oops.load(std::memory_order_relaxed));
-        ctx.check("global_ref_distinct_object_a_reads_AAAA",
+        ctx.check("oop_pin_distinct_object_a_reads_AAAA",
                   g_distinct_reads_a.load(std::memory_order_relaxed));
-        ctx.check("global_ref_distinct_object_b_reads_BBBB",
+        ctx.check("oop_pin_distinct_object_b_reads_BBBB",
                   g_distinct_reads_b.load(std::memory_order_relaxed));
 
         // varied-type pins: String / primitive array / no-arg object
-        ctx.check("global_ref_string_pin_held", g_str_pin_held.load(std::memory_order_relaxed));
-        ctx.check("global_ref_string_pin_oop_nonnull",
+        ctx.check("oop_pin_string_pin_held", g_str_pin_held.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_string_pin_oop_nonnull",
                   g_str_pin_oop_nonnull.load(std::memory_order_relaxed));
-        ctx.check("global_ref_string_pin_reads_back",
+        ctx.check("oop_pin_string_pin_reads_back",
                   g_str_read_ok.load(std::memory_order_relaxed));
-        ctx.check("global_ref_array_pin_held", g_arr_pin_held.load(std::memory_order_relaxed));
-        ctx.check("global_ref_array_pin_oop_nonnull",
+        ctx.check("oop_pin_array_pin_held", g_arr_pin_held.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_array_pin_oop_nonnull",
                   g_arr_pin_oop_nonnull.load(std::memory_order_relaxed));
-        ctx.check("global_ref_noarg_object_pin_held",
+        ctx.check("oop_pin_noarg_object_pin_held",
                   g_noarg_pin_held.load(std::memory_order_relaxed));
-        ctx.check("global_ref_noarg_object_sentinel_is_zero",
+        ctx.check("oop_pin_noarg_object_sentinel_is_zero",
                   g_noarg_sentinel_zero.load(std::memory_order_relaxed));
-        ctx.check("global_ref_noarg_object_tag_is_empty",
+        ctx.check("oop_pin_noarg_object_tag_is_empty",
                   g_noarg_tag_empty.load(std::memory_order_relaxed));
 
         // null / empty safety
-        ctx.check("global_ref_default_is_falsy", g_empty_falsy.load(std::memory_order_relaxed));
-        ctx.check("global_ref_default_oop_is_null", g_empty_oop_null.load(std::memory_order_relaxed));
-        ctx.check("global_ref_default_handle_is_null", g_empty_handle_null.load(std::memory_order_relaxed));
-        ctx.check("global_ref_empty_reset_is_safe", g_empty_reset_safe.load(std::memory_order_relaxed));
-        ctx.check("global_ref_empty_double_reset_is_safe",
+        ctx.check("oop_pin_default_is_falsy", g_empty_falsy.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_default_oop_is_null", g_empty_oop_null.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_default_handle_is_null", g_empty_handle_null.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_empty_reset_is_safe", g_empty_reset_safe.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_empty_double_reset_is_safe",
                   g_empty_double_reset_safe.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_nullptr_is_falsy", g_pin_nulloop_falsy.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_nullptr_oop_is_null",
+        ctx.check("oop_pin_pin_nullptr_is_falsy", g_pin_nulloop_falsy.load(std::memory_order_relaxed));
+        ctx.check("oop_pin_pin_nullptr_oop_is_null",
                   g_pin_nulloop_oop_null.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_nullptr_handle_is_null",
+        ctx.check("oop_pin_pin_nullptr_handle_is_null",
                   g_pin_nulloop_handle_null.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_null_wrapper_is_falsy",
+        ctx.check("oop_pin_pin_null_wrapper_is_falsy",
                   g_pin_null_wrapper_falsy.load(std::memory_order_relaxed));
-        ctx.check("global_ref_pin_null_wrapper_oop_is_null",
+        ctx.check("oop_pin_pin_null_wrapper_oop_is_null",
                   g_pin_null_wrapper_oop_null.load(std::memory_order_relaxed));
 
         // The ENTIRE forced-System.gc() survive-GC drive below (Phase 2) is gated
@@ -1570,14 +1570,14 @@ VMHOOK_JVM_MODULE(global_ref)
                 {
                     if (value)
                     {
-                        global_ref_fixture::set_done(false);
-                        global_ref_fixture::set_mode(2);
+                        oop_pin_fixture::set_done(false);
+                        oop_pin_fixture::set_mode(2);
                     }
-                    global_ref_fixture::set_go(value);
+                    oop_pin_fixture::set_go(value);
                 },
-                []() { return global_ref_fixture::get_done(); }) };
+                []() { return oop_pin_fixture::get_done(); }) };
 
-            ctx.check("global_ref_phase2_probe_completed", done2);
+            ctx.check("oop_pin_phase2_probe_completed", done2);
 
             // HANDLE STABILITY across the GC — HARD on EVERY non-Windows collector,
             // including a relocating G1: a relocating collector moves the slot
@@ -1585,22 +1585,22 @@ VMHOOK_JVM_MODULE(global_ref)
             // pin's raw handle must be byte-identical pre/post-GC and still non-null.
             // This is a pure handle compare (no oop deref), so it is safe to assert
             // hard even when the live-oop reads below degrade to [INFO].
-            ctx.check("global_ref_handle_nonnull_after_gc",
+            ctx.check("oop_pin_handle_nonnull_after_gc",
                       g_phase2_handle_nonnull.load(std::memory_order_relaxed));
-            ctx.check("global_ref_handle_stable_across_gc",
+            ctx.check("oop_pin_handle_stable_across_gc",
                       g_phase2_handle_stable.load(std::memory_order_relaxed));
 
             // A forced System.gc() is only a HINT — the JVM may legally defer or
             // skip the collection — so "did a GC round actually run" is best-effort:
             // hard-PASS when the probe observed >= 1 round, else record an [INFO]
             // rather than FAILing on a deferred no-op collection.
-            if (global_ref_fixture::get_gc_rounds() >= 1)
+            if (oop_pin_fixture::get_gc_rounds() >= 1)
             {
-                ctx.check("global_ref_gc_actually_ran", true);
+                ctx.check("oop_pin_gc_actually_ran", true);
             }
             else
             {
-                ctx.record("[INFO] global_ref: forced System.gc() registered 0 GC "
+                ctx.record("[INFO] oop_pin: forced System.gc() registered 0 GC "
                            "rounds this run (a forced GC is a hint the JVM may defer / "
                            "treat as a no-op) — survive-GC drive ran but no relocation "
                            "round was observed; not asserted.");
@@ -1618,20 +1618,20 @@ VMHOOK_JVM_MODULE(global_ref)
             // fault.  This is what keeps the module from ever crashing the JVM on G1.
             if (g_survive_attainable.load(std::memory_order_relaxed))
             {
-                ctx.check("global_ref_survives_gc_oop_nonnull",
+                ctx.check("oop_pin_survives_gc_oop_nonnull",
                           g_survive_oop_nonnull.load(std::memory_order_relaxed));
-                ctx.check("global_ref_field_survives_gc",
+                ctx.check("oop_pin_field_survives_gc",
                           g_survive_read_ok.load(std::memory_order_relaxed));
-                ctx.check("global_ref_field_survives_gc_value_is_5A5A",
+                ctx.check("oop_pin_field_survives_gc_value_is_5A5A",
                           g_survive_read_val.load(std::memory_order_relaxed) == k_sentinel);
                 // The embedded `tag` String REFERENCE field also survived relocation
                 // (an object reference chased through the pin, not just a primitive).
-                ctx.check("global_ref_tag_ref_survives_gc",
+                ctx.check("oop_pin_tag_ref_survives_gc",
                           g_survive_tag_ok.load(std::memory_order_relaxed));
             }
             else
             {
-                ctx.record("[INFO] global_ref: post-GC oop could not be SAFELY resolved "
+                ctx.record("[INFO] oop_pin: post-GC oop could not be SAFELY resolved "
                            "through the still-held pin (documented relocating-GC limitation, "
                            "e.g. G1 on linux-gcc-java11) — the pin is still held at the HANDLE "
                            "level (verified below) but the live oop deref was gated off to avoid "
@@ -1653,12 +1653,12 @@ VMHOOK_JVM_MODULE(global_ref)
             // (On JDK 8 all of phase 2 is skipped — see the else branch below.)
             if (g_survive_attainable.load(std::memory_order_relaxed))
             {
-                ctx.check("global_ref_reset_clears_oop", g_reset_clears_oop.load(std::memory_order_relaxed));
-                ctx.check("global_ref_double_reset_safe", g_double_reset_safe.load(std::memory_order_relaxed));
+                ctx.check("oop_pin_reset_clears_oop", g_reset_clears_oop.load(std::memory_order_relaxed));
+                ctx.check("oop_pin_double_reset_safe", g_double_reset_safe.load(std::memory_order_relaxed));
             }
             else
             {
-                ctx.record("[INFO] global_ref: post-GC reset()/double-reset checks not "
+                ctx.record("[INFO] oop_pin: post-GC reset()/double-reset checks not "
                            "asserted this run — the post-GC pin was not SAFELY attainable "
                            "(documented relocating-GC limitation, e.g. G1 on linux-gcc), so "
                            "the detour left the pin HELD for the file-scope destructor rather "
@@ -1669,12 +1669,12 @@ VMHOOK_JVM_MODULE(global_ref)
         }
         else
         {
-            ctx.record("[INFO] global_ref post-GC survival test skipped on JDK 8 "
+            ctx.record("[INFO] oop_pin post-GC survival test skipped on JDK 8 "
                        "(global-ref/GC oop read faults on the JDK8 mingw build; "
                        "phase-1 handle semantics fully tested)");
         }
 #else
-        ctx.record("[INFO] global_ref: survive-GC (forced System.gc()) phase skipped on ALL Windows toolchains (msvc / mingw / clang-cl). Holding a JNI global ref across a relocating System.gc() and then releasing it post-relocation is fragile on Windows -- on MSVC it intermittently faults the JVM mid-suite (the post-GC DeleteGlobalRef on a relocated pin corrupts JNI state and cascades to crash the next module), and the no-SEH MinGW / clang-cl toolchains cannot contain such a fault. The pin install + ALL phase-1 build/pin/oop checks, the move-only semantics, the null/empty-pin checks (incl. empty-pin reset), and the teardown below still run here on every Windows toolchain; the forced-GC survive-GC path (and its post-GC reset()/DeleteGlobalRef) is exercised on linux/macos only.");
+        ctx.record("[INFO] oop_pin: survive-GC (forced System.gc()) phase skipped on ALL Windows toolchains (msvc / mingw / clang-cl). Holding a JNI global ref across a relocating System.gc() and then releasing it post-relocation is fragile on Windows -- on MSVC it intermittently faults the JVM mid-suite (the post-GC DeleteGlobalRef on a relocated pin corrupts JNI state and cascades to crash the next module), and the no-SEH MinGW / clang-cl toolchains cannot contain such a fault. The pin install + ALL phase-1 build/pin/oop checks, the move-only semantics, the null/empty-pin checks (incl. empty-pin reset), and the teardown below still run here on every Windows toolchain; the forced-GC survive-GC path (and its post-GC reset()/DeleteGlobalRef) is exercised on linux/macos only.");
 #endif
 
         // ── Diagnostic: pre/post-GC address relationship (relocation tracking) ───
@@ -1684,7 +1684,7 @@ VMHOOK_JVM_MODULE(global_ref)
             const std::uintptr_t hbits{ g_handle_bits.load(std::memory_order_relaxed) };
             const std::uintptr_t ibits{ g_instance_bits.load(std::memory_order_relaxed) };
             std::ostringstream oss{};
-            oss << "[INFO] global_ref diag: handle=0x" << std::hex << hbits
+            oss << "[INFO] oop_pin diag: handle=0x" << std::hex << hbits
                 << " handle_lowbits=0x" << (hbits & 0xF)
                 << " oop_pre_gc=0x" << pre
                 << " oop_post_gc=0x" << post
@@ -1695,15 +1695,15 @@ VMHOOK_JVM_MODULE(global_ref)
         }
 
         // ── Shutdown safety: g_pinned teardown is JDK-portable (incl. JDK 8) ─────
-        // g_pinned is a file-scope global_ref.  Its handle is released along one of
+        // g_pinned is a file-scope oop_pin.  Its handle is released along one of
         // two BY-DESIGN paths, both portable: (1) inside the phase-2 detour on a
         // LIVE JNIEnv (real DeleteGlobalRef) when the post-GC pin was safely
         // attainable, after which its automatic destructor at static destruction is
         // a guaranteed no-op; or (2) by the file-scope destructor itself, when the
         // detour deliberately left it HELD — on Windows (phase 2 compiled out) or on
         // a relocating G1 where releasing a relocated pin would fault.  The library
-        // global_ref destructor is idempotent and null-handle-safe, and a file-scope
-        // global_ref destructing at static destruction was the teardown shape green
+        // oop_pin destructor is idempotent and null-handle-safe, and a file-scope
+        // oop_pin destructing at static destruction was the teardown shape green
         // across the whole JDK matrix (including JDK 8) before this module grew any
         // explicit shutdown handling, so either path is safe.  We deliberately do NOT
         // add a manual "neutralise a still-held pin" step here: doing so on this
@@ -1717,7 +1717,7 @@ VMHOOK_JVM_MODULE(global_ref)
         // record, not a hard check, so a held pin (Windows skip / G1 non-attainable /
         // a probe timeout where phase 2 did not run) can never turn into a spurious
         // FAIL.
-        ctx.record(std::string{ "[INFO] global_ref: pin held after phase 2 = " }
+        ctx.record(std::string{ "[INFO] oop_pin: pin held after phase 2 = " }
                    + (static_cast<bool>(g_pinned) ? "true (file-scope dtor will release at "
                                                     "static destruction)"
                                                   : "false (already released on a live JNIEnv)"));
@@ -1725,7 +1725,7 @@ VMHOOK_JVM_MODULE(global_ref)
         // Record whether the real DeleteGlobalRef path actually ran this session
         // (it does on a non-Windows collector where phase 2 completes AND the post-GC
         // pin was safely attainable) — diagnostic only.
-        ctx.record(std::string{ "[INFO] global_ref: pin released on a live JNIEnv = " }
+        ctx.record(std::string{ "[INFO] oop_pin: pin released on a live JNIEnv = " }
                    + (g_pin_released_live.load(std::memory_order_relaxed) ? "true" : "false"));
     }
 }

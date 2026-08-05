@@ -11,7 +11,7 @@
 // live JVM, and they are the real perfect-forwarding surface of this function:
 //
 //   (1) The Java "<init>" descriptor the JNI path assembles:
-//           "(" + (jni_signature_for_arg<remove_cvref_t<args_t>>() + ...) + ")V"
+//           "(" + (jvm_descriptor_for_arg<remove_cvref_t<args_t>>() + ...) + ")V"
 //       (vmhook.hpp jni_make_unique).  remove_cvref_t means the descriptor is
 //       value-category INVARIANT — lvalue / const-lvalue / rvalue / mixed all
 //       yield the SAME "<init>" descriptor for the same decayed types.  That
@@ -258,7 +258,7 @@ public:
 };
 
 // Wrapper used purely to exercise the object-reference *descriptor* arm of
-// jni_signature_for_arg (an object_base-derived arg / unique_ptr<object> arg
+// jvm_descriptor_for_arg (an object_base-derived arg / unique_ptr<object> arg
 // resolves "L<registered-name>;" or the "Ljava/lang/Object;" fallback).  Kept
 // separate from plain_wrapper so its registration state can be toggled in an
 // isolated, snapshot/restore block without perturbing the other sections.
@@ -285,7 +285,7 @@ concept has_matching_construct =
     requires(wrapper_type& w, args_t&&... a) { w.construct(std::forward<args_t>(a)...); };
 
 // The compile-time JNI descriptor builder make_unique uses per arg.  Each arg's
-// contribution is jni_signature_for_arg<remove_cvref_t<arg>>(); make_unique
+// contribution is jvm_descriptor_for_arg<remove_cvref_t<arg>>(); make_unique
 // concatenates them inside "(" ... ")V".  We reproduce that assembly EXACTLY so
 // the test's "expected descriptor" is derived from the same builder the library
 // calls, then assert value-category invariance against it.
@@ -293,7 +293,7 @@ template<typename... args_t>
 static auto init_descriptor() -> std::string
 {
     std::string sig{ "(" };
-    ((sig += vmhook::detail::jni_signature_for_arg<std::remove_cvref_t<args_t>>()), ...);
+    ((sig += vmhook::detail::jvm_descriptor_for_arg<std::remove_cvref_t<args_t>>()), ...);
     sig += ")V";
     return sig;
 }
@@ -618,7 +618,7 @@ int main()
     // =====================================================================
     // SECTION D — "<init>" DESCRIPTOR ASSEMBLY & VALUE-CATEGORY INVARIANCE.
     // make_unique's JNI path builds the constructor descriptor as
-    //   "(" + jni_signature_for_arg<remove_cvref_t<args_t>>()... + ")V".
+    //   "(" + jvm_descriptor_for_arg<remove_cvref_t<args_t>>()... + ")V".
     // init_descriptor<...>() reproduces that EXACT assembly.  We assert:
     //   (a) the empty-pack descriptor is "()V";
     //   (b) each arity/type combination produces the documented descriptor; and
@@ -635,7 +635,7 @@ int main()
         check("D_descriptor_empty_pack_is_void_ctor",
               init_descriptor<>() == "()V");
 
-        // (b) Single-arg descriptors for EVERY type jni_signature_for_arg maps.
+        // (b) Single-arg descriptors for EVERY type jvm_descriptor_for_arg maps.
         // These mirror the live header's per-type dispatch exactly:
         //   bool->Z  int8/uint8->B  int16->S  uint16->C  int32/uint32->I
         //   int64/uint64->J  float->F  double->D  string family->Ljava/lang/String;
@@ -677,7 +677,7 @@ int main()
 
         // (b'') The WHOLE string family — std::string, const char*, char*
         // (non-const), and std::string_view — yields the SAME String descriptor
-        // (jni_signature_for_arg lists all four in one branch).  Proves the
+        // (jvm_descriptor_for_arg lists all four in one branch).  Proves the
         // assembly is type-, not spelling-, driven.
         check("D_descriptor_cstring",
               init_descriptor<const char*>() == "(Ljava/lang/String;)V");
@@ -780,7 +780,7 @@ int main()
     // =====================================================================
     // SECTION D2 — OBJECT-REFERENCE arg descriptor (the wrapper-as-ctor-arg arm).
     // make_unique can take an object_base-derived arg or a unique_ptr<wrapper>
-    // arg; jni_signature_for_arg resolves its descriptor to "L<registered-name>;"
+    // arg; jvm_descriptor_for_arg resolves its descriptor to "L<registered-name>;"
     // by looking the wrapper's typeid up in type_to_class_map, and FALLS BACK to
     // "Ljava/lang/Object;" when the wrapper is unregistered.  Both arms are
     // deterministic with no JVM (pure map lookup + string assembly), so we pin
@@ -835,7 +835,7 @@ int main()
 
     // =====================================================================
     // SECTION D3 — TRAIT GATES the factory's arg pipeline depends on.
-    // make_unique's per-arg dispatch (jni_signature_for_arg / append_jni_arg)
+    // make_unique's per-arg dispatch (jvm_descriptor_for_arg / append_jni_arg)
     // routes object-wrapper args through is_unique_ptr / is_unique_object_ptr and
     // the object_base base test.  These traits are the compile-time gates that
     // decide whether an arg becomes a Java object parameter vs a primitive — pin
@@ -855,7 +855,7 @@ int main()
         static_assert(!is_unique_ptr<plain_wrapper*>::value);
 
         // value_type_t exposes the pointee (the wrapper) — this is what
-        // jni_signature_for_arg uses to resolve the "L...;" descriptor.  It must
+        // jvm_descriptor_for_arg uses to resolve the "L...;" descriptor.  It must
         // be the WRAPPER type, NOT bool (the shadowing footgun the header warns
         // about); pin it so that regression cannot return silently.
         static_assert(std::is_same_v<
@@ -1025,7 +1025,7 @@ int main()
         // NOTE on move-only / arbitrary user types as make_unique ARGS: a
         // move_only (or any non-JNI-convertible user type) is REJECTED at
         // compile time by make_unique — every forwarded arg flows through
-        // jni_make_unique -> make_jni_args -> jni_signature_for_arg /
+        // jni_make_unique -> make_jni_args -> jvm_descriptor_for_arg /
         // convert_jni_arg, which static_assert (dependent_false_v) unless the
         // arg is one of {string, c-string, unique_ptr<object>, object_base,
         // bool, integral, float, double} (it must become a Java <init>
@@ -1354,7 +1354,7 @@ int main()
     // =====================================================================
     // SECTION H — EXTENDED / NATIVE INTEGRAL DESCRIPTOR LADDER (additive).
     // Section D pins the FIXED-WIDTH std::intNN_t aliases only.  But make_unique's
-    // descriptor builder (jni_signature_for_arg, vmhook.hpp) also admits every
+    // descriptor builder (jvm_descriptor_for_arg, vmhook.hpp) also admits every
     // *native* and *extended* integral type through a generic sizeof ladder, plus
     // two explicit early branches:
     //     bool                      -> "Z"   (claimed before the sizeof==1 byte arm)
@@ -1363,7 +1363,7 @@ int main()
     //     integral, sizeof == 2     -> "S"
     //     integral, sizeof == 4     -> "I"
     //     integral, sizeof == 8     -> "J"
-    // The header comment (vmhook.hpp jni_signature_for_arg) records that admitting
+    // The header comment (vmhook.hpp jvm_descriptor_for_arg) records that admitting
     // plain `char` / `char8_t` / `wchar_t` / `char32_t` was a real fix: they used
     // to hit the terminal dependent_false static_assert even though the overload
     // selector already accepted them.  This section pins that whole ladder — the
@@ -1412,7 +1412,7 @@ int main()
 
         // (b) SIZE-VARIANT native types: short / int / long / long long and their
         // unsigned twins.  The expected letter must REPLICATE the library's exact
-        // branch ORDER, not just sizeof: jni_signature_for_arg claims
+        // branch ORDER, not just sizeof: jvm_descriptor_for_arg claims
         // char16_t|uint16_t -> "C" BEFORE the generic sizeof==2 -> "S" arm.  So a
         // 2-byte type that is THE SAME TYPE as std::uint16_t (every mainstream
         // platform aliases unsigned short == uint16_t) yields "C", NOT "S".  The
@@ -1484,15 +1484,15 @@ int main()
         // (d) A MULTI-ARG <init> assembled purely from native/extended types, to
         // prove the per-arg letters concatenate correctly in one "(...)V".  The
         // expectation is assembled from the SAME per-arg builder make_unique uses
-        // (jni_signature_for_arg per arg), so the whole expected string is computed
+        // (jvm_descriptor_for_arg per arg), so the whole expected string is computed
         // from source and platform-correct (int->"I", long long->"J", etc.).
         const std::string native_pack_expected{
             std::string{ "(" }
-            + vmhook::detail::jni_signature_for_arg<bool>()       // Z
-            + vmhook::detail::jni_signature_for_arg<char>()       // B
-            + vmhook::detail::jni_signature_for_arg<char16_t>()   // C
-            + vmhook::detail::jni_signature_for_arg<int>()        // I (4-byte)
-            + vmhook::detail::jni_signature_for_arg<long long>()  // J (8-byte)
+            + vmhook::detail::jvm_descriptor_for_arg<bool>()       // Z
+            + vmhook::detail::jvm_descriptor_for_arg<char>()       // B
+            + vmhook::detail::jvm_descriptor_for_arg<char16_t>()   // C
+            + vmhook::detail::jvm_descriptor_for_arg<int>()        // I (4-byte)
+            + vmhook::detail::jvm_descriptor_for_arg<long long>()  // J (8-byte)
             + ")V" };
         check("H_native_multi_arg_pack_assembly",
               (init_descriptor<bool, char, char16_t, int, long long>() == native_pack_expected));
@@ -1539,16 +1539,16 @@ int main()
                   make_unique_is_null_and_safe<plain_wrapper>(true, c_arg, c16_arg, 7, ll_arg));
         }
 
-        // (f) vmhook::detail::jni_signature_for_arg<T>() (the public forwarding twin)
-        // routes to the SAME jni_signature_for_arg, so it MUST agree letter-for-
+        // (f) vmhook::detail::jvm_descriptor_for_arg<T>() (the public forwarding twin)
+        // routes to the SAME jvm_descriptor_for_arg, so it MUST agree letter-for-
         // letter on the native ladder — pin the equivalence so a future divergence
         // of the two entry points is caught here, no JVM needed.
         check("H_signature_for_arg_agrees_char",
-              vmhook::detail::jni_signature_for_arg<char>() == vmhook::detail::jni_signature_for_arg<char>());
+              vmhook::detail::jvm_descriptor_for_arg<char>() == vmhook::detail::jvm_descriptor_for_arg<char>());
         check("H_signature_for_arg_agrees_long",
-              vmhook::detail::jni_signature_for_arg<long>() == vmhook::detail::jni_signature_for_arg<long>());
+              vmhook::detail::jvm_descriptor_for_arg<long>() == vmhook::detail::jvm_descriptor_for_arg<long>());
         check("H_signature_for_arg_agrees_char16",
-              vmhook::detail::jni_signature_for_arg<char16_t>() == vmhook::detail::jni_signature_for_arg<char16_t>());
+              vmhook::detail::jvm_descriptor_for_arg<char16_t>() == vmhook::detail::jvm_descriptor_for_arg<char16_t>());
     }
 
     // =====================================================================
@@ -1566,7 +1566,7 @@ int main()
     //        ill-formed at the descriptor builder — see the gap-note below).
     //        We therefore pin the forwarding via the construct()-detection
     //        predicate (which is plain C++ overload resolution and does NOT
-    //        flow through jni_signature_for_arg) AND the no-JVM safe-default
+    //        flow through jvm_descriptor_for_arg) AND the no-JVM safe-default
     //        contract on the legal pack (int, std::string, double).
     //   (I2) MOVE-ONLY-arg perfect-forwarding into T(std::unique_ptr<int>&&,
     //        oop_t).  std::unique_ptr<int> is move-only (no copy ctor) and is
@@ -1643,7 +1643,7 @@ int main()
         // ----- (I1) VARIADIC ctor forwarding ---------------------------------
         // The ledger asks for (int, std::string, double, oop_t).  oop_t is
         // void*, which is NOT one of the JNI-acceptable arg shapes
-        // (jni_signature_for_arg static_asserts on unknown types), so the
+        // (jvm_descriptor_for_arg static_asserts on unknown types), so the
         // descriptor-layer call make_unique<W>(int, string, double, oop_t) is
         // intentionally ill-formed.  But the construct()-detection PREDICATE
         // is plain overload resolution and accepts oop_t happily — it is the

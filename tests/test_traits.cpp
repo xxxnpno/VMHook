@@ -9,8 +9,8 @@
 // covered exhaustively in tests/test_traits_extra.cpp (the `traits_extra` target)
 // and tests/test_traits_function_traits.cpp; value_t_convertible_target_v lives in
 // test_field_proxy_value_conversions.cpp / test_unified_call_syntax.cpp, the
-// signature_for_arg<T> VALUE table in test_helpers.cpp, and the global_ref
-// type-surface in test_global_ref.cpp.  This file therefore does NOT re-assert
+// signature_for_arg<T> VALUE table in test_helpers.cpp, and the oop_pin
+// type-surface in test_oop_pin.cpp.  This file therefore does NOT re-assert
 // those.  It instead drives EXHAUSTIVE compile-time truth tables — over a
 // representative-complete type zoo (fundamentals incl. void / nullptr_t / the
 // char family, pointers incl. function / member / void*, lvalue/rvalue refs,
@@ -22,7 +22,7 @@
 // the rest of the library is built on: oop_t / oop_type_t, object_base, object<D>,
 // return_value, the surviving pure-VM entry points (find_class / make_java_string /
 // read_java_string), and the register_class / hook / make_unique entry-point
-// signatures.  (The vmhook::jni:: forwarder surface this file used to pin was
+// signatures.  (The vmhook:: forwarder surface this file used to pin was
 // deleted wholesale by the de-JNI refactor; see the two sections below for the
 // itemised list of what went with it.)  Every fact is derived from the live header
 // and asserted with static_assert (the strongest guarantee — a regression breaks
@@ -95,7 +95,7 @@ static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<int>&>,
 // dispatching null IChatComponent into Lunar / Forge / vanilla.
 // (The consumer named in the original comment, detail::write_jni_arg_to_slot,
 // was deleted by the de-JNI refactor.  The identical `if constexpr` on
-// value_type_t survives in detail::jni_signature_for_arg (vmhook.hpp ~12379)
+// value_type_t survives in detail::jvm_descriptor_for_arg (vmhook.hpp ~12379)
 // and in the field-proxy / call-argument conversion paths (~14896, ~15167,
 // ~15550), so the shadow bug is still live-fire — the trait facts below are
 // unchanged and still load-bearing.)
@@ -106,7 +106,7 @@ static_assert(std::is_same_v<typename vmhook::detail::is_unique_ptr<std::unique_
               "is_unique_ptr<unique_ptr<string>>::value_type_t must be string");
 static_assert(std::is_same_v<typename vmhook::detail::is_unique_ptr<std::unique_ptr<vmhook::object_base>>::value_type_t, vmhook::object_base>,
               "is_unique_ptr<unique_ptr<object_base>>::value_type_t must be object_base "
-              "(this is the exact trait usage that drives detail::jni_signature_for_arg's "
+              "(this is the exact trait usage that drives detail::jvm_descriptor_for_arg's "
               "unique_ptr<wrapper> branch and would re-introduce the chat-not-sending "
               "bug if it broke).");
 
@@ -121,7 +121,7 @@ namespace {
 }
 static_assert(std::is_base_of_v<vmhook::object_base, test_wrapper>,
               "vmhook::object<T> -> object_base inheritance must hold for the "
-              "static_assert in detail::jni_signature_for_arg to accept user wrappers");
+              "static_assert in detail::jvm_descriptor_for_arg to accept user wrappers");
 static_assert(std::is_base_of_v<
                   vmhook::object_base,
                   typename vmhook::detail::is_unique_ptr<std::unique_ptr<test_wrapper>>::value_type_t>,
@@ -142,7 +142,7 @@ static_assert(!vmhook::detail::is_unique_object_ptr<int>::value,
 
 // -----------------------------------------------------------------------------
 // dependent_false_v — the lazy static_assert helper used by the fall-through
-// guards in detail::jni_signature_for_arg and the value-conversion paths
+// guards in detail::jvm_descriptor_for_arg and the value-conversion paths
 // (vmhook.hpp ~10181, ~12419, ~14427).  (The write_jni_arg_to_slot /
 // append_jni_arg consumers named here originally were deleted by the de-JNI
 // refactor; the helper and its remaining three call sites are unaffected.)
@@ -157,16 +157,16 @@ static_assert(!vmhook::detail::dependent_false_v<std::vector<int>>,
 // -----------------------------------------------------------------------------
 // Pure-VM class resolution / string marshalling — public surface
 //
-// This section used to pin the vmhook::jni::* forwarder type-signatures.  The
+// This section used to pin the vmhook::* forwarder type-signatures.  The
 // de-JNI refactor DELETED that entire namespace-level surface, so the following
 // assertions were removed here (no surviving API expresses the same property):
-//   * vmhook::jni::value / vmhook::detail::jni_value — the JNI argument union is
+//   * vmhook::value / vmhook::detail::jni_value — the JNI argument union is
 //     gone, so there is no alias left to pin.
-//   * vmhook::jni::decode_object — the jobject->oop unwrap has no pure-VM public
+//   * vmhook::decode_object — the jobject->oop unwrap has no pure-VM public
 //     replacement (the header decodes OOPs internally via decode_oop_pointer).
-//   * vmhook::jni::exception_clear — there is no JNIEnv to clear a pending
+//   * vmhook::exception_clear — there is no JNIEnv to clear a pending
 //     exception on any more.
-//   * vmhook::jni::get_object_class — the jobject->jclass forwarder is gone; the
+//   * vmhook::get_object_class — the jobject->jclass forwarder is gone; the
 //     pure-VM direction that survives is klass::get_java_mirror(), which is the
 //     INVERSE mapping and therefore not the same property.
 // The remaining two — new_string_utf and get_string_utf — DO have exact pure-VM
@@ -188,7 +188,7 @@ static_assert(std::is_invocable_r_v<vmhook::hotspot::klass*,
                   decltype(vmhook::find_class), std::string_view>,
               "vmhook::find_class must accept a string_view and yield a klass*");
 
-// RE-POINTED from vmhook::jni::new_string_utf / ::get_string_utf: the pure-VM
+// RE-POINTED from vmhook::new_string_utf / ::get_string_utf: the pure-VM
 // String marshalling pair carries exactly the same contract (UTF-8 text -> raw
 // java.lang.String OOP, and back to std::string).
 static_assert(std::is_same_v<decltype(vmhook::make_java_string(std::declval<std::string_view>())),
@@ -204,9 +204,9 @@ static_assert(std::is_same_v<decltype(vmhook::read_java_string(std::declval<void
 // signature_for_arg<T> returns std::string (non-constexpr) so the VALUE cross-
 // check lives in test_helpers.cpp where we can call it at runtime.  Here we just
 // confirm it exists and the return type matches.  (The public
-// vmhook::jni::signature_for_arg forwarder was deleted; detail::jni_signature_for_arg
+// vmhook::signature_for_arg forwarder was deleted; detail::jvm_descriptor_for_arg
 // is the surviving spelling and is pure compile-time logic.)
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>,
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<int>()), std::string>,
               "signature_for_arg<T> must return std::string");
 
 // -----------------------------------------------------------------------------
@@ -801,13 +801,13 @@ static_assert(std::is_same_v<
 // signature_for_arg<T> — the argument-descriptor return-type table.
 //
 // This section used to complete the type-signature coverage of the
-// vmhook::jni:: forwarder surface.  The de-JNI refactor deleted every one of
+// vmhook:: forwarder surface.  The de-JNI refactor deleted every one of
 // those forwarders, so the following assertions were REMOVED — none has a
 // surviving pure-VM equivalent that expresses the same property:
 //   jni::value (the detail::jni_value union alias), jni::decode_object,
 //   jni::oop_handle (the raw oop -> jobject-handle round-trip; the surviving
-//   holder is vmhook::jni::global_ref / vmhook::pin, whose type surface is owned
-//   by tests/test_global_ref.cpp), jni::exception_clear, jni::get_object_class,
+//   holder is vmhook::oop_pin / vmhook::pin, whose type surface is owned
+//   by tests/test_oop_pin.cpp), jni::exception_clear, jni::get_object_class,
 //   jni::get_method_id, jni::get_static_method_id, jni::get_static_field_id,
 //   jni::get_static_object_field, jni::call_object_method,
 //   jni::call_static_object_method, jni::klass_from_class_mirror.
@@ -824,26 +824,26 @@ static_assert(std::is_same_v<
 // (the VALUE table is in test_helpers.cpp; here we pin the return type uniformly
 // across the whole accepted set — primitives, wide ints, string spellings, and a
 // registered-or-not wrapper, which all resolve to std::string at the type level).
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<bool>()),               std::string>, "sig<bool> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::int8_t>()),        std::string>, "sig<int8> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::uint8_t>()),       std::string>, "sig<uint8> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::int16_t>()),       std::string>, "sig<int16> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::uint16_t>()),      std::string>, "sig<uint16> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::int32_t>()),       std::string>, "sig<int32> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::int64_t>()),       std::string>, "sig<int64> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::uint64_t>()),      std::string>, "sig<uint64> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<float>()),              std::string>, "sig<float> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<double>()),             std::string>, "sig<double> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::string>()),        std::string>, "sig<string> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::string_view>()),   std::string>, "sig<string_view> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<const char*>()),        std::string>, "sig<const char*> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<char*>()),              std::string>, "sig<char*> -> string");
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<std::unique_ptr<zoo::wrapper_a>>()), std::string>, "sig<unique_ptr<wrapper>> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<bool>()),               std::string>, "sig<bool> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<std::int8_t>()),        std::string>, "sig<int8> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<std::uint8_t>()),       std::string>, "sig<uint8> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<std::int16_t>()),       std::string>, "sig<int16> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<std::uint16_t>()),      std::string>, "sig<uint16> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<std::int32_t>()),       std::string>, "sig<int32> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<std::int64_t>()),       std::string>, "sig<int64> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<std::uint64_t>()),      std::string>, "sig<uint64> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<float>()),              std::string>, "sig<float> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<double>()),             std::string>, "sig<double> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<std::string>()),        std::string>, "sig<string> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<std::string_view>()),   std::string>, "sig<string_view> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<const char*>()),        std::string>, "sig<const char*> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<char*>()),              std::string>, "sig<char*> -> string");
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<zoo::wrapper_a>>()), std::string>, "sig<unique_ptr<wrapper>> -> string");
 // REMOVED: the "public wrapper forwards to the detail implementation" pin.  The
-// public vmhook::jni::signature_for_arg forwarder was deleted by the de-JNI
+// public vmhook::signature_for_arg forwarder was deleted by the de-JNI
 // refactor, and the eaff990 sed rewrote its side of the comparison into
-// detail::jni_signature_for_arg — leaving `is_same_v<decltype(X), decltype(X)>`,
-// a tautology that asserted nothing.  detail::jni_signature_for_arg is now the
+// detail::jvm_descriptor_for_arg — leaving `is_same_v<decltype(X), decltype(X)>`,
+// a tautology that asserted nothing.  detail::jvm_descriptor_for_arg is now the
 // only spelling and its return type is pinned by the table immediately above.
 
 // -----------------------------------------------------------------------------
@@ -1120,12 +1120,12 @@ int main()
     // signature_for_arg branches: these never touch the JVM (the wrapper branches
     // do; we avoid those here).  Matches the authoritative table in
     // test_helpers.cpp but proves the traits-target binary agrees.
-    check("signature_for_arg<bool> == Z",    vmhook::detail::jni_signature_for_arg<bool>() == "Z");
-    check("signature_for_arg<int32_t> == I", vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I");
-    check("signature_for_arg<int64_t> == J", vmhook::detail::jni_signature_for_arg<std::int64_t>() == "J");
-    check("signature_for_arg<double> == D",  vmhook::detail::jni_signature_for_arg<double>() == "D");
+    check("signature_for_arg<bool> == Z",    vmhook::detail::jvm_descriptor_for_arg<bool>() == "Z");
+    check("signature_for_arg<int32_t> == I", vmhook::detail::jvm_descriptor_for_arg<std::int32_t>() == "I");
+    check("signature_for_arg<int64_t> == J", vmhook::detail::jvm_descriptor_for_arg<std::int64_t>() == "J");
+    check("signature_for_arg<double> == D",  vmhook::detail::jvm_descriptor_for_arg<double>() == "D");
     check("signature_for_arg<string> == Ljava/lang/String;",
-          vmhook::detail::jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
+          vmhook::detail::jvm_descriptor_for_arg<std::string>() == "Ljava/lang/String;");
 
     // -------------------------------------------------------------------------
     // ADDITIVE runtime tally — unified_call_syntax no-JVM surface.
@@ -1179,9 +1179,9 @@ int main()
     //     carries the same property:
     //       * jni::oop_handle round-trip (stores an oop verbatim into caller
     //         storage and hands back a pointer to it).  The surviving verbatim
-    //         holder is vmhook::jni::global_ref / vmhook::pin, and its
+    //         holder is vmhook::oop_pin / vmhook::pin, and its
     //         store-and-return-unchanged behaviour is already covered
-    //         exhaustively by tests/test_global_ref.cpp — re-asserting it here
+    //         exhaustively by tests/test_oop_pin.cpp — re-asserting it here
     //         would duplicate, which this file's scope rule forbids.
     //       * jni::decode_object(nullptr), jni::get_object_class(nullptr),
     //         jni::klass_from_class_mirror(nullptr), jni::get_method_id,

@@ -1,4 +1,4 @@
-// jni_local_ref_hygiene — exhaustive JVM test for vmhook's JNI LOCAL-REFERENCE
+// repeat_call_stability — exhaustive JVM test for vmhook's JNI LOCAL-REFERENCE
 // discipline: it proves that vmhook does NOT leak JNI local references on the
 // paths that create them, when those paths run from a long-lived attached detour
 // thread in a tight loop FAR past HotSpot's default 16-entry local-ref table.
@@ -40,10 +40,10 @@
 // access violation. We never unbound-spin and never take the JVM down.
 //
 // call() must run where current_java_thread is set, i.e. inside a hook detour, so
-// we hook JniLocalRef.trigger() and run all the call()/return loops in that
+// we hook RepeatCallProbe.trigger() and run all the call()/return loops in that
 // detour against the live receiver + the static methods. The set_arg(String)
 // loop is driven separately by hooking inject(String): the probe dispatches
-// inject(...) JniLocalRef.INJECT_ITERATIONS times, the detour injects a fresh
+// inject(...) RepeatCallProbe.INJECT_ITERATIONS times, the detour injects a fresh
 // String each time, and the Java body records what it received.
 //
 // This module does NOT modify vmhook.hpp. If it ever observed a real unreleased
@@ -60,7 +60,7 @@
 
 namespace
 {
-    // Wrapper for vmhook.fixtures.JniLocalRef. Instance helpers drive the
+    // Wrapper for vmhook.fixtures.RepeatCallProbe. Instance helpers drive the
     // reference-returning call() paths; static helpers exercise the
     // FindClass-based static jclass resolution.
     class jni_local_ref : public vmhook::object<jni_local_ref>
@@ -238,7 +238,7 @@ namespace
     const std::string k_inject_mixed_payload{ "set-arg-mixed-loop" };
 
     // The exact int the injectMixed hook injects into slot 2. Must match the
-    // fixture's JniLocalRef.INJECT_MIXED_INT (asserted at runtime via
+    // fixture's RepeatCallProbe.INJECT_MIXED_INT (asserted at runtime via
     // get_inject_mixed_int()). A compile-time constant (not a captured value) so
     // the stateless hook lambda can reference it.
     constexpr std::int32_t JLR_MIXED_INT{ 1337 };
@@ -264,7 +264,7 @@ namespace
     // resolution re-walks + re-drives the context-loader JNI path every iteration
     // (uncached), churning FindClass/NewStringUTF local refs and a ClassNotFound
     // exception that must be cleared each time.
-    const std::string k_fc_hit_name{ "vmhook/fixtures/JniLocalRef" };
+    const std::string k_fc_hit_name{ "vmhook/fixtures/RepeatCallProbe" };
     const std::string k_fc_miss_name{ "vmhook/fixtures/NoSuchClass_jlr_hygiene_$$" };
 
     // Length / element_size for the NATIVE make_java_array loop (a fresh int[]
@@ -951,9 +951,9 @@ namespace
     }
 }
 
-VMHOOK_JVM_MODULE(jni_local_ref_hygiene)
+VMHOOK_JVM_MODULE(repeat_call_stability)
 {
-    vmhook::register_class<jni_local_ref>("vmhook/fixtures/JniLocalRef");
+    vmhook::register_class<jni_local_ref>("vmhook/fixtures/RepeatCallProbe");
 
     // Record which call() dispatch path the live JDK uses. Both paths allocate
     // and must release the same JNI local refs for the cases under test; the
@@ -1037,7 +1037,7 @@ VMHOOK_JVM_MODULE(jni_local_ref_hygiene)
         ctx.check("jlr_trigger_count_advanced", jni_local_ref::get_trigger_count() >= 1);
 
         const bool stub{ g_call_stub_present.load(std::memory_order_relaxed) };
-        ctx.record(std::string{ "[INFO] jni_local_ref_hygiene call() dispatch path: " }
+        ctx.record(std::string{ "[INFO] repeat_call_stability call() dispatch path: " }
                    + (stub ? "call_stub fast path (StubRoutines::_call_stub_entry present)"
                            : "call_jni JNI fallback (Call(Static)?ObjectMethodA — "
                              "the path whose local refs this module stresses)"));
@@ -1256,7 +1256,7 @@ VMHOOK_JVM_MODULE(jni_local_ref_hygiene)
                   g_post_native_mkstr_ok.load(std::memory_order_relaxed));
 
         // ════════════════ set_arg(String) local-ref discipline ════════════════
-        // The probe dispatched inject() JniLocalRef.INJECT_ITERATIONS times; each
+        // The probe dispatched inject() RepeatCallProbe.INJECT_ITERATIONS times; each
         // dispatch the detour injected a fresh Java String via set_arg(1, ...),
         // which allocates a NewStringUTF local ref and releases it
         // (jni_delete_local_ref). Far past the 16-slot table, so a missing

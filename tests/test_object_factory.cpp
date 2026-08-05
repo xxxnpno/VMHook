@@ -51,7 +51,7 @@
 //       - type_to_class_map.insert_or_assign : LAST write wins per type key.
 //       - g_type_factory_map.emplace         : FIRST write wins per name key
 //         (emplace is a no-op on an existing key).
-//   * detail::jni_signature_for_arg<unique_ptr<W>>() / <W>()  [noexcept, -> std::string]
+//   * detail::jvm_descriptor_for_arg<unique_ptr<W>>() / <W>()  [noexcept, -> std::string]
 //       - W registered   -> "L<class-name>;"
 //       - W unregistered -> "Ljava/lang/Object;" (deliberate non-static_assert fallback)
 //   * for_each_instance<T>()          [-> std::size_t]
@@ -195,7 +195,7 @@ public:
 //       `delete built;` at the factory consumption site is well-defined.
 // The factory map's value type must be exactly the documented function-pointer
 // signature.  The unique_ptr trait the read-side (extract_frame_arg /
-// jni_signature_for_arg / argument_matches_descriptor) uses to peel the wrapper
+// jvm_descriptor_for_arg / argument_matches_descriptor) uses to peel the wrapper
 // out of `unique_ptr<W>` must recognise every cv/ref spelling.  None of this
 // needs a JVM — it is all decided by the type system, so we pin it with
 // static_assert: a regression here is a hard compile error, not a silent miss.
@@ -272,7 +272,7 @@ static_assert(std::is_same_v<
 // The unique_ptr trait the read-side uses to peel W out of unique_ptr<W> must
 // recognise every cv/ref spelling that can appear as a hook detour parameter,
 // and report the correct element type.  These back the L<name>; descriptor that
-// extract_frame_arg / jni_signature_for_arg derive for a wrapper argument.
+// extract_frame_arg / jvm_descriptor_for_arg derive for a wrapper argument.
 static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<registry_alpha>>);
 static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<registry_alpha>>);
 static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<registry_alpha>&>);
@@ -296,16 +296,16 @@ static_assert(noexcept(vmhook::make_java_object(nullptr, std::size_t{ 0 })));
 static_assert(noexcept(vmhook::make_java_array(std::string_view{}, 0, 0u, true)));
 static_assert(noexcept(vmhook::get_class_methods<registry_alpha>()));
 static_assert(noexcept(vmhook::find_methods_by_signature<registry_alpha>(std::string_view{})));
-static_assert(noexcept(vmhook::detail::jni_signature_for_arg<registry_alpha>()));
-static_assert(noexcept(vmhook::detail::jni_signature_for_arg<std::unique_ptr<registry_alpha>>()));
-static_assert(noexcept(vmhook::detail::jni_signature_for_arg<int>()));
+static_assert(noexcept(vmhook::detail::jvm_descriptor_for_arg<registry_alpha>()));
+static_assert(noexcept(vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<registry_alpha>>()));
+static_assert(noexcept(vmhook::detail::jvm_descriptor_for_arg<int>()));
 // Return types of the factory entry points are exactly as documented.
 static_assert(std::is_same_v<decltype(vmhook::register_class<registry_alpha>(std::string_view{})), bool>);
 static_assert(std::is_same_v<decltype(vmhook::make_java_string(std::string_view{})), void*>);
 static_assert(std::is_same_v<decltype(vmhook::make_java_object(nullptr, std::size_t{ 0 })), void*>);
 static_assert(std::is_same_v<decltype(vmhook::make_java_array(std::string_view{}, 0, 0u, true)), void*>);
 static_assert(std::is_same_v<decltype(vmhook::make_unique<registry_alpha>()), std::unique_ptr<registry_alpha>>);
-static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>);
+static_assert(std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<int>()), std::string>);
 
 // ---------------------------------------------------------------------------
 // register_class's exact write sequence, reproduced with no JVM.
@@ -404,7 +404,7 @@ static auto factory_for_name(const std::string& name) -> vmhook::type_factory_fu
 template<typename arg_t>
 static auto sig() -> std::string
 {
-    return vmhook::detail::jni_signature_for_arg<arg_t>();
+    return vmhook::detail::jvm_descriptor_for_arg<arg_t>();
 }
 
 // Faithful, trait-derived mirror of method_proxy::argument_matches_descriptor<T>
@@ -412,7 +412,7 @@ static auto sig() -> std::string
 // the single JVM descriptor token that the (private) overload-selector accepts
 // for T.  It MUST track argument_matches_descriptor's exact precedence and
 // sizeof-based ladder; the whole point of R16b below is to prove
-// jni_signature_for_arg<T>() agrees with this selector contract for EVERY
+// jvm_descriptor_for_arg<T>() agrees with this selector contract for EVERY
 // fundamental type.  Because the selector is a private member of method_proxy it
 // cannot be called from the test, so this is the "argument_matches_descriptor-
 // equivalent" the agreement matrix compares against.
@@ -470,7 +470,7 @@ static auto selector_token() -> std::string_view
     }
 }
 
-// One agreement assertion: jni_signature_for_arg<T>() (the descriptor BUILDER)
+// One agreement assertion: jvm_descriptor_for_arg<T>() (the descriptor BUILDER)
 // must equal the token argument_matches_descriptor<T> (the overload SELECTOR)
 // accepts.  Both expectations are trait-derived, so this pins the two dispatchers
 // to each other without hardcoding any platform-dependent answer.
@@ -930,7 +930,7 @@ int main()
     // R1. Direct type_to_class_map insert + lookup (the part of register_class
     // that is pure bookkeeping).  insert_or_assign maps the type_index of the
     // wrapper to the class name; the library's resolve_klass / get_field /
-    // jni_signature_for_arg all read exactly this entry.
+    // jvm_descriptor_for_arg all read exactly this entry.
     // =====================================================================
     {
         map_state_guard guard{};
@@ -1181,7 +1181,7 @@ int main()
     }
 
     // =====================================================================
-    // R10. Signature derivation through jni_signature_for_arg<> (no JVM).  This
+    // R10. Signature derivation through jvm_descriptor_for_arg<> (no JVM).  This
     // is the live read-side of type_to_class_map the no-JVM suite can drive end
     // to end: the library builds a method descriptor token from the registered
     // class name for an object / unique_ptr<object> argument.
@@ -1230,7 +1230,7 @@ int main()
     }
 
     // =====================================================================
-    // R11. jni_signature_for_arg reflects last-wins re-point of the type map
+    // R11. jvm_descriptor_for_arg reflects last-wins re-point of the type map
     // (the descriptor follows whatever the CURRENT type->name binding is).
     // =====================================================================
     {
@@ -1345,7 +1345,7 @@ int main()
     }
 
     // =====================================================================
-    // R16. jni_signature_for_arg<> EXHAUSTIVE primitive / string descriptor
+    // R16. jvm_descriptor_for_arg<> EXHAUSTIVE primitive / string descriptor
     // table.  This is a pure compile-time dispatch (noexcept, no map lookup for
     // the non-wrapper arms), so it is 100% deterministic with no JVM and every
     // JVM primitive's descriptor is pinned to its exact one-character token.
@@ -1401,7 +1401,7 @@ int main()
 
     // =====================================================================
     // R16b. DISPATCHER-AGREEMENT MATRIX (regression guard for the integral-domain
-    // split between the two sibling classifiers).  detail::jni_signature_for_arg<T>
+    // split between the two sibling classifiers).  detail::jvm_descriptor_for_arg<T>
     // (the descriptor BUILDER) and method_proxy::argument_matches_descriptor<T>
     // (the overload SELECTOR) must classify the SAME C++ arg type domain into the
     // SAME JVM token.  They used to disagree: the builder classified sub-int
@@ -1915,7 +1915,7 @@ int main()
     // =====================================================================
     // R26. Many distinct registered types resolve their OWN descriptor with no
     // cross-talk, at scale.  We register four distinct wrapper types to four
-    // distinct names simultaneously and assert jni_signature_for_arg<W> returns
+    // distinct names simultaneously and assert jvm_descriptor_for_arg<W> returns
     // each type's own L<name>; for both the by-value and unique_ptr<W> spelling,
     // while a fifth unregistered type still falls back.  This is the read-side of
     // the per-type type-map keying exercised end-to-end with no JVM.
@@ -2171,7 +2171,7 @@ int main()
     // fabricated pointer that slipped past is_valid_pointer would SEGV on
     // POSIX).
     //
-    // De-JNI refactor: this section used to drive the vmhook::jni:: forwarder
+    // De-JNI refactor: this section used to drive the vmhook:: forwarder
     // surface (which resolved slots through a thread_local current_jni_env).
     // That whole namespace was deleted.  Where a forwarder has a pure-VM
     // successor with the same shape and the same null contract, the checks are
@@ -2241,26 +2241,26 @@ int main()
         check("J0_make_java_string_no_throw", no_throw);
     }
     {
-        // detail::jni_signature_for_arg<T> is a pure compile-time table (it
+        // detail::jvm_descriptor_for_arg<T> is a pure compile-time table (it
         // survived the de-JNI refactor intact, being logic rather than a JNI
         // call), so it is fully deterministic with no JVM.  Pin a representative
         // spread of tokens for the read-side argument types.
-        check("J0_jni_sig_bool_Z", vmhook::detail::jni_signature_for_arg<bool>() == "Z");
-        check("J0_jni_sig_int_I", vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I");
-        check("J0_jni_sig_long_J", vmhook::detail::jni_signature_for_arg<std::int64_t>() == "J");
-        check("J0_jni_sig_double_D", vmhook::detail::jni_signature_for_arg<double>() == "D");
-        check("J0_jni_sig_string", vmhook::detail::jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
+        check("J0_jni_sig_bool_Z", vmhook::detail::jvm_descriptor_for_arg<bool>() == "Z");
+        check("J0_jni_sig_int_I", vmhook::detail::jvm_descriptor_for_arg<std::int32_t>() == "I");
+        check("J0_jni_sig_long_J", vmhook::detail::jvm_descriptor_for_arg<std::int64_t>() == "J");
+        check("J0_jni_sig_double_D", vmhook::detail::jvm_descriptor_for_arg<double>() == "D");
+        check("J0_jni_sig_string", vmhook::detail::jvm_descriptor_for_arg<std::string>() == "Ljava/lang/String;");
         // (A "forwarder forwards to detail" identity check sat here; the
         //  mechanical rewrite had collapsed both sides onto the same expression,
         //  making it `x == x`.  Deleted as vacuous — the public jni:: forwarder
         //  it compared against no longer exists.  Replaced with the descriptor
         //  tokens that were NOT previously pinned, so the table stays covered.)
-        check("J0_jni_sig_float_F", vmhook::detail::jni_signature_for_arg<float>() == "F");
-        check("J0_jni_sig_short_S", vmhook::detail::jni_signature_for_arg<std::int16_t>() == "S");
-        check("J0_jni_sig_byte_B", vmhook::detail::jni_signature_for_arg<std::int8_t>() == "B");
+        check("J0_jni_sig_float_F", vmhook::detail::jvm_descriptor_for_arg<float>() == "F");
+        check("J0_jni_sig_short_S", vmhook::detail::jvm_descriptor_for_arg<std::int16_t>() == "S");
+        check("J0_jni_sig_byte_B", vmhook::detail::jvm_descriptor_for_arg<std::int8_t>() == "B");
         // An unregistered wrapper still falls back to Object.
         check("J0_jni_sig_unregistered_wrapper_object",
-              vmhook::detail::jni_signature_for_arg<registry_unmapped>() == "Ljava/lang/Object;");
+              vmhook::detail::jvm_descriptor_for_arg<registry_unmapped>() == "Ljava/lang/Object;");
     }
     {
         // Oop-taking entry points: each is null/no-op with no JVM and NEVER
@@ -2283,9 +2283,9 @@ int main()
         //                                       there are no handles to decode.
         //   * jni::oop_handle                 — wrapped an oop in caller storage;
         //                                       its successor is the
-        //                                       global_ref / pin() holder, whose
+        //                                       oop_pin / pin() holder, whose
         //                                       storage round-trip is covered in
-        //                                       test_global_ref.cpp.
+        //                                       test_oop_pin.cpp.
         // RE-POINTED (same shape, same null contract):
         //   * get_object_class / klass_from_class_mirror -> klass_from_oop
         //   * get_string_utf                             -> read_java_string
@@ -2366,7 +2366,7 @@ int main()
 
         // Return-type contract (observed at runtime): find_class -> klass*,
         // read_java_string -> std::string, make_java_string -> void*,
-        // jni_signature_for_arg -> std::string.
+        // jvm_descriptor_for_arg -> std::string.
         //
         // De-JNI refactor: a "find_class -> void*" check sat at the top of this
         // group.  It named the DELETED jni::find_class, and the mechanical
@@ -2382,8 +2382,8 @@ int main()
               std::is_same_v<decltype(vmhook::read_java_string(nullptr)), std::string>);
         check("T0_make_java_string_returns_void_ptr",
               std::is_same_v<decltype(vmhook::make_java_string(std::string_view{})), void*>);
-        check("T0_jni_signature_for_arg_returns_string",
-              std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>);
+        check("T0_jvm_descriptor_for_arg_returns_string",
+              std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<int>()), std::string>);
     }
 
     // =====================================================================

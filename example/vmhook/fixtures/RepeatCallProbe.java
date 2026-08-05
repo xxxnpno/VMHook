@@ -3,46 +3,46 @@ package vmhook.fixtures;
 import vmhook.Harness;
 
 /**
- * Fixture for the {@code jni_local_ref_hygiene} feature: it proves that vmhook
- * does NOT leak JNI <em>local</em> references on the four code paths that create
- * them, when those paths are driven from a long-lived attached detour thread in
- * a tight loop well past HotSpot's default 16-entry local-reference table.
+ * Fixture for the {@code repeat_call_stability} feature: it proves that
+ * {@code method_proxy::call()} and {@code return_value::set_arg()} accumulate
+ * NO per-call state, when driven from a long-lived attached detour thread in a
+ * tight loop of hundreds of iterations.
  *
- * <p>Each of the following vmhook operations internally allocates one (or more)
- * JNI local reference that vmhook is responsible for releasing via
- * {@code JNIEnv::DeleteLocalRef} (vmhook.hpp {@code jni_delete_local_ref}, JNI
- * table slot 23):</p>
+ * <p>HISTORY, because it explains why the loops are shaped the way they are.
+ * This was {@code JniLocalRef}, and it existed to catch JNI <em>local
+ * reference</em> leaks.  call() used to dispatch through a JNI fallback that
+ * allocated a local ref per operation ({@code CallObjectMethodA} for a String
+ * or Object return, {@code NewStringUTF} for a String argument,
+ * {@code FindClass} / {@code GetObjectClass} for the dispatch class), and a
+ * missed {@code DeleteLocalRef} starved HotSpot's default 16-entry table.  The
+ * symptom was not a crash: once the table was full the allocating call simply
+ * returned null, so String returns came back {@code ""}, reference returns
+ * became null, and injected String args stopped reaching the body.</p>
+ *
+ * <p>That dispatcher no longer exists - call() runs pure-VM through the
+ * interpreter call stub, and there is no local-reference table involved.  The
+ * loops are KEPT because the property they measure outlived the mechanism: a
+ * dispatcher that accumulates ANY per-call state shows up exactly the same way,
+ * as values drifting or emptying out across iterations.  That makes this the
+ * suite's sharpest characterization of repeat-call stability, and it costs
+ * nothing to keep pointed at the surviving path.</p>
+ *
+ * <p>The paths driven in a loop:</p>
  * <ul>
- *   <li>{@code method_proxy::call()} returning a {@code String} -&gt; the JNI
- *       fallback path ({@code call_jni}) obtains the returned {@code jstring}
- *       via {@code Call(Static)?ObjectMethodA}, decodes it, and must release the
- *       local ref;</li>
- *   <li>{@code method_proxy::call()} returning a non-String reference
- *       ({@code Object}/array) -&gt; same {@code CallObjectMethodA} local ref,
- *       released in the {@code 'L'/'['} arm;</li>
- *   <li>{@code method_proxy::call(java.lang.String arg)} -&gt; the String arg is
- *       marshalled through {@code NewStringUTF}, which returns a local ref that
- *       the arg-cleanup RAII must release;</li>
- *   <li>STATIC dispatch -&gt; resolves the declaring {@code jclass} via
- *       {@code FindClass} (a local ref); instance dispatch resolves it via
- *       {@code GetObjectClass} (also a local ref);</li>
- *   <li>{@code return_value::set_arg(index, String)} -&gt; injects a Java String
- *       argument; vmhook calls {@code NewStringUTF} (local ref) then
- *       {@code DeleteLocalRef} after extracting the OOP (vmhook.hpp
- *       {@code return_value::set_arg}, the documented v0.4.x leak fix).</li>
+ *   <li>{@code call()} returning a {@code String};</li>
+ *   <li>{@code call()} returning a non-String reference ({@code Object} /
+ *       array);</li>
+ *   <li>{@code call(java.lang.String arg)} - a String argument marshalled in
+ *       and echoed back;</li>
+ *   <li>STATIC vs INSTANCE dispatch, interleaved;</li>
+ *   <li>{@code return_value::set_arg(index, String)} - injecting a Java String
+ *       argument on a real interpreter frame.</li>
  * </ul>
  *
- * <p>If any of these refs were leaked, the local-ref table (default capacity 16)
- * would overflow within ~16 iterations; HotSpot then emits a
- * <em>"JNI local reference table overflow"</em> warning and later calls degrade
- * (a starved {@code CallObjectMethodA} returns null, so the decoded String comes
- * back empty / the returned wrapper becomes null, and an injected arg stops
- * reaching the body).  The native module therefore drives every path
- * <strong>100+ times</strong> and asserts the observable result stays correct on
- * every iteration -- the behavioural proof that the refs are released.  Crucially
- * the loops are BOUNDED so that even if a leak existed it would surface as the
- * benign table-overflow warning, never an access violation that takes the JVM
- * down.</p>
+ * <p>The native module drives every path <strong>100+ times</strong> and
+ * asserts the observable result stays correct on every iteration.  The loops
+ * are BOUNDED, so a regression surfaces as degraded values the module catches
+ * as a [FAIL], never as an access violation that takes the JVM down.</p>
  *
  * <p>How the native module drives it: it hooks {@link #trigger()} (the only
  * context where {@code vmhook::hotspot::current_java_thread} is established,
@@ -53,13 +53,13 @@ import vmhook.Harness;
  * so each dispatch fires the {@code inject} hook and exercises one
  * {@code set_arg(String)} on a fresh interpreter frame.  The body of
  * {@code inject} copies the (mutated) argument into observable static fields so
- * the native side can prove the injected String reached the body unstarved.</p>
+ * the native side can prove the injected String reached the body intact.</p>
  *
  * <p>Target Java 8 syntax only (no var / records / switch-expressions / lambdas
  * outside the anonymous Probe).  All strings are pure ASCII so javac decodes the
  * source identically on every CI host regardless of file encoding.</p>
  */
-public final class JniLocalRef
+public final class RepeatCallProbe
 {
     /** Native sets this true to request the probe action; cleared afterwards. */
     public static volatile boolean go;
@@ -150,7 +150,7 @@ public final class JniLocalRef
     /** A non-String reference return (the SINGLETON itself): exercises the
      *  CallObjectMethodA local-ref release on the 'L' arm without involving the
      *  String decoder. */
-    public JniLocalRef self()
+    public RepeatCallProbe self()
     {
         return this;
     }
@@ -239,7 +239,7 @@ public final class JniLocalRef
      *  ({@code value.l == &storage}), which the arg-cleanup must NOT DeleteLocalRef
      *  (it is not a NewStringUTF local ref).  Returns the same object so the
      *  native side gets an Object-return local ref to release too. */
-    public JniLocalRef echoObj(final JniLocalRef other)
+    public RepeatCallProbe echoObj(final RepeatCallProbe other)
     {
         return other;
     }
@@ -306,7 +306,7 @@ public final class JniLocalRef
 
     /** Static non-String reference return (the SINGLETON): the static-dispatch
      *  CallStaticObjectMethodA local ref AND the FindClass jclass local ref. */
-    public static JniLocalRef staticSelf()
+    public static RepeatCallProbe staticSelf()
     {
         return SINGLETON;
     }
@@ -330,7 +330,7 @@ public final class JniLocalRef
             @Override
             public boolean pending()
             {
-                return JniLocalRef.go && !JniLocalRef.done;
+                return RepeatCallProbe.go && !RepeatCallProbe.done;
             }
 
             @Override
@@ -364,7 +364,7 @@ public final class JniLocalRef
                     SINGLETON.injectMixed("original", 0);
                 }
 
-                JniLocalRef.done = true;
+                RepeatCallProbe.done = true;
             }
         });
     }
@@ -377,5 +377,5 @@ public final class JniLocalRef
      * The single instance the native module wraps and drives.  Created eagerly
      * so the detour reaches the instance methods on a stable OOP.
      */
-    public static final JniLocalRef SINGLETON = new JniLocalRef();
+    public static final RepeatCallProbe SINGLETON = new RepeatCallProbe();
 }

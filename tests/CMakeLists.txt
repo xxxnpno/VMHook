@@ -182,7 +182,7 @@ vmhook_add_test(wrapper_pattern_nojvm          SOURCES test_wrapper_pattern_nojv
 vmhook_add_test(interface_polymorphism_nojvm   SOURCES test_interface_polymorphism_nojvm.cpp)
 vmhook_add_test(poly_inherited_oop_nojvm       SOURCES test_poly_inherited_oop_nojvm.cpp)
 vmhook_add_test(make_java_string_nojvm         SOURCES test_make_java_string_nojvm.cpp)
-# NOT REGISTERED: test_jni_local_ref_hygiene_nojvm.cpp.  It exists solely to
+# NOT REGISTERED: test_repeat_call_stability_nojvm.cpp.  It exists solely to
 # exercise vmhook::detail::jni_delete_local_ref (a test-local RAII wrapper used
 # the library function as its deleter); that function — and the whole notion of
 # a JNI local reference — was deleted by the de-JNI refactor, and pure-VM there

@@ -10,10 +10,10 @@
 //       BasicType int (Z4 C5 F6 D7 B8 S9 I10 J11 L12 [13 V14; default 12 T_OBJECT)
 //   * detail::jvm_primitive_byte_width(string_view)   : primitive descriptor -> in-heap
 //       byte width (size!=1 ->0; Z/B 1, S/C 2, I/F 4, J/D 8; default 0)
-//   * detail::jni_signature_for_arg<T>()              : C++ type -> JNI descriptor
+//   * detail::jvm_descriptor_for_arg<T>()              : C++ type -> JNI descriptor
 //       string (String/Z/B/S/C(uint16!)/J/F/D, generic is_integral&&sizeof==4 -> I,
 //       unique_ptr<wrapper> & object_base -> class-map "L...;" (Object fallback), else
-//       a hard static_assert).  Public re-export: vmhook::detail::jni_signature_for_arg<T>.
+//       a hard static_assert).  Public re-export: vmhook::detail::jvm_descriptor_for_arg<T>.
 //
 // And the return-descriptor extraction the live method_proxy::call performs
 // (vmhook.hpp ~14146-14174): rparen = sig.rfind(')'); the return char is the byte
@@ -94,7 +94,7 @@ namespace
         }
     };
 
-    // A registerable wrapper used ONLY to exercise jni_signature_for_arg's
+    // A registerable wrapper used ONLY to exercise jvm_descriptor_for_arg's
     // class-map resolution end-to-end against a REAL registered class name (it is
     // registered to FindMethodsBySig in the body, then its unique_ptr<>/by-value
     // descriptor is asserted to be "Lvmhook/fixtures/FindMethodsBySig;").
@@ -107,7 +107,7 @@ namespace
         }
     };
 
-    // A wrapper that is DELIBERATELY never registered, so jni_signature_for_arg
+    // A wrapper that is DELIBERATELY never registered, so jvm_descriptor_for_arg
     // falls back to the compilable-but-wrong "Ljava/lang/Object;" descriptor
     // (the documented hazard for callers who forget register_class<T>()).
     class sigp_unregistered : public vmhook::object<sigp_unregistered>
@@ -380,50 +380,50 @@ namespace
         }
 
         // =====================================================================
-        //  3. detail::jni_signature_for_arg<T> -- the C++ type -> JNI descriptor
+        //  3. detail::jvm_descriptor_for_arg<T> -- the C++ type -> JNI descriptor
         //     table, including the uint16->C asymmetry and the platform-sized
         //     integral matrix (gated so the matrix stays green on LP64 + LLP64).
         // =====================================================================
         {
             // The full fixed-width row, greppable in one place.
             ctx.check("jnisig_fixed_width_row",
-                         vmhook::detail::jni_signature_for_arg<bool>() == "Z"
-                      && vmhook::detail::jni_signature_for_arg<std::int8_t>() == "B"
-                      && vmhook::detail::jni_signature_for_arg<std::uint8_t>() == "B"
-                      && vmhook::detail::jni_signature_for_arg<std::int16_t>() == "S"
-                      && vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C"
-                      && vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I"
-                      && vmhook::detail::jni_signature_for_arg<std::uint32_t>() == "I"
-                      && vmhook::detail::jni_signature_for_arg<std::int64_t>() == "J"
-                      && vmhook::detail::jni_signature_for_arg<std::uint64_t>() == "J"
-                      && vmhook::detail::jni_signature_for_arg<float>() == "F"
-                      && vmhook::detail::jni_signature_for_arg<double>() == "D");
+                         vmhook::detail::jvm_descriptor_for_arg<bool>() == "Z"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::int8_t>() == "B"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::uint8_t>() == "B"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::int16_t>() == "S"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::uint16_t>() == "C"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::int32_t>() == "I"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::uint32_t>() == "I"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::int64_t>() == "J"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::uint64_t>() == "J"
+                      && vmhook::detail::jvm_descriptor_for_arg<float>() == "F"
+                      && vmhook::detail::jvm_descriptor_for_arg<double>() == "D");
 
             // String-mapped types and cv/ref decay.
             ctx.check("jnisig_string_family_and_decay",
-                         vmhook::detail::jni_signature_for_arg<std::string>() == "Ljava/lang/String;"
-                      && vmhook::detail::jni_signature_for_arg<std::string_view>() == "Ljava/lang/String;"
-                      && vmhook::detail::jni_signature_for_arg<const char*>() == "Ljava/lang/String;"
-                      && vmhook::detail::jni_signature_for_arg<char*>() == "Ljava/lang/String;"
-                      && vmhook::detail::jni_signature_for_arg<const std::string&>() == "Ljava/lang/String;"
-                      && vmhook::detail::jni_signature_for_arg<const double&>() == "D"
-                      && vmhook::detail::jni_signature_for_arg<volatile bool>() == "Z"
-                      && vmhook::detail::jni_signature_for_arg<float&&>() == "F");
+                         vmhook::detail::jvm_descriptor_for_arg<std::string>() == "Ljava/lang/String;"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::string_view>() == "Ljava/lang/String;"
+                      && vmhook::detail::jvm_descriptor_for_arg<const char*>() == "Ljava/lang/String;"
+                      && vmhook::detail::jvm_descriptor_for_arg<char*>() == "Ljava/lang/String;"
+                      && vmhook::detail::jvm_descriptor_for_arg<const std::string&>() == "Ljava/lang/String;"
+                      && vmhook::detail::jvm_descriptor_for_arg<const double&>() == "D"
+                      && vmhook::detail::jvm_descriptor_for_arg<volatile bool>() == "Z"
+                      && vmhook::detail::jvm_descriptor_for_arg<float&&>() == "F");
 
             // The uint16->C split, pinned hard and round-tripped: signed 16-bit
             // is Java short (S, T_SHORT 9), UNSIGNED 16-bit is Java char (C,
             // T_CHAR 5).  Both width 2.  Any "unify uint16 to S" change breaks here.
             ctx.check("jnisig_int16_S_uint16_C_distinct",
-                         vmhook::detail::jni_signature_for_arg<std::int16_t>() == "S"
-                      && vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C"
-                      && vmhook::detail::jni_signature_for_arg<std::int16_t>()
-                             != vmhook::detail::jni_signature_for_arg<std::uint16_t>());
+                         vmhook::detail::jvm_descriptor_for_arg<std::int16_t>() == "S"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::uint16_t>() == "C"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::int16_t>()
+                             != vmhook::detail::jvm_descriptor_for_arg<std::uint16_t>());
             ctx.check("jnisig_uint16_C_roundtrips_to_T_CHAR_5",
                       vmhook::detail::sig_char_to_basic_type(
-                          vmhook::detail::jni_signature_for_arg<std::uint16_t>()[0]) == 5);
+                          vmhook::detail::jvm_descriptor_for_arg<std::uint16_t>()[0]) == 5);
             ctx.check("jnisig_int16_S_roundtrips_to_T_SHORT_9",
                       vmhook::detail::sig_char_to_basic_type(
-                          vmhook::detail::jni_signature_for_arg<std::int16_t>()[0]) == 9);
+                          vmhook::detail::jvm_descriptor_for_arg<std::int16_t>()[0]) == 9);
 
             // char32_t is a 4-byte integral, NOT uint16_t, so it routes through
             // the generic sizeof==4 -> "I" branch (the C-split keys on the EXACT
@@ -431,7 +431,7 @@ namespace
             static_assert(!std::is_same_v<std::decay_t<char32_t>, std::uint16_t>,
                           "char32_t must not alias uint16_t");
             ctx.check("jnisig_char32_t_is_I_not_C",
-                      vmhook::detail::jni_signature_for_arg<char32_t>() == "I");
+                      vmhook::detail::jvm_descriptor_for_arg<char32_t>() == "I");
 
             // Platform-sized integral matrix: `long` / `unsigned long` are LP64
             // 8-byte (alias int64) -> "J", or LLP64 4-byte -> "I".  Gate each arm
@@ -440,38 +440,38 @@ namespace
             if constexpr (std::is_same_v<long, std::int64_t>)
             {
                 ctx.check("jnisig_long_is_J_on_LP64",
-                          vmhook::detail::jni_signature_for_arg<long>() == "J");
+                          vmhook::detail::jvm_descriptor_for_arg<long>() == "J");
             }
             else if constexpr (std::is_integral_v<long> && sizeof(long) == sizeof(std::int32_t))
             {
                 ctx.check("jnisig_long_is_I_on_LLP64",
-                          vmhook::detail::jni_signature_for_arg<long>() == "I");
+                          vmhook::detail::jvm_descriptor_for_arg<long>() == "I");
             }
             if constexpr (std::is_same_v<std::size_t, std::uint64_t>)
             {
                 ctx.check("jnisig_size_t_is_J_on_64bit",
-                          vmhook::detail::jni_signature_for_arg<std::size_t>() == "J");
+                          vmhook::detail::jvm_descriptor_for_arg<std::size_t>() == "J");
             }
             else if constexpr (std::is_integral_v<std::size_t>
                                && sizeof(std::size_t) == sizeof(std::int32_t))
             {
                 ctx.check("jnisig_size_t_is_I_on_32bit",
-                          vmhook::detail::jni_signature_for_arg<std::size_t>() == "I");
+                          vmhook::detail::jvm_descriptor_for_arg<std::size_t>() == "I");
             }
 
-            // Public re-export parity: vmhook::detail::jni_signature_for_arg<T> forwards
-            // verbatim to detail::jni_signature_for_arg<T>.
+            // Public re-export parity: vmhook::detail::jvm_descriptor_for_arg<T> forwards
+            // verbatim to detail::jvm_descriptor_for_arg<T>.
             ctx.check("jnisig_public_reexport_parity",
-                         vmhook::detail::jni_signature_for_arg<std::string>()
-                             == vmhook::detail::jni_signature_for_arg<std::string>()
-                      && vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C"
-                      && vmhook::detail::jni_signature_for_arg<std::int64_t>()
-                             == vmhook::detail::jni_signature_for_arg<std::int64_t>()
-                      && vmhook::detail::jni_signature_for_arg<double>() == "D");
+                         vmhook::detail::jvm_descriptor_for_arg<std::string>()
+                             == vmhook::detail::jvm_descriptor_for_arg<std::string>()
+                      && vmhook::detail::jvm_descriptor_for_arg<std::uint16_t>() == "C"
+                      && vmhook::detail::jvm_descriptor_for_arg<std::int64_t>()
+                             == vmhook::detail::jvm_descriptor_for_arg<std::int64_t>()
+                      && vmhook::detail::jvm_descriptor_for_arg<double>() == "D");
         }
 
         // =====================================================================
-        //  3b. jni_signature_for_arg<T> -- EXTENDED / NATIVE-SPELLED integral and
+        //  3b. jvm_descriptor_for_arg<T> -- EXTENDED / NATIVE-SPELLED integral and
         //      character-type matrix.  Section 3 pins the fixed-WIDTH aliases
         //      (std::int*_t / std::uint*_t); this section pins the SPELLINGS those
         //      aliases map FROM (plain `char`, `short`, `int`, `long long`, ...)
@@ -490,14 +490,14 @@ namespace
             // covers char32_t (-> I); this pins the 16-bit char type -> "C".
             static_assert(sizeof(char16_t) == 2, "char16_t is a 16-bit type");
             ctx.check("jnisig_char16_t_is_C_not_S",
-                         vmhook::detail::jni_signature_for_arg<char16_t>() == "C"
-                      && vmhook::detail::jni_signature_for_arg<char16_t>()
-                             != vmhook::detail::jni_signature_for_arg<std::int16_t>());
+                         vmhook::detail::jvm_descriptor_for_arg<char16_t>() == "C"
+                      && vmhook::detail::jvm_descriptor_for_arg<char16_t>()
+                             != vmhook::detail::jvm_descriptor_for_arg<std::int16_t>());
             // char16_t round-trips through the BasicType table to T_CHAR(5), exactly
             // like std::uint16_t.
             ctx.check("jnisig_char16_t_roundtrips_to_T_CHAR_5",
                       vmhook::detail::sig_char_to_basic_type(
-                          vmhook::detail::jni_signature_for_arg<char16_t>()[0]) == 5);
+                          vmhook::detail::jvm_descriptor_for_arg<char16_t>()[0]) == 5);
 
             // Plain `char`, `signed char`, `unsigned char` are all 1-byte integrals
             // and route through the generic sizeof==1 branch to "B" (Java byte).
@@ -506,14 +506,14 @@ namespace
             // a hard static_assert to a real branch, so it must stay green.
             static_assert(std::is_integral_v<char> && sizeof(char) == 1, "char is 1-byte integral");
             ctx.check("jnisig_plain_char_is_B",
-                      vmhook::detail::jni_signature_for_arg<char>() == "B");
+                      vmhook::detail::jvm_descriptor_for_arg<char>() == "B");
             ctx.check("jnisig_signed_unsigned_char_are_B",
-                         vmhook::detail::jni_signature_for_arg<signed char>() == "B"
-                      && vmhook::detail::jni_signature_for_arg<unsigned char>() == "B");
+                         vmhook::detail::jvm_descriptor_for_arg<signed char>() == "B"
+                      && vmhook::detail::jvm_descriptor_for_arg<unsigned char>() == "B");
             // char round-trips to T_BYTE(8) via the table.
             ctx.check("jnisig_plain_char_roundtrips_to_T_BYTE_8",
                       vmhook::detail::sig_char_to_basic_type(
-                          vmhook::detail::jni_signature_for_arg<char>()[0]) == 8);
+                          vmhook::detail::jvm_descriptor_for_arg<char>()[0]) == 8);
 
             // wchar_t: a 2-byte integral on Windows (-> generic "S", Java short) or a
             // 4-byte integral on the SysV LP64 targets (-> generic "I", Java int).
@@ -523,12 +523,12 @@ namespace
             if constexpr (std::is_integral_v<wchar_t> && sizeof(wchar_t) == 2)
             {
                 ctx.check("jnisig_wchar_t_is_S_on_2byte_target",
-                          vmhook::detail::jni_signature_for_arg<wchar_t>() == "S");
+                          vmhook::detail::jvm_descriptor_for_arg<wchar_t>() == "S");
             }
             else if constexpr (std::is_integral_v<wchar_t> && sizeof(wchar_t) == 4)
             {
                 ctx.check("jnisig_wchar_t_is_I_on_4byte_target",
-                          vmhook::detail::jni_signature_for_arg<wchar_t>() == "I");
+                          vmhook::detail::jvm_descriptor_for_arg<wchar_t>() == "I");
             }
 
             // NATIVE-SPELLED fixed-width siblings: assert the spelling the C++ code
@@ -542,19 +542,19 @@ namespace
             {
                 // signed `short` is NOT the explicit-C type, so it is "S".
                 ctx.check("jnisig_native_short_is_S",
-                          vmhook::detail::jni_signature_for_arg<short>() == "S");
+                          vmhook::detail::jvm_descriptor_for_arg<short>() == "S");
             }
             if constexpr (std::is_integral_v<int> && sizeof(int) == 4)
             {
                 ctx.check("jnisig_native_int_is_I",
-                          vmhook::detail::jni_signature_for_arg<int>() == "I"
-                          && vmhook::detail::jni_signature_for_arg<unsigned int>() == "I");
+                          vmhook::detail::jvm_descriptor_for_arg<int>() == "I"
+                          && vmhook::detail::jvm_descriptor_for_arg<unsigned int>() == "I");
             }
             if constexpr (std::is_integral_v<long long> && sizeof(long long) == 8)
             {
                 ctx.check("jnisig_native_longlong_is_J",
-                          vmhook::detail::jni_signature_for_arg<long long>() == "J"
-                          && vmhook::detail::jni_signature_for_arg<unsigned long long>() == "J");
+                          vmhook::detail::jvm_descriptor_for_arg<long long>() == "J"
+                          && vmhook::detail::jvm_descriptor_for_arg<unsigned long long>() == "J");
             }
 
             // `unsigned short` is the platform's unsigned-16 type.  On EVERY target
@@ -566,7 +566,7 @@ namespace
             if constexpr (std::is_same_v<unsigned short, std::uint16_t>)
             {
                 ctx.check("jnisig_native_unsigned_short_is_C_when_uint16",
-                          vmhook::detail::jni_signature_for_arg<unsigned short>() == "C");
+                          vmhook::detail::jvm_descriptor_for_arg<unsigned short>() == "C");
             }
 
             // ptrdiff_t is the signed pointer-difference type: 8-byte -> "J" on LP64
@@ -576,13 +576,13 @@ namespace
                           && sizeof(std::ptrdiff_t) == 8)
             {
                 ctx.check("jnisig_ptrdiff_t_is_J_on_64bit",
-                          vmhook::detail::jni_signature_for_arg<std::ptrdiff_t>() == "J");
+                          vmhook::detail::jvm_descriptor_for_arg<std::ptrdiff_t>() == "J");
             }
             else if constexpr (std::is_integral_v<std::ptrdiff_t>
                                && sizeof(std::ptrdiff_t) == 4)
             {
                 ctx.check("jnisig_ptrdiff_t_is_I_on_32bit",
-                          vmhook::detail::jni_signature_for_arg<std::ptrdiff_t>() == "I");
+                          vmhook::detail::jvm_descriptor_for_arg<std::ptrdiff_t>() == "I");
             }
 
             // EXHAUSTIVE width->letter invariant for the generic integral ladder:
@@ -596,17 +596,17 @@ namespace
             {
                 const bool width_letter_consistent{
                        vmhook::detail::jvm_primitive_byte_width(
-                           vmhook::detail::jni_signature_for_arg<std::int8_t>()) == sizeof(std::int8_t)
+                           vmhook::detail::jvm_descriptor_for_arg<std::int8_t>()) == sizeof(std::int8_t)
                     && vmhook::detail::jvm_primitive_byte_width(
-                           vmhook::detail::jni_signature_for_arg<std::int16_t>()) == sizeof(std::int16_t)
+                           vmhook::detail::jvm_descriptor_for_arg<std::int16_t>()) == sizeof(std::int16_t)
                     && vmhook::detail::jvm_primitive_byte_width(
-                           vmhook::detail::jni_signature_for_arg<std::int32_t>()) == sizeof(std::int32_t)
+                           vmhook::detail::jvm_descriptor_for_arg<std::int32_t>()) == sizeof(std::int32_t)
                     && vmhook::detail::jvm_primitive_byte_width(
-                           vmhook::detail::jni_signature_for_arg<std::int64_t>()) == sizeof(std::int64_t)
+                           vmhook::detail::jvm_descriptor_for_arg<std::int64_t>()) == sizeof(std::int64_t)
                     && vmhook::detail::jvm_primitive_byte_width(
-                           vmhook::detail::jni_signature_for_arg<float>()) == sizeof(float)
+                           vmhook::detail::jvm_descriptor_for_arg<float>()) == sizeof(float)
                     && vmhook::detail::jvm_primitive_byte_width(
-                           vmhook::detail::jni_signature_for_arg<double>()) == sizeof(double) };
+                           vmhook::detail::jvm_descriptor_for_arg<double>()) == sizeof(double) };
                 ctx.check("jnisig_emitted_letter_width_matches_sizeof", width_letter_consistent);
             }
         }
@@ -975,7 +975,7 @@ namespace
 
         // =====================================================================
         //  6. CONSTRUCTOR-SIGNATURE BUILD.  jni_make_unique builds the <init>
-        //     descriptor as "(" + concat(jni_signature_for_arg<decay<args>>()...)
+        //     descriptor as "(" + concat(jvm_descriptor_for_arg<decay<args>>()...)
         //     + ")V" (vmhook.hpp ~11142) and feeds it to jni_get_method_id.
         //     Reproduce the EXACT fold and assert representative arg packs compose
         //     into the right whole-constructor signature -- including the empty
@@ -992,9 +992,9 @@ namespace
             // (int, double, String) -> "(IDLjava/lang/String;)V".
             {
                 std::string s{ "(" };
-                s += vmhook::detail::jni_signature_for_arg<int>();
-                s += vmhook::detail::jni_signature_for_arg<double>();
-                s += vmhook::detail::jni_signature_for_arg<std::string>();
+                s += vmhook::detail::jvm_descriptor_for_arg<int>();
+                s += vmhook::detail::jvm_descriptor_for_arg<double>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::string>();
                 s += ")V";
                 ctx.check("ctor_int_double_string_is_IDLString_V",
                           s == "(IDLjava/lang/String;)V");
@@ -1003,18 +1003,18 @@ namespace
             // visible end-to-end inside a whole constructor descriptor.
             {
                 std::string s{ "(" };
-                s += vmhook::detail::jni_signature_for_arg<std::uint16_t>();
-                s += vmhook::detail::jni_signature_for_arg<std::int64_t>();
-                s += vmhook::detail::jni_signature_for_arg<bool>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::uint16_t>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::int64_t>();
+                s += vmhook::detail::jvm_descriptor_for_arg<bool>();
                 s += ")V";
                 ctx.check("ctor_uint16_int64_bool_is_CJZ_V", s == "(CJZ)V");
             }
             // (int8, int16, float) -> "(BSF)V".
             {
                 std::string s{ "(" };
-                s += vmhook::detail::jni_signature_for_arg<std::int8_t>();
-                s += vmhook::detail::jni_signature_for_arg<std::int16_t>();
-                s += vmhook::detail::jni_signature_for_arg<float>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::int8_t>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::int16_t>();
+                s += vmhook::detail::jvm_descriptor_for_arg<float>();
                 s += ")V";
                 ctx.check("ctor_int8_int16_float_is_BSF_V", s == "(BSF)V");
             }
@@ -1024,8 +1024,8 @@ namespace
             // end-to-end through the same fold jni_make_unique uses.
             {
                 std::string s{ "(" };
-                s += vmhook::detail::jni_signature_for_arg<char16_t>();
-                s += vmhook::detail::jni_signature_for_arg<char>();
+                s += vmhook::detail::jvm_descriptor_for_arg<char16_t>();
+                s += vmhook::detail::jvm_descriptor_for_arg<char>();
                 s += ")V";
                 ctx.check("ctor_char16_char_is_CB_V", s == "(CB)V");
             }
@@ -1035,9 +1035,9 @@ namespace
             // bare types.  (const string&, double&&, volatile bool) -> "(LString;DZ)V".
             {
                 std::string s{ "(" };
-                s += vmhook::detail::jni_signature_for_arg<const std::string&>();
-                s += vmhook::detail::jni_signature_for_arg<double&&>();
-                s += vmhook::detail::jni_signature_for_arg<volatile bool>();
+                s += vmhook::detail::jvm_descriptor_for_arg<const std::string&>();
+                s += vmhook::detail::jvm_descriptor_for_arg<double&&>();
+                s += vmhook::detail::jvm_descriptor_for_arg<volatile bool>();
                 s += ")V";
                 ctx.check("ctor_cvref_qualified_pack_decays_to_LString_D_Z_V",
                           s == "(Ljava/lang/String;DZ)V");
@@ -1048,15 +1048,15 @@ namespace
             // "(ZBSCIJFDLjava/lang/String;)V".
             {
                 std::string s{ "(" };
-                s += vmhook::detail::jni_signature_for_arg<bool>();
-                s += vmhook::detail::jni_signature_for_arg<std::int8_t>();
-                s += vmhook::detail::jni_signature_for_arg<std::int16_t>();
-                s += vmhook::detail::jni_signature_for_arg<std::uint16_t>();
-                s += vmhook::detail::jni_signature_for_arg<std::int32_t>();
-                s += vmhook::detail::jni_signature_for_arg<std::int64_t>();
-                s += vmhook::detail::jni_signature_for_arg<float>();
-                s += vmhook::detail::jni_signature_for_arg<double>();
-                s += vmhook::detail::jni_signature_for_arg<std::string>();
+                s += vmhook::detail::jvm_descriptor_for_arg<bool>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::int8_t>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::int16_t>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::uint16_t>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::int32_t>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::int64_t>();
+                s += vmhook::detail::jvm_descriptor_for_arg<float>();
+                s += vmhook::detail::jvm_descriptor_for_arg<double>();
+                s += vmhook::detail::jvm_descriptor_for_arg<std::string>();
                 s += ")V";
                 ctx.check("ctor_every_primitive_plus_string_is_ZBSCIJFD_LString_V",
                           s == "(ZBSCIJFDLjava/lang/String;)V");
@@ -1064,7 +1064,7 @@ namespace
         }
 
         // =====================================================================
-        //  7. CLASS-MAP wrapper-arg resolution (jni_signature_for_arg<wrapper>).
+        //  7. CLASS-MAP wrapper-arg resolution (jvm_descriptor_for_arg<wrapper>).
         //     Register sigp_registered to a REAL class name and assert its
         //     unique_ptr<>/by-value descriptor resolves to "L<that name>;".  Leave
         //     sigp_unregistered unregistered and assert it falls back to the
@@ -1073,10 +1073,10 @@ namespace
         {
             // Pre-condition: an unregistered wrapper falls back to Object.
             ctx.check("clsmap_unregistered_uniqueptr_falls_back_to_Object",
-                      vmhook::detail::jni_signature_for_arg<std::unique_ptr<sigp_unregistered>>()
+                      vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<sigp_unregistered>>()
                           == "Ljava/lang/Object;");
             ctx.check("clsmap_unregistered_value_falls_back_to_Object",
-                      vmhook::detail::jni_signature_for_arg<sigp_unregistered>()
+                      vmhook::detail::jvm_descriptor_for_arg<sigp_unregistered>()
                           == "Ljava/lang/Object;");
 
             if (class_loaded)
@@ -1088,19 +1088,19 @@ namespace
                 {
                     const std::string expected{ "Lvmhook/fixtures/FindMethodsBySig;" };
                     ctx.check("clsmap_registered_uniqueptr_is_Lname",
-                              vmhook::detail::jni_signature_for_arg<std::unique_ptr<sigp_registered>>()
+                              vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<sigp_registered>>()
                                   == expected);
                     ctx.check("clsmap_registered_value_is_Lname",
-                              vmhook::detail::jni_signature_for_arg<sigp_registered>() == expected);
+                              vmhook::detail::jvm_descriptor_for_arg<sigp_registered>() == expected);
                     // cv/ref qualification still resolves through decay.
                     ctx.check("clsmap_registered_const_ref_is_Lname",
-                              vmhook::detail::jni_signature_for_arg<const sigp_registered&>()
+                              vmhook::detail::jvm_descriptor_for_arg<const sigp_registered&>()
                                   == expected);
                     // A whole constructor descriptor taking the registered wrapper
                     // + an int composes correctly: "(L...;I)V".
                     std::string s{ "(" };
-                    s += vmhook::detail::jni_signature_for_arg<std::unique_ptr<sigp_registered>>();
-                    s += vmhook::detail::jni_signature_for_arg<int>();
+                    s += vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<sigp_registered>>();
+                    s += vmhook::detail::jvm_descriptor_for_arg<int>();
                     s += ")V";
                     ctx.check("clsmap_ctor_wrapper_int_is_Lname_I_V",
                               s == "(Lvmhook/fixtures/FindMethodsBySig;I)V");

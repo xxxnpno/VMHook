@@ -81,7 +81,7 @@
 //       store-barrier hazard.  The entire forced-GC drive is GATED to the
 //       toolchains where holding/handing JVM oops across a relocating collection
 //       is safe in this suite ((MSVC-non-clang) || non-Windows), mirroring the
-//       global_ref / field_introspection GC gates; elsewhere it is recorded as a
+//       oop_pin / field_introspection GC gates; elsewhere it is recorded as a
 //       documented skip.  Nothing post-GC is hard-asserted — a relocated/reclaimed
 //       String is the very thing under study, not a test failure.
 //
@@ -1925,12 +1925,12 @@ namespace
         //     reclaimed/relocated String is the phenomenon under study.
         //
         //     GATED to the toolchains where holding/handing JVM oops across a
-        //     relocating System.gc() is gated to NON-WINDOWS ONLY.  global_ref's
+        //     relocating System.gc() is gated to NON-WINDOWS ONLY.  oop_pin's
         //     Phase-2 proved that a forced relocating collection intermittently
         //     CRASHES even MSVC-non-clang Windows (SEH did NOT reliably contain it
         //     on java24/25/8) and was ultimately gated `!defined(_WIN32)`; this
         //     module follows that proven-safe configuration -> forced GC runs on
-        //     linux/macos (where global_ref's GC was fine), compiled out on ALL
+        //     linux/macos (where oop_pin's GC was fine), compiled out on ALL
         //     Windows toolchains and recorded as a documented skip.
         // =====================================================================
 #if !defined(_WIN32)
@@ -2044,7 +2044,7 @@ namespace
         ctx.record("[INFO] survive-GC: SKIPPED on this toolchain (no-SEH MinGW / clang-cl "
                    "Windows). Forcing a relocating System.gc() over freshly-made unrooted/young "
                    "oops is uncontained there; the store-barrier hazard is probed on "
-                   "MSVC-non-clang and non-Windows builds. Gate mirrors global_ref / "
+                   "MSVC-non-clang and non-Windows builds. Gate mirrors oop_pin / "
                    "field_introspection.");
 #endif
     }

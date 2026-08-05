@@ -100,14 +100,14 @@ static_assert(static_cast<std::uint8_t>(vmhook::anchor_kind::empty) == 0u,
               "anchor_kind::empty must be the zero value so defaults fail closed");
 
 // -- ref<T> is an ordinary, cheap C++ VALUE.  Copyable is the headline
-//    difference from jni::global_ref (which is move-only); a snapshot that
+//    difference from vmhook::oop_pin (which is move-only); a snapshot that
 //    copies ~80 refs per tick depends on it.
 static_assert(std::is_default_constructible_v<vmhook::ref<ar_entity>>,
               "ref must be default-constructible (the empty state)");
 static_assert(std::is_nothrow_default_constructible_v<vmhook::ref<ar_entity>>,
               "ref's empty state must not allocate");
 static_assert(std::is_copy_constructible_v<vmhook::ref<ar_entity>>,
-              "ref MUST be copyable -- this is the whole point vs global_ref");
+              "ref MUST be copyable -- this is the whole point vs oop_pin");
 static_assert(std::is_copy_assignable_v<vmhook::ref<ar_entity>>,
               "ref must be copy-assignable");
 static_assert(std::is_nothrow_move_constructible_v<vmhook::ref<ar_entity>>,

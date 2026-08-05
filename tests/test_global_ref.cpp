@@ -1,9 +1,9 @@
-// Standalone (no-JVM) unit test for vmhook::jni::global_ref and vmhook::pin().
+// Standalone (no-JVM) unit test for vmhook::oop_pin and vmhook::pin().
 //
 // ===========================================================================
 // !! READ THIS BEFORE EDITING — GC-SURVIVAL COVERAGE IS INTENTIONALLY ABSENT !!
 // ===========================================================================
-// vmhook::jni::global_ref is a RELOCATION DETECTOR, not a GC root.  The
+// vmhook::oop_pin is a RELOCATION DETECTOR, not a GC root.  The
 // constructor stores the raw OOP you hand it AND a vmhook::gc_epoch() sample;
 // oop() re-samples and returns nullptr the moment the epoch has moved on.  So
 // the holder
@@ -79,7 +79,7 @@ static auto check(const char* name, bool ok) -> void
 // NOTE raw_unsafe(): it is the ONE accessor that distinguishes "empty" from
 // "armed but stale".  Without it, every armed holder in this no-JVM binary
 // would look empty and the move-semantics assertions below would be vacuous.
-static auto is_empty(const vmhook::jni::global_ref& g) -> bool
+static auto is_empty(const vmhook::oop_pin& g) -> bool
 {
     return !static_cast<bool>(g)
         && g.oop() == nullptr
@@ -98,7 +98,7 @@ static auto is_empty(const vmhook::jni::global_ref& g) -> bool
 //
 // A `nullptr` expectation degenerates to the empty state, which is why the
 // null-OOP sections can keep using this helper unchanged.
-static auto holds(const vmhook::jni::global_ref& g,
+static auto holds(const vmhook::oop_pin& g,
                   const vmhook::oop_t expected) -> bool
 {
     return g.raw_unsafe() == expected
@@ -130,12 +130,12 @@ namespace
     };
 
     // Performs `dst = std::move(src)` behind a function boundary.  Passing the
-    // SAME object as both arguments exercises global_ref's `this != &other`
+    // SAME object as both arguments exercises oop_pin's `this != &other`
     // self-assignment guard at runtime WITHOUT any compiler seeing a syntactic
     // self-move at the call site -- so clang's -Wself-move never fires under
     // -Werror (it is a purely syntactic diagnostic).
-    auto launder_move_assign(vmhook::jni::global_ref& dst,
-                             vmhook::jni::global_ref& src) -> void
+    auto launder_move_assign(vmhook::oop_pin& dst,
+                             vmhook::oop_pin& src) -> void
     {
         dst = std::move(src);
     }
@@ -146,83 +146,83 @@ namespace
         return reinterpret_cast<vmhook::oop_t>(bits);
     }
 
-    // Returns a global_ref BY VALUE built from the given OOP.  Used to drive the
+    // Returns a oop_pin BY VALUE built from the given OOP.  Used to drive the
     // return-by-value / NRVO / guaranteed-elision paths through a real function
     // boundary (a prvalue returned from a named local).  The returned holder
     // must carry the address through the move-on-return unchanged.
-    auto make_ref(const std::uintptr_t bits) -> vmhook::jni::global_ref
+    auto make_ref(const std::uintptr_t bits) -> vmhook::oop_pin
     {
-        vmhook::jni::global_ref local{ oop_of(bits) };
+        vmhook::oop_pin local{ oop_of(bits) };
         return local;  // NRVO / implicit move of a local on return
     }
 }
 
 int main()
 {
-    using vmhook::jni::global_ref;
+    using vmhook::oop_pin;
 
     // ========================================================================
     // SECTION 1 -- Type properties: move-only, exactly (compile-time)
     // ========================================================================
-    static_assert(!std::is_copy_constructible_v<global_ref>,
-                  "global_ref must not be copy-constructible (single ownership)");
-    static_assert(!std::is_copy_assignable_v<global_ref>,
-                  "global_ref must not be copy-assignable (single ownership)");
-    static_assert(std::is_move_constructible_v<global_ref>,
-                  "global_ref must be move-constructible");
-    static_assert(std::is_move_assignable_v<global_ref>,
-                  "global_ref must be move-assignable");
-    static_assert(std::is_nothrow_move_constructible_v<global_ref>,
-                  "global_ref move ctor must be noexcept (vector relocation must not throw)");
-    static_assert(std::is_nothrow_move_assignable_v<global_ref>,
-                  "global_ref move assignment must be noexcept");
-    static_assert(std::is_nothrow_destructible_v<global_ref>,
-                  "global_ref destructor must be noexcept (RAII release must not throw)");
-    static_assert(std::is_nothrow_default_constructible_v<global_ref>,
-                  "global_ref default ctor must be noexcept (empty holder, no VM call)");
+    static_assert(!std::is_copy_constructible_v<oop_pin>,
+                  "oop_pin must not be copy-constructible (single ownership)");
+    static_assert(!std::is_copy_assignable_v<oop_pin>,
+                  "oop_pin must not be copy-assignable (single ownership)");
+    static_assert(std::is_move_constructible_v<oop_pin>,
+                  "oop_pin must be move-constructible");
+    static_assert(std::is_move_assignable_v<oop_pin>,
+                  "oop_pin must be move-assignable");
+    static_assert(std::is_nothrow_move_constructible_v<oop_pin>,
+                  "oop_pin move ctor must be noexcept (vector relocation must not throw)");
+    static_assert(std::is_nothrow_move_assignable_v<oop_pin>,
+                  "oop_pin move assignment must be noexcept");
+    static_assert(std::is_nothrow_destructible_v<oop_pin>,
+                  "oop_pin destructor must be noexcept (RAII release must not throw)");
+    static_assert(std::is_nothrow_default_constructible_v<oop_pin>,
+                  "oop_pin default ctor must be noexcept (empty holder, no VM call)");
     // The from-OOP ctor is the only value-taking constructor: pin it noexcept.
-    static_assert(std::is_nothrow_constructible_v<global_ref, vmhook::oop_t>,
-                  "global_ref(oop_t) must be noexcept");
+    static_assert(std::is_nothrow_constructible_v<oop_pin, vmhook::oop_t>,
+                  "oop_pin(oop_t) must be noexcept");
     // The from-OOP ctor must be explicit: an oop_t (void*) must NOT implicitly
-    // convert to a global_ref (that would silently pin in surprising contexts).
-    static_assert(!std::is_convertible_v<vmhook::oop_t, global_ref>,
-                  "global_ref(oop_t) must be explicit (no implicit pin from a raw OOP)");
-    // operator bool is explicit: a global_ref must not implicitly convert to bool
+    // convert to a oop_pin (that would silently pin in surprising contexts).
+    static_assert(!std::is_convertible_v<vmhook::oop_t, oop_pin>,
+                  "oop_pin(oop_t) must be explicit (no implicit pin from a raw OOP)");
+    // operator bool is explicit: a oop_pin must not implicitly convert to bool
     // / int (it would let `pin + 1` etc. compile).  It IS contextually usable.
-    static_assert(!std::is_convertible_v<global_ref, bool>,
+    static_assert(!std::is_convertible_v<oop_pin, bool>,
                   "operator bool must be explicit (no implicit bool conversion)");
-    static_assert(std::is_constructible_v<bool, global_ref>,
+    static_assert(std::is_constructible_v<bool, oop_pin>,
                   "operator bool must still allow explicit/contextual bool conversion");
     // It is a final class (the header marks it `final`); pin that down.
-    static_assert(std::is_final_v<global_ref>,
-                  "global_ref is declared final");
+    static_assert(std::is_final_v<oop_pin>,
+                  "oop_pin is declared final");
     // Accessor return types are exactly as documented.
-    static_assert(std::is_same_v<decltype(std::declval<const global_ref&>().oop()), vmhook::oop_t>,
+    static_assert(std::is_same_v<decltype(std::declval<const oop_pin&>().oop()), vmhook::oop_t>,
                   "oop() returns vmhook::oop_t");
-    static_assert(std::is_same_v<decltype(std::declval<const global_ref&>().handle()), void*>,
+    static_assert(std::is_same_v<decltype(std::declval<const oop_pin&>().handle()), void*>,
                   "handle() returns void*");
-    static_assert(std::is_same_v<decltype(std::declval<global_ref&>().reset()), void>,
+    static_assert(std::is_same_v<decltype(std::declval<oop_pin&>().reset()), void>,
                   "reset() returns void");
     // oop() / handle() / operator bool are const-callable (usable on a const pin).
-    static_assert(noexcept(std::declval<const global_ref&>().oop()),
+    static_assert(noexcept(std::declval<const oop_pin&>().oop()),
                   "oop() must be noexcept");
-    static_assert(noexcept(std::declval<const global_ref&>().handle()),
+    static_assert(noexcept(std::declval<const oop_pin&>().handle()),
                   "handle() must be noexcept");
-    static_assert(noexcept(static_cast<bool>(std::declval<const global_ref&>())),
+    static_assert(noexcept(static_cast<bool>(std::declval<const oop_pin&>())),
                   "operator bool must be noexcept");
-    static_assert(noexcept(std::declval<global_ref&>().reset()),
+    static_assert(noexcept(std::declval<oop_pin&>().reset()),
                   "reset() must be noexcept");
     check("move_only_type_traits", true);
 
-    // pin() free-function return types: both overloads yield a global_ref BY
+    // pin() free-function return types: both overloads yield a oop_pin BY
     // VALUE (never a reference / wrapper).  Pin the signatures.
     static_assert(
-        std::is_same_v<decltype(vmhook::pin(std::declval<vmhook::oop_t>())), global_ref>,
-        "pin(oop_t) must return a global_ref by value");
+        std::is_same_v<decltype(vmhook::pin(std::declval<vmhook::oop_t>())), oop_pin>,
+        "pin(oop_t) must return a oop_pin by value");
     static_assert(
         std::is_same_v<decltype(vmhook::pin(std::declval<const std::unique_ptr<dummy_wrapper>&>())),
-                       global_ref>,
-        "pin(unique_ptr<wrapper>&) must return a global_ref by value");
+                       oop_pin>,
+        "pin(unique_ptr<wrapper>&) must return a oop_pin by value");
     static_assert(noexcept(vmhook::pin(std::declval<vmhook::oop_t>())),
                   "pin(oop_t) must be noexcept");
     static_assert(noexcept(vmhook::pin(std::declval<const std::unique_ptr<dummy_wrapper>&>())),
@@ -238,48 +238,48 @@ int main()
     //   assignment will and won't bind.
     // ========================================================================
 
-    // -- Layout: global_ref is a thin, standard-layout wrapper around ONE void*
+    // -- Layout: oop_pin is a thin, standard-layout wrapper around ONE void*
     //    plus the gc_epoch_t sample the relocation detector needs.  Asserting
     //    sizeof/alignof RELATIVE to those two types (never an absolute byte
     //    count) keeps this true on ILP32 and LP64 / LLP64 alike, and it is a
     //    tripwire for any hidden state creeping in.
-    static_assert(std::is_standard_layout_v<global_ref>,
-                  "global_ref must be standard-layout (plain members, no vtable)");
-    static_assert(sizeof(global_ref) == sizeof(void*) + sizeof(vmhook::gc_epoch_t),
-                  "global_ref must be exactly {oop, gc_epoch_t} wide (no hidden state)");
-    static_assert(alignof(global_ref) == alignof(void*),
-                  "global_ref must have pointer alignment (thin wrapper over void* + epoch)");
+    static_assert(std::is_standard_layout_v<oop_pin>,
+                  "oop_pin must be standard-layout (plain members, no vtable)");
+    static_assert(sizeof(oop_pin) == sizeof(void*) + sizeof(vmhook::gc_epoch_t),
+                  "oop_pin must be exactly {oop, gc_epoch_t} wide (no hidden state)");
+    static_assert(alignof(oop_pin) == alignof(void*),
+                  "oop_pin must have pointer alignment (thin wrapper over void* + epoch)");
     // The epoch itself must stay a trivial, cheap-to-copy value type: it is
     // copied on every move and returned by value from gc_epoch().
     static_assert(std::is_trivially_copyable_v<vmhook::gc_epoch_t>
                       && std::is_standard_layout_v<vmhook::gc_epoch_t>,
                   "gc_epoch_t must stay a trivially-copyable, standard-layout value");
     // Not an aggregate (it has user-declared constructors / private members).
-    static_assert(!std::is_aggregate_v<global_ref>,
-                  "global_ref must not be an aggregate (it has user-declared ctors)");
-    static_assert(!std::is_empty_v<global_ref>,
-                  "global_ref is not empty (it stores an oop + an epoch)");
-    static_assert(!std::is_polymorphic_v<global_ref>,
-                  "global_ref must not be polymorphic (no virtual functions)");
+    static_assert(!std::is_aggregate_v<oop_pin>,
+                  "oop_pin must not be an aggregate (it has user-declared ctors)");
+    static_assert(!std::is_empty_v<oop_pin>,
+                  "oop_pin is not empty (it stores an oop + an epoch)");
+    static_assert(!std::is_polymorphic_v<oop_pin>,
+                  "oop_pin must not be polymorphic (no virtual functions)");
 
     // -- Triviality.  The move operations are user-provided (they steal and null
     //    the source), so the type is deliberately non-trivial on those axes; a
     //    drift to a defaulted/trivial move (which would leave the source armed,
     //    duplicating the address) is a real bug and must fail to compile.
-    static_assert(!std::is_trivially_copyable_v<global_ref>,
-                  "global_ref must NOT be trivially copyable (custom move + deleted copy)");
-    static_assert(!std::is_trivial_v<global_ref>,
-                  "global_ref must NOT be trivial");
-    static_assert(!std::is_trivially_move_constructible_v<global_ref>,
-                  "global_ref move ctor is user-provided (steals + nulls source) -> not trivial");
-    static_assert(!std::is_trivially_move_assignable_v<global_ref>,
-                  "global_ref move assignment is user-provided (steals + nulls source) -> not trivial");
+    static_assert(!std::is_trivially_copyable_v<oop_pin>,
+                  "oop_pin must NOT be trivially copyable (custom move + deleted copy)");
+    static_assert(!std::is_trivial_v<oop_pin>,
+                  "oop_pin must NOT be trivial");
+    static_assert(!std::is_trivially_move_constructible_v<oop_pin>,
+                  "oop_pin move ctor is user-provided (steals + nulls source) -> not trivial");
+    static_assert(!std::is_trivially_move_assignable_v<oop_pin>,
+                  "oop_pin move assignment is user-provided (steals + nulls source) -> not trivial");
     // The default ctor is `= default` but both members carry NSDMIs, so
     // default-construction is NOT trivial -- an uninitialised holder would be
     // indistinguishable from an armed one, and an uninitialised EPOCH could
     // read as valid and let a stale address through.
-    static_assert(!std::is_trivially_default_constructible_v<global_ref>,
-                  "global_ref must value-initialise its members (NSDMIs) -> not trivially default-constructible");
+    static_assert(!std::is_trivially_default_constructible_v<oop_pin>,
+                  "oop_pin must value-initialise its members (NSDMIs) -> not trivially default-constructible");
     // -- DETECTOR-SPECIFIC (see the file header): the destructor is `= default`
     //    and releases nothing, because there is still nothing registered with
     //    the VM to release -- the detector observes relocation, it does not root
@@ -288,74 +288,74 @@ int main()
     //    trivially destructible, and this line fails -- which is exactly the
     //    signal to come back here and restore the GC-survival coverage that the
     //    file header says is missing.  Do not delete this assertion; flip it.
-    static_assert(std::is_trivially_destructible_v<global_ref>,
-                  "DETECTOR TRIPWIRE: global_ref's dtor releases nothing today.  If this fails, a "
+    static_assert(std::is_trivially_destructible_v<oop_pin>,
+                  "DETECTOR TRIPWIRE: oop_pin's dtor releases nothing today.  If this fails, a "
                   "real releasing destructor landed -- flip this to !is_trivially_destructible "
                   "and restore the GC-survival coverage described at the top of this file.");
 
     // -- Swappability: a move-only type that is nothrow-move-constructible AND
     //    nothrow-move-assignable is itself nothrow-swappable via std::swap.
-    static_assert(std::is_swappable_v<global_ref>,
-                  "global_ref must be swappable (move-constructible + move-assignable)");
-    static_assert(std::is_nothrow_swappable_v<global_ref>,
-                  "global_ref swap must be noexcept (both move ops are noexcept)");
+    static_assert(std::is_swappable_v<oop_pin>,
+                  "oop_pin must be swappable (move-constructible + move-assignable)");
+    static_assert(std::is_nothrow_swappable_v<oop_pin>,
+                  "oop_pin swap must be noexcept (both move ops are noexcept)");
 
     // -- Constructibility value-category matrix.  Move-construct binds an
     //    rvalue; copy-construct from an lvalue / const-lvalue is DELETED, so
     //    is_constructible from those must be false.
-    static_assert(std::is_constructible_v<global_ref, global_ref&&>,
-                  "global_ref must be constructible from an rvalue global_ref (move)");
-    static_assert(!std::is_constructible_v<global_ref, global_ref&>,
-                  "global_ref must NOT be constructible from a non-const lvalue (copy deleted)");
-    static_assert(!std::is_constructible_v<global_ref, const global_ref&>,
-                  "global_ref must NOT be constructible from a const lvalue (copy deleted)");
+    static_assert(std::is_constructible_v<oop_pin, oop_pin&&>,
+                  "oop_pin must be constructible from an rvalue oop_pin (move)");
+    static_assert(!std::is_constructible_v<oop_pin, oop_pin&>,
+                  "oop_pin must NOT be constructible from a non-const lvalue (copy deleted)");
+    static_assert(!std::is_constructible_v<oop_pin, const oop_pin&>,
+                  "oop_pin must NOT be constructible from a const lvalue (copy deleted)");
     // The from-OOP ctor accepts a std::nullptr_t (nullptr -> void* is fine) but
     // is explicit, so it is constructible-but-not-convertible from nullptr_t.
-    static_assert(std::is_constructible_v<global_ref, std::nullptr_t>,
-                  "global_ref must be explicitly constructible from nullptr_t (oop_t is void*)");
-    static_assert(!std::is_convertible_v<std::nullptr_t, global_ref>,
-                  "nullptr_t must NOT implicitly convert to global_ref (the OOP ctor is explicit)");
-    // A bare int must NOT construct a global_ref: there is no int -> void*
+    static_assert(std::is_constructible_v<oop_pin, std::nullptr_t>,
+                  "oop_pin must be explicitly constructible from nullptr_t (oop_t is void*)");
+    static_assert(!std::is_convertible_v<std::nullptr_t, oop_pin>,
+                  "nullptr_t must NOT implicitly convert to oop_pin (the OOP ctor is explicit)");
+    // A bare int must NOT construct a oop_pin: there is no int -> void*
     // implicit conversion, so the only candidate (the oop_t ctor) does not apply.
-    static_assert(!std::is_constructible_v<global_ref, int>,
-                  "global_ref must NOT be constructible from int (no int->oop_t conversion)");
-    static_assert(!std::is_constructible_v<global_ref, std::uintptr_t>,
-                  "global_ref must NOT be constructible from a raw uintptr_t (no integer->oop_t conversion)");
+    static_assert(!std::is_constructible_v<oop_pin, int>,
+                  "oop_pin must NOT be constructible from int (no int->oop_t conversion)");
+    static_assert(!std::is_constructible_v<oop_pin, std::uintptr_t>,
+                  "oop_pin must NOT be constructible from a raw uintptr_t (no integer->oop_t conversion)");
 
     // -- Assignability value-category matrix.  Move-assign binds an rvalue;
     //    copy-assign from an lvalue / const-lvalue is DELETED.
-    static_assert(std::is_assignable_v<global_ref&, global_ref&&>,
-                  "global_ref must be move-assignable from an rvalue");
-    static_assert(!std::is_assignable_v<global_ref&, global_ref&>,
-                  "global_ref must NOT be assignable from a non-const lvalue (copy-assign deleted)");
-    static_assert(!std::is_assignable_v<global_ref&, const global_ref&>,
-                  "global_ref must NOT be assignable from a const lvalue (copy-assign deleted)");
-    // You cannot assign anything to a CONST global_ref (no member is const-
+    static_assert(std::is_assignable_v<oop_pin&, oop_pin&&>,
+                  "oop_pin must be move-assignable from an rvalue");
+    static_assert(!std::is_assignable_v<oop_pin&, oop_pin&>,
+                  "oop_pin must NOT be assignable from a non-const lvalue (copy-assign deleted)");
+    static_assert(!std::is_assignable_v<oop_pin&, const oop_pin&>,
+                  "oop_pin must NOT be assignable from a const lvalue (copy-assign deleted)");
+    // You cannot assign anything to a CONST oop_pin (no member is const-
     // qualified for assignment); pin that a const lvalue is not an assign target.
-    static_assert(!std::is_assignable_v<const global_ref&, global_ref&&>,
-                  "a const global_ref must not be an assignment target");
+    static_assert(!std::is_assignable_v<const oop_pin&, oop_pin&&>,
+                  "a const oop_pin must not be an assignment target");
     // Nor may a raw oop_t / nullptr be assigned in: there is no converting
     // assignment operator, and the converting ctor is explicit.
-    static_assert(!std::is_assignable_v<global_ref&, vmhook::oop_t>,
-                  "a raw oop_t must NOT be assignable to a global_ref (explicit ctor, no converting assign)");
-    static_assert(!std::is_assignable_v<global_ref&, std::nullptr_t>,
-                  "nullptr must NOT be assignable to a global_ref (use reset())");
+    static_assert(!std::is_assignable_v<oop_pin&, vmhook::oop_t>,
+                  "a raw oop_t must NOT be assignable to a oop_pin (explicit ctor, no converting assign)");
+    static_assert(!std::is_assignable_v<oop_pin&, std::nullptr_t>,
+                  "nullptr must NOT be assignable to a oop_pin (use reset())");
 
     // -- Move ctor / move assign EXPRESSION noexcept (decltype-level, in
     //    addition to the is_nothrow_* traits above).
-    static_assert(noexcept(global_ref{ std::declval<global_ref&&>() }),
+    static_assert(noexcept(oop_pin{ std::declval<oop_pin&&>() }),
                   "move-construction expression must be noexcept");
-    static_assert(noexcept(std::declval<global_ref&>() = std::declval<global_ref&&>()),
+    static_assert(noexcept(std::declval<oop_pin&>() = std::declval<oop_pin&&>()),
                   "move-assignment expression must be noexcept");
-    static_assert(noexcept(std::swap(std::declval<global_ref&>(), std::declval<global_ref&>())),
-                  "std::swap(global_ref&, global_ref&) must be noexcept");
+    static_assert(noexcept(std::swap(std::declval<oop_pin&>(), std::declval<oop_pin&>())),
+                  "std::swap(oop_pin&, oop_pin&) must be noexcept");
 
     // -- handle() / oop() / operator bool are usable on an rvalue pin as well as
     //    a const lvalue (they are const member functions -> callable on prvalues).
     static_assert(std::is_same_v<decltype(make_ref(0u).oop()), vmhook::oop_t>,
-                  "oop() must be callable on an rvalue global_ref and yield oop_t");
+                  "oop() must be callable on an rvalue oop_pin and yield oop_t");
     static_assert(std::is_same_v<decltype(make_ref(0u).handle()), void*>,
-                  "handle() must be callable on an rvalue global_ref and yield void*");
+                  "handle() must be callable on an rvalue oop_pin and yield void*");
 
     // -- pin(unique_ptr<T>)'s base-of contract: the wrappers we instantiate it
     //    with genuinely satisfy `is_base_of<object_base, T>` (so the in-template
@@ -365,36 +365,36 @@ int main()
     static_assert(std::is_base_of_v<vmhook::object_base, other_wrapper>,
                   "other_wrapper must derive from object_base (pin(unique_ptr<T>) requirement)");
 
-    // -- A container of global_ref keeps the move-only contract: the value type
-    //    of a std::vector<global_ref> is exactly global_ref (not a copy-wrapped
+    // -- A container of oop_pin keeps the move-only contract: the value type
+    //    of a std::vector<oop_pin> is exactly oop_pin (not a copy-wrapped
     //    proxy), and the vector is move-constructible.
     //    NOTE: we deliberately do NOT assert !is_copy_constructible_v<vector<...>>
     //    -- std::vector's copy constructor is declared UNCONDITIONALLY (it is not
     //    SFINAE-constrained on the element type), so the trait reports `true` even
     //    though instantiating the copy of a vector<move-only> is ill-formed.  That
-    //    is a property of std::vector's declaration, not of global_ref, so it
+    //    is a property of std::vector's declaration, not of oop_pin, so it
     //    belongs nowhere in this feature's contract.  std::optional, by contrast,
     //    DOES conditionally delete its copy members, so the optional asserts below
-    //    faithfully reflect global_ref's move-only-ness.
-    static_assert(std::is_same_v<std::vector<global_ref>::value_type, global_ref>,
-                  "vector<global_ref>::value_type must be global_ref");
-    static_assert(std::is_move_constructible_v<std::vector<global_ref>>,
-                  "vector<global_ref> must be move-constructible");
-    // std::optional<global_ref> preserves move-only-ness (optional conditionally
+    //    faithfully reflect oop_pin's move-only-ness.
+    static_assert(std::is_same_v<std::vector<oop_pin>::value_type, oop_pin>,
+                  "vector<oop_pin>::value_type must be oop_pin");
+    static_assert(std::is_move_constructible_v<std::vector<oop_pin>>,
+                  "vector<oop_pin> must be move-constructible");
+    // std::optional<oop_pin> preserves move-only-ness (optional conditionally
     // deletes its copy members based on the contained type).
-    static_assert(!std::is_copy_constructible_v<std::optional<global_ref>>,
-                  "optional<global_ref> must be move-only (no copy ctor)");
-    static_assert(std::is_move_constructible_v<std::optional<global_ref>>,
-                  "optional<global_ref> must be move-constructible");
-    static_assert(std::is_nothrow_move_constructible_v<std::optional<global_ref>>,
-                  "optional<global_ref> move must stay noexcept");
+    static_assert(!std::is_copy_constructible_v<std::optional<oop_pin>>,
+                  "optional<oop_pin> must be move-only (no copy ctor)");
+    static_assert(std::is_move_constructible_v<std::optional<oop_pin>>,
+                  "optional<oop_pin> must be move-constructible");
+    static_assert(std::is_nothrow_move_constructible_v<std::optional<oop_pin>>,
+                  "optional<oop_pin> move must stay noexcept");
     check("deeper_type_traits", true);
 
     // ========================================================================
     // SECTION 2 -- Default construction is empty / inert
     // ========================================================================
     {
-        global_ref empty{};
+        oop_pin empty{};
         check("default_constructed_is_falsy", !static_cast<bool>(empty));
         check("default_constructed_oop_is_null", empty.oop() == nullptr);
         check("default_constructed_handle_is_null", empty.handle() == nullptr);
@@ -417,7 +417,7 @@ int main()
 
     // A const default-constructed pin: every const accessor must work.
     {
-        const global_ref const_empty{};
+        const oop_pin const_empty{};
         check("const_default_is_falsy", !static_cast<bool>(const_empty));
         check("const_default_oop_is_null", const_empty.oop() == nullptr);
         check("const_default_handle_is_null", const_empty.handle() == nullptr);
@@ -427,7 +427,7 @@ int main()
     // SECTION 3 -- Null-OOP construction is empty / inert
     // ========================================================================
     {
-        global_ref from_null{ static_cast<vmhook::oop_t>(nullptr) };
+        oop_pin from_null{ static_cast<vmhook::oop_t>(nullptr) };
         check("null_oop_construct_is_falsy", !static_cast<bool>(from_null));
         check("null_oop_construct_oop_is_null", from_null.oop() == nullptr);
         check("null_oop_construct_handle_is_null", from_null.handle() == nullptr);
@@ -459,7 +459,7 @@ int main()
         for (const std::uintptr_t bits : fakes)
         {
             auto* const fake_oop{ oop_of(bits) };
-            global_ref armed{ fake_oop };
+            oop_pin armed{ fake_oop };
             all_hold   = all_hold && holds(armed, fake_oop);
             all_refuse = all_refuse
                       && armed.is_stale()
@@ -477,7 +477,7 @@ int main()
     // the captured address.
     {
         auto* const fake_oop{ oop_of(0x4100u) };
-        const global_ref armed{ fake_oop };
+        const oop_pin armed{ fake_oop };
         check("oop_and_handle_are_the_same_view",
               armed.oop() == armed.handle() && armed.oop() == nullptr);
         check("raw_unsafe_bypasses_the_staleness_check",
@@ -490,7 +490,7 @@ int main()
     // reset() on an armed holder clears it, and is idempotent afterwards.
     {
         auto* const fake_oop{ oop_of(0x4000u) };
-        global_ref armed{ fake_oop };
+        oop_pin armed{ fake_oop };
         check("armed_before_reset", holds(armed, fake_oop));
         armed.reset();
         check("reset_clears_armed_holder", is_empty(armed));
@@ -504,8 +504,8 @@ int main()
     //   holding exactly the source's address, and the source ends up empty.
     // ========================================================================
     {
-        global_ref a{};                       // empty
-        global_ref b{ std::move(a) };
+        oop_pin a{};                       // empty
+        oop_pin b{ std::move(a) };
         check("moved_from_empty_is_falsy", !static_cast<bool>(a));            // NOLINT(bugprone-use-after-move)
         check("moved_from_empty_oop_is_null", a.oop() == nullptr);           // NOLINT(bugprone-use-after-move)
         check("moved_from_empty_handle_is_null", a.handle() == nullptr);     // NOLINT(bugprone-use-after-move)
@@ -517,8 +517,8 @@ int main()
     // nulled (no duplicate holder of the same address exists afterwards).
     {
         auto* const fake_oop{ oop_of(0x2000u) };
-        global_ref a{ fake_oop };
-        global_ref b{ std::move(a) };
+        oop_pin a{ fake_oop };
+        oop_pin b{ std::move(a) };
         check("move_ctor_src_is_emptied", is_empty(a));                      // NOLINT(bugprone-use-after-move)
         check("move_ctor_dst_takes_address", holds(b, fake_oop));
     }
@@ -527,12 +527,12 @@ int main()
     // re-assigned-into afterwards (no resurrection of the stolen address).
     {
         auto* const fake_oop{ oop_of(0x2100u) };
-        global_ref a{ fake_oop };
-        global_ref b{ std::move(a) };
+        oop_pin a{ fake_oop };
+        oop_pin b{ std::move(a) };
         check("moved_from_before_reset_empty", is_empty(a));                 // NOLINT(bugprone-use-after-move)
         a.reset();                                  // legal on a moved-from object
         check("moved_from_can_be_reset", is_empty(a));
-        a = global_ref{ oop_of(0x2200u) };          // re-arm the moved-from holder
+        a = oop_pin{ oop_of(0x2200u) };          // re-arm the moved-from holder
         check("moved_from_can_be_rearmed", holds(a, oop_of(0x2200u)));
         check("move_ctor_dst_unaffected_by_src_rearm", holds(b, fake_oop));
     }
@@ -541,8 +541,8 @@ int main()
     // SECTION 6 -- Move assignment: steals the source's address, nulls source
     // ========================================================================
     {
-        global_ref a{};
-        global_ref b{};
+        oop_pin a{};
+        oop_pin b{};
         b = std::move(a);
         check("move_assign_empty_source_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
         check("move_assign_empty_dest_empty", is_empty(b));
@@ -552,9 +552,9 @@ int main()
     // the reference it returns is the destination object itself.
     {
         auto* const fake_oop{ oop_of(0x2300u) };
-        global_ref a{ fake_oop };
-        global_ref b{};
-        global_ref& result{ (b = std::move(a)) };
+        oop_pin a{ fake_oop };
+        oop_pin b{};
+        oop_pin& result{ (b = std::move(a)) };
         check("move_assign_returns_this", &result == &b);
         check("move_assign_returns_dest_state", holds(result, fake_oop));
     }
@@ -564,8 +564,8 @@ int main()
     {
         auto* const fake_a{ oop_of(0x3000u) };
         auto* const fake_b{ oop_of(0x5000u) };
-        global_ref a{ fake_a };
-        global_ref b{ fake_b };
+        oop_pin a{ fake_a };
+        oop_pin b{ fake_b };
         b = std::move(a);
         check("move_assign_armed_src_emptied", is_empty(a));   // NOLINT(bugprone-use-after-move)
         check("move_assign_armed_dst_takes_src_address", holds(b, fake_a));
@@ -583,23 +583,23 @@ int main()
     //   broken guard would have gone unnoticed here.
     // ========================================================================
     {
-        global_ref a{};
-        global_ref* const self{ &a };
+        oop_pin a{};
+        oop_pin* const self{ &a };
         *self = std::move(a);   // guarded self-move on an empty holder
         check("self_move_assign_empty_safe", is_empty(a));
     }
     {
         auto* const fake_oop{ oop_of(0x6000u) };
-        global_ref a{ fake_oop };
-        global_ref* const self{ &a };
+        oop_pin a{ fake_oop };
+        oop_pin* const self{ &a };
         *self = std::move(a);   // guarded self-move; must NOT clear the address
         check("self_move_assign_preserves_address", holds(a, fake_oop));
     }
     // Repeated self-move-assign stays safe (no accumulating corruption).
     {
         auto* const fake_oop{ oop_of(0x6100u) };
-        global_ref a{ fake_oop };
-        global_ref* const self{ &a };
+        oop_pin a{ fake_oop };
+        oop_pin* const self{ &a };
         *self = std::move(a);
         *self = std::move(a);
         *self = std::move(a);
@@ -611,9 +611,9 @@ int main()
     // ========================================================================
     {
         auto* const fake_oop{ oop_of(0x7100u) };
-        global_ref a{ fake_oop };
-        global_ref b{ std::move(a) };
-        global_ref c{ std::move(b) };  // chain the move-ctor
+        oop_pin a{ fake_oop };
+        oop_pin b{ std::move(a) };
+        oop_pin c{ std::move(b) };  // chain the move-ctor
         check("double_move_ctor_first_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
         check("double_move_ctor_middle_empty", is_empty(b));  // NOLINT(bugprone-use-after-move)
         check("double_move_ctor_last_holds_address", holds(c, fake_oop));
@@ -621,9 +621,9 @@ int main()
     {
         auto* const fake_a{ oop_of(0x7200u) };
         auto* const fake_b{ oop_of(0x7300u) };
-        global_ref a{ fake_a };
-        global_ref b{ fake_b };
-        global_ref c{};
+        oop_pin a{ fake_a };
+        oop_pin b{ fake_b };
+        oop_pin c{};
         c = std::move(b);
         b = std::move(a);  // move-assign chain in the other direction
         check("chained_move_assign_a_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
@@ -633,9 +633,9 @@ int main()
     // Mixed: move-construct, then move-assign the result onward.
     {
         auto* const fake_oop{ oop_of(0x7400u) };
-        global_ref a{ fake_oop };
-        global_ref b{ std::move(a) };
-        global_ref c{};
+        oop_pin a{ fake_oop };
+        oop_pin b{ std::move(a) };
+        oop_pin c{};
         c = std::move(b);
         check("move_ctor_then_move_assign_src_empty", is_empty(a));  // NOLINT(bugprone-use-after-move)
         check("move_ctor_then_move_assign_mid_empty", is_empty(b));  // NOLINT(bugprone-use-after-move)
@@ -650,11 +650,11 @@ int main()
     {
         auto* const fake_a{ oop_of(0x10u) };
         auto* const fake_b{ oop_of(0x20u) };
-        global_ref a{ fake_a };
-        global_ref b{ fake_b };
-        global_ref c{ std::move(a) };   // c <- a's address, a empty
+        oop_pin a{ fake_a };
+        oop_pin b{ fake_b };
+        oop_pin c{ std::move(a) };   // c <- a's address, a empty
         b = std::move(c);               // b <- a's address (b's own dropped), c empty
-        global_ref d{};
+        oop_pin d{};
         d = std::move(b);               // d <- a's address, b empty
         check("shuffle_a_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
         check("shuffle_b_empty", is_empty(b));   // NOLINT(bugprone-use-after-move)
@@ -672,11 +672,11 @@ int main()
     }
     {
         // Non-null OOP -> pin() must produce the same verbatim-storage holder as
-        // `global_ref{ oop }` does.
+        // `oop_pin{ oop }` does.
         auto* const fake_oop{ oop_of(0x7000u) };
         auto pinned = vmhook::pin(fake_oop);
         check("pin_nonnull_oop_stores_verbatim", holds(pinned, fake_oop));
-        const global_ref direct{ fake_oop };
+        const oop_pin direct{ fake_oop };
         check("pin_matches_direct_construction",
               pinned.raw_unsafe() == direct.raw_unsafe()
                   && pinned.oop() == direct.oop()
@@ -687,14 +687,14 @@ int main()
         // (guaranteed-copy-elision path) and move-assign from; the address must
         // survive both.
         auto* const fake_oop{ oop_of(0x7500u) };
-        global_ref moved_from_pin{ vmhook::pin(fake_oop) };
+        oop_pin moved_from_pin{ vmhook::pin(fake_oop) };
         check("pin_result_move_constructs_with_address", holds(moved_from_pin, fake_oop));
 
-        global_ref sink{};
+        oop_pin sink{};
         sink = vmhook::pin(oop_of(0x7600u));  // move-assign from prvalue
         check("pin_result_move_assigns_with_address", holds(sink, oop_of(0x7600u)));
 
-        global_ref null_sink{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
+        oop_pin null_sink{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
         check("pin_null_result_move_constructs_empty", is_empty(null_sink));
     }
 
@@ -710,7 +710,7 @@ int main()
     }
     {
         // A *non-null* wrapper around a non-null fake OOP: pin() forwards
-        // wrapper->get_instance() into the global_ref ctor, which stores it
+        // wrapper->get_instance() into the oop_pin ctor, which stores it
         // verbatim -> the pin reports the wrapper's instance address.
         auto* const fake_oop{ oop_of(0x8000u) };
         std::unique_ptr<dummy_wrapper> live_wrapper{
@@ -745,7 +745,7 @@ int main()
     //   to its new slot unchanged.
     // ========================================================================
     {
-        std::vector<global_ref> pins;
+        std::vector<oop_pin> pins;
         pins.emplace_back();
         pins.emplace_back(static_cast<vmhook::oop_t>(nullptr));
         pins.emplace_back(oop_of(0x1234u));
@@ -757,7 +757,7 @@ int main()
     {
         // Grow across multiple reallocations (each push past capacity move-
         // relocates every element); every address must survive every relocation.
-        std::vector<global_ref> pins;
+        std::vector<oop_pin> pins;
         for (int i = 0; i < 50; ++i)
         {
             pins.emplace_back(oop_of(static_cast<std::uintptr_t>(0x100 + i)));
@@ -786,23 +786,23 @@ int main()
     }
     {
         // std::move the whole vector: pins follow the buffer, originals drained.
-        std::vector<global_ref> src;
+        std::vector<oop_pin> src;
         src.emplace_back();
         src.emplace_back(oop_of(0x1250u));
-        std::vector<global_ref> dst{ std::move(src) };
+        std::vector<oop_pin> dst{ std::move(src) };
         check("vector_move_transfers_pins",
               dst.size() == 2 && is_empty(dst[0]) && holds(dst[1], oop_of(0x1250u)));
     }
     {
-        // A std::unique_ptr<global_ref> -- heap-owned pin, deleted via dtor.
-        auto heap_pin = std::make_unique<global_ref>();
-        check("unique_ptr_global_ref_is_empty", is_empty(*heap_pin));
-        *heap_pin = global_ref{ oop_of(0x1260u) };
-        check("unique_ptr_global_ref_rearms", holds(*heap_pin, oop_of(0x1260u)));
+        // A std::unique_ptr<oop_pin> -- heap-owned pin, deleted via dtor.
+        auto heap_pin = std::make_unique<oop_pin>();
+        check("unique_ptr_oop_pin_is_empty", is_empty(*heap_pin));
+        *heap_pin = oop_pin{ oop_of(0x1260u) };
+        check("unique_ptr_oop_pin_rearms", holds(*heap_pin, oop_of(0x1260u)));
         heap_pin->reset();
-        check("unique_ptr_global_ref_reset_safe", is_empty(*heap_pin));
-        heap_pin.reset();  // delete the heap global_ref -> dtor runs
-        check("unique_ptr_global_ref_delete_safe", heap_pin == nullptr);
+        check("unique_ptr_oop_pin_reset_safe", is_empty(*heap_pin));
+        heap_pin.reset();  // delete the heap oop_pin -> dtor runs
+        check("unique_ptr_oop_pin_delete_safe", heap_pin == nullptr);
     }
 
     // ========================================================================
@@ -815,7 +815,7 @@ int main()
         for (int i = 0; i < 1000; ++i)
         {
             auto* const bits{ oop_of(static_cast<std::uintptr_t>(0x10000 + i)) };
-            global_ref scoped{ bits };
+            oop_pin scoped{ bits };
             ok = ok && holds(scoped, bits);
             scoped.reset();
             ok = ok && is_empty(scoped);
@@ -826,9 +826,9 @@ int main()
         // Nested scopes with overlapping lifetimes, inner moved out to outer:
         // the address outlives the inner scope inside the outer holder.
         auto* const fake_oop{ oop_of(0x13100u) };
-        global_ref outer{};
+        oop_pin outer{};
         {
-            global_ref inner{ fake_oop };
+            oop_pin inner{ fake_oop };
             outer = std::move(inner);
             check("nested_inner_moved_out_empty", is_empty(inner));  // NOLINT(bugprone-use-after-move)
         }  // inner dtor
@@ -842,8 +842,8 @@ int main()
     {
         auto* const fake_a{ oop_of(0xA000u) };
         auto* const fake_b{ oop_of(0xB000u) };
-        global_ref a{ fake_a };
-        global_ref b{ fake_b };
+        oop_pin a{ fake_a };
+        oop_pin b{ fake_b };
         using std::swap;
         swap(a, b);
         check("swap_exchanges_addresses_a", holds(a, fake_b));
@@ -855,8 +855,8 @@ int main()
     {
         // Swap an armed holder with an empty one: the emptiness swaps too.
         auto* const fake_oop{ oop_of(0xB800u) };
-        global_ref armed{ fake_oop };
-        global_ref empty{};
+        oop_pin armed{ fake_oop };
+        oop_pin empty{};
         using std::swap;
         swap(armed, empty);
         check("swap_armed_with_empty_src_now_empty", is_empty(armed));
@@ -867,7 +867,7 @@ int main()
         // object internally (NOT a syntactic self-move, so -Wself-move stays
         // silent) and must leave the stored address intact.
         auto* const fake_oop{ oop_of(0xC000u) };
-        global_ref a{ fake_oop };
+        oop_pin a{ fake_oop };
         using std::swap;
         swap(a, a);
         check("self_swap_preserves_address", holds(a, fake_oop));
@@ -875,9 +875,9 @@ int main()
     {
         // A 3-way rotation built from two swaps; track where each address lands.
         auto* const fake_b{ oop_of(0xD000u) };
-        global_ref a{};
-        global_ref b{ fake_b };
-        global_ref c{ static_cast<vmhook::oop_t>(nullptr) };
+        oop_pin a{};
+        oop_pin b{ fake_b };
+        oop_pin c{ static_cast<vmhook::oop_t>(nullptr) };
         using std::swap;
         swap(a, b);   // a <- 0xD000, b <- empty
         swap(b, c);   // b <- empty,  c <- empty
@@ -888,15 +888,15 @@ int main()
 
     // ========================================================================
     // SECTION 15 -- Return-by-value / NRVO / guaranteed-elision through a real
-    //   function boundary.  make_ref() returns a prvalue global_ref; bind it,
+    //   function boundary.  make_ref() returns a prvalue oop_pin; bind it,
     //   move-assign it, and feed it straight into a container.  The address must
     //   survive the move-on-return in every path.
     // ========================================================================
     {
-        global_ref r{ make_ref(0xE000u) };   // move-on-return into a fresh pin
+        oop_pin r{ make_ref(0xE000u) };   // move-on-return into a fresh pin
         check("return_by_value_carries_address", holds(r, oop_of(0xE000u)));
 
-        global_ref sink{};
+        oop_pin sink{};
         sink = make_ref(0xE100u);             // move-assign from a returned prvalue
         check("return_by_value_move_assigns_address", holds(sink, oop_of(0xE100u)));
 
@@ -907,7 +907,7 @@ int main()
     {
         // A returned pin pushed into a vector (the prvalue is moved into the
         // element slot -- exercises emplace-from-prvalue, not emplace-in-place).
-        std::vector<global_ref> v;
+        std::vector<oop_pin> v;
         v.push_back(make_ref(0xE300u));
         v.push_back(make_ref(0xE400u));
         check("return_by_value_into_vector",
@@ -916,24 +916,24 @@ int main()
     }
 
     // ========================================================================
-    // SECTION 16 -- Ternary / conditional yielding a prvalue global_ref.  The
+    // SECTION 16 -- Ternary / conditional yielding a prvalue oop_pin.  The
     //   selected arm's address must be the one that survives into the binding.
     // ========================================================================
     {
         const bool take_left{ (failures % 2) == 0 };
-        global_ref chosen{ take_left ? global_ref{ oop_of(0xF000u) }
-                                     : global_ref{ static_cast<vmhook::oop_t>(nullptr) } };
+        oop_pin chosen{ take_left ? oop_pin{ oop_of(0xF000u) }
+                                     : oop_pin{ static_cast<vmhook::oop_t>(nullptr) } };
         check("ternary_prvalue_selects_correct_arm",
               take_left ? holds(chosen, oop_of(0xF000u)) : is_empty(chosen));
     }
 
     // ========================================================================
-    // SECTION 17 -- std::optional<global_ref>: a move-only payload in optional.
+    // SECTION 17 -- std::optional<oop_pin>: a move-only payload in optional.
     //   emplace / reset / move-construct / move-assign the optional and confirm
     //   the contained holder's address survives each transition.
     // ========================================================================
     {
-        std::optional<global_ref> opt;
+        std::optional<oop_pin> opt;
         check("optional_starts_disengaged", !opt.has_value());
 
         opt.emplace(oop_of(0x11000u));           // construct a holder in place
@@ -945,41 +945,41 @@ int main()
 
         // Move-construct an engaged optional into another; the address migrates
         // to the destination and the source's contained holder is emptied.
-        std::optional<global_ref> src;
+        std::optional<oop_pin> src;
         src.emplace(oop_of(0x11100u));
-        std::optional<global_ref> dst{ std::move(src) };
+        std::optional<oop_pin> dst{ std::move(src) };
         check("optional_move_ctor_dst_holds", dst.has_value() && holds(*dst, oop_of(0x11100u)));
         check("optional_move_ctor_src_contained_emptied",
               src.has_value() && is_empty(*src));   // NOLINT(bugprone-use-after-move)
 
         // Move-assign a fresh engaged optional over an engaged one.
-        std::optional<global_ref> reassigned;
+        std::optional<oop_pin> reassigned;
         reassigned.emplace(oop_of(0x12000u));
-        reassigned = std::optional<global_ref>{ global_ref{ oop_of(0x13000u) } };
+        reassigned = std::optional<oop_pin>{ oop_pin{ oop_of(0x13000u) } };
         check("optional_move_assign_holds_new_address",
               reassigned.has_value() && holds(*reassigned, oop_of(0x13000u)));
     }
 
     // ========================================================================
-    // SECTION 18 -- global_ref inside std::pair / std::tuple (move-only members
+    // SECTION 18 -- oop_pin inside std::pair / std::tuple (move-only members
     //   in aggregates the STL moves as a unit).  Build, move the whole
     //   pair/tuple, and confirm each embedded address survives.
     // ========================================================================
     {
-        std::pair<int, global_ref> p{ 7, global_ref{ oop_of(0x14000u) } };
+        std::pair<int, oop_pin> p{ 7, oop_pin{ oop_of(0x14000u) } };
         check("pair_member_holds", holds(p.second, oop_of(0x14000u)));
-        std::pair<int, global_ref> moved{ std::move(p) };
+        std::pair<int, oop_pin> moved{ std::move(p) };
         check("pair_moved_member_holds",
               moved.first == 7 && holds(moved.second, oop_of(0x14000u)));
         check("pair_moved_from_member_emptied", is_empty(p.second));  // NOLINT(bugprone-use-after-move)
     }
     {
-        std::tuple<global_ref, int, global_ref> t{
-            global_ref{ oop_of(0x15000u) }, 9, global_ref{ static_cast<vmhook::oop_t>(nullptr) } };
+        std::tuple<oop_pin, int, oop_pin> t{
+            oop_pin{ oop_of(0x15000u) }, 9, oop_pin{ static_cast<vmhook::oop_t>(nullptr) } };
         check("tuple_members_hold",
               holds(std::get<0>(t), oop_of(0x15000u)) && std::get<1>(t) == 9
                   && is_empty(std::get<2>(t)));
-        std::tuple<global_ref, int, global_ref> moved{ std::move(t) };
+        std::tuple<oop_pin, int, oop_pin> moved{ std::move(t) };
         check("tuple_moved_members_hold",
               holds(std::get<0>(moved), oop_of(0x15000u)) && std::get<1>(moved) == 9
                   && is_empty(std::get<2>(moved)));
@@ -988,11 +988,11 @@ int main()
 
     // ========================================================================
     // SECTION 19 -- Other containers: std::deque (block relocation differs from
-    //   vector) and std::map<int, global_ref> (move-only mapped type, node-based
+    //   vector) and std::map<int, oop_pin> (move-only mapped type, node-based
     //   so no element relocation but exercises piecewise construction + erase).
     // ========================================================================
     {
-        std::deque<global_ref> dq;
+        std::deque<oop_pin> dq;
         for (int i = 0; i < 40; ++i)
         {
             dq.emplace_back(oop_of(static_cast<std::uintptr_t>(0x16000 + i)));
@@ -1014,12 +1014,12 @@ int main()
         check("deque_clear_safe", dq.empty());
     }
     {
-        std::map<int, global_ref> m;
-        m.emplace(1, global_ref{ oop_of(0x17000u) });
-        m.emplace(2, global_ref{ static_cast<vmhook::oop_t>(nullptr) });
-        m.emplace(3, global_ref{});
+        std::map<int, oop_pin> m;
+        m.emplace(1, oop_pin{ oop_of(0x17000u) });
+        m.emplace(2, oop_pin{ static_cast<vmhook::oop_t>(nullptr) });
+        m.emplace(3, oop_pin{});
         // operator[] default-constructs then move-assigns a fresh holder in.
-        m[4] = global_ref{ oop_of(0x17400u) };
+        m[4] = oop_pin{ oop_of(0x17400u) };
         check("map_of_pins_holds_addresses",
               m.size() == 4 && holds(m.at(1), oop_of(0x17000u)) && is_empty(m.at(2))
                   && is_empty(m.at(3)) && holds(m.at(4), oop_of(0x17400u)));
@@ -1035,12 +1035,12 @@ int main()
     //   up holding every address in order.
     // ========================================================================
     {
-        std::vector<global_ref> src;
+        std::vector<oop_pin> src;
         for (int i = 0; i < 16; ++i)
         {
             src.emplace_back(oop_of(static_cast<std::uintptr_t>(0x18000 + i)));
         }
-        std::vector<global_ref> dst;
+        std::vector<oop_pin> dst;
         dst.reserve(src.size());
         dst.insert(dst.end(),
                    std::make_move_iterator(src.begin()),
@@ -1066,12 +1066,12 @@ int main()
         // std::vector::insert in the MIDDLE move-shifts the tail RIGHT (distinct
         // from the erase/left-shift already covered) -- every address must land
         // in its new slot unchanged.
-        std::vector<global_ref> v;
+        std::vector<oop_pin> v;
         for (int i = 0; i < 20; ++i)
         {
             v.emplace_back(oop_of(static_cast<std::uintptr_t>(0x19000 + i)));
         }
-        v.insert(v.begin() + 5, global_ref{ oop_of(0x19500u) });
+        v.insert(v.begin() + 5, oop_pin{ oop_of(0x19500u) });
         bool ok{ v.size() == 21
             && holds(v[4], oop_of(0x19004u))
             && holds(v[5], oop_of(0x19500u))     // the inserted element
@@ -1098,11 +1098,11 @@ int main()
     {
         // Double braces: std::array is an aggregate wrapping a C array, so a
         // single brace level draws clang's -Wmissing-braces under -Werror.
-        std::array<global_ref, 4> arr{ {
-            global_ref{ oop_of(0x1A000u) },
-            global_ref{ static_cast<vmhook::oop_t>(nullptr) },
-            global_ref{ oop_of(0x1A200u) },
-            global_ref{} } };
+        std::array<oop_pin, 4> arr{ {
+            oop_pin{ oop_of(0x1A000u) },
+            oop_pin{ static_cast<vmhook::oop_t>(nullptr) },
+            oop_pin{ oop_of(0x1A200u) },
+            oop_pin{} } };
         check("std_array_of_pins_holds",
               holds(arr[0], oop_of(0x1A000u)) && is_empty(arr[1])
                   && holds(arr[2], oop_of(0x1A200u)) && is_empty(arr[3]));
@@ -1112,9 +1112,9 @@ int main()
         // source), then move INTO it (as destination), alternating several
         // times.  The address must never be duplicated or resurrected.
         auto* const fake_oop{ oop_of(0x1B000u) };
-        global_ref a{ fake_oop };
-        global_ref b{ std::move(a) };          // b takes 0x1B000, a moved-from
-        global_ref c{ std::move(a) };          // move the moved-from a AGAIN  // NOLINT(bugprone-use-after-move)
+        oop_pin a{ fake_oop };
+        oop_pin b{ std::move(a) };          // b takes 0x1B000, a moved-from
+        oop_pin c{ std::move(a) };          // move the moved-from a AGAIN  // NOLINT(bugprone-use-after-move)
         check("double_move_from_same_source_a_empty", is_empty(a));   // NOLINT(bugprone-use-after-move)
         check("double_move_from_same_source_b_holds", holds(b, fake_oop));
         check("double_move_from_same_source_c_empty", is_empty(c));
@@ -1134,11 +1134,11 @@ int main()
     //   not poison the object for a subsequent re-arm.
     // ========================================================================
     {
-        global_ref g{ oop_of(0x1C000u) };
+        oop_pin g{ oop_of(0x1C000u) };
         check("reset_then_repin_initial_holds", holds(g, oop_of(0x1C000u)));
         g.reset();
         check("reset_then_repin_reset_empty", is_empty(g));
-        g = global_ref{ oop_of(0x1C100u) };     // re-arm via move-assign from prvalue
+        g = oop_pin{ oop_of(0x1C100u) };     // re-arm via move-assign from prvalue
         check("reset_then_repin_rearmed_holds", holds(g, oop_of(0x1C100u)));
         g.reset();
         check("reset_then_repin_final_reset_empty", is_empty(g));
@@ -1147,14 +1147,14 @@ int main()
         // Move OUT of g (g becomes moved-from), then re-arm g via assignment, in
         // a loop -- proves an object can cycle move-out / re-arm indefinitely
         // and that each cycle's address lands where it should.
-        global_ref g{};
+        oop_pin g{};
         bool ok{ true };
         for (int i = 0; i < 64; ++i)
         {
-            global_ref taken{ std::move(g) };
+            oop_pin taken{ std::move(g) };
             ok = ok && is_empty(g);             // NOLINT(bugprone-use-after-move)
             auto* const bits{ oop_of(static_cast<std::uintptr_t>(0x1D000 + i)) };
-            g = global_ref{ bits };
+            g = oop_pin{ bits };
             ok = ok && holds(g, bits);
             (void)taken;                         // taken dtors here
         }
@@ -1163,18 +1163,18 @@ int main()
     {
         // Laundered self-move-assign (no syntactic self-move -> no -Wself-move),
         // exercising the runtime `this != &other` guard on both states.
-        global_ref empty_self{};
+        oop_pin empty_self{};
         launder_move_assign(empty_self, empty_self);
         check("laundered_self_move_empty_safe", is_empty(empty_self));
 
         auto* const fake_oop{ oop_of(0x1E000u) };
-        global_ref oop_self{ fake_oop };
+        oop_pin oop_self{ fake_oop };
         launder_move_assign(oop_self, oop_self);
         check("laundered_self_move_preserves_address", holds(oop_self, fake_oop));
 
         // Repeated laundered self-moves accumulate no corruption.
         auto* const repeat_oop{ oop_of(0x1E100u) };
-        global_ref repeat_self{ repeat_oop };
+        oop_pin repeat_self{ repeat_oop };
         launder_move_assign(repeat_self, repeat_self);
         launder_move_assign(repeat_self, repeat_self);
         launder_move_assign(repeat_self, repeat_self);
@@ -1197,7 +1197,7 @@ int main()
         for (std::uintptr_t tag = 0; tag < 8u; ++tag)
         {
             const std::uintptr_t bits{ 0x20000u | tag };
-            global_ref g{ oop_of(bits) };
+            oop_pin g{ oop_of(bits) };
             all_hold = all_hold && holds(g, oop_of(bits));
         }
         check("ctor_all_low3_tag_patterns_stored_unmasked", all_hold);
@@ -1212,7 +1212,7 @@ int main()
         bool all_hold{ true };
         for (const std::uintptr_t bits : sentinels)
         {
-            global_ref g{ oop_of(bits) };
+            oop_pin g{ oop_of(bits) };
             all_hold = all_hold && holds(g, oop_of(bits));
         }
         check("ctor_sentinel_patterns_stored_verbatim", all_hold);
@@ -1233,7 +1233,7 @@ int main()
         bool all_ok{ true };
         for (const std::uintptr_t bits : edges)
         {
-            global_ref g{ oop_of(bits) };
+            oop_pin g{ oop_of(bits) };
             all_ok = all_ok && holds(g, oop_of(bits));
             g.reset();
             all_ok = all_ok && is_empty(g);
@@ -1249,27 +1249,27 @@ int main()
     // ========================================================================
 
     // Move-only contract via the precise deleted-vs-defined trait pairing.
-    static_assert(std::is_nothrow_move_constructible_v<global_ref>
-                      && std::is_nothrow_move_assignable_v<global_ref>
-                      && !std::is_copy_constructible_v<global_ref>
-                      && !std::is_copy_assignable_v<global_ref>,
-                  "global_ref must be move-only with noexcept moves");
+    static_assert(std::is_nothrow_move_constructible_v<oop_pin>
+                      && std::is_nothrow_move_assignable_v<oop_pin>
+                      && !std::is_copy_constructible_v<oop_pin>
+                      && !std::is_copy_assignable_v<oop_pin>,
+                  "oop_pin must be move-only with noexcept moves");
 
     // Default ctor + dtor + reset() all noexcept (the "safe on null" trio).
-    static_assert(std::is_nothrow_default_constructible_v<global_ref>
-                      && std::is_nothrow_destructible_v<global_ref>
-                      && noexcept(std::declval<global_ref&>().reset()),
+    static_assert(std::is_nothrow_default_constructible_v<oop_pin>
+                      && std::is_nothrow_destructible_v<oop_pin>
+                      && noexcept(std::declval<oop_pin&>().reset()),
                   "default ctor, destructor, and reset() must all be noexcept");
 
     // Runtime: default-construct holds nullptr across every accessor.
     {
-        global_ref g{};
+        oop_pin g{};
         check("w28_default_ctor_holds_nullptr",
               g.handle() == nullptr && g.oop() == nullptr && !static_cast<bool>(g));
     }
     // Runtime: reset() on an already-null holder is a no-op (still null, idempotent).
     {
-        global_ref g{};
+        oop_pin g{};
         g.reset();
         g.reset();
         g.reset();
@@ -1279,15 +1279,15 @@ int main()
     // Runtime: destructor on a null holder is safe (exits cleanly).
     {
         {
-            global_ref g{};
+            oop_pin g{};
             (void)g;
         }
         check("w28_dtor_safe_on_null", true);
     }
     // Runtime: nullptr ctor matches default ctor's empty state.
     {
-        global_ref a{};
-        global_ref b{ nullptr };
+        oop_pin a{};
+        oop_pin b{ nullptr };
         check("w28_nullptr_ctor_matches_default",
               is_empty(a) && is_empty(b));
     }
@@ -1296,7 +1296,7 @@ int main()
     // desyncs one view from the others fails here.
     {
         auto* const fake_oop{ oop_of(0x1F000u) };
-        global_ref g{ fake_oop };
+        oop_pin g{ fake_oop };
         check("w28_armed_views_are_consistent",
               g.raw_unsafe() == fake_oop && g.oop() == nullptr && g.handle() == nullptr
                   && !static_cast<bool>(g) && !is_empty(g));

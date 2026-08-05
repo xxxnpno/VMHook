@@ -18,7 +18,7 @@ import vmhook.Harness;
  * left in ExceptionOccurred state, JVM healthy afterwards", proven once per
  * exception KIND.
  *
- * How the native module drives it (mirrors MethodCallJni / MethodPrimitives):
+ * How the native module drives it (mirrors MethodCallDispatch / MethodPrimitives):
  *   - The native side hooks {@link #trigger(int)}.  Inside that detour
  *     vmhook::hotspot::current_java_thread is set, which is the ONLY context in
  *     which method_proxy::call() may invoke the interpreter / JNI call gate.

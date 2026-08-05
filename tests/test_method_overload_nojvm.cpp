@@ -195,7 +195,7 @@ static_assert(std::string_view{ "Ljava/lang/String;" } != std::string_view{ "Lco
               "in argument_matches_descriptor IGNORES that distinction — first-match-wins.");
 
 // ===========================================================================
-// (4) BRIDGE TO THE PUBLIC BUILDER: jni_signature_for_arg<T>().
+// (4) BRIDGE TO THE PUBLIC BUILDER: jvm_descriptor_for_arg<T>().
 //
 // The library's PUBLIC signature builder must agree with our mirror of the
 // PRIVATE selector for every fundamental type.  If the two ever drift, an
@@ -206,7 +206,7 @@ static_assert(std::string_view{ "Ljava/lang/String;" } != std::string_view{ "Lco
 template<typename T>
 constexpr auto builder_letter() noexcept -> std::string_view
 {
-    // jni_signature_for_arg returns a std::string (runtime), so wrap into
+    // jvm_descriptor_for_arg returns a std::string (runtime), so wrap into
     // an explicit constexpr-friendly switch by calling at static-init time
     // through a runtime helper — fundamental-type tests below assert this
     // at runtime via check().
@@ -216,7 +216,7 @@ constexpr auto builder_letter() noexcept -> std::string_view
 template<typename T>
 static auto bridge_signature(const char* tag) -> void
 {
-    const std::string actual{ vmhook::detail::jni_signature_for_arg<T>() };
+    const std::string actual{ vmhook::detail::jvm_descriptor_for_arg<T>() };
     check(tag, std::string_view{ actual } == selector_letter<T>());
 }
 
@@ -482,17 +482,17 @@ int main()
           ret_of("([[I)[Ljava/lang/Object;") == "[Ljava/lang/Object;");
     check("return: no closing paren -> empty",    ret_of("garbage").empty());
 
-    // --- (9) PUBLIC BUILDER bridge: jni_signature_for_arg<unique_ptr<W>> ---
-    // The PUBLIC signature builder (vmhook::detail::jni_signature_for_arg)
+    // --- (9) PUBLIC BUILDER bridge: jvm_descriptor_for_arg<unique_ptr<W>> ---
+    // The PUBLIC signature builder (vmhook::detail::jvm_descriptor_for_arg)
     // exposes the wrapper branch: registered wrappers must produce the
     // EXACT "L<class>;" descriptor anchored to type_to_class_map.  This is
     // the only public-side hook into wrapper matching; an unregistered
     // wrapper triggers a static_assert in the builder, so the matcher's
     // wildcard reality lives in the documented [medium] flaw above.
     {
-        const std::string sa{ vmhook::detail::jni_signature_for_arg<std::unique_ptr<registered_a>>() };
-        const std::string sb{ vmhook::detail::jni_signature_for_arg<std::unique_ptr<registered_b>>() };
-        const std::string su{ vmhook::detail::jni_signature_for_arg<std::unique_ptr<unregistered_w>>() };
+        const std::string sa{ vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<registered_a>>() };
+        const std::string sb{ vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<registered_b>>() };
+        const std::string su{ vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<unregistered_w>>() };
         // Each branch returns a syntactically valid "L...;" descriptor — either
         // the exact registered name or the "Ljava/lang/Object;" fallback.  Both
         // paths must produce a descriptor that the per-token matcher would

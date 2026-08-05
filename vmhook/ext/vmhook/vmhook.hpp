@@ -261,6 +261,44 @@
     #define VMHOOK_HAS_DEDUCING_THIS 0
 #endif
 
+// std::expected requires GCC 12+ / Clang 16+ (libc++ 16) / MSVC 19.33+.  Used
+// for the try_* accessors, which report WHY a lookup failed instead of
+// collapsing every cause into an empty optional.
+#if __has_include(<expected>) && (defined(__cpp_lib_expected) && __cpp_lib_expected >= 202202L)
+    #include <expected>
+    #define VMHOOK_HAS_STD_EXPECTED 1
+#else
+    #define VMHOOK_HAS_STD_EXPECTED 0
+#endif
+
+// ---------------------------------------------------------------------------
+// C++26 static reflection (P2996) — OPTIONAL, and additive wherever it is used.
+//
+// vmhook has to describe C++ types to a JVM: a wrapper class needs a Java class
+// name, an argument type needs a descriptor, and a failure needs to say WHICH
+// type it was talking about.  Today all three go through either a string the
+// user hands over (`register_class<T>("com/example/Foo")`) or `typeid(T).name()`,
+// which is implementation-defined and in practice emits a mangled identifier
+// ("5playerE") into user-facing warnings.  Reflection replaces the second with
+// the actual spelling of the type, and lets the first be derived.
+//
+// SHIPPING REALITY: P2996 landed in C++26 but is implemented almost nowhere.
+// Clang 21+ has it behind -freflection with -std=c++2c; GCC has not merged it;
+// MSVC has not shipped it.  vmhook's CI builds -std=c++23 on GCC, Clang and
+// MSVC, so NOTHING here may depend on reflection being present.  Every use is
+// gated and every gate has a C++23 fallback that behaves the same, only with a
+// worse diagnostic string.  This mirrors how VMHOOK_HAS_DEDUCING_THIS and
+// VMHOOK_HAS_STD_FORMAT are handled.
+//
+// Gate on BOTH feature-test macros plus the header: the language macro alone is
+// true in some in-progress builds where <meta> is absent or incomplete.
+#if defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202506L     && defined(__cpp_lib_reflection) && __cpp_lib_reflection >= 202506L     && __has_include(<meta>)
+    #include <meta>
+    #define VMHOOK_HAS_REFLECTION 1
+#else
+    #define VMHOOK_HAS_REFLECTION 0
+#endif
+
 #if VMHOOK_OS_WINDOWS
     // <windows.h> defines macros (min, max, ERROR, etc.) that clash with C++.
     // We guard them and undefine the worst offenders right after include.
@@ -1669,7 +1707,7 @@ namespace vmhook
         Thread-safety: every read / mutation of this map AND of g_type_factory_map
         below must hold registration_mutex.  register_class() can be called from
         whichever thread the user runs setup on, while extract_frame_arg /
-        jni_signature_for_arg / on_class_loaded read the map from hook detour
+        jvm_descriptor_for_arg / on_class_loaded read the map from hook detour
         threads.  Without the mutex, a racing insert during an unordered_map
         rehash corrupts the buckets.  The map only ever grows, so a plain
         std::mutex is enough — read contention is irrelevant on the steady-state
@@ -1705,6 +1743,107 @@ namespace vmhook
     template<class wrapper_type>
     static auto register_class(std::string_view class_name) noexcept
         -> bool;
+
+    /*
+        @brief Why a member lookup failed.
+        @details
+        get_field() / get_method() return std::optional, which says a lookup
+        failed but not why - and the four causes want four different responses.
+        "The class is not loaded yet" is usually a timing problem the caller can
+        retry past; "this wrapper was never registered" is a setup bug that will
+        never fix itself; "the field does not exist" is a name typo or an
+        obfuscated build that renamed it; "the object is null" is ordinary Java.
+
+        Collapsing all four into nullopt is why the house one-liner
+        `get_field("x")->get()` is so common and so dangerous: with no way to
+        distinguish "not yet" from "never", callers stopped checking at all.  It
+        has taken the whole JVM suite down at least once.
+
+        The try_* accessors return std::expected<T, access_error> so the caller
+        can branch on the cause without giving up the one-liner in the happy
+        path.  @see vmhook::error_message.
+    */
+    enum class access_error : std::uint8_t
+    {
+        /* The wrapper type was never passed to register_class<T>(). */
+        wrapper_not_registered,
+        /* Registered, but the JVM has not loaded that class (yet). */
+        class_not_loaded,
+        /* The class is loaded and has no such member. */
+        member_not_found,
+        /* An instance member was requested through a null object. */
+        null_instance,
+        /* The member exists but its java.lang.Class mirror could not be read. */
+        mirror_unreadable,
+    };
+
+    /*
+        @brief A short, human-readable explanation of an access_error.
+        @details Stable strings intended for logs and assertion messages.
+        Complexity: O(1).  Exception safety: noexcept.
+    */
+    [[nodiscard]] inline constexpr auto error_message(const vmhook::access_error error) noexcept
+        -> std::string_view
+    {
+        switch (error)
+        {
+        case vmhook::access_error::wrapper_not_registered:
+            return "wrapper type not registered - call vmhook::register_class<T>() first";
+        case vmhook::access_error::class_not_loaded:
+            return "the JVM has not loaded this class yet";
+        case vmhook::access_error::member_not_found:
+            return "no such member in the class hierarchy";
+        case vmhook::access_error::null_instance:
+            return "instance member requested through a null object";
+        case vmhook::access_error::mirror_unreadable:
+            return "the java.lang.Class mirror could not be read";
+        }
+        return "unknown access error";
+    }
+
+    /*
+        @brief Annotation that gives a C++ wrapper its Java class name.
+        @details
+        The zero-ceremony form of registration.  Instead of
+
+            class player : public vmhook::object<player> { ... };
+            vmhook::register_class<player>("com/example/Player");
+
+        the name travels WITH the type:
+
+            class [[= vmhook::java_class("com/example/Player")]] player
+                : public vmhook::object<player> { ... };
+            vmhook::register_class<player>();
+
+        Why this is worth a C++26 dependency rather than a macro: the name stops
+        being a runtime argument.  Today a wrapper used before its
+        register_class() call, or registered under a typo, fails at RUNTIME - and
+        fails quietly, because the descriptor builder degrades an unregistered
+        wrapper to "Ljava/lang/Object;" and method resolution then picks the
+        wrong overload or none at all.  An annotation is available at compile
+        time, so the descriptor for an annotated wrapper is a constant that
+        cannot disagree with the registry, and the "not registered" branch stops
+        being reachable for it at all.
+
+        The name is the JVM-internal (slash-separated) form, the same string the
+        two-argument register_class takes: "java/lang/String", not
+        "java.lang.String".
+
+        AVAILABILITY: annotations are C++26 (P3394) and reflection is P2996.  On
+        a C++23 toolchain this type is still declared - so the annotation syntax
+        is not the thing that breaks - but nothing reads it, and the no-argument
+        register_class<T>() overload does not exist.  Use the string form there.
+        See VMHOOK_HAS_REFLECTION.
+    */
+    struct java_class
+    {
+        std::string_view name{};
+
+        consteval explicit java_class(const std::string_view class_name) noexcept
+            : name{ class_name }
+        {
+        }
+    };
 
     class object_base;
     template<typename derived = void> class object;
@@ -1854,6 +1993,96 @@ namespace vmhook
         */
         template<typename type>
         inline constexpr bool is_unique_ptr_v{ is_unique_ptr<std::remove_cvref_t<type>>::value };
+
+        /*
+            @brief The human-readable spelling of a C++ type, for diagnostics.
+            @details
+            Every "wrapper not registered" warning in this header names the type
+            that failed.  Until now that name came from `vmhook::detail::type_name<T>()`, which
+            is implementation-defined: libstdc++ and libc++ return the MANGLED
+            identifier, so a user who forgot a register_class<player>() call was
+            told about "6playerE" and had to know Itanium mangling to read their
+            own error message.  MSVC happens to return "class player", which made
+            the problem invisible to anyone testing only on Windows.
+
+            With C++26 reflection this is exact: identifier_of(^^T) is the name
+            as written.  Without it we fall back to typeid, i.e. to today's
+            behaviour - no diagnostic gets WORSE, some get much better.
+
+            Returns std::string rather than string_view because the reflection
+            branch produces a string_view into a value that does not outlive the
+            call, and every caller feeds it straight into VMHOOK_LOG anyway.
+
+            Complexity: O(1) reflected / O(name length) fallback.
+            Exception safety: may allocate (the string).  Thread safety: safe.
+        */
+        template<typename type>
+        inline auto type_name() noexcept
+            -> std::string
+        {
+#if VMHOOK_HAS_REFLECTION
+            // display_string_of() over identifier_of(): the former handles
+            // unnamed and closure types, which a wrapper never is but a
+            // mis-instantiated template argument can be.
+            return std::string{ std::meta::display_string_of(^^type) };
+#else
+            return std::string{ typeid(type).name() };
+#endif
+        }
+
+        /*
+            @brief The Java class name a wrapper was annotated with, at compile time.
+            @details
+            Reads the vmhook::java_class annotation off `wrapper_type` and returns
+            the JVM-internal name it carries.  Returns an EMPTY view when the type
+            carries no such annotation, which is the normal case for wrappers
+            registered the string way and is never an error here - callers fall
+            back to the runtime registry.
+
+            Empty is also what every C++23 toolchain gets, unconditionally: with
+            no reflection there is nothing to read, so every lookup falls back and
+            behaviour is exactly what it was before this existed.
+
+            consteval on the reflected branch: an annotated wrapper's descriptor
+            becomes a compile-time constant, so it cannot drift from the registry
+            and cannot silently degrade to Ljava/lang/Object;.
+
+            Complexity: O(annotations) at compile time, zero at runtime.
+        */
+        template<typename wrapper_type>
+#if VMHOOK_HAS_REFLECTION
+        consteval auto annotated_class_name() noexcept
+            -> std::string_view
+        {
+            // A type may carry several annotations; take the first java_class.
+            // More than one is a user error we cannot diagnose from here without
+            // making this a hard compile failure for a merely redundant tag, so
+            // first-wins is the forgiving reading.
+            for (const std::meta::info annotation : std::meta::annotations_of(^^wrapper_type))
+            {
+                if (std::meta::type_of(annotation) == ^^vmhook::java_class)
+                {
+                    return std::meta::extract<vmhook::java_class>(annotation).name;
+                }
+            }
+            return {};
+        }
+#else
+        constexpr auto annotated_class_name() noexcept
+            -> std::string_view
+        {
+            return {};
+        }
+#endif
+
+        /*
+            @brief True when `wrapper_type` carries a vmhook::java_class annotation.
+            @details Always false without reflection, so every gate built on it
+            takes the runtime-registry path on a C++23 toolchain.
+        */
+        template<typename wrapper_type>
+        inline constexpr bool has_annotated_class_name_v{
+            !vmhook::detail::annotated_class_name<wrapper_type>().empty() };
 
         /*
             @brief Type trait that detects whether a type is a vmhook::borrowed<W>.
@@ -9618,7 +9847,7 @@ namespace vmhook
         // Serialise both map writes behind registration_mutex.  Without
         // this, two threads racing through register_class() can trip an
         // unordered_map rehash mid-insert and corrupt the bucket array.
-        // Readers in detour-hot paths (extract_frame_arg / jni_signature_for_arg /
+        // Readers in detour-hot paths (extract_frame_arg / jvm_descriptor_for_arg /
         // on_class_loaded) do NOT take the lock - the documented contract is
         // that register_class is called from single-threaded setup BEFORE
         // hooks fire.  This lock guards against concurrent registers, which
@@ -9653,6 +9882,43 @@ namespace vmhook
 
         return true;
     }
+
+    /*
+        @brief Registers a wrapper using the name it was annotated with.
+        @details
+        The zero-ceremony registration:
+
+            class [[= vmhook::java_class("com/example/Player")]] player
+                : public vmhook::object<player> { ... };
+
+            vmhook::register_class<player>();     // no string
+
+        Exactly equivalent to passing the annotation's name to the string
+        overload - same verification, same maps, same return value.  What it
+        removes is the opportunity for the string at the call site to disagree
+        with the type it is registering, which is a real and silent bug: a
+        copy-pasted register_class<item>("com/example/Player") binds `item` to
+        Player's klass and every field read after it is nonsense at a plausible
+        offset.
+
+        Constrained rather than static_assert'd, so a call on an UNannotated
+        wrapper is a clean "no matching overload" that points at the missing
+        annotation, instead of an error from inside the body.
+
+        AVAILABILITY: C++26 reflection only.  On a C++23 toolchain this overload
+        does not exist and the string form is the only spelling.
+    */
+#if VMHOOK_HAS_REFLECTION
+    template<typename wrapper_type>
+        requires (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
+    static auto register_class() noexcept
+        -> bool
+    {
+        constexpr std::string_view annotated{
+            vmhook::detail::annotated_class_name<wrapper_type>() };
+        return vmhook::register_class<wrapper_type>(annotated);
+    }
+#endif
 
     // -------------------------------------------------------------------------
     // Method enumeration / introspection.
@@ -9778,7 +10044,7 @@ namespace vmhook
     {
         const auto methods{ vmhook::get_class_methods<wrapper_type>() };
         VMHOOK_LOG("{} log_class_methods<{}>(): {} method(s):",
-                   vmhook::info_tag, typeid(wrapper_type).name(), methods.size());
+                   vmhook::info_tag, vmhook::detail::type_name<wrapper_type>(), methods.size());
         std::size_t method_index{ 0 };
         for (const auto& [name, descriptor] : methods)
         {
@@ -10884,7 +11150,7 @@ namespace vmhook
         {
             VMHOOK_LOG("{} return_value::set_arg(index={}): unsupported value_type '{}' "
                        "(not trivially copyable or larger than a pointer).",
-                       vmhook::error_tag, index, typeid(clean_value_type).name());
+                       vmhook::error_tag, index, vmhook::detail::type_name<clean_value_type>());
             return false;
         }
     }
@@ -11008,7 +11274,7 @@ namespace vmhook
             const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
             if (type_map_entry == vmhook::type_to_class_map.end())
             {
-                throw vmhook::exception{ std::format("Class not registered for type {}. Did you call register_class<wrapper_type>()?", typeid(wrapper_type).name()) };
+                throw vmhook::exception{ std::format("Class not registered for type {}. Did you call register_class<wrapper_type>()?", vmhook::detail::type_name<wrapper_type>()) };
             }
 
             vmhook::hotspot::klass* const target_klass{ vmhook::find_class(type_map_entry->second) };
@@ -12170,14 +12436,14 @@ namespace vmhook
         {
             VMHOOK_LOG("{} hook_by_signature<{}>('{}'): no method matches that descriptor "
                        "(class not loaded / not registered, or the descriptor is wrong).",
-                       vmhook::error_tag, typeid(wrapper_type).name(), jvm_descriptor);
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(), jvm_descriptor);
             return false;
         }
         if (names.size() > 1)
         {
             VMHOOK_LOG("{} hook_by_signature<{}>('{}'): {} methods share that descriptor - "
                        "refusing to guess.  Hook by name with hook<T>(name, descriptor, detour).",
-                       vmhook::error_tag, typeid(wrapper_type).name(), jvm_descriptor, names.size());
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(), jvm_descriptor, names.size());
             return false;
         }
         return vmhook::hook<wrapper_type>(names.front(), jvm_descriptor,
@@ -12220,7 +12486,7 @@ namespace vmhook
                                          &already_hooked))
         {
             VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): underlying vmhook::hook() failed - returning empty handle.",
-                       vmhook::error_tag, typeid(wrapper_type).name(),
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(),
                        method_name, method_signature);
             return hook_handle{};
         }
@@ -12240,7 +12506,7 @@ namespace vmhook
             VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): method already hooked - this duplicate install "
                        "registers no second detour; returning a not-installed handle (installed()==false). "
                        "The pre-existing hook stays live and owns the method.",
-                       vmhook::warning_tag, typeid(wrapper_type).name(),
+                       vmhook::warning_tag, vmhook::detail::type_name<wrapper_type>(),
                        method_name, method_signature);
             return hook_handle{};
         }
@@ -12258,7 +12524,7 @@ namespace vmhook
             {
                 VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): wrapper type not registered "
                            "(call register_class<T>() first) - returning empty handle.",
-                           vmhook::error_tag, typeid(wrapper_type).name(),
+                           vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(),
                            method_name, method_signature);
                 return hook_handle{};
             }
@@ -12268,7 +12534,7 @@ namespace vmhook
             {
                 VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): find_class('{}') returned null - "
                            "returning empty handle.",
-                           vmhook::error_tag, typeid(wrapper_type).name(),
+                           vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(),
                            method_name, method_signature, type_map_entry->second);
                 return hook_handle{};
             }
@@ -12278,7 +12544,7 @@ namespace vmhook
             {
                 VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): klass has no methods array (count={}) - "
                            "returning empty handle.",
-                           vmhook::error_tag, typeid(wrapper_type).name(),
+                           vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(),
                            method_name, method_signature, method_count);
                 return hook_handle{};
             }
@@ -12302,21 +12568,21 @@ namespace vmhook
             VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): hook installed but Method* re-resolution "
                        "did not find a matching method in the klass; returning empty handle. "
                        "The hook IS active, but the caller has no way to disarm it individually.",
-                       vmhook::error_tag, typeid(wrapper_type).name(),
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(),
                        method_name, method_signature);
         }
         catch (const std::exception& exception)
         {
             VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): exception during Method* re-resolution: {} - "
                        "returning empty handle.",
-                       vmhook::error_tag, typeid(wrapper_type).name(),
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(),
                        method_name, method_signature, exception.what());
         }
         catch (...)
         {
             VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): unknown exception during Method* re-resolution - "
                        "returning empty handle.",
-                       vmhook::error_tag, typeid(wrapper_type).name(),
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(),
                        method_name, method_signature);
         }
         return hook_handle{};
@@ -12537,12 +12803,14 @@ namespace vmhook
               integral, sizeof 8         -> "J" (int64_t/uint64_t, and long/size_t when 8 bytes)
               float                      -> "F"
               double                     -> "D"
-              unique_ptr<wrapper> / object_base-derived -> "Lpkg/Name;"
+              borrowed<wrapper> / unique_ptr<wrapper> /
+              object_base-derived        -> "Lpkg/Name;"
             Used to build the method descriptor that overload selection matches
             against.
 
-            @note The name is a leftover — nothing here is JNI-specific.  A
-            descriptor is a class-file construct; the rename is pending.
+            @note Was `jni_signature_for_arg` until v0.6.0.  Nothing here was
+            ever JNI-specific — a descriptor is a class-file construct — and the
+            old name outlived the JNI layer it was named after.
 
             Exception safety: noexcept — compile-time dispatch only.
 
@@ -12550,7 +12818,7 @@ namespace vmhook
             @return  JVM type descriptor string.
         */
         template<typename arg_type>
-        inline auto jni_signature_for_arg() noexcept
+        inline auto jvm_descriptor_for_arg() noexcept
             -> std::string
         {
             using clean_t = std::decay_t<arg_type>;
@@ -12621,15 +12889,23 @@ namespace vmhook
                 {
                     return "Ljava/lang/Object;";
                 }
+                else if constexpr (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
+                {
+                    // Annotated: the descriptor is a compile-time constant, so it
+                    // cannot disagree with the registry and cannot degrade to
+                    // Ljava/lang/Object; because someone forgot to register.
+                    return std::format(
+                        "L{};", vmhook::detail::annotated_class_name<wrapper_type>());
+                }
                 else
                 {
                     const auto entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
                     if (entry == vmhook::type_to_class_map.end())
                     {
-                        VMHOOK_LOG("{} vmhook::detail::jni_signature_for_arg<{}>: borrowed<T> wrapper "
+                        VMHOOK_LOG("{} vmhook::detail::jvm_descriptor_for_arg<{}>: borrowed<T> wrapper "
                                    "not registered via vmhook::register_class<T>(name); falling back to "
                                    "Ljava/lang/Object;.",
-                                   vmhook::warning_tag, typeid(wrapper_type).name());
+                                   vmhook::warning_tag, vmhook::detail::type_name<wrapper_type>());
                         return "Ljava/lang/Object;";
                     }
                     return std::format("L{};", entry->second);
@@ -12639,45 +12915,62 @@ namespace vmhook
             {
                 using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
                 static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
-                              "vmhook::detail::jni_signature_for_arg: unique_ptr<T> arg's T must "
+                              "vmhook::detail::jvm_descriptor_for_arg: unique_ptr<T> arg's T must "
                               "derive from vmhook::object_base.  Pass a wrapper, not a raw object.");
-                // Resolve the JVM class name from the registered wrapper map so the
-                // descriptor reads `Lcom/example/Foo;` instead of the old silently-wrong
-                // `I` fallback, which broke object construction whenever someone
-                // passed an object to a constructor that took another object.
-                const auto entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
-                if (entry == vmhook::type_to_class_map.end())
+                if constexpr (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
                 {
-                    VMHOOK_LOG("{} vmhook::detail::jni_signature_for_arg<{}>: unique_ptr<T> wrapper "
-                               "not registered via vmhook::register_class<T>(name); falling back to "
-                               "Ljava/lang/Object;.",
-                               vmhook::warning_tag, typeid(wrapper_type).name());
-                    return "Ljava/lang/Object;";
+                    return std::format(
+                        "L{};", vmhook::detail::annotated_class_name<wrapper_type>());
                 }
-                return std::format("L{};", entry->second);
+                else
+                {
+                    // Resolve the JVM class name from the registered wrapper map so the
+                    // descriptor reads `Lcom/example/Foo;` instead of the old silently-wrong
+                    // `I` fallback, which broke object construction whenever someone
+                    // passed an object to a constructor that took another object.
+                    const auto entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
+                    if (entry == vmhook::type_to_class_map.end())
+                    {
+                        VMHOOK_LOG("{} vmhook::detail::jvm_descriptor_for_arg<{}>: unique_ptr<T> wrapper "
+                                   "not registered via vmhook::register_class<T>(name); falling back to "
+                                   "Ljava/lang/Object;.",
+                                   vmhook::warning_tag, vmhook::detail::type_name<wrapper_type>());
+                        return "Ljava/lang/Object;";
+                    }
+                    return std::format("L{};", entry->second);
+                }
             }
             else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
             {
-                const auto entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(clean_t) }) };
-                if (entry == vmhook::type_to_class_map.end())
+                if constexpr (vmhook::detail::has_annotated_class_name_v<clean_t>)
                 {
-                    VMHOOK_LOG("{} vmhook::detail::jni_signature_for_arg<{}>: object wrapper not "
-                               "registered via vmhook::register_class<T>(name); falling back to "
-                               "Ljava/lang/Object;.",
-                               vmhook::warning_tag, typeid(clean_t).name());
-                    return "Ljava/lang/Object;";
+                    return std::format(
+                        "L{};", vmhook::detail::annotated_class_name<clean_t>());
                 }
-                return std::format("L{};", entry->second);
+                else
+                {
+                    const auto entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(clean_t) }) };
+                    if (entry == vmhook::type_to_class_map.end())
+                    {
+                        VMHOOK_LOG("{} vmhook::detail::jvm_descriptor_for_arg<{}>: object wrapper not "
+                                   "registered via vmhook::register_class<T>(name); falling back to "
+                                   "Ljava/lang/Object;.",
+                                   vmhook::warning_tag, vmhook::detail::type_name<clean_t>());
+                        return "Ljava/lang/Object;";
+                    }
+                    return std::format("L{};", entry->second);
+                }
             }
             else
             {
                 static_assert(vmhook::detail::dependent_false_v<clean_t>,
-                              "vmhook::detail::jni_signature_for_arg: unsupported argument type.  "
+                              "vmhook::detail::jvm_descriptor_for_arg: unsupported argument type.  "
                               "The old `else return \"I\";` fallback silently mis-encoded every "
                               "wrapper-pointer / 64-bit / unknown-integral arg as Java `int`, so "
                               "method resolution then failed with no clear explanation.  "
                               "Add an explicit branch above or convert the arg to one "
-                              "of: string, c-string, unique_ptr<vmhook::object>, object_base-derived, "
+                              "of: string, c-string, borrowed<vmhook::object>, "
+                              "unique_ptr<vmhook::object>, object_base-derived, "
                               "bool, integral (8/16/32/64-bit), float, double.");
             }
         }
@@ -12868,14 +13161,14 @@ namespace vmhook
     {
         if (!vmhook::hotspot::ensure_current_java_thread())
         {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): failed to attach current native thread to the JVM.", vmhook::error_tag, typeid(wrapper_type).name());
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): failed to attach current native thread to the JVM.", vmhook::error_tag, vmhook::detail::type_name<wrapper_type>());
             return nullptr;
         }
 
         auto map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
         if (map_entry == vmhook::type_to_class_map.end())
         {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): type not registered.", vmhook::error_tag, typeid(wrapper_type).name());
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): type not registered.", vmhook::error_tag, vmhook::detail::type_name<wrapper_type>());
             return nullptr;
         }
 
@@ -12888,14 +13181,14 @@ namespace vmhook
         if (!klass)
         {
             VMHOOK_LOG("{} vmhook::make_unique<{}>(): find_class('{}') returned null - class not loaded.",
-                       vmhook::error_tag, typeid(wrapper_type).name(), map_entry->second);
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(), map_entry->second);
             return nullptr;
         }
 
         const std::size_t raw_size{ klass->get_instance_size() };
         if (raw_size == 0)
         {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): failed to read HotSpot instance size.", vmhook::error_tag, typeid(wrapper_type).name());
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): failed to read HotSpot instance size.", vmhook::error_tag, vmhook::detail::type_name<wrapper_type>());
             return nullptr;
         }
 
@@ -12912,7 +13205,7 @@ namespace vmhook
         void* const object_pointer{ vmhook::make_java_object(klass, raw_size) };
         if (!object_pointer)
         {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): make_java_object() failed to allocate {} bytes.", vmhook::warning_tag, typeid(wrapper_type).name(), raw_size);
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): make_java_object() failed to allocate {} bytes.", vmhook::warning_tag, vmhook::detail::type_name<wrapper_type>(), raw_size);
             return nullptr;
         }
 
@@ -12927,7 +13220,7 @@ namespace vmhook
         }
         else if constexpr (sizeof...(args_t) > 0)
         {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): object allocated, but wrapper has no matching construct(...) method for the provided arguments.", vmhook::warning_tag, typeid(wrapper_type).name());
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): object allocated, but wrapper has no matching construct(...) method for the provided arguments.", vmhook::warning_tag, vmhook::detail::type_name<wrapper_type>());
         }
 
         return result;
@@ -13070,7 +13363,7 @@ namespace vmhook
         }
         catch (const std::exception& exception)
         {
-            VMHOOK_LOG("{} vmhook::get_field<{}>('{}') {}", vmhook::error_tag, typeid(value_type).name(), name, exception.what());
+            VMHOOK_LOG("{} vmhook::get_field<{}>('{}') {}", vmhook::error_tag, vmhook::detail::type_name<value_type>(), name, exception.what());
             return value_type{};
         }
     }
@@ -13125,7 +13418,7 @@ namespace vmhook
         }
         catch (const std::exception& exception)
         {
-            VMHOOK_LOG("{} vmhook::set_field<{}>('{}') {}", vmhook::error_tag, typeid(value_type).name(), name, exception.what());
+            VMHOOK_LOG("{} vmhook::set_field<{}>('{}') {}", vmhook::error_tag, vmhook::detail::type_name<value_type>(), name, exception.what());
         }
     }
 
@@ -14330,7 +14623,7 @@ namespace vmhook
                 Complexity: O(1).  Exception safety: noexcept.
             */
             template<typename wrapper_type = void>
-            auto to_borrowed() const noexcept
+            [[nodiscard]] auto to_borrowed() const noexcept
                 -> vmhook::borrowed<wrapper_type>;
         };
 
@@ -14862,7 +15155,7 @@ namespace vmhook
             GC-SAFETY OF THE VALUE: the field slot is itself a GC root once the
             reference lands in it, but the window between allocating `decoded_oop`
             and this store is NOT rooted, and this library offers no primitive that
-            can root it — see vmhook::jni::global_ref, which is not a GC root.  The
+            can root it — see vmhook::oop_pin, which is not a GC root.  The
             only available discipline is to keep that window short and free of
             anything that could trigger a collection, so an interleaved GC cannot
             collect or relocate the value out from under the write.  store_string()
@@ -14909,6 +15202,54 @@ namespace vmhook
             // compressed OOP through the fault-safe path.
             const std::uint32_t compressed{ vmhook::hotspot::encode_oop_pointer(decoded_oop) };
             return vmhook::os::safe_write(write_pointer, &compressed, sizeof(compressed));
+        }
+
+        /*
+            @brief Stores the object behind a lifetime-checked handle into this
+                   reference field.
+            @details
+            Phase-3 intercept: the write counterpart of value_t::to_borrowed(),
+            and the one place where taking a handle is genuinely SAFER than
+            taking an address rather than merely tidier.
+
+            A raw store_object_oop(addr) call cannot tell whether `addr` was
+            still valid at the instant of the write.  If a collection moved the
+            object between the caller reading the address and this store, the
+            field ends up holding a pointer into free or relocated space and the
+            corruption surfaces arbitrarily later, in unrelated code.  That is
+            the single worst failure mode this library can produce.
+
+            Resolving the handle HERE, immediately before the write, closes the
+            window as far as it can be closed without a real GC root: an expired
+            handle is refused outright (returns false, writes nothing) instead of
+            storing a known-stale address.  What it cannot close is a collection
+            that lands between this resolve and the safe_write a few instructions
+            later; nothing in a pure-VM build can, and Layer 2 is where that gets
+            fixed properly.
+
+            An EMPTY handle is not an error - it stores a null reference, which
+            is what "no object" means in Java.  An EXPIRED handle IS an error,
+            because the caller believes they have an object and they do not.
+            That asymmetry is the whole reason the two states are distinct.
+
+            @param handle  Borrow of the object to store.  Empty -> stores null.
+                           Expired -> refused.
+            @return  true if a reference was written (including a null one);
+                     false on an expired handle or any store_object_oop failure.
+        */
+        template<typename wrapper_type>
+        auto store_object(const vmhook::borrowed<wrapper_type>& handle) const noexcept
+            -> bool
+        {
+            if (handle.expired())
+            {
+                VMHOOK_LOG("{} field_proxy::store_object(): refusing to store an EXPIRED "
+                           "handle - the object it named has been moved or reclaimed, and "
+                           "writing its old address would corrupt the field.",
+                           vmhook::warning_tag);
+                return false;
+            }
+            return this->store_object_oop(handle.resolve());
         }
 
         /*
@@ -16010,6 +16351,36 @@ namespace vmhook
                     }
                 , data);
             }
+
+            /*
+                @brief The returned object as a lifetime-checked handle.
+                @details
+                What a reference-returning call() should hand back: a
+                vmhook::borrowed stamped with the collection epoch the value was
+                decoded in, rather than an address the caller must re-resolve.
+
+                    auto b = proxy->call().to_borrowed<item>();
+                    if (b) { use(b->name()); }
+
+                Only the compressed-OOP alternative produces a handle.  A
+                primitive return yields an EMPTY borrow rather than a borrow of
+                reinterpreted bits, and so does a String return — the eager
+                std::string decode has already consumed it, and inventing an
+                address for it would be a lie.  Java null likewise yields empty,
+                which is never "expired": nothing was borrowed.
+
+                Note the borrow is only as good as the moment call() returned.
+                An object allocated or returned inside a detour is live for that
+                detour; to keep it, pin() it into a vmhook::ref anchored on a
+                vmhook::root.
+
+                Defined out-of-line, after vmhook::borrowed.
+
+                Complexity: O(1).  Exception safety: noexcept.
+            */
+            template<typename wrapper_type = void>
+            [[nodiscard]] auto to_borrowed() const noexcept
+                -> vmhook::borrowed<wrapper_type>;
         };
 
         /*
@@ -17763,6 +18134,122 @@ namespace vmhook
             return std::nullopt;
         }
 
+
+#if VMHOOK_HAS_STD_EXPECTED
+        /*
+            @brief get_field() with the REASON for a failure.
+            @details
+            Same lookup, same result on success.  The difference is the failure
+            channel: an empty optional says only "no", while an access_error says
+            whether to fix your setup, wait for the class to load, or fix the
+            name.  @see vmhook::access_error for why those three want different
+            responses and what conflating them has already cost.
+
+                if (auto f = obj.try_field("health"))          { use(f->get()); }
+                else if (f.error() == access_error::class_not_loaded) { retry_later(); }
+                else { report(vmhook::error_message(f.error())); }
+
+            Deliberately does NOT log.  get_field() logs on every failure because
+            the optional carries nothing; here the caller has the reason in hand,
+            so logging too would double-report an outcome the caller may be
+            handling deliberately (probing whether a class is loaded yet is a
+            legitimate thing to do in a loop).
+
+            Complexity: O(1) after the first lookup per (klass, name).
+            Exception safety: does not throw.
+        */
+        [[nodiscard]] auto try_field(const std::string_view name) const
+            -> std::expected<vmhook::field_proxy, vmhook::access_error>
+        {
+            const auto type_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(*this) }) };
+            if (type_entry == vmhook::type_to_class_map.end())
+            {
+                return std::unexpected{ vmhook::access_error::wrapper_not_registered };
+            }
+            if (!vmhook::find_class(type_entry->second))
+            {
+                return std::unexpected{ vmhook::access_error::class_not_loaded };
+            }
+
+            // The klass resolves, so any remaining failure is about the MEMBER
+            // or the receiver, and get_field can distinguish those two by
+            // whether an instance was needed.
+            const auto entry{ vmhook::find_field(this->resolve_klass(), name) };
+            if (!entry)
+            {
+                return std::unexpected{ vmhook::access_error::member_not_found };
+            }
+            if (!entry->is_static && !this->instance)
+            {
+                return std::unexpected{ vmhook::access_error::null_instance };
+            }
+
+            auto proxy{ this->get_field(name) };
+            if (!proxy)
+            {
+                // find_field succeeded and the receiver is fine, so the only
+                // remaining way get_field bails is an unreadable mirror.
+                return std::unexpected{ vmhook::access_error::mirror_unreadable };
+            }
+            return std::expected<vmhook::field_proxy, vmhook::access_error>{ *std::move(proxy) };
+        }
+
+        /*
+            @brief get_method() with the REASON for a failure.
+            @details The method twin of try_field; see it for the rationale.
+            null_instance is never reported here - a method proxy on a null
+            receiver is legal to build (a static method has no receiver, and an
+            instance call through a null receiver fails at call() time with its
+            own diagnostic).
+        */
+        [[nodiscard]] auto try_method(const std::string_view name) const
+            -> std::expected<vmhook::method_proxy, vmhook::access_error>
+        {
+            const auto type_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(*this) }) };
+            if (type_entry == vmhook::type_to_class_map.end())
+            {
+                return std::unexpected{ vmhook::access_error::wrapper_not_registered };
+            }
+            if (!vmhook::find_class(type_entry->second))
+            {
+                return std::unexpected{ vmhook::access_error::class_not_loaded };
+            }
+
+            auto proxy{ this->get_method(name) };
+            if (!proxy)
+            {
+                return std::unexpected{ vmhook::access_error::member_not_found };
+            }
+            return std::expected<vmhook::method_proxy, vmhook::access_error>{ *std::move(proxy) };
+        }
+
+        /*
+            @brief try_method() for an explicitly-descriptored overload.
+            @details Use when the name is overloaded and the descriptor selects
+            which one; member_not_found covers "no overload with that descriptor".
+        */
+        [[nodiscard]] auto try_method(const std::string_view name,
+                                      const std::string_view descriptor) const
+            -> std::expected<vmhook::method_proxy, vmhook::access_error>
+        {
+            const auto type_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(*this) }) };
+            if (type_entry == vmhook::type_to_class_map.end())
+            {
+                return std::unexpected{ vmhook::access_error::wrapper_not_registered };
+            }
+            if (!vmhook::find_class(type_entry->second))
+            {
+                return std::unexpected{ vmhook::access_error::class_not_loaded };
+            }
+
+            auto proxy{ this->get_method(name, descriptor) };
+            if (!proxy)
+            {
+                return std::unexpected{ vmhook::access_error::member_not_found };
+            }
+            return std::expected<vmhook::method_proxy, vmhook::access_error>{ *std::move(proxy) };
+        }
+#endif  // VMHOOK_HAS_STD_EXPECTED
     protected:
         /*
             @brief The raw decoded OOP pointer to the wrapped Java object.
@@ -18306,7 +18793,7 @@ namespace vmhook
 
             Complexity: O(1).  Exception safety: noexcept.
         */
-        auto self() const noexcept
+        [[nodiscard]] auto self() const noexcept
             -> vmhook::borrowed<derived>;
 
         // -------------------------------------------------------------------
@@ -18693,6 +19180,32 @@ namespace vmhook
         {
         }
 
+        /*
+            @brief Wraps the Java collection behind a lifetime-checked handle.
+            @details
+            Phase-3 intercept: the way to build a collection wrapper WITHOUT the
+            caller ever spelling a raw address.  The borrow is resolved once,
+            here, so an already-expired handle produces a null-safe (empty)
+            wrapper rather than one bound to an address known to be stale.
+
+            The wrapper itself still holds a plain address afterwards - it is a
+            view over one object for the duration of a call, exactly like the
+            oop_t constructor.  Resolving at construction is what makes the
+            EXPIRED case fail closed instead of silently walking a moved object.
+
+            Declared as a member template so it can name vmhook::borrowed, which
+            is only complete much later in this header; the body is instantiated
+            at the call site, by which point it is.
+
+            Exception safety: noexcept.
+            @param handle  Borrow of the Java object, possibly empty or expired.
+        */
+        template<typename wrapper_type>
+        explicit collection(const vmhook::borrowed<wrapper_type>& handle) noexcept
+            : vmhook::oop_reflective_base{ handle.resolve() }
+        {
+        }
+
         // oop_klass() / get_field_by_oop_klass() / get_method_by_oop_klass()
         // are inherited (protected) from vmhook::oop_reflective_base.
 
@@ -18930,6 +19443,18 @@ namespace vmhook
             : vmhook::collection{ oop }
         {
         }
+
+        /*
+            @brief Wraps the Java object behind a lifetime-checked handle.
+            @details See vmhook::collection's borrow constructor - same contract:
+            resolved once at construction, empty/expired yields a null-safe
+            wrapper.  Exception safety: noexcept.
+        */
+        template<typename wrapper_type>
+        explicit list(const vmhook::borrowed<wrapper_type>& handle) noexcept
+            : vmhook::collection{ handle.resolve() }
+        {
+        }
     };
 
     /*
@@ -18951,6 +19476,18 @@ namespace vmhook
             : vmhook::collection{ oop }
         {
         }
+
+        /*
+            @brief Wraps the Java object behind a lifetime-checked handle.
+            @details See vmhook::collection's borrow constructor - same contract:
+            resolved once at construction, empty/expired yields a null-safe
+            wrapper.  Exception safety: noexcept.
+        */
+        template<typename wrapper_type>
+        explicit set(const vmhook::borrowed<wrapper_type>& handle) noexcept
+            : vmhook::collection{ handle.resolve() }
+        {
+        }
     };
 
     /*
@@ -18970,6 +19507,18 @@ namespace vmhook
     public:
         explicit linked_list(vmhook::oop_t oop) noexcept
             : vmhook::list{ oop }
+        {
+        }
+
+        /*
+            @brief Wraps the Java object behind a lifetime-checked handle.
+            @details See vmhook::collection's borrow constructor - same contract:
+            resolved once at construction, empty/expired yields a null-safe
+            wrapper.  Exception safety: noexcept.
+        */
+        template<typename wrapper_type>
+        explicit linked_list(const vmhook::borrowed<wrapper_type>& handle) noexcept
+            : vmhook::list{ handle.resolve() }
         {
         }
     };
@@ -18997,6 +19546,18 @@ namespace vmhook
         */
         explicit map(vmhook::oop_t oop) noexcept
             : vmhook::oop_reflective_base{ oop }
+        {
+        }
+
+        /*
+            @brief Wraps the Java object behind a lifetime-checked handle.
+            @details See vmhook::collection's borrow constructor - same contract:
+            resolved once at construction, empty/expired yields a null-safe
+            wrapper.  Exception safety: noexcept.
+        */
+        template<typename wrapper_type>
+        explicit map(const vmhook::borrowed<wrapper_type>& handle) noexcept
+            : vmhook::oop_reflective_base{ handle.resolve() }
         {
         }
 
@@ -19091,6 +19652,18 @@ namespace vmhook
     public:
         explicit hash_map(vmhook::oop_t oop) noexcept
             : vmhook::map{ oop }
+        {
+        }
+
+        /*
+            @brief Wraps the Java object behind a lifetime-checked handle.
+            @details See vmhook::collection's borrow constructor - same contract:
+            resolved once at construction, empty/expired yields a null-safe
+            wrapper.  Exception safety: noexcept.
+        */
+        template<typename wrapper_type>
+        explicit hash_map(const vmhook::borrowed<wrapper_type>& handle) noexcept
+            : vmhook::map{ handle.resolve() }
         {
         }
     };
@@ -19718,7 +20291,7 @@ namespace vmhook
         {
             VMHOOK_LOG("{} field_proxy::value_t::to_vector<{}>(): underlying collection OOP is "
                        "null or invalid (compressed=0x{:08X}) - returning empty vector.",
-                       vmhook::warning_tag, typeid(element_type).name(), compressed_collection);
+                       vmhook::warning_tag, vmhook::detail::type_name<element_type>(), compressed_collection);
             return {};
         }
 
@@ -19780,7 +20353,7 @@ namespace vmhook
         {
             VMHOOK_LOG("{} field_proxy::value_t::to_entries<{},{}>(): underlying map OOP is null "
                        "or invalid (compressed=0x{:08X}) - returning empty entries vector.",
-                       vmhook::warning_tag, typeid(key_type).name(), typeid(value_type).name(),
+                       vmhook::warning_tag, vmhook::detail::type_name<key_type>(), vmhook::detail::type_name<value_type>(),
                        compressed_map);
             return {};
         }
@@ -20594,14 +21167,14 @@ namespace vmhook
         if (!proxy.has_value())
         {
             VMHOOK_LOG("{} watch_static_field<{}>('{}'): field not found",
-                       vmhook::error_tag, typeid(wrapper_type).name(), field_name);
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(), field_name);
             return watch_handle{};
         }
         void* const address{ proxy->raw_address() };
         if (!address)
         {
             VMHOOK_LOG("{} watch_static_field<{}>('{}'): null address",
-                       vmhook::error_tag, typeid(wrapper_type).name(), field_name);
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(), field_name);
             return watch_handle{};
         }
 
@@ -20645,13 +21218,13 @@ namespace vmhook
             {
                 VMHOOK_LOG("{} watch_static_field<{}>: user on_change callback threw: {} - "
                            "swallowed to keep the DR trap handler safe.",
-                           vmhook::error_tag, typeid(field_type).name(), ex.what());
+                           vmhook::error_tag, vmhook::detail::type_name<field_type>(), ex.what());
             }
             catch (...)
             {
                 VMHOOK_LOG("{} watch_static_field<{}>: user on_change callback threw an unknown "
                            "exception - swallowed to keep the DR trap handler safe.",
-                           vmhook::error_tag, typeid(field_type).name());
+                           vmhook::error_tag, vmhook::detail::type_name<field_type>());
             }
         };
         detail::dr_slots[slot].in_use.store(true, std::memory_order_release);
@@ -20678,7 +21251,7 @@ namespace vmhook
         (void)on_change;
         VMHOOK_LOG("{} watch_static_field<{}>('{}'): hardware data breakpoints "
                    "are unsupported on this platform; the watch was not armed",
-                   vmhook::error_tag, typeid(wrapper_type).name(), field_name);
+                   vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(), field_name);
         return watch_handle{};
 #endif
     }
@@ -21686,7 +22259,7 @@ namespace vmhook
         The one-off flag walk costs ~1-1.5 ms on a live VM (MEASURED on JDK 8 /
         21 / 26) and is serialised by the magic-static guard, so the FIRST caller
         pays it and any concurrent caller blocks behind it.  gc_epoch() - and
-        therefore every global_ref construction - goes through here, so if that
+        therefore every oop_pin construction - goes through here, so if that
         first call would otherwise land inside a latency-sensitive detour, warm
         it by calling vm_capabilities() once during setup.
 
@@ -21951,7 +22524,7 @@ namespace vmhook
     // WHAT THIS IS NOT.  It is still not a GC ROOT.  Nothing here keeps a Java
     // object alive; creating a real root requires a call into the VM this pure-VM
     // build has no way to make (see docs/DESIGN_anchored_refs.md and the
-    // jni::global_ref doc below).  What an anchored ref DOES guarantee is that it
+    // vmhook::oop_pin doc below).  What an anchored ref DOES guarantee is that it
     // never hands back an address a relocating collection may have invalidated:
     // it re-derives, or it reports empty.  A ref that reports empty is a correct
     // outcome; a stale address never is.
@@ -22570,7 +23143,7 @@ namespace vmhook
     /*
         @brief A rooted, revalidating, copyable reference to a live Java object.
         @details
-        Replaces the raw oop_t / std::unique_ptr<object<T>> / jni::global_ref
+        Replaces the raw oop_t / std::unique_ptr<object<T>> / vmhook::oop_pin
         triple in user code.  A ref stores exactly one thing: an ANCHOR - a
         description of how to find its object again, from a root the collector
         maintains.  It stores NO address.  Every dereference re-walks the chain
@@ -23508,6 +24081,121 @@ namespace vmhook
         return vmhook::borrowed<derived>{ instance };
     }
 
+    // -------------------------------------------------------------------------
+    // Handle-returning allocation.  Phase-3 intercept #6.
+    //
+    // make_java_object / make_java_array / make_java_string return a raw void*,
+    // which is the single most dangerous shape in the whole API: the address is
+    // FRESH, so it looks trustworthy, and it is UNROOTED, so the very next
+    // allocation or safepoint can move it out from under the caller.  Every
+    // consumer bug in this area starts with a fresh address being treated as a
+    // durable one.
+    //
+    // The new_* forms return a vmhook::borrowed instead: same allocation, same
+    // failure modes, but the result carries the collection epoch it was made in
+    // and reports EXPIRED once that moves.  A failed allocation yields an EMPTY
+    // borrow, which is distinguishable from an expired one - a caller that got
+    // nothing and a caller that got something and lost it need different
+    // handling.
+    //
+    // The raw make_* forms stay: they are what the header itself uses
+    // internally (where the address is consumed immediately, under a documented
+    // no-safepoint window), and they are the escape hatch for callers who
+    // genuinely need an address.
+    // -------------------------------------------------------------------------
+
+    /*
+        @brief Allocates a Java object and returns a lifetime-checked handle.
+        @details Handle-returning form of make_java_object.  Empty borrow when
+        the allocation failed (no allocation thread, no TLAB space, invalid
+        klass) - never a borrow of a null address.
+        Complexity: O(instance size).  Exception safety: noexcept.
+    */
+    template<typename wrapper_type = void>
+    [[nodiscard]] inline auto new_object(vmhook::hotspot::klass* const klass,
+                           const std::size_t requested_size) noexcept
+        -> vmhook::borrowed<wrapper_type>
+    {
+        void* const allocated{ vmhook::make_java_object(klass, requested_size) };
+        return allocated ? vmhook::borrowed<wrapper_type>{ allocated }
+                         : vmhook::borrowed<wrapper_type>{};
+    }
+
+    /*
+        @brief Allocates a Java array and returns a lifetime-checked handle.
+        @details Handle-returning form of make_java_array.  Empty borrow on any
+        allocation failure, including a negative length.
+        Complexity: O(length * element_size).  Exception safety: noexcept.
+    */
+    template<typename wrapper_type = void>
+    [[nodiscard]] inline auto new_array(const std::string_view class_name,
+                          const std::int32_t length,
+                          const std::size_t element_size) noexcept
+        -> vmhook::borrowed<wrapper_type>
+    {
+        void* const allocated{ vmhook::make_java_array(class_name, length, element_size) };
+        return allocated ? vmhook::borrowed<wrapper_type>{ allocated }
+                         : vmhook::borrowed<wrapper_type>{};
+    }
+
+    /*
+        @brief Builds a java.lang.String and returns a lifetime-checked handle.
+        @details
+        Handle-returning form of make_java_string.  Empty borrow on failure.
+
+        Worth stating plainly, because the raw form invites the opposite
+        assumption: the returned String is NOT kept alive by this handle.  It is
+        reachable only from wherever you store it next, and if you store it
+        nowhere it is garbage the moment the collector looks.  The handle tells
+        you when the address stopped being usable; it does not stop that
+        happening.  Store it into a field, or anchor it off a vmhook::root.
+
+        Complexity: O(N) in the length of value.  Exception safety: noexcept.
+    */
+    [[nodiscard]] inline auto new_string(const std::string_view value) noexcept
+        -> vmhook::borrowed<>
+    {
+        void* const allocated{ vmhook::make_java_string(value) };
+        return allocated ? vmhook::borrowed<>{ allocated } : vmhook::borrowed<>{};
+    }
+
+    /*
+        @brief Out-of-line definition of method_proxy::value_t::to_borrowed<W>().
+        @details
+        Deferred for the same reason as the field_proxy twin below: this is the
+        first point in the header where vmhook::borrowed is complete.
+
+        Only the compressed-OOP alternative yields a handle.  The std::string
+        alternative deliberately does NOT: by the time the variant holds a
+        string, call() has already decoded the String oop eagerly and the
+        address is gone, so producing a borrow would mean producing one from
+        nothing.  Callers who want the String want as_string(); callers who want
+        the OBJECT should declare the return as a reference type.
+    */
+    template<typename wrapper_type>
+    auto method_proxy::value_t::to_borrowed() const noexcept
+        -> vmhook::borrowed<wrapper_type>
+    {
+        return std::visit([](const auto& stored) noexcept
+            -> vmhook::borrowed<wrapper_type>
+            {
+                using stored_type = std::remove_cvref_t<decltype(stored)>;
+                if constexpr (std::is_same_v<stored_type, std::uint32_t>)
+                {
+                    if (stored == 0u)
+                    {
+                        return vmhook::borrowed<wrapper_type>{};
+                    }
+                    return vmhook::borrowed<wrapper_type>{
+                        vmhook::hotspot::decode_oop_pointer(stored) };
+                }
+                else
+                {
+                    return vmhook::borrowed<wrapper_type>{};
+                }
+            }, this->data);
+    }
+
     /*
         @brief Out-of-line definition of field_proxy::value_t::to_borrowed<W>().
         @details
@@ -23740,218 +24428,246 @@ namespace vmhook
     // Object pins: a move-only holder for a raw heap OOP, guarded by the
     // Layer 1 relocation detector above.
     //
+    // Was `vmhook::jni::global_ref` until v0.6.0.  Both halves of that name were
+    // wrong: there is no JNI anywhere in this header, and the type was never a
+    // global reference in the JNI sense (it registers nothing with the VM).
+    //
     // WARNING: this is still NOT a lifetime primitive.  Creating a real GC root
     // requires a call into the VM, which this pure-VM build has no way to make,
-    // so the class below does not keep the object alive.  What it now DOES is
+    // so the class below does not keep the object alive.  What it DOES do is
     // refuse to hand back an address once a collection has happened, so a moved
     // (or reclaimed) object surfaces as a nullptr instead of as undefined
     // behaviour.  See the class doc for the exact contract before using it.
+    //
+    // PREFER vmhook::ref / vmhook::borrowed.  An oop_pin stores an ADDRESS and
+    // tells you when it went bad; a ref stores a PATH and re-walks it, so it
+    // keeps working across the collection that invalidates a pin.  oop_pin
+    // remains for the cases where only an address is available.
     // -------------------------------------------------------------------------
-    namespace jni
+    /*
+        @brief Move-only, NON-OWNING holder for a raw heap OOP that REFUSES
+        to hand the address back once a collection has happened.
+        @details
+        READ THIS FIRST — this type does less than "pin" suggests, but it is
+        no longer a no-op.
+
+        WHAT IT DOES NOT DO: it is not a GC root.  There is no VM-side
+        registration of any kind, so the object is NOT kept alive.  Drop the
+        last Java-side reference and the collector may reclaim it while this
+        holder is still non-empty.
+
+        WHAT IT NOW DOES: the constructor records a vmhook::gc_epoch()
+        sample — `CollectedHeap::_total_collections` paired with the
+        gc-active flag — alongside the raw address.  oop() re-samples and
+        returns nullptr the moment the epoch has moved on, so an address
+        invalidated by a relocating collection surfaces as a null instead of
+        as undefined behaviour.  That converts the header's oldest silent
+        use-after-relocation bug into a detectable, checkable failure.
+
+        THE CONTRACT, precisely: a ref is valid exactly until the next
+        collection.  That covers "compute now, consume later on this tick"
+        and every cross-thread hand-off that completes before a GC.  It does
+        NOT let you carry an object across a collection — nothing here can.
+
+        FAIL-CLOSED, ALWAYS.  When the epoch cannot be trusted the ref
+        reports stale rather than guessing.  Concretely, oop() is nullptr
+        whenever any of these hold:
+
+          * no JVM is present, or the VMStructs coordinates the detector
+            needs did not resolve;
+          * the collector is ZGC, Shenandoah, or could not be determined —
+            see vmhook::vm_capabilities().  Those collectors relocate
+            concurrently and their counters tick at cycle start, so an
+            unchanged counter proves nothing and the detector would itself
+            become silent UB;
+          * a stop-the-world pause was running when the ref was built, or is
+            running now;
+          * the collection counter differs from the recorded one.
+
+        Only Serial, Parallel and G1 (where `_total_collections` provably
+        increments before any object is copied) and Epsilon (which never
+        moves anything) ever report fresh.
+
+        raw_unsafe() bypasses the check and returns the captured address
+        verbatim.  It exists for diagnostics and logging — never dereference
+        it.
+
+        Copying is disabled; moving transfers the address AND its epoch,
+        emptying the source.  Construction touches the VM only through
+        fault-safe reads, so it behaves identically with and without a JVM
+        present (with no JVM, every ref is simply born stale).
+
+            vmhook::oop_pin pinned{ wrapper->get_instance() };
+            if (pinned) { use(pinned.oop()); }   // null after any collection
+
+        @note Layers 2 and 3 of audit/research/gc_root_feasibility.md would
+        add a real, relocation-tracking root.  Until they land, this remains
+        a detector, not a pin: it stops you using a moved object, it does not
+        stop the object being moved or collected.
+    */
+    class oop_pin final
     {
-        /*
-            @brief Move-only, NON-OWNING holder for a raw heap OOP that REFUSES
-            to hand the address back once a collection has happened.
-            @details
-            READ THIS FIRST — this type still does less than its name suggests,
-            but it is no longer a no-op.
+    public:
+        oop_pin() noexcept = default;
 
-            WHAT IT DOES NOT DO: it is not a GC root.  There is no VM-side
-            registration of any kind, so the object is NOT kept alive.  Drop the
-            last Java-side reference and the collector may reclaim it while this
-            holder is still non-empty.
-
-            WHAT IT NOW DOES: the constructor records a vmhook::gc_epoch()
-            sample — `CollectedHeap::_total_collections` paired with the
-            gc-active flag — alongside the raw address.  oop() re-samples and
-            returns nullptr the moment the epoch has moved on, so an address
-            invalidated by a relocating collection surfaces as a null instead of
-            as undefined behaviour.  That converts the header's oldest silent
-            use-after-relocation bug into a detectable, checkable failure.
-
-            THE CONTRACT, precisely: a ref is valid exactly until the next
-            collection.  That covers "compute now, consume later on this tick"
-            and every cross-thread hand-off that completes before a GC.  It does
-            NOT let you carry an object across a collection — nothing here can.
-
-            FAIL-CLOSED, ALWAYS.  When the epoch cannot be trusted the ref
-            reports stale rather than guessing.  Concretely, oop() is nullptr
-            whenever any of these hold:
-
-              * no JVM is present, or the VMStructs coordinates the detector
-                needs did not resolve;
-              * the collector is ZGC, Shenandoah, or could not be determined —
-                see vmhook::vm_capabilities().  Those collectors relocate
-                concurrently and their counters tick at cycle start, so an
-                unchanged counter proves nothing and the detector would itself
-                become silent UB;
-              * a stop-the-world pause was running when the ref was built, or is
-                running now;
-              * the collection counter differs from the recorded one.
-
-            Only Serial, Parallel and G1 (where `_total_collections` provably
-            increments before any object is copied) and Epsilon (which never
-            moves anything) ever report fresh.
-
-            raw_unsafe() bypasses the check and returns the captured address
-            verbatim.  It exists for diagnostics and logging — never dereference
-            it.
-
-            Copying is disabled; moving transfers the address AND its epoch,
-            emptying the source.  Construction touches the VM only through
-            fault-safe reads, so it behaves identically with and without a JVM
-            present (with no JVM, every ref is simply born stale).
-
-                vmhook::jni::global_ref pinned{ wrapper->get_instance() };
-                if (pinned) { use(pinned.oop()); }   // null after any collection
-
-            @note Layers 2 and 3 of audit/research/gc_root_feasibility.md would
-            add a real, relocation-tracking root.  Until they land, this remains
-            a detector, not a pin: it stops you using a moved object, it does not
-            stop the object being moved or collected.
-        */
-        class global_ref final
+        explicit oop_pin(vmhook::oop_t const raw_oop) noexcept
+            : oop_{ raw_oop }
+            , epoch_{ vmhook::gc_epoch() }
         {
-        public:
-            global_ref() noexcept = default;
+        }
 
-            explicit global_ref(vmhook::oop_t const raw_oop) noexcept
-                : oop_{ raw_oop }
-                , epoch_{ vmhook::gc_epoch() }
+        ~oop_pin() noexcept = default;
+
+        oop_pin(const oop_pin&)                    = delete;
+        auto operator=(const oop_pin&) -> oop_pin& = delete;
+
+        oop_pin(oop_pin&& other) noexcept
+            : oop_{ other.oop_ }
+            , epoch_{ other.epoch_ }
+        {
+            other.oop_   = nullptr;
+            other.epoch_ = vmhook::gc_epoch_t{};
+        }
+
+        auto operator=(oop_pin&& other) noexcept -> oop_pin&
+        {
+            if (this != &other)
             {
-            }
-
-            ~global_ref() noexcept = default;
-
-            global_ref(const global_ref&)                    = delete;
-            auto operator=(const global_ref&) -> global_ref& = delete;
-
-            global_ref(global_ref&& other) noexcept
-                : oop_{ other.oop_ }
-                , epoch_{ other.epoch_ }
-            {
+                this->oop_   = other.oop_;
+                this->epoch_ = other.epoch_;
                 other.oop_   = nullptr;
                 other.epoch_ = vmhook::gc_epoch_t{};
             }
+            return *this;
+        }
 
-            auto operator=(global_ref&& other) noexcept -> global_ref&
-            {
-                if (this != &other)
-                {
-                    this->oop_   = other.oop_;
-                    this->epoch_ = other.epoch_;
-                    other.oop_   = nullptr;
-                    other.epoch_ = vmhook::gc_epoch_t{};
-                }
-                return *this;
-            }
+        /*
+            @brief True when the captured address must not be used.
+            @details
+            Re-samples the collection epoch and compares it with the one
+            recorded at construction (see vmhook::gc_epoch_changed).  A
+            default-constructed or reset() holder is stale, and so is one
+            built on a VM where the detector cannot vouch for anything — an
+            unreadable epoch NEVER degrades to "assume it did not move".
+            Complexity: O(1) (three fault-safe reads).
+            Exception safety: noexcept.  Thread safety: safe.
+        */
+        auto is_stale() const noexcept -> bool
+        {
+            return vmhook::gc_epoch_changed(this->epoch_);
+        }
 
-            /*
-                @brief True when the captured address must not be used.
-                @details
-                Re-samples the collection epoch and compares it with the one
-                recorded at construction (see vmhook::gc_epoch_changed).  A
-                default-constructed or reset() holder is stale, and so is one
-                built on a VM where the detector cannot vouch for anything — an
-                unreadable epoch NEVER degrades to "assume it did not move".
-                Complexity: O(1) (three fault-safe reads).
-                Exception safety: noexcept.  Thread safety: safe.
-            */
-            auto is_stale() const noexcept -> bool
-            {
-                return vmhook::gc_epoch_changed(this->epoch_);
-            }
+        /*
+            @brief The stored heap OOP, or nullptr if empty OR stale.
+            @details
+            Returns the captured address only while the collection epoch is
+            unchanged; otherwise nullptr.  It is still not a liveness
+            guarantee — a non-relocating collector can reclaim the object
+            without bumping anything this can observe, and the holder is not
+            a root — but it will never hand back an address a relocating
+            collection may have invalidated.
+            Complexity: O(1).  Exception safety: noexcept.
+            Thread safety: safe.
+        */
+        auto oop() const noexcept -> vmhook::oop_t
+        {
+            return this->is_stale() ? nullptr : this->oop_;
+        }
 
-            /*
-                @brief The stored heap OOP, or nullptr if empty OR stale.
-                @details
-                Returns the captured address only while the collection epoch is
-                unchanged; otherwise nullptr.  It is still not a liveness
-                guarantee — a non-relocating collector can reclaim the object
-                without bumping anything this can observe, and the holder is not
-                a root — but it will never hand back an address a relocating
-                collection may have invalidated.
-                Complexity: O(1).  Exception safety: noexcept.
-                Thread safety: safe.
-            */
-            auto oop() const noexcept -> vmhook::oop_t
-            {
-                return this->is_stale() ? nullptr : this->oop_;
-            }
+        /*
+            @brief The captured address with NO staleness check.  May be
+            stale, may be dangling — for diagnostics and logging only.
+            @details
+            Exists so a log line can say which address went stale.  Never
+            dereference it and never pass it to anything that will.
+        */
+        auto raw_unsafe() const noexcept -> vmhook::oop_t
+        {
+            return this->oop_;
+        }
 
-            /*
-                @brief The captured address with NO staleness check.  May be
-                stale, may be dangling — for diagnostics and logging only.
-                @details
-                Exists so a log line can say which address went stale.  Never
-                dereference it and never pass it to anything that will.
-            */
-            auto raw_unsafe() const noexcept -> vmhook::oop_t
-            {
-                return this->oop_;
-            }
+        /*
+            @brief Clears the stored OOP and its epoch (idempotent).  oop()
+            and raw_unsafe() return nullptr after.  Nothing is released —
+            there was no VM-side registration to release.
+        */
+        auto reset() noexcept -> void
+        {
+            this->oop_   = nullptr;
+            this->epoch_ = vmhook::gc_epoch_t{};
+        }
 
-            /*
-                @brief Clears the stored OOP and its epoch (idempotent).  oop()
-                and raw_unsafe() return nullptr after.  Nothing is released —
-                there was no VM-side registration to release.
-            */
-            auto reset() noexcept -> void
-            {
-                this->oop_   = nullptr;
-                this->epoch_ = vmhook::gc_epoch_t{};
-            }
+        /*
+            @brief The usable OOP (retained for API compatibility).  Applies
+            the same staleness check as oop(); null when empty or stale.
+        */
+        auto handle() const noexcept -> void*
+        {
+            return this->oop();
+        }
 
-            /*
-                @brief The usable OOP (retained for API compatibility).  Applies
-                the same staleness check as oop(); null when empty or stale.
-            */
-            auto handle() const noexcept -> void*
-            {
-                return this->oop();
-            }
+        explicit operator bool() const noexcept
+        {
+            return this->oop() != nullptr;
+        }
 
-            explicit operator bool() const noexcept
-            {
-                return this->oop() != nullptr;
-            }
-
-        private:
-            vmhook::oop_t     oop_{ nullptr };
-            vmhook::gc_epoch_t epoch_{};
-        };
-    }
+    private:
+        vmhook::oop_t     oop_{ nullptr };
+        vmhook::gc_epoch_t epoch_{};
+    };
 
     /*
-        @brief Wraps a raw OOP in a vmhook::jni::global_ref holder.
-        @details One-liner for the `global_ref{ oop }` pattern.  This does NOT
+        @brief Wraps a raw OOP in a vmhook::oop_pin holder.
+        @details One-liner for the `oop_pin{ oop }` pattern.  This does NOT
         protect the object from GC and is NOT a root — it records the current
         collection epoch so the holder reports stale (oop() == nullptr) after
         the next collection instead of handing back a moved address.  See the
-        global_ref class doc for the full contract.
+        oop_pin class doc for the full contract.
     */
     inline auto pin(vmhook::oop_t const oop) noexcept
-        -> vmhook::jni::global_ref
+        -> vmhook::oop_pin
     {
-        return vmhook::jni::global_ref{ oop };
+        return vmhook::oop_pin{ oop };
     }
 
     /*
         @brief Wraps the Java object behind a wrapper unique_ptr in a holder.
-        @details `pin(wrapper)` instead of `vmhook::jni::global_ref{ wrapper->get_instance() }`.
+        @details `pin(wrapper)` instead of `vmhook::oop_pin{ wrapper->get_instance() }`.
         Returns an empty holder for a null wrapper.  No GC protection, and no
-        root — only the relocation detector described in the global_ref class
+        root — only the relocation detector described in the oop_pin class
         doc.
     */
     template<typename wrapper_type>
     inline auto pin(const std::unique_ptr<wrapper_type>& wrapper) noexcept
-        -> vmhook::jni::global_ref
+        -> vmhook::oop_pin
     {
         static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
                       "vmhook::pin(unique_ptr<T>): T must derive from vmhook::object_base.");
         return wrapper
-            ? vmhook::jni::global_ref{ wrapper->vmhook::object_base::get_instance() }
-            : vmhook::jni::global_ref{};
+            ? vmhook::oop_pin{ wrapper->vmhook::object_base::get_instance() }
+            : vmhook::oop_pin{};
+    }
+
+    /*
+        @brief Wraps the object behind a vmhook::borrowed in a holder.
+        @details
+        The bridge from the handle model back to the address model, for code
+        that still needs an address (a raw callback, a C ABI, a log line).
+        Resolves the borrow FIRST, so an already-expired borrow yields an empty
+        holder rather than pinning an address that is known to be stale — a pin
+        built on a stale address is exactly the bug the pin exists to catch.
+
+        Note this is a DOWNGRADE in every respect except address availability:
+        the borrow's epoch is discarded and re-sampled, and the result still
+        keeps nothing alive.  Prefer borrowed::pin(), which promotes to a
+        vmhook::ref and stays in the model.
+    */
+    template<typename wrapper_type>
+    inline auto pin(const vmhook::borrowed<wrapper_type>& handle) noexcept
+        -> vmhook::oop_pin
+    {
+        vmhook::oop_t const address{ handle.resolve() };
+        return address ? vmhook::oop_pin{ address } : vmhook::oop_pin{};
     }
 }
 

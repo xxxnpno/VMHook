@@ -1,6 +1,6 @@
 // Standalone (no-JVM) unit test for the Layer 0 capability gate
 // (vmhook::vm_capabilities) and the Layer 1 GC relocation detector
-// (vmhook::gc_epoch / vmhook::gc_epoch_changed, and global_ref's use of them).
+// (vmhook::gc_epoch / vmhook::gc_epoch_changed, and oop_pin's use of them).
 //
 // ===========================================================================
 // WHAT THIS FILE CAN AND CANNOT PROVE
@@ -16,7 +16,7 @@
 //   * gc_epoch_changed() must answer TRUE for every input, including a sample
 //     hand-built to look pristine -- fail closed, never "assume it did not
 //     move";
-//   * a global_ref built from a FABRICATED address must report stale and hand
+//   * a oop_pin built from a FABRICATED address must report stale and hand
 //     back nullptr from oop() / handle() / operator bool, while raw_unsafe()
 //     still shows what was captured;
 //   * move semantics must carry the address AND the epoch, and empty the source.
@@ -27,7 +27,7 @@
 // Nothing below asserts any of it.
 //
 // SAFETY: the fabricated addresses here are never dereferenced by the test, and
-// the header never dereferences them either -- global_ref only ever stores and
+// the header never dereferences them either -- oop_pin only ever stores and
 // compares them.  The two layers themselves read only through os::safe_read /
 // hotspot::safe_read_pointer, which are kernel-validated and cannot fault.
 // ===========================================================================
@@ -117,17 +117,17 @@ static_assert(noexcept(vmhook::gc_epoch()),
               "gc_epoch() must be noexcept (it runs inside detours)");
 static_assert(noexcept(vmhook::gc_epoch_changed(std::declval<const vmhook::gc_epoch_t&>())),
               "gc_epoch_changed() must be noexcept");
-static_assert(noexcept(std::declval<const vmhook::jni::global_ref&>().is_stale()),
-              "global_ref::is_stale() must be noexcept");
-static_assert(noexcept(std::declval<const vmhook::jni::global_ref&>().raw_unsafe()),
-              "global_ref::raw_unsafe() must be noexcept");
-static_assert(std::is_same_v<decltype(std::declval<const vmhook::jni::global_ref&>().raw_unsafe()),
+static_assert(noexcept(std::declval<const vmhook::oop_pin&>().is_stale()),
+              "oop_pin::is_stale() must be noexcept");
+static_assert(noexcept(std::declval<const vmhook::oop_pin&>().raw_unsafe()),
+              "oop_pin::raw_unsafe() must be noexcept");
+static_assert(std::is_same_v<decltype(std::declval<const vmhook::oop_pin&>().raw_unsafe()),
                              vmhook::oop_t>,
               "raw_unsafe() must yield oop_t");
 
 int main()
 {
-    using vmhook::jni::global_ref;
+    using vmhook::oop_pin;
 
     // =======================================================================
     // SECTION 1 -- Layer 0: with no JVM the capability gate must degrade to
@@ -199,7 +199,7 @@ int main()
     }
 
     // Calling it repeatedly is stable and still never faults (this is the call
-    // pattern global_ref::oop() produces -- once per dereference).
+    // pattern oop_pin::oop() produces -- once per dereference).
     {
         bool all_invalid{ true };
         for (int i{ 0 }; i < 1000; ++i)
@@ -240,13 +240,13 @@ int main()
     }
 
     // =======================================================================
-    // SECTION 4 -- global_ref is wired to the detector: a fabricated address is
+    // SECTION 4 -- oop_pin is wired to the detector: a fabricated address is
     //   CAPTURED but never handed back.  This is the bug the whole exercise
     //   exists to fix -- the old stub returned it verbatim, forever.
     // =======================================================================
     {
         auto* const fake_oop{ oop_of(0x1234'5678u) };
-        const global_ref ref{ fake_oop };
+        const oop_pin ref{ fake_oop };
 
         check("ref_reports_stale_without_a_readable_epoch", ref.is_stale());
         check("ref_oop_is_null_when_stale", ref.oop() == nullptr);
@@ -270,7 +270,7 @@ int main()
         for (const std::uintptr_t bits : fakes)
         {
             auto* const fake_oop{ oop_of(bits) };
-            const global_ref ref{ fake_oop };
+            const oop_pin ref{ fake_oop };
             all_captured = all_captured && ref.raw_unsafe() == fake_oop;
             all_refused  = all_refused
                         && ref.is_stale()
@@ -284,12 +284,12 @@ int main()
     // A default-constructed / reset holder is stale too -- there is no address
     // to vouch for, so the answer is the same "do not use this".
     {
-        global_ref empty{};
+        oop_pin empty{};
         check("default_constructed_ref_is_stale", empty.is_stale());
         check("default_constructed_ref_has_no_captured_address",
               empty.raw_unsafe() == nullptr);
 
-        global_ref armed{ oop_of(0x4000u) };
+        oop_pin armed{ oop_of(0x4000u) };
         armed.reset();
         check("reset_clears_the_captured_address", armed.raw_unsafe() == nullptr);
         check("reset_holder_is_stale", armed.is_stale());
@@ -305,8 +305,8 @@ int main()
     // =======================================================================
     {
         auto* const fake_oop{ oop_of(0x5100u) };
-        global_ref source{ fake_oop };
-        global_ref destination{ std::move(source) };
+        oop_pin source{ fake_oop };
+        oop_pin destination{ std::move(source) };
 
         check("move_ctor_transfers_the_captured_address",
               destination.raw_unsafe() == fake_oop);
@@ -320,8 +320,8 @@ int main()
     {
         auto* const fake_a{ oop_of(0x5200u) };
         auto* const fake_b{ oop_of(0x5300u) };
-        global_ref a{ fake_a };
-        global_ref b{ fake_b };
+        oop_pin a{ fake_a };
+        oop_pin b{ fake_b };
         b = std::move(a);
 
         check("move_assign_transfers_the_captured_address", b.raw_unsafe() == fake_a);
@@ -334,23 +334,23 @@ int main()
     {
         // Re-arming a moved-from holder must work (it is an ordinary empty
         // holder afterwards, not a poisoned one).
-        global_ref a{ oop_of(0x5400u) };
-        const global_ref b{ std::move(a) };
-        a = global_ref{ oop_of(0x5500u) };                  // NOLINT(bugprone-use-after-move)
+        oop_pin a{ oop_of(0x5400u) };
+        const oop_pin b{ std::move(a) };
+        a = oop_pin{ oop_of(0x5500u) };                  // NOLINT(bugprone-use-after-move)
         check("moved_from_holder_can_be_rearmed", a.raw_unsafe() == oop_of(0x5500u));
         check("rearm_does_not_disturb_the_move_destination", b.raw_unsafe() == oop_of(0x5400u));
     }
     {
         // Container round-trip: the addresses survive a vector reallocation,
         // and every element still fails closed afterwards.
-        std::vector<global_ref> refs;
+        std::vector<oop_pin> refs;
         for (std::uintptr_t bits{ 0x6000u }; bits < 0x6000u + 64u * 0x10u; bits += 0x10u)
         {
             refs.emplace_back(oop_of(bits));
         }
         bool ok{ true };
         std::uintptr_t expected{ 0x6000u };
-        for (const global_ref& ref : refs)
+        for (const oop_pin& ref : refs)
         {
             ok = ok && ref.raw_unsafe() == oop_of(expected) && ref.is_stale() && ref.oop() == nullptr;
             expected += 0x10u;
@@ -363,12 +363,12 @@ int main()
     // =======================================================================
     {
         auto* const fake_oop{ oop_of(0x7100u) };
-        const vmhook::jni::global_ref pinned{ vmhook::pin(fake_oop) };
+        const vmhook::oop_pin pinned{ vmhook::pin(fake_oop) };
         check("pin_captures_the_address", pinned.raw_unsafe() == fake_oop);
         check("pin_result_is_stale_without_a_readable_epoch", pinned.is_stale());
         check("pin_result_refuses_to_hand_the_address_back", pinned.oop() == nullptr);
 
-        const vmhook::jni::global_ref pinned_null{ vmhook::pin(vmhook::oop_t{ nullptr }) };
+        const vmhook::oop_pin pinned_null{ vmhook::pin(vmhook::oop_t{ nullptr }) };
         check("pin_null_is_empty_and_stale",
               pinned_null.raw_unsafe() == nullptr && pinned_null.is_stale());
     }

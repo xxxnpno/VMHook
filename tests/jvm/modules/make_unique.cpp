@@ -236,7 +236,7 @@ namespace
 
     // ── Narrow-primitive NewObjectA descriptors: (S)V (B)V (C)V (F)V (J)V ──────
     // The fixture grew one constructor per narrow JVM descriptor the library's
-    // jni_signature_for_arg + convert_jni_arg already support (short->"S",
+    // jvm_descriptor_for_arg + convert_jni_arg already support (short->"S",
     // int8->"B", char/uint16->"C", float->"F", int64->"J") but which the original
     // fixture had NO matching <init> for — so these used to silently route through
     // the TLAB fallback.  With the dedicated <init> present, make_unique resolves

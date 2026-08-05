@@ -1777,7 +1777,7 @@ int main()
     //   M1  decode_u5            (vmhook::hotspot::klass, vmhook.hpp:3848-3871)
     //   M2  sig_char_to_basic_type / jvm_primitive_byte_width (detail, 16215/16250)
     //   M3  clamp_safe_container_count (vmhook, 14753-14765)
-    //   M4  jni_signature_for_arg / signature_for_arg (detail/jni, 12994/13712)
+    //   M4  jvm_descriptor_for_arg / signature_for_arg (detail/jni, 12994/13712)
     //   M5  is_unique_ptr_v / function_traits::args_tuple_t (detail, 1788/9319)
     //   M6  array_length / get_array_element / set_array_element on a REAL owned
     //       buffer laid out as a HotSpot array header (vmhook.hpp:14778/14814/14860)
@@ -2020,68 +2020,68 @@ int main()
     }
 
     // ---------------------------------------------------------------------
-    // M4 — jni_signature_for_arg / signature_for_arg (vmhook.hpp:12994-13103,
+    // M4 — jvm_descriptor_for_arg / signature_for_arg (vmhook.hpp:12994-13103,
     // 13712-13715).  Compile-time descriptor table.  We assert ONLY the pure
     // branches that produce a fixed string with no type_to_class_map lookup
     // (string/bool/char/integral-width/float/double), exhaustively across the
     // type domain, and prove jni::signature_for_arg delegates byte-identically.
     // ---------------------------------------------------------------------
     {
-        using vmhook::detail::jni_signature_for_arg;
+        using vmhook::detail::jvm_descriptor_for_arg;
 
         // String family => "Ljava/lang/String;" (vmhook.hpp:12999-13002).
-        check("jni_sig_std_string",       jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
-        check("jni_sig_string_view",      jni_signature_for_arg<std::string_view>() == "Ljava/lang/String;");
-        check("jni_sig_const_char_ptr",   jni_signature_for_arg<const char*>() == "Ljava/lang/String;");
-        check("jni_sig_char_ptr",         jni_signature_for_arg<char*>() == "Ljava/lang/String;");
+        check("jni_sig_std_string",       jvm_descriptor_for_arg<std::string>() == "Ljava/lang/String;");
+        check("jni_sig_string_view",      jvm_descriptor_for_arg<std::string_view>() == "Ljava/lang/String;");
+        check("jni_sig_const_char_ptr",   jvm_descriptor_for_arg<const char*>() == "Ljava/lang/String;");
+        check("jni_sig_char_ptr",         jvm_descriptor_for_arg<char*>() == "Ljava/lang/String;");
 
         // bool => "Z", claimed BEFORE the generic 1-byte branch (13003-13009).
-        check("jni_sig_bool_is_Z",        jni_signature_for_arg<bool>() == "Z");
+        check("jni_sig_bool_is_Z",        jvm_descriptor_for_arg<bool>() == "Z");
 
         // char16_t / uint16_t => "C", claimed BEFORE the generic 2-byte branch
         // (13014-13017) so uint16_t is "C", NOT "S".
-        check("jni_sig_char16_is_C",      jni_signature_for_arg<char16_t>() == "C");
-        check("jni_sig_uint16_is_C",      jni_signature_for_arg<std::uint16_t>() == "C");
+        check("jni_sig_char16_is_C",      jvm_descriptor_for_arg<char16_t>() == "C");
+        check("jni_sig_uint16_is_C",      jvm_descriptor_for_arg<std::uint16_t>() == "C");
 
         // Generic integral width ladder (13028-13043): 1->B, 2->S, 4->I, 8->J.
-        check("jni_sig_int8_is_B",        jni_signature_for_arg<std::int8_t>() == "B");
-        check("jni_sig_uint8_is_B",       jni_signature_for_arg<std::uint8_t>() == "B");
-        check("jni_sig_int16_is_S",       jni_signature_for_arg<std::int16_t>() == "S");
-        check("jni_sig_int32_is_I",       jni_signature_for_arg<std::int32_t>() == "I");
-        check("jni_sig_uint32_is_I",      jni_signature_for_arg<std::uint32_t>() == "I");
-        check("jni_sig_int64_is_J",       jni_signature_for_arg<std::int64_t>() == "J");
-        check("jni_sig_uint64_is_J",      jni_signature_for_arg<std::uint64_t>() == "J");
+        check("jni_sig_int8_is_B",        jvm_descriptor_for_arg<std::int8_t>() == "B");
+        check("jni_sig_uint8_is_B",       jvm_descriptor_for_arg<std::uint8_t>() == "B");
+        check("jni_sig_int16_is_S",       jvm_descriptor_for_arg<std::int16_t>() == "S");
+        check("jni_sig_int32_is_I",       jvm_descriptor_for_arg<std::int32_t>() == "I");
+        check("jni_sig_uint32_is_I",      jvm_descriptor_for_arg<std::uint32_t>() == "I");
+        check("jni_sig_int64_is_J",       jvm_descriptor_for_arg<std::int64_t>() == "J");
+        check("jni_sig_uint64_is_J",      jvm_descriptor_for_arg<std::uint64_t>() == "J");
 
         // Extended/implementation integral types that newly route by sizeof
         // (the comment at 13018-13027): plain char (size 1) => "B"; char8_t
         // (size 1, distinct unsigned) => "B"; char32_t (size 4) => "I".
-        check("jni_sig_plain_char_is_B",  jni_signature_for_arg<char>() == "B");
-        check("jni_sig_char8_is_B",       jni_signature_for_arg<char8_t>() == "B");
-        check("jni_sig_char32_is_I",      jni_signature_for_arg<char32_t>() == "I");
+        check("jni_sig_plain_char_is_B",  jvm_descriptor_for_arg<char>() == "B");
+        check("jni_sig_char8_is_B",       jvm_descriptor_for_arg<char8_t>() == "B");
+        check("jni_sig_char32_is_I",      jvm_descriptor_for_arg<char32_t>() == "I");
 
         // float => "F", double => "D" (13044-13051).
-        check("jni_sig_float_is_F",       jni_signature_for_arg<float>() == "F");
-        check("jni_sig_double_is_D",      jni_signature_for_arg<double>() == "D");
+        check("jni_sig_float_is_F",       jvm_descriptor_for_arg<float>() == "F");
+        check("jni_sig_double_is_D",      jvm_descriptor_for_arg<double>() == "D");
 
         // cv/ref qualifiers are stripped via std::decay_t (clean_t, 12997) — a
         // const/ref-qualified arg yields the SAME descriptor as its bare type.
         check("jni_sig_const_ref_int32_decays_to_I",
-              jni_signature_for_arg<const std::int32_t&>() == "I");
+              jvm_descriptor_for_arg<const std::int32_t&>() == "I");
         check("jni_sig_const_double_decays_to_D",
-              jni_signature_for_arg<const double>() == "D");
+              jvm_descriptor_for_arg<const double>() == "D");
 
         // jni::signature_for_arg is a thin delegate (13712-13715) — byte-identical
         // to the detail mapping for a representative spread of types.
         check("signature_for_arg_delegates_string",
-              vmhook::detail::jni_signature_for_arg<std::string>() == jni_signature_for_arg<std::string>());
+              vmhook::detail::jvm_descriptor_for_arg<std::string>() == jvm_descriptor_for_arg<std::string>());
         check("signature_for_arg_delegates_bool",
-              vmhook::detail::jni_signature_for_arg<bool>() == jni_signature_for_arg<bool>());
+              vmhook::detail::jvm_descriptor_for_arg<bool>() == jvm_descriptor_for_arg<bool>());
         check("signature_for_arg_delegates_int64",
-              vmhook::detail::jni_signature_for_arg<std::int64_t>() == jni_signature_for_arg<std::int64_t>());
+              vmhook::detail::jvm_descriptor_for_arg<std::int64_t>() == jvm_descriptor_for_arg<std::int64_t>());
         check("signature_for_arg_delegates_double",
-              vmhook::detail::jni_signature_for_arg<double>() == jni_signature_for_arg<double>());
+              vmhook::detail::jvm_descriptor_for_arg<double>() == jvm_descriptor_for_arg<double>());
         check("signature_for_arg_delegates_char16_C",
-              vmhook::detail::jni_signature_for_arg<char16_t>() == jni_signature_for_arg<char16_t>());
+              vmhook::detail::jvm_descriptor_for_arg<char16_t>() == jvm_descriptor_for_arg<char16_t>());
     }
 
     // ---------------------------------------------------------------------

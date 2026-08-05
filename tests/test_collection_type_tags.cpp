@@ -2602,11 +2602,11 @@ static auto test_function_traits_decomposition() -> void
 }
 
 // ---------------------------------------------------------------------------
-// 23. [ADDITIVE] jni::jni_signature_for_arg<T>() — the C++ argument type -> JVM
+// 23. [ADDITIVE] jni::jvm_descriptor_for_arg<T>() — the C++ argument type -> JVM
 //     descriptor classifier the element type-tag mapping rides for reference
 //     element/key/value wrappers and primitive args.
 //
-// Contract (vmhook.hpp jni_signature_for_arg, public jni::signature_for_arg):
+// Contract (vmhook.hpp jvm_descriptor_for_arg, public jni::signature_for_arg):
 //   string / string_view / char* / const char*  -> "Ljava/lang/String;"
 //   bool                                          -> "Z"   (claimed before sizeof==1)
 //   char16_t / std::uint16_t                      -> "C"   (claimed before sizeof==2)
@@ -2620,35 +2620,35 @@ static auto test_function_traits_decomposition() -> void
 // verbatim from the header ladder; a regression that reordered the bool /
 // uint16 early claims (so bool encoded "B" or uint16 encoded "S") fails loudly.
 // ---------------------------------------------------------------------------
-static auto test_jni_signature_for_arg_mapping() -> void
+static auto test_jvm_descriptor_for_arg_mapping() -> void
 {
-    using vmhook::detail::jni_signature_for_arg;
+    using vmhook::detail::jvm_descriptor_for_arg;
 
     // --- String-like family all collapse to the String descriptor. ---
-    check("sig_string",        jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
-    check("sig_string_view",   jni_signature_for_arg<std::string_view>() == "Ljava/lang/String;");
-    check("sig_cstr",          jni_signature_for_arg<const char*>() == "Ljava/lang/String;");
-    check("sig_mutable_cstr",  jni_signature_for_arg<char*>() == "Ljava/lang/String;");
+    check("sig_string",        jvm_descriptor_for_arg<std::string>() == "Ljava/lang/String;");
+    check("sig_string_view",   jvm_descriptor_for_arg<std::string_view>() == "Ljava/lang/String;");
+    check("sig_cstr",          jvm_descriptor_for_arg<const char*>() == "Ljava/lang/String;");
+    check("sig_mutable_cstr",  jvm_descriptor_for_arg<char*>() == "Ljava/lang/String;");
 
     // --- bool is claimed FIRST as "Z" (must NOT fall to the sizeof==1 "B"). ---
-    check("sig_bool_is_Z",     jni_signature_for_arg<bool>() == "Z");
+    check("sig_bool_is_Z",     jvm_descriptor_for_arg<bool>() == "Z");
 
     // --- char16_t / uint16_t claimed as "C" BEFORE the generic 2-byte "S". ---
-    check("sig_char16_is_C",   jni_signature_for_arg<char16_t>() == "C");
-    check("sig_uint16_is_C",   jni_signature_for_arg<std::uint16_t>() == "C");
+    check("sig_char16_is_C",   jvm_descriptor_for_arg<char16_t>() == "C");
+    check("sig_uint16_is_C",   jvm_descriptor_for_arg<std::uint16_t>() == "C");
 
     // --- Fixed-width integral ladder by sizeof. ---
-    check("sig_i8_is_B",       jni_signature_for_arg<std::int8_t>() == "B");
-    check("sig_u8_is_B",       jni_signature_for_arg<std::uint8_t>() == "B");
-    check("sig_i16_is_S",      jni_signature_for_arg<std::int16_t>() == "S");
-    check("sig_i32_is_I",      jni_signature_for_arg<std::int32_t>() == "I");
-    check("sig_u32_is_I",      jni_signature_for_arg<std::uint32_t>() == "I");
-    check("sig_i64_is_J",      jni_signature_for_arg<std::int64_t>() == "J");
-    check("sig_u64_is_J",      jni_signature_for_arg<std::uint64_t>() == "J");
+    check("sig_i8_is_B",       jvm_descriptor_for_arg<std::int8_t>() == "B");
+    check("sig_u8_is_B",       jvm_descriptor_for_arg<std::uint8_t>() == "B");
+    check("sig_i16_is_S",      jvm_descriptor_for_arg<std::int16_t>() == "S");
+    check("sig_i32_is_I",      jvm_descriptor_for_arg<std::int32_t>() == "I");
+    check("sig_u32_is_I",      jvm_descriptor_for_arg<std::uint32_t>() == "I");
+    check("sig_i64_is_J",      jvm_descriptor_for_arg<std::int64_t>() == "J");
+    check("sig_u64_is_J",      jvm_descriptor_for_arg<std::uint64_t>() == "J");
 
     // --- Floating point. ---
-    check("sig_float_is_F",    jni_signature_for_arg<float>() == "F");
-    check("sig_double_is_D",   jni_signature_for_arg<double>() == "D");
+    check("sig_float_is_F",    jvm_descriptor_for_arg<float>() == "F");
+    check("sig_double_is_D",   jvm_descriptor_for_arg<double>() == "D");
 
     // --- Wrapper types resolve their "Lname;" descriptor from the register_class
     //     map.  With NO JVM, register_class<T>() returns false WITHOUT populating
@@ -2659,34 +2659,34 @@ static auto test_jni_signature_for_arg_mapping() -> void
     //     object/wrapper arg never mis-encodes as a primitive, it degrades to the
     //     generic Object descriptor. ---
     check("sig_elem_w_wrapper_object_fallback",
-          jni_signature_for_arg<elem_w>() == "Ljava/lang/Object;");
+          jvm_descriptor_for_arg<elem_w>() == "Ljava/lang/Object;");
     check("sig_key_w_wrapper_object_fallback",
-          jni_signature_for_arg<key_w>() == "Ljava/lang/Object;");
+          jvm_descriptor_for_arg<key_w>() == "Ljava/lang/Object;");
     check("sig_val_w_wrapper_object_fallback",
-          jni_signature_for_arg<val_w>() == "Ljava/lang/Object;");
+          jvm_descriptor_for_arg<val_w>() == "Ljava/lang/Object;");
     // unique_ptr<W> takes the SAME (unregistered) wrapper branch -> same fallback.
     check("sig_unique_ptr_elem_w_object_fallback",
-          jni_signature_for_arg<std::unique_ptr<elem_w>>() == "Ljava/lang/Object;");
+          jvm_descriptor_for_arg<std::unique_ptr<elem_w>>() == "Ljava/lang/Object;");
     check("sig_unique_ptr_val_w_object_fallback",
-          jni_signature_for_arg<std::unique_ptr<val_w>>() == "Ljava/lang/Object;");
+          jvm_descriptor_for_arg<std::unique_ptr<val_w>>() == "Ljava/lang/Object;");
 
     // --- cv/ref qualified args are decayed first, so they map identically. ---
-    check("sig_const_ref_int_is_I", jni_signature_for_arg<const std::int32_t&>() == "I");
-    check("sig_rref_double_is_D",   jni_signature_for_arg<double&&>() == "D");
-    check("sig_const_bool_is_Z",    jni_signature_for_arg<const bool>() == "Z");
+    check("sig_const_ref_int_is_I", jvm_descriptor_for_arg<const std::int32_t&>() == "I");
+    check("sig_rref_double_is_D",   jvm_descriptor_for_arg<double&&>() == "D");
+    check("sig_const_bool_is_Z",    jvm_descriptor_for_arg<const bool>() == "Z");
 
     // --- The mapper is noexcept (built on a detour thread when wiring a hook). ---
-    check("sig_for_arg_noexcept", noexcept(jni_signature_for_arg<std::int32_t>()));
+    check("sig_for_arg_noexcept", noexcept(jvm_descriptor_for_arg<std::int32_t>()));
 
     // --- Every primitive descriptor produced is a recognised single-byte
     //     BasicType in the primitive band [4,11] per sig_char_to_basic_type,
     //     tying this classifier to the descriptor parser used by the walks. ---
     {
         const std::string prim_sigs[]{
-            jni_signature_for_arg<bool>(),       jni_signature_for_arg<std::int8_t>(),
-            jni_signature_for_arg<std::int16_t>(), jni_signature_for_arg<std::int32_t>(),
-            jni_signature_for_arg<std::int64_t>(), jni_signature_for_arg<float>(),
-            jni_signature_for_arg<double>(),      jni_signature_for_arg<char16_t>(),
+            jvm_descriptor_for_arg<bool>(),       jvm_descriptor_for_arg<std::int8_t>(),
+            jvm_descriptor_for_arg<std::int16_t>(), jvm_descriptor_for_arg<std::int32_t>(),
+            jvm_descriptor_for_arg<std::int64_t>(), jvm_descriptor_for_arg<float>(),
+            jvm_descriptor_for_arg<double>(),      jvm_descriptor_for_arg<char16_t>(),
         };
         bool all_primitive_band{ true };
         for (const auto& s : prim_sigs)
@@ -2803,7 +2803,7 @@ static auto test_capability_macro_consistency() -> void
 }
 
 // ---------------------------------------------------------------------------
-// 25. [ADDITIVE] detail::is_unique_ptr_v — the trait jni_signature_for_arg uses
+// 25. [ADDITIVE] detail::is_unique_ptr_v — the trait jvm_descriptor_for_arg uses
 //     to recognise a unique_ptr<W> element/value argument (the exact shape
 //     to_vector<E>() / to_entries<K,V>() PRODUCE).  PURE type trait, no JVM.
 //
@@ -3232,7 +3232,7 @@ namespace
     auto build_ctor_descriptor() -> std::string
     {
         std::string signature{ "(" };
-        ((signature += vmhook::detail::jni_signature_for_arg<std::remove_cvref_t<args_t>>()), ...);
+        ((signature += vmhook::detail::jvm_descriptor_for_arg<std::remove_cvref_t<args_t>>()), ...);
         signature += ")V";
         return signature;
     }
@@ -3240,60 +3240,60 @@ namespace
 
 static auto test_jni_signature_width_ladder_and_packing() -> void
 {
-    using vmhook::detail::jni_signature_for_arg;
+    using vmhook::detail::jvm_descriptor_for_arg;
 
     // --- Extended integral types ride the generic sizeof ladder.  Each expected
     //     descriptor is derived from sizeof/signedness (LLP64-safe), NEVER a
     //     hard-coded letter, so this passes identically on Windows (long==4,
     //     wchar_t==2) and *nix (long==8, wchar_t==4). ---
     check("sig_char_matches_sizeof_ladder",
-          jni_signature_for_arg<char>() == expected_integral_descriptor<char>());
+          jvm_descriptor_for_arg<char>() == expected_integral_descriptor<char>());
     check("sig_signed_char_matches_ladder",
-          jni_signature_for_arg<signed char>() == expected_integral_descriptor<signed char>());
+          jvm_descriptor_for_arg<signed char>() == expected_integral_descriptor<signed char>());
     check("sig_unsigned_char_matches_ladder",
-          jni_signature_for_arg<unsigned char>() == expected_integral_descriptor<unsigned char>());
+          jvm_descriptor_for_arg<unsigned char>() == expected_integral_descriptor<unsigned char>());
     check("sig_short_matches_ladder",
-          jni_signature_for_arg<short>() == expected_integral_descriptor<short>());
+          jvm_descriptor_for_arg<short>() == expected_integral_descriptor<short>());
     check("sig_unsigned_short_matches_ladder",
-          jni_signature_for_arg<unsigned short>() == expected_integral_descriptor<unsigned short>());
+          jvm_descriptor_for_arg<unsigned short>() == expected_integral_descriptor<unsigned short>());
     check("sig_int_matches_ladder",
-          jni_signature_for_arg<int>() == expected_integral_descriptor<int>());
+          jvm_descriptor_for_arg<int>() == expected_integral_descriptor<int>());
     check("sig_unsigned_int_matches_ladder",
-          jni_signature_for_arg<unsigned int>() == expected_integral_descriptor<unsigned int>());
+          jvm_descriptor_for_arg<unsigned int>() == expected_integral_descriptor<unsigned int>());
     check("sig_long_matches_ladder",
-          jni_signature_for_arg<long>() == expected_integral_descriptor<long>());
+          jvm_descriptor_for_arg<long>() == expected_integral_descriptor<long>());
     check("sig_unsigned_long_matches_ladder",
-          jni_signature_for_arg<unsigned long>() == expected_integral_descriptor<unsigned long>());
+          jvm_descriptor_for_arg<unsigned long>() == expected_integral_descriptor<unsigned long>());
     check("sig_long_long_matches_ladder",
-          jni_signature_for_arg<long long>() == expected_integral_descriptor<long long>());
+          jvm_descriptor_for_arg<long long>() == expected_integral_descriptor<long long>());
     check("sig_unsigned_long_long_matches_ladder",
-          jni_signature_for_arg<unsigned long long>() == expected_integral_descriptor<unsigned long long>());
+          jvm_descriptor_for_arg<unsigned long long>() == expected_integral_descriptor<unsigned long long>());
     check("sig_char8_matches_ladder",
-          jni_signature_for_arg<char8_t>() == expected_integral_descriptor<char8_t>());
+          jvm_descriptor_for_arg<char8_t>() == expected_integral_descriptor<char8_t>());
     check("sig_char32_matches_ladder",
-          jni_signature_for_arg<char32_t>() == expected_integral_descriptor<char32_t>());
+          jvm_descriptor_for_arg<char32_t>() == expected_integral_descriptor<char32_t>());
     check("sig_wchar_matches_ladder",
-          jni_signature_for_arg<wchar_t>() == expected_integral_descriptor<wchar_t>());
+          jvm_descriptor_for_arg<wchar_t>() == expected_integral_descriptor<wchar_t>());
     check("sig_size_t_matches_ladder",
-          jni_signature_for_arg<std::size_t>() == expected_integral_descriptor<std::size_t>());
+          jvm_descriptor_for_arg<std::size_t>() == expected_integral_descriptor<std::size_t>());
     check("sig_ptrdiff_t_matches_ladder",
-          jni_signature_for_arg<std::ptrdiff_t>() == expected_integral_descriptor<std::ptrdiff_t>());
+          jvm_descriptor_for_arg<std::ptrdiff_t>() == expected_integral_descriptor<std::ptrdiff_t>());
 
     // --- char8_t is a distinct 1-byte integral -> "B" on every platform (its
     //     size is fixed by the standard, unlike long/wchar_t). ---
-    check("sig_char8_is_B_fixed", jni_signature_for_arg<char8_t>() == "B");
+    check("sig_char8_is_B_fixed", jvm_descriptor_for_arg<char8_t>() == "B");
     // char32_t is a fixed 4-byte integral -> "I" on every platform.
-    check("sig_char32_is_I_fixed", jni_signature_for_arg<char32_t>() == "I");
+    check("sig_char32_is_I_fixed", jvm_descriptor_for_arg<char32_t>() == "I");
 
     // --- The descriptor for any integral is exactly one byte and lands in the
     //     primitive BasicType band [4,11] (ties the classifier to the parser). ---
     {
         const std::string ladder[]{
-            jni_signature_for_arg<char>(),      jni_signature_for_arg<short>(),
-            jni_signature_for_arg<int>(),       jni_signature_for_arg<long>(),
-            jni_signature_for_arg<long long>(), jni_signature_for_arg<wchar_t>(),
-            jni_signature_for_arg<char8_t>(),   jni_signature_for_arg<char32_t>(),
-            jni_signature_for_arg<std::size_t>(),
+            jvm_descriptor_for_arg<char>(),      jvm_descriptor_for_arg<short>(),
+            jvm_descriptor_for_arg<int>(),       jvm_descriptor_for_arg<long>(),
+            jvm_descriptor_for_arg<long long>(), jvm_descriptor_for_arg<wchar_t>(),
+            jvm_descriptor_for_arg<char8_t>(),   jvm_descriptor_for_arg<char32_t>(),
+            jvm_descriptor_for_arg<std::size_t>(),
         };
         bool all_one_byte_band{ true };
         for (const auto& d : ladder)
@@ -3333,7 +3333,7 @@ static auto test_jni_signature_width_ladder_and_packing() -> void
     // --- The single-arg public descriptor equals the first concatenation token,
     //     proving signature_for_arg IS the packing unit. ---
     check("packing_unit_is_signature_for_arg",
-          build_ctor_descriptor<float>() == std::string{ "(" } + jni_signature_for_arg<float>() + ")V");
+          build_ctor_descriptor<float>() == std::string{ "(" } + jvm_descriptor_for_arg<float>() + ")V");
 }
 
 // ---------------------------------------------------------------------------
@@ -3781,7 +3781,7 @@ int main()
     test_value_t_aggregate_field_semantics();
     test_narrow_codec_roundtrip();
     test_function_traits_decomposition();
-    test_jni_signature_for_arg_mapping();
+    test_jvm_descriptor_for_arg_mapping();
     test_capability_macro_consistency();
     test_is_unique_ptr_trait();
     test_return_slot_encoding();

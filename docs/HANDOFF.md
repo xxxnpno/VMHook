@@ -1,163 +1,156 @@
-# Handoff — 2026-08-05
+# Handoff — 2026-08-05 (second session)
 
-Session goal: make vmhook **0 JNI** and make it so **the user never manages global refs or
-oops** (driven by `npnoqol`). Roadmap: `docs/ROADMAP_ZERO_JNI.md`. Evidence: `docs/research/`.
+Session goal: **finish** the zero-JNI / zero-ceremony program, plus a new ask — use current C++
+features to improve `vmhook.hpp`. Roadmap: `docs/ROADMAP_ZERO_JNI.md`. Evidence: `docs/research/`.
 
-## State
+## ⚠ READ FIRST: NOTHING IN THIS SESSION WAS COMPILED
 
-Working tree has:
-- `viewer/payload/payload.cpp` — **Arno's own pre-existing edit**, untouched, unstaged.
-- the `audit/` + `.claude/` deletions — **intentionally left unstaged, never commit them**
-  (249 are under `audit/features` + `audit/graph`, the exact path filter for `registry.yml`;
-  committing them makes that workflow red because `validate.py` would be gone).
+The user asked, explicitly and mid-session, to stop running CI and to stop compiling — *"just
+code for now"*. So this handoff describes a large body of **unverified** work:
 
-## The previous session's open question — answered
+- ~1300 lines of header change across 20+ edit operations, much of it applied by script.
+- Two file renames with ~900 identifier substitutions.
+- A C++26 reflection block that **no available toolchain can even parse** (Clang 21+ behind
+  `-freflection` only; GCC hasn't merged P2996; MSVC hasn't shipped it). Its syntax is written
+  against the published papers and has never been through a compiler.
 
-It pointed at CI run `30960739495`. That run was **cancelled**: the docs push (`325c77c`)
-triggered cancel-in-progress. The real result is run **`30961706826`** for `325c77c`:
-**34 green / 21 red**, and the 21 red are exactly the 21 JVM cells.
+**The first action next session is a build, not more features.** Expect real errors. The
+scripted edits most likely to have gone wrong are flagged in "Where to look first" below.
 
-`warnings-as-errors (linux/clang)` — red on master since the de-JNI work — **is now green**.
-That closes B1.
+## Working tree
 
-### JVM triage against the `27db40e` baseline (run `29374188146`)
+- `viewer/payload/payload.cpp` — **Arno's own uncommitted edit** (40 insertions). Untouched
+  this session, deliberately: see Phase 4.4 below.
+- the `audit/` + `.claude/` deletions — **intentionally unstaged, never commit them** (249 are
+  under `audit/features` + `audit/graph`, the exact path filter for `registry.yml`; committing
+  them makes that workflow red because `validate.py` would be gone).
 
-Comparing unique `[FAIL]` names per cell:
+## Goal A — zero JNI: the header and test suite are DONE; the viewer is not
 
-| cell | baseline | at `325c77c` | genuinely new |
-|---|---|---|---|
-| msvc · java 26 | 3098 | **406** | 3 |
-| msvc · java 21 | 3095 | **406** | 3 |
-| mingw · java 8 | 284 | **18** | — |
+| Item | Status |
+|---|---|
+| `namespace jni` | **deleted**, no alias. `global_ref` → `vmhook::oop_pin` at `vmhook` scope |
+| `detail::jni_signature_for_arg` | → `jvm_descriptor_for_arg`, 711 refs across 14 files |
+| `MethodCallJni` fixture + module | → `MethodCallDispatch` / `method_call_dispatch` |
+| `JniLocalRef` fixture + module | → `RepeatCallProbe` / `repeat_call_stability` |
+| `viewer/payload/payload.cpp` | **still `#include <jni.h>`** — the last real JNI in the project |
+| ~200 stale JNI mentions in test comments | **not swept** |
 
-Caveat: `mingw·java26` and `clang·java26` baselines **died early**, so their "new" names are
-overwhelmingly tests that never *ran* before, not regressions. The msvc cells are the honest
-comparison — the failure set collapsed ~7.6×.
+**Why the viewer was left alone.** Two of its three JNI uses are now trivially replaceable —
+`NewStringUTF` → `make_java_string`, and `invoke_jni`'s ~120 lines → `method_proxy::call()`,
+which works now. Only thread promotion genuinely needs the detour pump. But it is a ~200-line
+rewrite in a file with the user's own uncommitted changes, and rewriting that blind, without a
+compiler, would both risk their work and produce something unverifiable. It is the single
+biggest remaining Goal-A item and it wants a session with a build loop.
 
-Only **3** genuinely new assertion names existed, all in the `mcj_*` module, and all three were
-stale expectations rather than library defects. Fixed this session (see below).
+**Why the ~200 comments were left.** They are prose (`call_jni`, "JNI fallback", "JNI local
+ref"), not names. A sed turns explanations into nonsense — *"call() short-circuits into
+call_jni()"* has no single-word fix. Two symbols named in comments no longer exist at all:
+`jni::find_class_with_context_loader` and `jni_delete_local_ref`. Catalogued as roadmap 4.6.
 
-## What landed this session
+The remaining `JNI` hits in the header are **correct**: `JNIHandleBlock` is a real HotSpot
+VMStructs type the code genuinely reads, and the "no JNI" claims are accurate.
 
-### 1. The 3 new CI failures, fixed at the root
+## Goal B — zero ceremony: all six Phase-3 intercepts now have handle forms
 
-`tests/jvm/modules/method_call_jni_fallback.cpp` → renamed **`method_call_dispatch.cpp`**
-(module name `method_call_dispatch`; `mcj_` assertion prefix deliberately KEPT so several
-thousand names stay comparable against historical CI runs — that comparability is what made the
-triage above possible). Sibling `test_method_call_jni_fallback_nojvm.cpp` →
-`test_method_call_dispatch_nojvm.cpp`.
+| # | Intercept | Handle form |
+|---|---|---|
+| 1 | every detour argument | `extract_frame_arg` accepts `borrowed<W>` *(last session)* |
+| 2 | `object_base` ctor + `get_instance` | `object<W>::self()` *(last session)* |
+| 3 | `field_proxy` read + **write** | `value_t::to_borrowed<W>()` · **`store_object(borrowed<W>)`** |
+| 4 | `method_proxy` result | `value_t::to_borrowed<W>()` |
+| 5 | the six collection ctors | each takes `const borrowed<W>&` |
+| 6 | `make_java_*` | `new_object` / `new_array` / `new_string` → `borrowed<W>` |
 
-- `mcj_jni_fallback_is_the_live_path` asserted `!stub` on the premise that no JDK publishes
-  `_call_stub_entry`. Both halves were wrong, and the fallback it guarded no longer exists.
-  Now `mcj_call_stub_is_the_live_path`, asserting a live dispatcher exists at all.
-- `mcj_echo_str_unicode_call_stub` expected `"caf??"` from a per-path split written against two
-  lossy behaviours that were since fixed (`make_java_string` used to copy raw UTF-8 bytes into
-  LATIN1; `read_java_string` used to substitute `'?'` for every char ≥ 0x80). "café" now
-  round-trips byte-for-byte on every layout — one assertion, no path split.
-- `mcj_exc_throw_mechanism_fired_call_stub` was **unsatisfiable**: the de-JNI removal took out
-  the `ExceptionCheck` that produced the observation and left `const bool pend{ false };`
-  behind, so `seen_pending` could never be non-zero. Rewritten to read the returned `value_t`
-  (`threw()` / `exception_class`), which is both pure-VM and strictly stronger — it now pins
-  WHICH exception each call reported (`IllegalStateException` / `ArithmeticException` /
-  `IllegalStateException`) plus the value-initialised-on-throw contract. All these assertions
-  are now unconditional.
+Two are more than ergonomics:
 
-### 2. Roadmap §2.6 — `detail::extract_frame_arg` now produces `borrowed<T>`
+- **`store_object`** resolves the handle immediately before the write and **refuses an expired
+  one**. A raw `store_object_oop(addr)` cannot tell whether `addr` survived the gap between the
+  caller reading it and the store; if it did not, the field holds a pointer into relocated
+  space and the corruption surfaces arbitrarily later in unrelated code. This closes that
+  window as far as a pure-VM build can. It does *not* close a collection landing between the
+  resolve and the `safe_write` a few instructions later — that needs Layer 2.
+- **`new_*`** exists because a fresh address is the most dangerous shape in the API: it *looks*
+  trustworthy and is completely unrooted.
 
-The single highest-leverage item on the previous list. A detour can now declare its receiver
-and any object argument as a lifetime-checked handle:
+Invariant at every intercept: an **EMPTY** handle (Java null, failed allocation) is never an
+**EXPIRED** one. Different causes, different recovery.
 
-```cpp
-vmhook::scoped_hook<player>("damage",
-    [](vmhook::return_value&, vmhook::borrowed<player> self, std::int32_t amount) {
-        if (self) { /* self->hp() — no raw address, expires instead of dangling */ }
-    });
-```
+The collection constructors are member templates taking `const borrowed<W>&` so they can name
+`vmhook::borrowed`, which is only complete ~4000 lines later in the header; the body is
+instantiated at the call site, by which point it is. **This is one of the riskier scripted
+edits — check it compiles.**
 
-Three tables had to agree, all wired: `extract_frame_arg` (produces the handle),
-`jni_signature_for_arg` (`borrowed<W>` → `Lclass;`, `borrowed<void>` → `Ljava/lang/Object;`),
-and `is_java_double_slot_v` (one slot).
+## Phase 4b — modern C++ (the new ask)
 
-**Library bug found while doing it:** `extract_frame_arg` called `frame->get_locals()` with no
-null check. `get_locals()` survives it — it gates on `is_valid_pointer(this)` — but the member
-call on a null pointer is already UB by then. GCC diagnoses exactly that under `-Wnonnull` once
-a caller can be seen passing null. Guarded at the choke point.
+Before this the header used essentially none: **zero** `[[nodiscard]]`, `std::expected`,
+`std::span`, `std::bit_cast`, `consteval`, or concepts. The only C++20+ feature in use was
+`requires`.
 
-### 3. Two more Phase-3 intercepts
+- **`VMHOOK_HAS_REFLECTION`** (P2996 + P3394), gated exactly like `VMHOOK_HAS_DEDUCING_THIS`.
+  - `detail::type_name<T>()` — **wired into all 33 diagnostics that emitted mangled names.**
+    Someone who forgot `register_class<player>()` was told about `"6playerE"`. MSVC returns
+    `"class player"`, which is why this survived: invisible to anyone testing only on Windows.
+    **This one benefits every user today**, reflection or not — the fallback is what we had.
+  - **`vmhook::java_class` annotation** + no-string `register_class<T>()`. Kills a real silent
+    bug: `register_class<item>("com/example/Player")` binds `item` to Player's klass and every
+    field read after it is nonsense at a plausible offset.
+  - `jvm_descriptor_for_arg` short-circuits on the annotation at compile time, so an annotated
+    wrapper's descriptor cannot disagree with the registry or degrade to `Ljava/lang/Object;`.
+- **`std::expected`** — `object_base::try_field` / `try_method` → `expected<T, access_error>`.
+  Not style: `get_field` collapses four causes into one empty optional, and they want different
+  responses. That conflation is *why* `get_field("x")->get()` became the house idiom and why it
+  has taken the whole JVM suite down.
+- **`[[nodiscard]]`** on this session's new API only. A blanket sweep would turn every existing
+  legitimate discard into a `-Werror` failure — not a change to make without a compiler.
 
-- `object<W>::self()` → `borrowed<W>` (the wrapper's own instance; intercept #2).
-- `field_proxy::value_t::to_borrowed<W>()` (a reference FIELD; the read half of intercept #3).
+## Where to look first when it fails to build
 
-Both yield an EMPTY borrow — never an expired one — for Java null, and `to_borrowed` yields
-empty for a non-reference alternative rather than a borrow of reinterpreted primitive bits.
+Ranked by how likely the scripted edit went wrong:
 
-### 4. Cleanup
-
-`std::format("L{};", …)` replaced the three-line
-`std::string sig{"L"}; sig.append(…); sig.push_back(';')` idiom at all three sites in
-`jni_signature_for_arg`.
-
-### New test files
-
-- `tests/test_borrowed_detour_arg_nojvm.cpp` — 36 checks + the compile-time pins: trait truth
-  table, descriptors, the **slot-offset table** across borrow/long/double orderings (a wrong
-  slot width does not crash — it silently feeds the detour garbage — so it is pinned at compile
-  time), null-frame degradation, and the `self()` / `to_borrowed()` intercepts.
-- `tests/jvm/modules/borrowed_detour_arg.cpp` — live-JVM proof. Drives `HookBasic`
-  **unchanged**, on the same modes `hook_basic` drives through `unique_ptr`, so the two argument
-  models are asserted against identical scenarios: receiver identity across two instances,
-  borrowed object arguments distinct from the receiver, Java-null arguments, and the slot table
-  behind `combine(int,long,int)` and the 8-arg `manyArgs`.
-
-## Validation status — READ THIS
-
-- **Local no-JVM ctest: 100/100 green**, MinGW `-Werror`, before the last two intercepts.
-- Every changed/new TU compiles clean under **both** MinGW g++ `-Werror` and the CI-equivalent
-  clang line.
-- `test_borrowed_detour_arg_nojvm` runs green (36/36) standalone.
-- ⚠ **The live JVM module `borrowed_detour_arg.cpp` has NEVER been run against a JVM.** It is
-  compile-validated only. Per the project's own "build-only risk" lesson, a build-only test
-  module can ship a deterministic wrong hard-assert that only CI catches. Run it first.
-- ⚠ No `.localci` run and no GitHub run covers the final tree — the user asked to stop running
-  CI mid-session. A full local pre-flight is the first thing to do.
+1. **`jvm_descriptor_for_arg`** — three arms were wrapped in new `if constexpr/else` blocks by
+   script, then re-indented by a second script. Brace balance was eyeballed, not compiled.
+2. **The six collection borrow constructors** — the member-template-naming-an-incomplete-type
+   trick is correct in principle; verify the compiler agrees at each of the six.
+3. **`try_field` / `try_method`** — inserted, then *moved* between access sections by a second
+   script. Confirm they are `public` and that `this->instance` / `this->get_field` resolve.
+4. **The `oop_pin` de-namespacing** — the class body was dedented 4 spaces by script after the
+   `namespace jni {` wrapper was removed.
+5. **Anything reflection-gated** — `VMHOOK_HAS_REFLECTION` is 0 everywhere available, so these
+   blocks are not even parsed. They are unverified by construction; do not treat "it builds" as
+   evidence they are right.
 
 ## What's next, in priority order
 
-1. **Validate.** `.localci/run-local-ci.ps1 -Compilers mingw,msvc -Java 8,21,26`, then push.
-   `VMHOOK_JVM_MODULES=borrowed_detour_arg,method_call_dispatch` narrows a run to the two
-   modules that changed. Never use `.localci -NoBuild` as a gate — it silently reuses a stale DLL.
-2. **The remaining Phase 3 intercepts** — `method_proxy`'s receiver, the six collection ctors,
-   `make_java_object`/`make_java_array`/`make_java_string`, and the WRITE half of `field_proxy`
-   (`store_object_oop`). These are the harder half: a write needs the address valid at the
-   instant of the store, so they want the store to happen THROUGH the handle rather than to
-   take one as an argument.
-3. **Phase 4 zero-JNI finish** — rename `jni::global_ref` → `vmhook::oop_pin` and delete the
-   `jni` namespace; rename `detail::jni_signature_for_arg` (~629 references, one mechanical
-   pass); then rebuild `viewer/payload` on a **detour pump** (stop entering Java from native —
-   hook a method the JVM already calls and drain a work queue) and delete its `<jni.h>`.
-4. **Layer 2 — a real pin** (`ClassLoaderData::_handles` on 11+, `JNIHandles::_global_handles`
-   on 8). Design in `gc_root_feasibility.md` §10. Everything shipped so far only *detects*
-   relocation; nothing keeps an object alive.
-5. **The ~400-failure JVM baseline.** Untouched this session and not investigated —
-   `java_getter_*` (95), `htm_size_oracle_*` (16), `xchk_*` (15), `const_*` (14). These
-   predate the de-JNI work.
-6. **House-convention sweep**: `get_field("x")->get()` with no `has_value()` check is UB for any
-   class that may not be loaded. It crashed the whole JVM suite once. Several modules use it.
+1. **Build it.** `cmake --build` + `ctest`, MinGW `-Werror` and the clang CI line. Then the JVM
+   matrix, then push. Nothing from this session or the previous one has run against a JVM.
+2. **`tests/jvm/modules/borrowed_detour_arg.cpp`** (previous session) has still never run on a
+   JVM. Per this project's own "build-only risk" lesson, build-only modules ship deterministic
+   wrong hard-asserts that only CI catches.
+3. **Tests for this session's surface** — none were written. Needed: `access_error` /
+   `error_message`, the `new_*` helpers cold, `store_object`'s expired-refusal, the collection
+   borrow ctors, `method_proxy::value_t::to_borrowed`, and `type_name`'s fallback.
+4. **Phase 4.4 — the viewer detour pump.** The last real JNI. Needs a build loop and Arno's
+   `payload.cpp` edit resolved first.
+5. **Layer 2 — a real pin** (`ClassLoaderData::_handles` on 11+, `JNIHandles::_global_handles`
+   on 8). Design in `gc_root_feasibility.md` §10. Everything shipped only *detects* relocation.
+   `store_object`'s residual window is a Layer 2 problem.
+6. **The ~400-failure JVM baseline** — untouched, uninvestigated. `java_getter_*` (95),
+   `htm_size_oracle_*` (16), `xchk_*` (15), `const_*` (14). Predates the de-JNI work.
+7. **Roadmap 4.6** — the ~200 stale JNI comments.
 
 ## Small things left on the floor
 
 - **B3**: MSVC `/WX` C4127 ×3 in `tests/test_iterate_entries_safety.cpp`. Two are
-  `if (sizeof(void*) == 8u)` at 1617/2516 (`if constexpr` is the honest fix); the third at
-  line 574 is **not** obviously constant and needs an actual MSVC run — don't guess. Local-only,
-  invisible to CI.
-- `tests/test_jni_local_ref_hygiene_nojvm.cpp` tests only a deleted forwarder — recommended
-  for deletion, not deleted.
-- Latent bugs **L1-L14** catalogued in `ROADMAP_ZERO_JNI.md` §3.2b. **L1** (barrier-less
-  reference store) and **L2** (unconditional compressed-oop assumption) are shipping
-  heap-corruption risks, and their fixes are the same primitives Layer 2 needs.
+  `if (sizeof(void*) == 8u)` at 1617/2516 (`if constexpr` is the honest fix); the third at line
+  574 is **not** obviously constant and needs an actual MSVC run — don't guess.
+- Latent bugs **L1-L14** in `ROADMAP_ZERO_JNI.md` §3.2b. **L1** (barrier-less reference store)
+  and **L2** (unconditional compressed-oop assumption) are shipping heap-corruption risks, and
+  their fixes are the same primitives Layer 2 needs.
 - `borrowed::operator*` returns the `access` proxy, not the wrapper, so the wrapper is one hop
-  further than `*b` suggests (`(*b)->method()`). Pinned by a test; worth revisiting as
-  ergonomics.
+  further than `*b` suggests (`(*b)->method()`). Pinned by a test; worth revisiting.
+- `test_global_ref.cpp` / the `global_ref` ctest target still carry the old name; contents were
+  swept to `oop_pin` but the filenames were not.
 
 ## Useful commands
 
@@ -176,15 +169,18 @@ cmake -S . -B build/x -G Ninja -DCMAKE_BUILD_TYPE=Release -DVMHOOK_WARNINGS_AS_E
 cmake --build build/x --parallel && ctest --test-dir build/x
 
 # restrict a JVM run to named modules
-VMHOOK_JVM_MODULES=borrowed_detour_arg,method_call_dispatch
+VMHOOK_JVM_MODULES=borrowed_detour_arg,method_call_dispatch,repeat_call_stability
 ```
 
+Never use `.localci -NoBuild` as a gate — it silently reuses a stale DLL.
+
 ```bash
-# how the CI triage above was done — diff unique failure names per cell against a baseline run
+# CI failure-diff triage: find REAL regressions in the 21-cell matrix by diffing unique
+# [FAIL] names against a baseline run.  Collapsed 3098 vs 406 failures to 3 real ones.
 gh run view <run> --json jobs > jobs.json
 id=$(jq -r --arg n "jvm · windows · msvc · java 26" '.jobs[]|select(.name==$n)|.databaseId' jobs.json)
 gh run view --job $id --log | grep -o '\[FAIL\] [A-Za-z0-9_]*' | sed 's/\[FAIL\] //' | sort -u
-# NOTE: gh's --jq does NOT accept --arg; pipe to jq separately as above.
-# NOTE: a cell that CRASHED early has a short list — its "new" names are mostly newly-REACHED
-# tests, not regressions.  Only compare cells that completed in both runs.
+# gh's --jq does NOT accept --arg; pipe to jq separately as above.
+# A cell that CRASHED early has a short list — its "new" names are mostly newly-REACHED tests,
+# not regressions.  Only compare cells that completed in BOTH runs.
 ```

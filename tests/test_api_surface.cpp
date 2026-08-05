@@ -33,7 +33,7 @@
 //       static get_method(type_index,name,sig), return_value::set<wrapper>(
 //       nullptr) / set_arg / stack_trace(max_depth), method_proxy's full
 //       accessor + call surface, field_proxy's 5-arg GC-stable ctor,
-//       jni::global_ref's oop()/reset()/handle()/operator bool, and the
+//       vmhook::oop_pin's oop()/reset()/handle()/operator bool, and the
 //       get/set_array_element + signature_for_arg element-type matrices.
 //
 // EVERY static_assert lives in an unevaluated decltype()/is_invocable context,
@@ -872,47 +872,47 @@ namespace matrix
                       vmhook::watch_handle>,
                   "watch_static_field<T,int32>(const char* name, callback)");
 
-    // ===== GROUP 11 — pin() + global_ref MATRIX ==============================
+    // ===== GROUP 11 — pin() + oop_pin MATRIX ==============================
     // pin(oop) and pin(unique_ptr<T>&) over the wrapper-type matrix.
     static_assert(std::is_same_v<
                       decltype(vmhook::pin(std::declval<vmhook::oop_t>())),
-                      vmhook::jni::global_ref>,
-                  "pin(oop_t) -> jni::global_ref");
+                      vmhook::oop_pin>,
+                  "pin(oop_t) -> vmhook::oop_pin");
     static_assert(std::is_same_v<
                       decltype(vmhook::pin(std::declval<std::nullptr_t>())),
-                      vmhook::jni::global_ref>,
-                  "pin(nullptr) -> jni::global_ref");
+                      vmhook::oop_pin>,
+                  "pin(nullptr) -> vmhook::oop_pin");
     template<typename W>
-    inline constexpr bool pin_uptr_global_ref_v =
+    inline constexpr bool pin_uptr_oop_pin_v =
         std::is_same_v<decltype(vmhook::pin(std::declval<const std::unique_ptr<W>&>())),
-                       vmhook::jni::global_ref>;
-    static_assert(pin_uptr_global_ref_v<fx::plain_w>, "pin(unique_ptr<plain_w>&)");
-    static_assert(pin_uptr_global_ref_v<fx::lvl3_w>,  "pin(unique_ptr<lvl3_w>&)");
-    static_assert(pin_uptr_global_ref_v<fx::ntd_w>,   "pin(unique_ptr<ntd_w>&)");
+                       vmhook::oop_pin>;
+    static_assert(pin_uptr_oop_pin_v<fx::plain_w>, "pin(unique_ptr<plain_w>&)");
+    static_assert(pin_uptr_oop_pin_v<fx::lvl3_w>,  "pin(unique_ptr<lvl3_w>&)");
+    static_assert(pin_uptr_oop_pin_v<fx::ntd_w>,   "pin(unique_ptr<ntd_w>&)");
 
-    // jni::global_ref PUBLIC MEMBER surface the extended file does NOT pin:
+    // vmhook::oop_pin PUBLIC MEMBER surface the extended file does NOT pin:
     // oop() / reset() / handle() / explicit operator bool, plus constructibility.
     static_assert(std::is_same_v<
-                      decltype(std::declval<const vmhook::jni::global_ref&>().oop()), vmhook::oop_t>,
-                  "global_ref::oop() must return oop_t");
+                      decltype(std::declval<const vmhook::oop_pin&>().oop()), vmhook::oop_t>,
+                  "oop_pin::oop() must return oop_t");
     static_assert(std::is_same_v<
-                      decltype(std::declval<vmhook::jni::global_ref&>().reset()), void>,
-                  "global_ref::reset() must return void");
+                      decltype(std::declval<vmhook::oop_pin&>().reset()), void>,
+                  "oop_pin::reset() must return void");
     static_assert(std::is_same_v<
-                      decltype(std::declval<const vmhook::jni::global_ref&>().handle()), void*>,
-                  "global_ref::handle() must return void*");
-    static_assert(noexcept(std::declval<const vmhook::jni::global_ref&>().oop()),
-                  "global_ref::oop() must be noexcept");
-    static_assert(noexcept(std::declval<vmhook::jni::global_ref&>().reset()),
-                  "global_ref::reset() must be noexcept");
-    static_assert(std::is_constructible_v<vmhook::jni::global_ref, vmhook::oop_t>,
-                  "global_ref must be constructible from oop_t");
+                      decltype(std::declval<const vmhook::oop_pin&>().handle()), void*>,
+                  "oop_pin::handle() must return void*");
+    static_assert(noexcept(std::declval<const vmhook::oop_pin&>().oop()),
+                  "oop_pin::oop() must be noexcept");
+    static_assert(noexcept(std::declval<vmhook::oop_pin&>().reset()),
+                  "oop_pin::reset() must be noexcept");
+    static_assert(std::is_constructible_v<vmhook::oop_pin, vmhook::oop_t>,
+                  "oop_pin must be constructible from oop_t");
     // explicit operator bool — must be CONTEXTUALLY convertible but NOT
     // implicitly convertible (the conversion is `explicit`).
-    static_assert(std::is_constructible_v<bool, const vmhook::jni::global_ref&>,
-                  "global_ref must be explicitly bool-convertible (usable in if(g))");
-    static_assert(!std::is_convertible_v<vmhook::jni::global_ref, bool>,
-                  "global_ref::operator bool must be EXPLICIT (no implicit bool decay)");
+    static_assert(std::is_constructible_v<bool, const vmhook::oop_pin&>,
+                  "oop_pin must be explicitly bool-convertible (usable in if(g))");
+    static_assert(!std::is_convertible_v<vmhook::oop_pin, bool>,
+                  "oop_pin::operator bool must be EXPLICIT (no implicit bool decay)");
 
     // ===== GROUP 12 — return_value MUTATION SURFACE (overloads the extended ==
     // file omits): set<T> over the trivially-copyable scalar set, the
@@ -1207,7 +1207,7 @@ namespace matrix
     // hook detour parameter or make_unique ctor arg could carry.
     template<typename T>
     inline constexpr bool sig_for_arg_string_v =
-        std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<T>()), std::string>;
+        std::is_same_v<decltype(vmhook::detail::jvm_descriptor_for_arg<T>()), std::string>;
     static_assert(sig_for_arg_string_v<bool>,            "signature_for_arg<bool>");
     static_assert(sig_for_arg_string_v<std::int8_t>,     "signature_for_arg<int8>");
     static_assert(sig_for_arg_string_v<std::int16_t>,    "signature_for_arg<int16>");
@@ -1357,7 +1357,7 @@ static auto run_runtime_noop_checks() -> void
         check("object_base_get_method_type_index_name_sig_no_throw", !threw);
     }
 
-    // --- jni::global_ref public members (oop/reset/handle/operator bool) on an
+    // --- vmhook::oop_pin public members (oop/reset/handle/operator bool) on an
     // inert (default-constructed) handle: all safe, no JVM, no throw.
     {
         bool threw{ false };
@@ -1366,7 +1366,7 @@ static auto run_runtime_noop_checks() -> void
         bool bool_false{ true };
         try
         {
-            vmhook::jni::global_ref g{};            // inert (no NewGlobalRef)
+            vmhook::oop_pin g{};            // inert (no NewGlobalRef)
             oop_null    = g.oop() == nullptr;
             handle_null = g.handle() == nullptr;
             bool_false  = static_cast<bool>(g);
@@ -1374,20 +1374,20 @@ static auto run_runtime_noop_checks() -> void
             g.reset();
         }
         catch (...) { threw = true; }
-        check("inert_global_ref_oop_null", oop_null);
-        check("inert_global_ref_handle_null", handle_null);
-        check("inert_global_ref_bool_false", bool_false == false);
-        check("inert_global_ref_members_do_not_throw", !threw);
+        check("inert_oop_pin_oop_null", oop_null);
+        check("inert_oop_pin_handle_null", handle_null);
+        check("inert_oop_pin_bool_false", bool_false == false);
+        check("inert_oop_pin_members_do_not_throw", !threw);
     }
 
-    // --- pin(oop) round-trip via the global_ref accessors: a null-oop pin is
+    // --- pin(oop) round-trip via the oop_pin accessors: a null-oop pin is
     // inert; oop() is null and operator bool is false.
     {
         bool threw{ false };
         bool inert{ false };
         try
         {
-            vmhook::jni::global_ref g{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
+            vmhook::oop_pin g{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
             inert = (g.oop() == nullptr) && (static_cast<bool>(g) == false);
         }
         catch (...) { threw = true; }
@@ -1651,25 +1651,25 @@ static auto run_extra_noop_checks() -> void
     }
 
     // --- signature_for_arg<T> exact descriptor strings.  This is a compile-time
-    // table (jni_signature_for_arg), so the value is JVM-INDEPENDENT and derived
+    // table (jvm_descriptor_for_arg), so the value is JVM-INDEPENDENT and derived
     // straight from vmhook.hpp:12994-13091.  No JVM is consulted.
     {
         bool threw{ false };
         bool sigs_ok{ false };
         try
         {
-            const std::string s_bool   { vmhook::detail::jni_signature_for_arg<bool>() };
-            const std::string s_i8     { vmhook::detail::jni_signature_for_arg<std::int8_t>() };
-            const std::string s_i16    { vmhook::detail::jni_signature_for_arg<std::int16_t>() };
-            const std::string s_i32    { vmhook::detail::jni_signature_for_arg<std::int32_t>() };
-            const std::string s_i64    { vmhook::detail::jni_signature_for_arg<std::int64_t>() };
-            const std::string s_u16    { vmhook::detail::jni_signature_for_arg<std::uint16_t>() };
-            const std::string s_char   { vmhook::detail::jni_signature_for_arg<char16_t>() };
-            const std::string s_float  { vmhook::detail::jni_signature_for_arg<float>() };
-            const std::string s_double { vmhook::detail::jni_signature_for_arg<double>() };
-            const std::string s_str    { vmhook::detail::jni_signature_for_arg<std::string>() };
-            const std::string s_cstr   { vmhook::detail::jni_signature_for_arg<const char*>() };
-            const std::string s_sv     { vmhook::detail::jni_signature_for_arg<std::string_view>() };
+            const std::string s_bool   { vmhook::detail::jvm_descriptor_for_arg<bool>() };
+            const std::string s_i8     { vmhook::detail::jvm_descriptor_for_arg<std::int8_t>() };
+            const std::string s_i16    { vmhook::detail::jvm_descriptor_for_arg<std::int16_t>() };
+            const std::string s_i32    { vmhook::detail::jvm_descriptor_for_arg<std::int32_t>() };
+            const std::string s_i64    { vmhook::detail::jvm_descriptor_for_arg<std::int64_t>() };
+            const std::string s_u16    { vmhook::detail::jvm_descriptor_for_arg<std::uint16_t>() };
+            const std::string s_char   { vmhook::detail::jvm_descriptor_for_arg<char16_t>() };
+            const std::string s_float  { vmhook::detail::jvm_descriptor_for_arg<float>() };
+            const std::string s_double { vmhook::detail::jvm_descriptor_for_arg<double>() };
+            const std::string s_str    { vmhook::detail::jvm_descriptor_for_arg<std::string>() };
+            const std::string s_cstr   { vmhook::detail::jvm_descriptor_for_arg<const char*>() };
+            const std::string s_sv     { vmhook::detail::jvm_descriptor_for_arg<std::string_view>() };
             sigs_ok =
                 (s_bool == "Z") && (s_i8 == "B") && (s_i16 == "S") && (s_i32 == "I")
                 && (s_i64 == "J") && (s_u16 == "C") && (s_char == "C")
@@ -1717,7 +1717,7 @@ int main()
     check("matrix_g8_for_each_callable_type_matrix", true);
     check("matrix_g9_method_introspection_matrix", true);
     check("matrix_g10_watchers_callable_field_type_matrix", true);
-    check("matrix_g11_pin_global_ref_matrix", true);
+    check("matrix_g11_pin_oop_pin_matrix", true);
     check("matrix_g12_return_value_mutation_surface", true);
     check("matrix_g13_object_accessor_matrix", true);
     check("matrix_g14_field_proxy_ctor_accessor_matrix", true);

@@ -9,17 +9,17 @@
 //
 //   (2) An EXHAUSTIVE compile-time lockdown of the PUBLIC API SURFACE — every
 //       free function and every public type in namespace vmhook:: (plus the one
-//       surviving vmhook::jni:: type, global_ref) is pinned with
+//       surviving vmhook:: type, oop_pin) is pinned with
 //       std::is_invocable_r_v / is_same_v / type-trait static_asserts that fix
 //       its exact callable shape (parameter types + return type) or its
 //       structural traits (move-only, noexcept destructor, base classes,
 //       defaulted members, ...).  If any entry point is removed, renamed, or has
 //       its signature drift, THIS TRANSLATION UNIT FAILS TO COMPILE on every
 //       compiler / platform in CI.  That class of regression is exactly what
-//       this file exists to catch — the global_ref primitives went missing once
+//       this file exists to catch — the oop_pin primitives went missing once
 //       with nothing noticing.
 //
-//       NOTE: the header used to expose a vmhook::jni:: JNI forwarder layer.
+//       NOTE: the header used to expose a vmhook:: JNI forwarder layer.
 //       The de-JNI refactor (eaff990) deleted it; GROUP I below documents,
 //       forwarder by forwarder, which pure-VM entry point inherited the property
 //       and which capabilities have no equivalent at all.
@@ -511,40 +511,40 @@ namespace surface_lock
                   "vmhook::watch_static_field<T, int32>(name, callback) must return watch_handle");
 
     // -----------------------------------------------------------------------
-    // GROUP H — global_ref lifetime primitive + pin()
-    //   jni::global_ref (move-only RAII) / pin(oop) / pin(unique_ptr<T>&)
+    // GROUP H — oop_pin lifetime primitive + pin()
+    //   vmhook::oop_pin (move-only RAII) / pin(oop) / pin(unique_ptr<T>&)
     // -----------------------------------------------------------------------
     static_assert(std::is_same_v<decltype(vmhook::pin(std::declval<vmhook::oop_t>())),
-                                 vmhook::jni::global_ref>,
-                  "vmhook::pin(oop_t) must return jni::global_ref");
+                                 vmhook::oop_pin>,
+                  "vmhook::pin(oop_t) must return vmhook::oop_pin");
     static_assert(std::is_same_v<
                       decltype(vmhook::pin(std::declval<const std::unique_ptr<dummy_wrapper>&>())),
-                      vmhook::jni::global_ref>,
-                  "vmhook::pin(const unique_ptr<T>&) must return jni::global_ref");
+                      vmhook::oop_pin>,
+                  "vmhook::pin(const unique_ptr<T>&) must return vmhook::oop_pin");
     static_assert(noexcept(vmhook::pin(std::declval<vmhook::oop_t>())),
                   "vmhook::pin(oop_t) must be noexcept");
-    // global_ref is move-only with a noexcept destructor.
-    static_assert(std::is_nothrow_default_constructible_v<vmhook::jni::global_ref>,
-                  "jni::global_ref must be nothrow default-constructible");
-    static_assert(std::is_nothrow_move_constructible_v<vmhook::jni::global_ref>,
-                  "jni::global_ref must be nothrow move-constructible");
-    static_assert(std::is_nothrow_move_assignable_v<vmhook::jni::global_ref>,
-                  "jni::global_ref must be nothrow move-assignable");
-    static_assert(!std::is_copy_constructible_v<vmhook::jni::global_ref>,
-                  "jni::global_ref must NOT be copy-constructible (it owns a JNI global ref)");
-    static_assert(!std::is_copy_assignable_v<vmhook::jni::global_ref>,
-                  "jni::global_ref must NOT be copy-assignable");
-    static_assert(std::is_nothrow_destructible_v<vmhook::jni::global_ref>,
-                  "jni::global_ref destructor must be noexcept");
-    static_assert(std::is_constructible_v<vmhook::jni::global_ref, vmhook::oop_t>,
-                  "jni::global_ref must be constructible from a raw oop_t");
+    // oop_pin is move-only with a noexcept destructor.
+    static_assert(std::is_nothrow_default_constructible_v<vmhook::oop_pin>,
+                  "vmhook::oop_pin must be nothrow default-constructible");
+    static_assert(std::is_nothrow_move_constructible_v<vmhook::oop_pin>,
+                  "vmhook::oop_pin must be nothrow move-constructible");
+    static_assert(std::is_nothrow_move_assignable_v<vmhook::oop_pin>,
+                  "vmhook::oop_pin must be nothrow move-assignable");
+    static_assert(!std::is_copy_constructible_v<vmhook::oop_pin>,
+                  "vmhook::oop_pin must NOT be copy-constructible (it owns a JNI global ref)");
+    static_assert(!std::is_copy_assignable_v<vmhook::oop_pin>,
+                  "vmhook::oop_pin must NOT be copy-assignable");
+    static_assert(std::is_nothrow_destructible_v<vmhook::oop_pin>,
+                  "vmhook::oop_pin destructor must be noexcept");
+    static_assert(std::is_constructible_v<vmhook::oop_pin, vmhook::oop_t>,
+                  "vmhook::oop_pin must be constructible from a raw oop_t");
 
     // -----------------------------------------------------------------------
-    // GROUP I — the pure-VM successors of the deleted vmhook::jni:: forwarder
+    // GROUP I — the pure-VM successors of the deleted vmhook:: forwarder
     //   layer.
     //
     //   The de-JNI refactor (eaff990) removed the entire JNI bridge from the
-    //   header.  vmhook::jni:: now contains EXACTLY ONE entity — the global_ref
+    //   header.  vmhook:: now contains EXACTLY ONE entity — the oop_pin
     //   holder, pinned in GROUP H.  Everything this group used to pin is gone:
     //
     //     jni::value / detail::jni_value          jni::decode_object
@@ -555,8 +555,8 @@ namespace surface_lock
     //     jni::exception_clear                     jni::get_static_field_id
     //     jni::klass_from_class_mirror             jni::get_static_object_field
     //     jni::function<slot, fn_t>                jni::call_object_method
-    //     detail::jni_new_global_ref               jni::call_static_object_method
-    //     detail::jni_delete_global_ref
+    //     detail::jni_new_oop_pin               jni::call_static_object_method
+    //     detail::jni_delete_oop_pin
     //
     //   Each of those is handled below in one of two ways: RE-POINTED at the
     //   surviving pure-VM entry point that carries the same property (so the
@@ -623,33 +623,33 @@ namespace surface_lock
                   "klass_from_oop must take a void*");
 
     // RE-POINTED — jni::oop_handle(oop, void*& storage) minted a handle for a
-    // raw oop; detail::jni_new_global_ref / detail::jni_delete_global_ref were
-    // the two primitives behind global_ref.  All three are now internal to the
-    // JNI-free global_ref, which stores and clears the raw oop itself.  The
+    // raw oop; detail::jni_new_oop_pin / detail::jni_delete_oop_pin were
+    // the two primitives behind oop_pin.  All three are now internal to the
+    // JNI-free oop_pin, which stores and clears the raw oop itself.  The
     // original intent of those pins ("this capability went missing once; make it
     // a hard build break") is preserved by pinning the accessor shapes that now
     // ARE the primitive — these were previously only exercised at runtime
-    // (global_ref_*_inert_accessors below), never pinned at compile time.
+    // (oop_pin_*_inert_accessors below), never pinned at compile time.
     static_assert(std::is_same_v<
-                      decltype(std::declval<const vmhook::jni::global_ref&>().oop()),
+                      decltype(std::declval<const vmhook::oop_pin&>().oop()),
                       vmhook::oop_t>,
-                  "jni::global_ref::oop() must return oop_t");
-    static_assert(noexcept(std::declval<const vmhook::jni::global_ref&>().oop()),
-                  "jni::global_ref::oop() must be noexcept");
+                  "vmhook::oop_pin::oop() must return oop_t");
+    static_assert(noexcept(std::declval<const vmhook::oop_pin&>().oop()),
+                  "vmhook::oop_pin::oop() must be noexcept");
     static_assert(std::is_same_v<
-                      decltype(std::declval<const vmhook::jni::global_ref&>().handle()), void*>,
-                  "jni::global_ref::handle() must return void*");
-    static_assert(noexcept(std::declval<const vmhook::jni::global_ref&>().handle()),
-                  "jni::global_ref::handle() must be noexcept");
+                      decltype(std::declval<const vmhook::oop_pin&>().handle()), void*>,
+                  "vmhook::oop_pin::handle() must return void*");
+    static_assert(noexcept(std::declval<const vmhook::oop_pin&>().handle()),
+                  "vmhook::oop_pin::handle() must be noexcept");
     static_assert(std::is_same_v<
-                      decltype(std::declval<vmhook::jni::global_ref&>().reset()), void>,
-                  "jni::global_ref::reset() must return void");
-    static_assert(noexcept(std::declval<vmhook::jni::global_ref&>().reset()),
-                  "jni::global_ref::reset() must be noexcept");
-    static_assert(std::is_constructible_v<bool, vmhook::jni::global_ref>,
-                  "jni::global_ref must be contextually convertible to bool");
-    static_assert(!std::is_convertible_v<vmhook::jni::global_ref, bool>,
-                  "jni::global_ref::operator bool must be EXPLICIT (no implicit bool decay)");
+                      decltype(std::declval<vmhook::oop_pin&>().reset()), void>,
+                  "vmhook::oop_pin::reset() must return void");
+    static_assert(noexcept(std::declval<vmhook::oop_pin&>().reset()),
+                  "vmhook::oop_pin::reset() must be noexcept");
+    static_assert(std::is_constructible_v<bool, vmhook::oop_pin>,
+                  "vmhook::oop_pin must be contextually convertible to bool");
+    static_assert(!std::is_convertible_v<vmhook::oop_pin, bool>,
+                  "vmhook::oop_pin::operator bool must be EXPLICIT (no implicit bool decay)");
 
     // RE-POINTED — the JNI id-and-call quartet (jni::get_method_id,
     // jni::get_static_method_id, jni::get_static_field_id,
@@ -698,21 +698,21 @@ namespace surface_lock
                   "field_proxy::get() must return field_proxy::value_t "
                   "(succeeds jni::get_static_object_field)");
 
-    // SURVIVOR — detail::jni_signature_for_arg<T>() -> std::string.  Pure
+    // SURVIVOR — detail::jvm_descriptor_for_arg<T>() -> std::string.  Pure
     // compile-time descriptor logic with no VM/JNI dependency, so the de-JNI
     // refactor kept it (the name is historical).  Unchanged pins.
     static_assert(std::is_same_v<
-                      decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>,
-                  "detail::jni_signature_for_arg<int>() must return std::string");
+                      decltype(vmhook::detail::jvm_descriptor_for_arg<int>()), std::string>,
+                  "detail::jvm_descriptor_for_arg<int>() must return std::string");
     static_assert(std::is_same_v<
-                      decltype(vmhook::detail::jni_signature_for_arg<bool>()), std::string>,
-                  "detail::jni_signature_for_arg<bool>() must return std::string");
+                      decltype(vmhook::detail::jvm_descriptor_for_arg<bool>()), std::string>,
+                  "detail::jvm_descriptor_for_arg<bool>() must return std::string");
     static_assert(std::is_same_v<
-                      decltype(vmhook::detail::jni_signature_for_arg<double>()), std::string>,
-                  "detail::jni_signature_for_arg<double>() must return std::string");
+                      decltype(vmhook::detail::jvm_descriptor_for_arg<double>()), std::string>,
+                  "detail::jvm_descriptor_for_arg<double>() must return std::string");
     static_assert(std::is_same_v<
-                      decltype(vmhook::detail::jni_signature_for_arg<std::string>()), std::string>,
-                  "detail::jni_signature_for_arg<std::string>() must return std::string");
+                      decltype(vmhook::detail::jvm_descriptor_for_arg<std::string>()), std::string>,
+                  "detail::jvm_descriptor_for_arg<std::string>() must return std::string");
     // SURVIVOR — vmhook::make_unique<T>(args...) -> unique_ptr<T>.  It never was
     // a jni:: name (the old comment here said "jni::make_unique", which was
     // wrong even before eaff990); these two pins add the const-string& argument
@@ -1859,25 +1859,25 @@ int main()
         check("reanchor_classes_via_oop_does_not_throw", !threw);
     }
 
-    // --- pin(oop) / pin(unique_ptr<T>&): no JVM -> inert global_ref -------
-    // The JNI-free global_ref just stores the raw oop; global_ref{ null oop }
+    // --- pin(oop) / pin(unique_ptr<T>&): no JVM -> inert oop_pin -------
+    // The JNI-free oop_pin just stores the raw oop; oop_pin{ null oop }
     // therefore holds nullptr, makes no VM call at all, and its destructor is a
-    // no-op.  pin(empty unique_ptr) likewise yields a default (inert) global_ref.
+    // no-op.  pin(empty unique_ptr) likewise yields a default (inert) oop_pin.
     {
         bool threw{ false };
         try
         {
-            vmhook::jni::global_ref g1{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
+            vmhook::oop_pin g1{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
             std::unique_ptr<dummy_wrapper> empty_uptr{};
-            vmhook::jni::global_ref g2{ vmhook::pin(empty_uptr) };
-            vmhook::jni::global_ref g3{};                 // default-constructed
-            vmhook::jni::global_ref g4{ std::move(g3) };  // move-construct inert
+            vmhook::oop_pin g2{ vmhook::pin(empty_uptr) };
+            vmhook::oop_pin g3{};                 // default-constructed
+            vmhook::oop_pin g4{ std::move(g3) };  // move-construct inert
             g2 = std::move(g4);                           // move-assign inert
             (void)g1;
             (void)g2;
         }
         catch (...) { threw = true; }
-        check("pin_and_global_ref_inert_do_not_throw", !threw);
+        check("pin_and_oop_pin_inert_do_not_throw", !threw);
     }
 
     // =====================================================================
@@ -2134,8 +2134,8 @@ int main()
         check("object_null_wrapper_get_instance_null", obj.get_instance() == nullptr);
     }
 
-    // --- jni::global_ref inert-state accessors: no JVM, never deref ----------
-    // A default-constructed / null-pinned global_ref keeps its stored oop at
+    // --- vmhook::oop_pin inert-state accessors: no JVM, never deref ----------
+    // A default-constructed / null-pinned oop_pin keeps its stored oop at
     // nullptr, so operator bool() is false, oop() returns null, handle() (the
     // retained-for-compatibility spelling of the same field) is null, and
     // reset() is an idempotent no-op.  Since the de-JNI refactor the holder
@@ -2148,12 +2148,12 @@ int main()
         bool null_pin_inert{ false };
         try
         {
-            vmhook::jni::global_ref g_default{};
+            vmhook::oop_pin g_default{};
             default_inert = !static_cast<bool>(g_default)
                          && g_default.oop() == nullptr
                          && g_default.handle() == nullptr;
 
-            vmhook::jni::global_ref g_null{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
+            vmhook::oop_pin g_null{ vmhook::pin(static_cast<vmhook::oop_t>(nullptr)) };
             null_pin_inert = !static_cast<bool>(g_null)
                           && g_null.oop() == nullptr
                           && g_null.handle() == nullptr;
@@ -2166,9 +2166,9 @@ int main()
                           && g_null.handle() == nullptr;
         }
         catch (...) { threw = true; }
-        check("global_ref_default_inert_accessors", default_inert);
-        check("global_ref_null_pin_inert_accessors", null_pin_inert);
-        check("global_ref_inert_accessors_do_not_throw", !threw);
+        check("oop_pin_default_inert_accessors", default_inert);
+        check("oop_pin_null_pin_inert_accessors", null_pin_inert);
+        check("oop_pin_inert_accessors_do_not_throw", !threw);
     }
 
     // --- NEVER-THROW BLANKET over the remaining no-JVM surface ---------------
@@ -2228,7 +2228,7 @@ int main()
     check("surface_lock_groupE_enumeration_deopt_pinned", true);
     check("surface_lock_groupF_string_array_helpers_pinned", true);
     check("surface_lock_groupG_watchers_pinned", true);
-    check("surface_lock_groupH_global_ref_pin_pinned", true);
+    check("surface_lock_groupH_oop_pin_pin_pinned", true);
     check("surface_lock_groupI_purevm_jni_successors_pinned", true);
     check("surface_lock_groupJ_public_type_traits_pinned", true);
     check("wave14_additive_degenerate_input_deepening_present", true);

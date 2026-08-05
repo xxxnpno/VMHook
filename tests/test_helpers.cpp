@@ -8,7 +8,7 @@
 //   * vmhook::os::detail_dr::build_dr7   (Windows + x86_64 only)
 //   * vmhook::array_length / get_array_element / set_array_element on a fake buffer
 //   * vmhook::detail::is_unique_ptr        (unique_ptr<W> arg unwrap trait)
-//   * vmhook::detail::jni_signature_for_arg (C++ arg type -> JVM descriptor)
+//   * vmhook::detail::jvm_descriptor_for_arg (C++ arg type -> JVM descriptor)
 //   * the type_to_class_map / g_type_factory_map wrapper registry round-trip
 //
 // All cases run without a JVM in-process.
@@ -17,7 +17,7 @@
 // jni_value, detail::write_jni_arg_to_slot, detail::jni_delete_local_ref, the
 // public vmhook::jni::* forwarder namespace, method_proxy::call_jni).  Checks
 // in this file that observed those APIs were either re-pointed at the
-// surviving pure-VM equivalent (detail::jni_signature_for_arg /
+// surviving pure-VM equivalent (detail::jvm_descriptor_for_arg /
 // detail::is_unique_ptr) or deleted; every deletion site carries a
 // "REMOVED (de-JNI refactor)" comment naming what went and why.
 
@@ -622,7 +622,7 @@ static auto test_format_log_safe_on_bad_pattern() -> void
 //     RE-POINTED at the two surviving consumers of the SAME trait:
 //       * the trait itself — value_type_t must name the wrapped type, never
 //         the `bool` inherited from std::integral_constant (compile time), and
-//       * detail::jni_signature_for_arg<std::unique_ptr<W>>(), whose
+//       * detail::jvm_descriptor_for_arg<std::unique_ptr<W>>(), whose
 //         unique_ptr branch unwraps via is_unique_ptr<...>::value_type_t and
 //         then resolves the wrapper by typeid.  Re-introducing the shadow
 //         makes wrapper_type == bool, which (a) trips that branch's
@@ -693,22 +693,22 @@ static auto test_unique_ptr_arg_unwrap_not_shadowed() -> void
 
     // The by-value wrapper is the control...
     check("unique_ptr_unwrap_by_value_wrapper_resolves",
-          vmhook::detail::jni_signature_for_arg<test_wrapper_helpers>() == expected);
+          vmhook::detail::jvm_descriptor_for_arg<test_wrapper_helpers>() == expected);
     // ...and unique_ptr<W> must land on the SAME descriptor.  Under the
     // shadowing bug this resolved typeid(bool) and fell back to Object.
     check("unique_ptr_unwrap_unique_ptr_resolves_same_class",
-          vmhook::detail::jni_signature_for_arg<std::unique_ptr<test_wrapper_helpers>>()
+          vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<test_wrapper_helpers>>()
               == expected);
     check("unique_ptr_unwrap_not_object_fallback",
-          vmhook::detail::jni_signature_for_arg<std::unique_ptr<test_wrapper_helpers>>()
+          vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<test_wrapper_helpers>>()
               != "Ljava/lang/Object;");
     // A custom deleter must not change the descriptor either.
     check("unique_ptr_unwrap_custom_deleter_resolves_same_class",
-          vmhook::detail::jni_signature_for_arg<
+          vmhook::detail::jvm_descriptor_for_arg<
               std::unique_ptr<test_wrapper_helpers, test_wrapper_deleter>>() == expected);
     // cv/ref spellings decay to the same descriptor.
     check("unique_ptr_unwrap_const_ref_resolves_same_class",
-          vmhook::detail::jni_signature_for_arg<
+          vmhook::detail::jvm_descriptor_for_arg<
               const std::unique_ptr<test_wrapper_helpers>&>() == expected);
 
     // Restore global state so the suite leaves no side effects.
@@ -720,7 +720,7 @@ static auto test_unique_ptr_arg_unwrap_not_shadowed() -> void
     // After the erase the read path re-evaluates the map and the documented
     // fallback returns — proving the resolution above was a real lookup.
     check("unique_ptr_unwrap_after_cleanup_falls_back",
-          vmhook::detail::jni_signature_for_arg<std::unique_ptr<test_wrapper_helpers>>()
+          vmhook::detail::jvm_descriptor_for_arg<std::unique_ptr<test_wrapper_helpers>>()
               == "Ljava/lang/Object;");
 }
 
@@ -733,7 +733,7 @@ static auto test_unique_ptr_arg_unwrap_not_shadowed() -> void
 // property cannot be re-pointed — only deleted.
 
 // ---------------------------------------------------------------------------
-// 11. detail::jni_signature_for_arg — the C++ argument type -> JVM type
+// 11. detail::jvm_descriptor_for_arg — the C++ argument type -> JVM type
 //     descriptor mapping (test_signature_for_arg, below).  It returns a
 //     std::string (non-constexpr), so the mapping is pinned at runtime rather
 //     than via static_assert.
@@ -867,31 +867,31 @@ static auto test_return_value_set_nullptr_for_wrapper() -> void
 
 static auto test_signature_for_arg() -> void
 {
-    check("jni_signature_for_arg<bool> == 'Z'",
-          vmhook::detail::jni_signature_for_arg<bool>() == "Z");
-    check("jni_signature_for_arg<int8_t> == 'B'",
-          vmhook::detail::jni_signature_for_arg<std::int8_t>() == "B");
-    check("jni_signature_for_arg<int16_t> == 'S'",
-          vmhook::detail::jni_signature_for_arg<std::int16_t>() == "S");
-    check("jni_signature_for_arg<uint16_t> == 'C'",
-          vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C");
-    check("jni_signature_for_arg<int32_t> == 'I'",
-          vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I");
-    check("jni_signature_for_arg<int64_t> == 'J'",
-          vmhook::detail::jni_signature_for_arg<std::int64_t>() == "J");
-    check("jni_signature_for_arg<float> == 'F'",
-          vmhook::detail::jni_signature_for_arg<float>() == "F");
-    check("jni_signature_for_arg<double> == 'D'",
-          vmhook::detail::jni_signature_for_arg<double>() == "D");
-    check("jni_signature_for_arg<string> == 'Ljava/lang/String;'",
-          vmhook::detail::jni_signature_for_arg<std::string>() == "Ljava/lang/String;");
-    check("jni_signature_for_arg<string_view> == 'Ljava/lang/String;'",
-          vmhook::detail::jni_signature_for_arg<std::string_view>() == "Ljava/lang/String;");
-    check("jni_signature_for_arg<const char*> == 'Ljava/lang/String;'",
-          vmhook::detail::jni_signature_for_arg<const char*>() == "Ljava/lang/String;");
+    check("jvm_descriptor_for_arg<bool> == 'Z'",
+          vmhook::detail::jvm_descriptor_for_arg<bool>() == "Z");
+    check("jvm_descriptor_for_arg<int8_t> == 'B'",
+          vmhook::detail::jvm_descriptor_for_arg<std::int8_t>() == "B");
+    check("jvm_descriptor_for_arg<int16_t> == 'S'",
+          vmhook::detail::jvm_descriptor_for_arg<std::int16_t>() == "S");
+    check("jvm_descriptor_for_arg<uint16_t> == 'C'",
+          vmhook::detail::jvm_descriptor_for_arg<std::uint16_t>() == "C");
+    check("jvm_descriptor_for_arg<int32_t> == 'I'",
+          vmhook::detail::jvm_descriptor_for_arg<std::int32_t>() == "I");
+    check("jvm_descriptor_for_arg<int64_t> == 'J'",
+          vmhook::detail::jvm_descriptor_for_arg<std::int64_t>() == "J");
+    check("jvm_descriptor_for_arg<float> == 'F'",
+          vmhook::detail::jvm_descriptor_for_arg<float>() == "F");
+    check("jvm_descriptor_for_arg<double> == 'D'",
+          vmhook::detail::jvm_descriptor_for_arg<double>() == "D");
+    check("jvm_descriptor_for_arg<string> == 'Ljava/lang/String;'",
+          vmhook::detail::jvm_descriptor_for_arg<std::string>() == "Ljava/lang/String;");
+    check("jvm_descriptor_for_arg<string_view> == 'Ljava/lang/String;'",
+          vmhook::detail::jvm_descriptor_for_arg<std::string_view>() == "Ljava/lang/String;");
+    check("jvm_descriptor_for_arg<const char*> == 'Ljava/lang/String;'",
+          vmhook::detail::jvm_descriptor_for_arg<const char*>() == "Ljava/lang/String;");
 
     // REMOVED (de-JNI refactor): three "jni::signature_for_arg<T> matches
-    // detail::jni_signature_for_arg<T>" drift checks.  The public
+    // detail::jvm_descriptor_for_arg<T>" drift checks.  The public
     // vmhook::jni::signature_for_arg forwarder was deleted, so both sides of
     // the comparison now name the same function and the check is a tautology
     // rather than a delegation guard.  The mapping itself stays covered by
@@ -907,9 +907,9 @@ static auto test_signature_for_arg() -> void
 // and the local-ref lifetime concept are all gone; there is no surviving
 // pure-VM analogue of "which union member / does this need releasing".
 // The ARGUMENT-TYPE-MAPPING half of its intent (which JVM value kind each C++
-// type maps to) is re-pointed onto detail::jni_signature_for_arg and is
+// type maps to) is re-pointed onto detail::jvm_descriptor_for_arg and is
 // already asserted for every one of these types by test_signature_for_arg
-// above and, exhaustively, by test_jni_signature_for_arg_exhaustive (E6).
+// above and, exhaustively, by test_jvm_descriptor_for_arg_exhaustive (E6).
 
 // ---------------------------------------------------------------------------
 // 15. iterate_struct_entries / iterate_type_entries hardening
@@ -1972,7 +1972,7 @@ static auto test_build_dr7_exhaustive() -> void
 
 // ---------------------------------------------------------------------------
 // E5. Factory-registry round-trip — type_to_class_map / g_type_factory_map /
-//     jni_signature_for_arg.  THE feature that lives in this file because it
+//     jvm_descriptor_for_arg.  THE feature that lives in this file because it
 //     needs the runtime registry (register_class itself requires a live JVM
 //     via find_class, so in a no-JVM process we populate the public maps
 //     directly with exactly what register_class<T>() would write, then drive
@@ -2000,14 +2000,14 @@ namespace {
 
 static auto test_factory_registry_roundtrip() -> void
 {
-    using vmhook::detail::jni_signature_for_arg;
+    using vmhook::detail::jvm_descriptor_for_arg;
 
     // ---- Unregistered: both the by-value-object branch and the unique_ptr
     //      branch must hit the documented "Ljava/lang/Object;" fallback.
     check("registry_unregistered_object_falls_back_to_Object",
-          jni_signature_for_arg<registry_wrapper_unreg>() == "Ljava/lang/Object;");
+          jvm_descriptor_for_arg<registry_wrapper_unreg>() == "Ljava/lang/Object;");
     check("registry_unregistered_unique_ptr_falls_back_to_Object",
-          jni_signature_for_arg<std::unique_ptr<registry_wrapper_unreg>>()
+          jvm_descriptor_for_arg<std::unique_ptr<registry_wrapper_unreg>>()
               == "Ljava/lang/Object;");
 
     // ---- Register registry_wrapper exactly the way register_class<T>() would,
@@ -2028,9 +2028,9 @@ static auto test_factory_registry_roundtrip() -> void
     // ---- Registered: the signature now resolves to the JVM class name.
     const std::string expected_sig{ "L" + class_name + ";" };
     check("registry_registered_object_signature_resolves",
-          jni_signature_for_arg<registry_wrapper>() == expected_sig);
+          jvm_descriptor_for_arg<registry_wrapper>() == expected_sig);
     check("registry_registered_unique_ptr_signature_resolves",
-          jni_signature_for_arg<std::unique_ptr<registry_wrapper>>() == expected_sig);
+          jvm_descriptor_for_arg<std::unique_ptr<registry_wrapper>>() == expected_sig);
 
     // ---- REMOVED (de-JNI refactor): "the public jni:: wrapper must delegate
     //      without drift" — vmhook::jni::signature_for_arg no longer exists, so
@@ -2059,8 +2059,8 @@ static auto test_factory_registry_roundtrip() -> void
 
     // ---- Determinism: a second signature query is identical.
     check("registry_signature_deterministic",
-          jni_signature_for_arg<registry_wrapper>()
-              == jni_signature_for_arg<registry_wrapper>());
+          jvm_descriptor_for_arg<registry_wrapper>()
+              == jvm_descriptor_for_arg<registry_wrapper>());
 
     // ---- Restore global state so the suite is side-effect-free.
     {
@@ -2072,11 +2072,11 @@ static auto test_factory_registry_roundtrip() -> void
     // ---- After cleanup, the type once again resolves to the fallback,
     //      proving both the erase worked and the read path re-evaluates the map.
     check("registry_after_cleanup_falls_back_again",
-          jni_signature_for_arg<registry_wrapper>() == "Ljava/lang/Object;");
+          jvm_descriptor_for_arg<registry_wrapper>() == "Ljava/lang/Object;");
 }
 
 // ---------------------------------------------------------------------------
-// E6. detail::jni_signature_for_arg — EXHAUSTIVE over the full set of
+// E6. detail::jvm_descriptor_for_arg — EXHAUSTIVE over the full set of
 //     SUPPORTED C++ argument types, asserting the exact descriptor for each.
 //     (The "and the public jni::signature_for_arg wrapper delegates with zero
 //     drift" half was REMOVED by the de-JNI refactor: the public forwarder
@@ -2095,11 +2095,11 @@ static auto sig_pair_ok(const char* tag, std::string_view want) -> void
 {
     // Was a detail-vs-public-wrapper pair check; the wrapper is gone, so this
     // now pins the single surviving implementation against the expectation.
-    const std::string detail_sig{ vmhook::detail::jni_signature_for_arg<arg_type>() };
+    const std::string detail_sig{ vmhook::detail::jvm_descriptor_for_arg<arg_type>() };
     check(tag, detail_sig == want);
 }
 
-static auto test_jni_signature_for_arg_exhaustive() -> void
+static auto test_jvm_descriptor_for_arg_exhaustive() -> void
 {
     // String-like family -> Ljava/lang/String;
     sig_pair_ok<std::string>("sig_exhaustive_string", "Ljava/lang/String;");
@@ -2656,7 +2656,7 @@ static auto test_field_proxy_set_size_guard_matrix() -> void
 // surviving pure-VM type has a union representation or a local-ref release
 // flag to observe, so the union/needs_release properties are deleted outright.
 // Their ARGUMENT-TYPE-MAPPING intent (which JVM kind each C++ primitive maps
-// to) survives via detail::jni_signature_for_arg and is already asserted for
+// to) survives via detail::jvm_descriptor_for_arg and is already asserted for
 // every type E11 swept - bool, int8_t, int16_t, uint16_t, int32_t, int64_t,
 // float, double - by E6 above.  Value-fidelity of narrow-to-wide primitive
 // stores keeps its own coverage in E7 (return_value::set sign-extension /
@@ -3467,7 +3467,7 @@ int main()
     test_build_dr7_applier_roundtrip();
 #endif
     test_factory_registry_roundtrip();
-    test_jni_signature_for_arg_exhaustive();
+    test_jvm_descriptor_for_arg_exhaustive();
     test_return_value_set_sign_extension_exhaustive();
     test_untag_pointer_exhaustive();
     test_is_valid_pointer_gates_array_helpers();

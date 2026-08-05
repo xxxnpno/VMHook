@@ -3,52 +3,58 @@ package vmhook.fixtures;
 import vmhook.Harness;
 
 /**
- * Fixture for the "method_call_jni_fallback" feature: exercises
- * vmhook::method_proxy::call() over EVERY return type and argument shape, with
- * the deliberate intent of driving the JNI invocation FALLBACK path
- * (method_proxy::call_jni, vmhook.hpp ~12488-13064).
+ * Fixture for the "method_call_dispatch" feature: exercises
+ * vmhook::method_proxy::call() over EVERY return type and argument shape.
  *
- * WHY THIS HITS call_jni: method_proxy::call() first probes
- * detail::find_call_stub_entry() (StubRoutines::_call_stub_entry).  When that
- * VMStruct is present (typically JDK 8..20) call() dispatches through the
- * interpreter call-stub fast path; when it is ABSENT (JDK 21+, and in fact on
- * every JDK the CI exercises, where the entry is not exported via VMStructs)
- * call() short-circuits into call_jni(), which marshals args into a jvalue[]
- * and dispatches via Call(Static)?<Type>MethodA.  The native module records
- * which path is live (find_call_stub_entry) so the same assertions are valid on
- * either dispatcher — the converted value_t must be identical.
+ * HISTORY, because it explains the shape of this file.  It was written as
+ * MethodCallJni, to drive a SECOND dispatcher: call() probed
+ * detail::find_call_stub_entry(), and when the entry was absent it
+ * short-circuited into call_jni(), which marshalled args into a jvalue[] and
+ * dispatched via Call(Static)?&lt;Type&gt;MethodA.  The fixture was built on the
+ * belief that the entry is absent on JDK 21+, so CI naturally drove that path.
  *
- * Coverage shape (every return type x arg shape the audit's scenario list
- * enumerates):
+ * Both halves were wrong.  StubRoutines::_call_stub_entry was never published
+ * through VMStructs on ANY JDK, so find_call_stub_entry() returned null
+ * everywhere and call() was a silent no-op - the "fallback" was not a fallback,
+ * it was the only thing that ever ran.  The entry is now DERIVED from
+ * StubRoutines::_call_stub_return_address, resolves on 8/21/26 alike, and the
+ * JNI dispatcher has been deleted with it.  There is one dispatch path.
+ *
+ * So this fixture is now what it was always really worth: the widest single
+ * exercise of call() semantics in the suite.
+ *
+ * Coverage shape (every return type x arg shape):
  *   - return types : void / boolean(Z) / byte(B) / char(C) / short(S) / int(I)
  *                    / long(J) / float(F) / double(D) / String / Object,
  *   - arg shapes   : no-arg, single primitive, String arg, Object arg,
  *                    MULTI-ARG including long + double (each occupies TWO local
- *                    slots on the interpreter path; ONE jvalue cell on the JNI
- *                    path — the marshaller must agree either way),
- *   - dispatch kind: INSTANCE (Call<Type>MethodA) AND STATIC
- *                    (CallStatic<Type>MethodA — static path resolves the jclass
- *                    via the declaring class name through FindClass),
- *   - JNI-fallback stress:
- *       * a TIGHT LOOP of String-returning calls (the audit flags a local-ref
- *         leak: every String return / String arg creates a JNI local ref that
- *         must be released or HotSpot's default 16-entry local-ref table
- *         overflows; once starved, later calls return "" — the native side
- *         asserts the result is stable across the loop),
- *       * a TIGHT LOOP of String-ARG calls (NewStringUTF local ref per call),
- *       * a TIGHT LOOP of long+double MULTI-ARG primitive calls (the
- *         union-aliasing footgun: a primitive jvalue cell must NEVER be handed
- *         to DeleteLocalRef — the loop must not corrupt state),
- *       * REPEATED calls on the SAME proxy (cache warm-up: cached_method_id /
- *         cached_class_handle reused — no state corruption across iterations),
+ *                    slots, so the marshaller must not let later args drift),
+ *   - dispatch kind: INSTANCE and STATIC, interleaved,
+ *   - repeat-call stability:
+ *       * a TIGHT LOOP of String-returning calls,
+ *       * a TIGHT LOOP of String-ARG calls,
+ *       * a TIGHT LOOP of long+double MULTI-ARG primitive calls,
+ *       * REPEATED calls on the SAME proxy (the resolved method is reused - no
+ *         state corruption across iterations),
  *       * INSTANCE vs STATIC interleaving.
+ *     These began as JNI local-reference-leak guards, where a leak starved
+ *     HotSpot's 16-entry table and later calls silently returned "".  They are
+ *     KEPT because they remain the sharpest available characterization of
+ *     "call() accumulates no per-call state", which the surviving dispatcher
+ *     has to satisfy just as much.
+ *   - exception discipline: a throwing callee is reported through value_t and
+ *     its pending exception cleared off the JavaThread.
  *
  * Every value-returning method here uses a recognizable boundary value so the
  * native side can pin the exact decode (sign-extension for B/S/I/J,
- * zero-extension for C, IEEE-754 fidelity for F/D, modified-UTF-8 for String on
- * the JNI path).  Every void / arg-consuming method records its invocation and
- * arguments into observable static fields so the native side can prove the body
- * actually ran with the right arguments even when nothing is returned.
+ * zero-extension for C, IEEE-754 fidelity for F/D, exact bytes for String).
+ * Every void / arg-consuming method records its invocation and arguments into
+ * observable static fields so the native side can prove the body actually ran
+ * with the right arguments even when nothing is returned.
+ *
+ * Some string constants below still read "jni-..." - they are opaque test DATA
+ * mirrored by exact-match assertions on the native side, not descriptions of a
+ * code path.  Changing them means changing both sides in lockstep for no gain.
  *
  * How the native module drives it: it hooks {@link #trigger(int)} (the only
  * context where vmhook::hotspot::current_java_thread is set, which call()
@@ -57,7 +63,7 @@ import vmhook.Harness;
  *
  * Java 8 syntax only (no var / records / switch-expressions / lambdas).
  */
-public final class MethodCallJni
+public final class MethodCallDispatch
 {
     /** Native sets this true to request the action; clears it after. */
     public static volatile boolean go;
@@ -174,7 +180,7 @@ public final class MethodCallJni
 
     /** No-arg constructor: side-effect is ONLY the static counter bump, so the
      *  nonvirtual re-invocation test can re-run it on a live object harmlessly. */
-    public MethodCallJni()
+    public MethodCallDispatch()
     {
         ctorCalls++;
     }
@@ -365,13 +371,13 @@ public final class MethodCallJni
 
     // Object return (non-String reference): returns SINGLETON itself, so the
     // native side can prove the returned wrapper's OOP == the receiver OOP.
-    public MethodCallJni retSelf()
+    public MethodCallDispatch retSelf()
     {
         return this;
     }
 
     // Object return that is null (null reference contract -> null unique_ptr).
-    public MethodCallJni retNullObject()
+    public MethodCallDispatch retNullObject()
     {
         return null;
     }
@@ -541,12 +547,12 @@ public final class MethodCallJni
     public static double sEchoDouble(final double d) { return d; }
 
     // Static Object return (non-String reference): the published SINGLETON.
-    public static MethodCallJni sRetSingleton()
+    public static MethodCallDispatch sRetSingleton()
     {
         return SINGLETON;
     }
 
-    public static MethodCallJni sRetNullObject()
+    public static MethodCallDispatch sRetNullObject()
     {
         return null;
     }
@@ -558,21 +564,21 @@ public final class MethodCallJni
             @Override
             public boolean pending()
             {
-                return MethodCallJni.go && !MethodCallJni.done;
+                return MethodCallDispatch.go && !MethodCallDispatch.done;
             }
 
             @Override
             public void run()
             {
                 // Publish the receiver identity so the Object-arg check is exact.
-                MethodCallJni.selfIdentity = System.identityHashCode(SINGLETON);
+                MethodCallDispatch.selfIdentity = System.identityHashCode(SINGLETON);
 
                 // Drive trigger() through normal bytecode dispatch -> fires the
                 // native interpreter hook; that detour performs every
                 // method_proxy::call() the test asserts on.
                 SINGLETON.trigger(11);
 
-                MethodCallJni.done = true;
+                MethodCallDispatch.done = true;
             }
         });
     }
@@ -582,5 +588,5 @@ public final class MethodCallJni
      * so the native side reaches the instance methods on a stable OOP and so the
      * published identity matches the receiver the detour sees as `self`.
      */
-    public static final MethodCallJni SINGLETON = new MethodCallJni();
+    public static final MethodCallDispatch SINGLETON = new MethodCallDispatch();
 }

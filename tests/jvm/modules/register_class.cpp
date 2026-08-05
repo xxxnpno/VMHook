@@ -75,7 +75,7 @@
 //     dispatch is not a cold-compile fault on the no-SEH MinGW/clang toolchains.
 //
 //   * NO FORCED GC.  This module/fixture never drives System.gc(), so the
-//     forced-GC platform gate (field_introspection / dont_inline / global_ref) does
+//     forced-GC platform gate (field_introspection / dont_inline / oop_pin) does
 //     not apply -- there is no cold-forced-GC crash surface to guard.
 //
 // SAFETY: the ONLY hook is installed via scoped_hook<> and uninstalls on scope

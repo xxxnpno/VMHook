@@ -23,7 +23,7 @@
 //
 // What is intentionally out of scope: invoking a REAL JNIEnv::DeleteLocalRef
 // (no JVM here, slot-23 pointer is nullptr), measuring the HotSpot local-ref
-// table overflow at 16 (that is the live-JVM jni_local_ref_hygiene module's
+// table overflow at 16 (that is the live-JVM repeat_call_stability module's
 // job in tests/jvm/modules/), or fabricating a fake jobject and feeding it to
 // the slot-23 trampoline.  The deepening here is purely the wrapper RAII
 // contract on cold state.
@@ -261,7 +261,7 @@ int main()
     }
     ++asserts; // counted once for the loop
 
-    std::printf("[OK] jni_local_ref_hygiene_nojvm: %d runtime asserts, %d static_asserts\n",
+    std::printf("[OK] repeat_call_stability_nojvm: %d runtime asserts, %d static_asserts\n",
                 asserts, g_static_assert_count);
     return 0;
 }

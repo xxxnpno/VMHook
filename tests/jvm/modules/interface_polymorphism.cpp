@@ -2323,7 +2323,7 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
             // heap).  The detour reads forced_pin.oop() so it always reflects the
             // CURRENT relocated address.  Empty pin => skip (allocation failed).
             const vmhook::oop_t forced_raw{ vmhook::make_java_string("forced-speak-override") };
-            vmhook::jni::global_ref forced_pin{ vmhook::pin(forced_raw) };
+            vmhook::oop_pin forced_pin{ vmhook::pin(forced_raw) };
 
             // Pre-link: dispatch Dog.speak() once so its i2i entry exists before we
             // patch it (install-on-unlinked would otherwise fail).

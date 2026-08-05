@@ -1,4 +1,4 @@
-// gc_relocation_detector JVM test module -- area: gc / jni.global_ref.
+// gc_relocation_detector JVM test module -- area: gc / jni.oop_pin.
 //
 // FEATURE: the GC RELOCATION DETECTOR.
 //
@@ -10,12 +10,12 @@
 //   * vmhook::gc_epoch() / gc_epoch_changed()  -- Layer 1.  A PAIRED sample of
 //     CollectedHeap::_total_collections and the gc-active flag (_is_gc_active up
 //     to JDK 20, _is_stw_gc_active from 21; both probed, no version sniffed).
-//   * vmhook::jni::global_ref  -- records that epoch at construction, so oop()
+//   * vmhook::oop_pin  -- records that epoch at construction, so oop()
 //     returns nullptr once a collection has happened instead of handing back an
 //     address a relocating collector may have invalidated.  is_stale() reports
 //     it; raw_unsafe() still yields the captured address for diagnostics.
 //
-// WHAT MAKES THIS TEST WORTH ANYTHING.  global_ref is explicitly NOT a GC root
+// WHAT MAKES THIS TEST WORTH ANYTHING.  oop_pin is explicitly NOT a GC root
 // (see its class doc) -- it does not keep the object alive.  So the object under
 // test is kept alive from JAVA, in GcRelocationProbe.subject.  That static field
 // IS a real root, which is what makes this test provable rather than assumed:
@@ -30,7 +30,7 @@
 //
 //   HARD, always:
 //     * the fail-closed contract -- a default/empty/never-sampled epoch is
-//       ALWAYS treated as stale, and a default global_ref is stale with a null
+//       ALWAYS treated as stale, and a default oop_pin is stale with a null
 //       oop().  These need no collector and no JVM state at all.
 //     * Layer 0 identifies the collector, and `supported` is exactly the
 //       documented function of the collector + epoch readability.
@@ -76,30 +76,30 @@ namespace
     // ---------------------------------------------------------------------
     //  Compile-time contract of the newly added API surface.
     // ---------------------------------------------------------------------
-    using gref = vmhook::jni::global_ref;
+    using gref = vmhook::oop_pin;
 
     static_assert(!std::is_copy_constructible_v<gref>,
-                  "global_ref must NOT be copy-constructible.");
+                  "oop_pin must NOT be copy-constructible.");
     static_assert(!std::is_copy_assignable_v<gref>,
-                  "global_ref must NOT be copy-assignable.");
+                  "oop_pin must NOT be copy-assignable.");
     static_assert(std::is_nothrow_move_constructible_v<gref>,
-                  "global_ref move ctor must be noexcept.");
+                  "oop_pin move ctor must be noexcept.");
     static_assert(std::is_nothrow_move_assignable_v<gref>,
-                  "global_ref move-assign must be noexcept.");
+                  "oop_pin move-assign must be noexcept.");
     static_assert(std::is_nothrow_default_constructible_v<gref>,
                   "an empty holder must be a noexcept no-op.");
     static_assert(std::is_final_v<gref>,
-                  "global_ref must be final.");
+                  "oop_pin must be final.");
     static_assert(noexcept(std::declval<const gref&>().is_stale()),
-                  "global_ref::is_stale() must be a noexcept observer.");
+                  "oop_pin::is_stale() must be a noexcept observer.");
     static_assert(noexcept(std::declval<const gref&>().raw_unsafe()),
-                  "global_ref::raw_unsafe() must be a noexcept observer.");
+                  "oop_pin::raw_unsafe() must be a noexcept observer.");
     static_assert(noexcept(std::declval<const gref&>().oop()),
-                  "global_ref::oop() must be a noexcept observer.");
+                  "oop_pin::oop() must be a noexcept observer.");
     static_assert(std::is_same_v<decltype(std::declval<const gref&>().is_stale()), bool>,
-                  "global_ref::is_stale() must yield bool.");
+                  "oop_pin::is_stale() must yield bool.");
     static_assert(std::is_same_v<decltype(std::declval<const gref&>().raw_unsafe()), vmhook::oop_t>,
-                  "global_ref::raw_unsafe() must yield a vmhook::oop_t.");
+                  "oop_pin::raw_unsafe() must yield a vmhook::oop_t.");
     static_assert(noexcept(vmhook::vm_capabilities()),
                   "vm_capabilities() must be noexcept (it is read-only).");
     static_assert(noexcept(vmhook::gc_epoch()),
@@ -254,15 +254,15 @@ VMHOOK_JVM_MODULE(gc_relocation_detector)
                   vmhook::gc_epoch_changed(during_pause));
     }
     {
-        const vmhook::jni::global_ref empty{};
-        ctx.check("gc_default_global_ref_is_stale", empty.is_stale());
-        ctx.check("gc_default_global_ref_oop_is_null", empty.oop() == nullptr);
-        ctx.check("gc_default_global_ref_handle_is_null", empty.handle() == nullptr);
-        ctx.check("gc_default_global_ref_is_falsy", !static_cast<bool>(empty));
-        ctx.check("gc_default_global_ref_raw_unsafe_is_null", empty.raw_unsafe() == nullptr);
+        const vmhook::oop_pin empty{};
+        ctx.check("gc_default_oop_pin_is_stale", empty.is_stale());
+        ctx.check("gc_default_oop_pin_oop_is_null", empty.oop() == nullptr);
+        ctx.check("gc_default_oop_pin_handle_is_null", empty.handle() == nullptr);
+        ctx.check("gc_default_oop_pin_is_falsy", !static_cast<bool>(empty));
+        ctx.check("gc_default_oop_pin_raw_unsafe_is_null", empty.raw_unsafe() == nullptr);
     }
     {
-        vmhook::jni::global_ref null_ref{ vmhook::pin(vmhook::oop_t{ nullptr }) };
+        vmhook::oop_pin null_ref{ vmhook::pin(vmhook::oop_t{ nullptr }) };
         ctx.check("gc_pin_nullptr_is_falsy", !static_cast<bool>(null_ref));
         ctx.check("gc_pin_nullptr_oop_is_null", null_ref.oop() == nullptr);
         ctx.check("gc_pin_nullptr_raw_unsafe_is_null", null_ref.raw_unsafe() == nullptr);
@@ -438,7 +438,7 @@ VMHOOK_JVM_MODULE(gc_relocation_detector)
         }
 
         const vmhook::gc_epoch_t pre{ vmhook::gc_epoch() };
-        const vmhook::jni::global_ref ref{ vmhook::pin(vmhook::oop_t{ before }) };
+        const vmhook::oop_pin ref{ vmhook::pin(vmhook::oop_t{ before }) };
 
         // A freshly built ref, before any collection, must be usable.  If a
         // NATURAL collection slipped in between the pin and this read the ref is
@@ -630,7 +630,7 @@ VMHOOK_JVM_MODULE(gc_relocation_detector)
         const vmhook::gc_epoch_t sample{ vmhook::gc_epoch() };
         if (current != nullptr && sample.valid && !sample.gc_active)
         {
-            const vmhook::jni::global_ref rearmed{ vmhook::pin(vmhook::oop_t{ current }) };
+            const vmhook::oop_pin rearmed{ vmhook::pin(vmhook::oop_t{ current }) };
             if (!vmhook::gc_epoch_changed(sample))
             {
                 ctx.check("gc_ref_taken_after_the_collection_is_fresh_again", !rearmed.is_stale());
@@ -663,8 +663,8 @@ VMHOOK_JVM_MODULE(gc_relocation_detector)
         const vmhook::gc_epoch_t sample{ vmhook::gc_epoch() };
         if (current != nullptr && sample.valid && !sample.gc_active)
         {
-            vmhook::jni::global_ref source{ vmhook::pin(vmhook::oop_t{ current }) };
-            vmhook::jni::global_ref moved_to{ std::move(source) };
+            vmhook::oop_pin source{ vmhook::pin(vmhook::oop_t{ current }) };
+            vmhook::oop_pin moved_to{ std::move(source) };
             const bool quiet{ !vmhook::gc_epoch_changed(sample) };
             if (quiet)
             {
@@ -675,7 +675,7 @@ VMHOOK_JVM_MODULE(gc_relocation_detector)
                           source.raw_unsafe() == nullptr && source.oop() == nullptr
                               && source.is_stale());
 
-                vmhook::jni::global_ref target{};
+                vmhook::oop_pin target{};
                 target = std::move(moved_to);
                 ctx.check("gc_move_assign_transfers_the_address_and_epoch",
                           target.raw_unsafe() == current && target.oop() == current

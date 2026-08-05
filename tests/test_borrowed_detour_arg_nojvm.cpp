@@ -11,9 +11,9 @@
 // never handles a raw oop" rule is either enforced or lost.  Adding
 // borrowed<T> there means three separate compile-time tables must agree:
 //
-//   1. extract_frame_arg     -- produces the handle
-//   2. jni_signature_for_arg -- describes it to the JVM as Lclass;
-//   3. is_java_double_slot_v -- says it occupies ONE local slot
+//   1. extract_frame_arg      -- produces the handle
+//   2. jvm_descriptor_for_arg  -- describes it to the JVM as Lclass;
+//   3. is_java_double_slot_v   -- says it occupies ONE local slot
 //
 // Disagreement between (1) and (3) is the nastiest failure mode in this area
 // and has happened before: a wrong slot width does not fail to compile and
@@ -193,29 +193,29 @@ int main()
                                           "vmhook/test/BdaRegistered");
 
         check("sig_registered_borrow_is_its_class",
-              detail::jni_signature_for_arg<vmhook::borrowed<bda_registered>>()
+              detail::jvm_descriptor_for_arg<vmhook::borrowed<bda_registered>>()
               == "Lvmhook/test/BdaRegistered;");
 
         // Taking the argument by const-ref must not change the descriptor.
         check("sig_const_ref_borrow_matches_by_value",
-              detail::jni_signature_for_arg<const vmhook::borrowed<bda_registered>&>()
-              == detail::jni_signature_for_arg<vmhook::borrowed<bda_registered>>());
+              detail::jvm_descriptor_for_arg<const vmhook::borrowed<bda_registered>&>()
+              == detail::jvm_descriptor_for_arg<vmhook::borrowed<bda_registered>>());
 
         // borrowed<W> and unique_ptr<W> name the SAME Java type — they differ in
         // lifetime model, not in what they describe.
         check("sig_borrow_agrees_with_unique_ptr",
-              detail::jni_signature_for_arg<vmhook::borrowed<bda_registered>>()
-              == detail::jni_signature_for_arg<std::unique_ptr<bda_registered>>());
+              detail::jvm_descriptor_for_arg<vmhook::borrowed<bda_registered>>()
+              == detail::jvm_descriptor_for_arg<std::unique_ptr<bda_registered>>());
 
         // The untyped borrow carries no wrapper, so java/lang/Object is its
         // exact descriptor rather than a degraded guess.
         check("sig_untyped_borrow_is_object",
-              detail::jni_signature_for_arg<vmhook::borrowed<>>() == "Ljava/lang/Object;");
+              detail::jvm_descriptor_for_arg<vmhook::borrowed<>>() == "Ljava/lang/Object;");
 
         // An unregistered wrapper degrades to java/lang/Object with a warning
         // rather than failing to compile or emitting a wrong class name.
         check("sig_unregistered_borrow_degrades_to_object",
-              detail::jni_signature_for_arg<vmhook::borrowed<bda_unregistered>>()
+              detail::jvm_descriptor_for_arg<vmhook::borrowed<bda_unregistered>>()
               == "Ljava/lang/Object;");
     }
 

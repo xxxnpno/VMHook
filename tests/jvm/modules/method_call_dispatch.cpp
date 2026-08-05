@@ -40,7 +40,7 @@
 //   * instance vs static   : both dispatch kinds, interleaved.
 //
 // call() must run where current_java_thread is set, i.e. inside a hook detour.
-// So we hook MethodCallJni.trigger(int); the probe calls trigger() on a real
+// So we hook MethodCallDispatch.trigger(int); the probe calls trigger() on a real
 // bytecode dispatch, and the detour performs every call() below on the live
 // receiver + the static methods, recording observations into file-scope atomics.
 #include <vmhook/vmhook.hpp>
@@ -57,15 +57,15 @@
 
 namespace
 {
-    // Wrapper for vmhook.fixtures.MethodCallJni.  Instance helpers convert each
+    // Wrapper for vmhook.fixtures.MethodCallDispatch.  Instance helpers convert each
     // returned value_t into the exact matching C++ type (so the conversion
     // operator is exercised at the right target type); static helpers exercise
     // the CallStatic*MethodA slots / the FindClass-based static jclass path.
-    class method_call_jni : public vmhook::object<method_call_jni>
+    class mcd_fixture : public vmhook::object<mcd_fixture>
     {
     public:
-        explicit method_call_jni(vmhook::oop_t instance) noexcept
-            : vmhook::object<method_call_jni>{ instance }
+        explicit mcd_fixture(vmhook::oop_t instance) noexcept
+            : vmhook::object<mcd_fixture>{ instance }
         {
         }
 
@@ -534,13 +534,13 @@ namespace
     constexpr float        k_arg_float     = 2.5f;          // exact
     constexpr double       k_arg_double    = -8.5;          // exact
 
-    auto run_all(const std::unique_ptr<method_call_jni>& self) -> void
+    auto run_all(const std::unique_ptr<mcd_fixture>& self) -> void
     {
         if (!self)
         {
             return;
         }
-        method_call_jni& s = *self;
+        mcd_fixture& s = *self;
         g_receiver_instance.store(
             reinterpret_cast<std::uintptr_t>(s.get_instance()),
             std::memory_order_relaxed);
@@ -738,18 +738,18 @@ namespace
         }
 
         // ───────── static primitive returns ─────────
-        g_s_bool_true.store(method_call_jni::scall_bool("sRetBoolTrue") ? 1 : 0);
-        g_s_byte.store(method_call_jni::scall_byte("sRetByte"));
-        g_s_char.store(method_call_jni::scall_char("sRetChar"));
-        g_s_short.store(method_call_jni::scall_short("sRetShort"));
-        g_s_int.store(method_call_jni::scall_int("sRetInt"));
-        g_s_long.store(method_call_jni::scall_long("sRetLong"));
-        g_s_float_bits.store(f2bits(method_call_jni::scall_float("sRetFloat")));
+        g_s_bool_true.store(mcd_fixture::scall_bool("sRetBoolTrue") ? 1 : 0);
+        g_s_byte.store(mcd_fixture::scall_byte("sRetByte"));
+        g_s_char.store(mcd_fixture::scall_char("sRetChar"));
+        g_s_short.store(mcd_fixture::scall_short("sRetShort"));
+        g_s_int.store(mcd_fixture::scall_int("sRetInt"));
+        g_s_long.store(mcd_fixture::scall_long("sRetLong"));
+        g_s_float_bits.store(f2bits(mcd_fixture::scall_float("sRetFloat")));
         g_s_float_captured.store(true);
-        g_s_double_bits.store(d2bits(method_call_jni::scall_double("sRetDouble")));
+        g_s_double_bits.store(d2bits(mcd_fixture::scall_double("sRetDouble")));
         g_s_double_captured.store(true);
         {
-            auto p{ method_call_jni::static_method("sRetVoid") };
+            auto p{ mcd_fixture::static_method("sRetVoid") };
             if (p.has_value())
             {
                 g_s_void_is_void.store(p->call().is_void() ? 1 : 0);
@@ -760,7 +760,7 @@ namespace
         g_echo_int.store(static_cast<std::int32_t>(s.get_method("echoInt")->call(k_echo_int)));
         g_echo_long.store(static_cast<std::int64_t>(s.get_method("echoLong")->call(k_echo_long)));
         g_s_echo_int.store(static_cast<std::int32_t>(
-            method_call_jni::static_method("sEchoInt")->call(k_echo_int)));
+            mcd_fixture::static_method("sEchoInt")->call(k_echo_int)));
 
         // ───────── call_jni cache mis-keying (library #3) ─────────
         // ONE held name-only proxy reused across two overloads with DIFFERENT
@@ -828,14 +828,14 @@ namespace
             g_fd_arg_captured.store(true);
         }
         {
-            auto p{ method_call_jni::static_method("sEchoFloat") };
+            auto p{ mcd_fixture::static_method("sEchoFloat") };
             if (p.has_value())
             {
                 g_s_echo_float_bits.store(f2bits(static_cast<float>(p->call(k_echo_float))));
             }
         }
         {
-            auto p{ method_call_jni::static_method("sEchoDouble") };
+            auto p{ mcd_fixture::static_method("sEchoDouble") };
             if (p.has_value())
             {
                 g_s_echo_double_bits.store(d2bits(static_cast<double>(p->call(k_echo_double))));
@@ -894,7 +894,7 @@ namespace
             }
         }
         {
-            auto p{ method_call_jni::static_method("sSixArg") };
+            auto p{ mcd_fixture::static_method("sSixArg") };
             if (p.has_value())
             {
                 g_s_six_arg_ret.store(static_cast<std::int64_t>(
@@ -928,7 +928,7 @@ namespace
             auto p{ s.get_method("consumeNullableObject") };
             if (p.has_value())
             {
-                std::unique_ptr<method_call_jni> null_obj{};
+                std::unique_ptr<mcd_fixture> null_obj{};
                 p->call(null_obj);
                 g_null_obj_ran.store(1);
             }
@@ -960,9 +960,9 @@ namespace
             g_dret_special_captured.store(true);
         }
         {
-            auto pn{ method_call_jni::static_method("sRetFloatNaN") };
-            auto pi{ method_call_jni::static_method("sRetDoublePosInf") };
-            auto pz{ method_call_jni::static_method("sRetDoubleNegZero") };
+            auto pn{ mcd_fixture::static_method("sRetFloatNaN") };
+            auto pi{ mcd_fixture::static_method("sRetDoublePosInf") };
+            auto pz{ mcd_fixture::static_method("sRetDoubleNegZero") };
             if (pn.has_value()) { g_s_fret_nan_bits.store(f2bits(static_cast<float>(pn->call()))); }
             if (pi.has_value()) { g_s_dret_posinf_bits.store(d2bits(static_cast<double>(pi->call()))); }
             if (pz.has_value()) { g_s_dret_negzero_bits.store(d2bits(static_cast<double>(pz->call()))); }
@@ -1064,7 +1064,7 @@ namespace
         g_sum_ild.store(static_cast<std::int64_t>(
             s.get_method("sumILD")->call(k_sum_i, k_sum_j, k_sum_d)));
         g_s_sum_ild.store(static_cast<std::int64_t>(
-            method_call_jni::static_method("sSumILD")->call(k_sum_i, k_sum_j, k_sum_d)));
+            mcd_fixture::static_method("sSumILD")->call(k_sum_i, k_sum_j, k_sum_d)));
 
         // ───────── String returns ─────────
         {
@@ -1077,7 +1077,7 @@ namespace
             }
         }
         {
-            auto p{ method_call_jni::static_method("sRetString") };
+            auto p{ mcd_fixture::static_method("sRetString") };
             if (p.has_value())
             {
                 const auto v{ p->call() };
@@ -1093,7 +1093,7 @@ namespace
             if (p.has_value()) { g_str_inst_not_void.store(p->call().is_void() ? 0 : 1); }
         }
         {
-            auto p{ method_call_jni::static_method("sRetString") };
+            auto p{ mcd_fixture::static_method("sRetString") };
             if (p.has_value()) { g_str_static_not_void.store(p->call().is_void() ? 0 : 1); }
         }
 
@@ -1137,7 +1137,7 @@ namespace
             // copy-init (=), NOT brace-init: value_t's templated conversion
             // operator makes std::unique_ptr<T>{ value_t } ambiguous under MSVC
             // (C2440).  Copy-init resolves the user-defined conversion cleanly.
-            std::unique_ptr<method_call_jni> sp = s.get_method("retSelf")->call();
+            std::unique_ptr<mcd_fixture> sp = s.get_method("retSelf")->call();
             g_self_nonnull.store(sp != nullptr);
             if (sp)
             {
@@ -1151,7 +1151,7 @@ namespace
             }
         }
         {
-            std::unique_ptr<method_call_jni> np = s.get_method("retNullObject")->call();  // copy-init (MSVC C2440)
+            std::unique_ptr<mcd_fixture> np = s.get_method("retNullObject")->call();  // copy-init (MSVC C2440)
             g_null_obj_is_null.store(np == nullptr);
             auto p{ s.get_method("retNullObject") };
             if (p.has_value())
@@ -1160,10 +1160,10 @@ namespace
             }
         }
         {
-            auto sm{ method_call_jni::static_method("sRetSingleton") };
+            auto sm{ mcd_fixture::static_method("sRetSingleton") };
             if (sm.has_value())
             {
-                std::unique_ptr<method_call_jni> sp = sm->call();
+                std::unique_ptr<mcd_fixture> sp = sm->call();
                 g_static_self_nonnull.store(sp != nullptr);
                 if (sp)
                 {
@@ -1171,10 +1171,10 @@ namespace
                         reinterpret_cast<std::uintptr_t>(sp->get_instance()));
                 }
             }
-            auto sn{ method_call_jni::static_method("sRetNullObject") };
+            auto sn{ mcd_fixture::static_method("sRetNullObject") };
             if (sn.has_value())
             {
-                std::unique_ptr<method_call_jni> sp = sn->call();
+                std::unique_ptr<mcd_fixture> sp = sn->call();
                 g_static_null_is_null.store(sp == nullptr);
             }
         }
@@ -1246,10 +1246,10 @@ namespace
                 // "a\0b\0c" — three interior NULs; char len 5, code-point count 5.
                 const std::string nul_payload{ std::string("a\0b\0c", 5) };
                 p->call(nul_payload);
-                g_nul_arg_captured.store(method_call_jni::record_string_called() ? 1 : 0);
-                g_nul_arg_char_len.store(method_call_jni::record_string_char_len());
-                g_nul_arg_cp_count.store(method_call_jni::record_string_cp_count());
-                g_nul_arg_hash.store(method_call_jni::record_string_hash());
+                g_nul_arg_captured.store(mcd_fixture::record_string_called() ? 1 : 0);
+                g_nul_arg_char_len.store(mcd_fixture::record_string_char_len());
+                g_nul_arg_cp_count.store(mcd_fixture::record_string_cp_count());
+                g_nul_arg_hash.store(mcd_fixture::record_string_hash());
             }
         }
         {
@@ -1261,11 +1261,11 @@ namespace
                 // ASCII so a truncation/mangle is unmistakable.
                 const std::string astral_payload{ "X\xF0\x9F\x98\x80Y" };
                 p->call(astral_payload);
-                g_astral_arg_captured.store(method_call_jni::record_string_called() ? 1 : 0);
-                g_astral_arg_char_len.store(method_call_jni::record_string_char_len());
-                g_astral_arg_cp_count.store(method_call_jni::record_string_cp_count());
-                g_astral_arg_first_cp.store(method_call_jni::record_string_first_cp());
-                g_astral_arg_last_cp.store(method_call_jni::record_string_last_cp());
+                g_astral_arg_captured.store(mcd_fixture::record_string_called() ? 1 : 0);
+                g_astral_arg_char_len.store(mcd_fixture::record_string_char_len());
+                g_astral_arg_cp_count.store(mcd_fixture::record_string_cp_count());
+                g_astral_arg_first_cp.store(mcd_fixture::record_string_first_cp());
+                g_astral_arg_last_cp.store(mcd_fixture::record_string_last_cp());
             }
         }
 
@@ -1443,7 +1443,7 @@ namespace
         // The only CallNonvirtualVoidMethodA (invokespecial) path in the whole
         // library is call_jni's 'V' arm for a void <init>/<clinit> on an INSTANCE
         // proxy.  We resolve the no-arg constructor on the live receiver and
-        // call() it: that re-runs MethodCallJni() (which only bumps ctorCalls) via
+        // call() it: that re-runs MethodCallDispatch() (which only bumps ctorCalls) via
         // the nonvirtual slot, so the counter advancing by exactly one — with no
         // pending exception and a void result — proves the nonvirtual constructor
         // dispatch fired correctly and left the thread clean.
@@ -1452,10 +1452,10 @@ namespace
             g_ctor_proxy_found.store(p_ctor.has_value() ? 1 : 0);
             if (p_ctor.has_value())
             {
-                g_ctor_calls_before.store(method_call_jni::ctor_calls());
+                g_ctor_calls_before.store(mcd_fixture::ctor_calls());
                 const auto v{ p_ctor->call() };
                 g_ctor_call_is_void.store(v.is_void() ? 1 : 0);
-                g_ctor_calls_after.store(method_call_jni::ctor_calls());
+                g_ctor_calls_after.store(mcd_fixture::ctor_calls());
                 // call() reports a callee throw through the returned value_t, so
                 // "the constructor dispatch left the thread clean" is a real
                 // readback of that flag — not an assumption.
@@ -1503,7 +1503,7 @@ namespace
                 if (v.threw()) { ++seen_thrown; }
             }
 
-            auto p_ts{ method_call_jni::static_method("sThrowVoid") };
+            auto p_ts{ mcd_fixture::static_method("sThrowVoid") };
             if (p_ts.has_value())
             {
                 const auto v{ p_ts->call() };
@@ -1537,7 +1537,7 @@ namespace
 
 VMHOOK_JVM_MODULE(method_call_dispatch)
 {
-    vmhook::register_class<method_call_jni>("vmhook/fixtures/MethodCallJni");
+    vmhook::register_class<mcd_fixture>("vmhook/fixtures/MethodCallDispatch");
 
     // Record which dispatch path the live JDK uses.  On JDK 21+ (and any JDK
     // that does not export StubRoutines::_call_stub_entry via VMStructs) this is
@@ -1546,10 +1546,10 @@ VMHOOK_JVM_MODULE(method_call_dispatch)
                               std::memory_order_relaxed);
 
     {
-        auto handle{ vmhook::scoped_hook<method_call_jni>(
+        auto handle{ vmhook::scoped_hook<mcd_fixture>(
             "trigger",
             [](vmhook::return_value&,
-               const std::unique_ptr<method_call_jni>& self,
+               const std::unique_ptr<mcd_fixture>& self,
                std::int32_t /*delta*/)
             {
                 g_detour_calls.fetch_add(1, std::memory_order_relaxed);
@@ -1560,13 +1560,13 @@ VMHOOK_JVM_MODULE(method_call_dispatch)
         ctx.check("mcj_hook_installed", handle.installed());
 
         const bool done{ ctx.run_probe(
-            [](bool v) { method_call_jni::set_go(v); },
-            []() { return method_call_jni::get_done(); }) };
+            [](bool v) { mcd_fixture::set_go(v); },
+            []() { return mcd_fixture::get_done(); }) };
 
         ctx.check("mcj_probe_completed", done);
         ctx.check("mcj_detour_fired", g_detour_calls.load(std::memory_order_relaxed) >= 1);
         ctx.check("mcj_detour_saw_self", g_detour_saw_self.load(std::memory_order_relaxed));
-        ctx.check("mcj_trigger_count_advanced", method_call_jni::get_trigger_count() >= 1);
+        ctx.check("mcj_trigger_count_advanced", mcd_fixture::get_trigger_count() >= 1);
 
         const bool stub{ g_call_stub_present.load(std::memory_order_relaxed) };
         ctx.record(std::string{ "[INFO] method_call_dispatch path: " }
@@ -1610,7 +1610,7 @@ VMHOOK_JVM_MODULE(method_call_dispatch)
             ctx.check("mcj_double_e_exact", d == 2.718281828459045);
         }
         ctx.check("mcj_void_instance_is_void", g_void_is_void.load() == 1);
-        ctx.check("mcj_void_instance_side_effect", method_call_jni::void_instance_hits() == 1);
+        ctx.check("mcj_void_instance_side_effect", mcd_fixture::void_instance_hits() == 1);
 
         // ═════════════════════ STATIC primitive returns ═══════════════════════
         ctx.check("mcj_static_bool_true",  g_s_bool_true.load() == 1);
@@ -1634,11 +1634,11 @@ VMHOOK_JVM_MODULE(method_call_dispatch)
             ctx.check("mcj_static_double_neg_1_5", d == -1.5);
         }
         ctx.check("mcj_static_void_is_void", g_s_void_is_void.load() == 1);
-        ctx.check("mcj_static_void_side_effect", method_call_jni::void_static_hits() == 1);
+        ctx.check("mcj_static_void_side_effect", mcd_fixture::void_static_hits() == 1);
 
         // ═════════════════════ single-arg primitive echoes ════════════════════
         ctx.check("mcj_echo_int_passthrough", g_echo_int.load() == k_echo_int);
-        ctx.check("mcj_echo_int_side_effect", method_call_jni::last_echo_arg() == k_post_echo); // last echo was the post-loop one
+        ctx.check("mcj_echo_int_side_effect", mcd_fixture::last_echo_arg() == k_post_echo); // last echo was the post-loop one
         ctx.check("mcj_echo_long_passthrough", g_echo_long.load() == k_echo_long);
         ctx.check("mcj_static_echo_int_passthrough", g_s_echo_int.load() == k_echo_int);
 
@@ -1658,10 +1658,10 @@ VMHOOK_JVM_MODULE(method_call_dispatch)
         ctx.check("mcj_multi_arg_return_correct", g_sum_ild.load() == expected_sum);
         ctx.check("mcj_static_multi_arg_return_correct", g_s_sum_ild.load() == expected_sum);
         // And each argument arrived verbatim at the (instance) body.
-        ctx.check("mcj_multi_arg_called", method_call_jni::multi_prim_called());
-        ctx.check("mcj_multi_arg_int", method_call_jni::multi_arg_int() == k_sum_i);
-        ctx.check("mcj_multi_arg_long", method_call_jni::multi_arg_long() == k_sum_j);
-        ctx.check("mcj_multi_arg_double", method_call_jni::multi_arg_double() == k_sum_d);
+        ctx.check("mcj_multi_arg_called", mcd_fixture::multi_prim_called());
+        ctx.check("mcj_multi_arg_int", mcd_fixture::multi_arg_int() == k_sum_i);
+        ctx.check("mcj_multi_arg_long", mcd_fixture::multi_arg_long() == k_sum_j);
+        ctx.check("mcj_multi_arg_double", mcd_fixture::multi_arg_double() == k_sum_d);
 
         // ═════════════════════ boundary primitive-arg echoes ══════════════════
         // INT_MIN / INT_MAX / -1 / 0 and LONG_MIN / LONG_MAX / -1 round-trip
@@ -1713,27 +1713,27 @@ VMHOOK_JVM_MODULE(method_call_dispatch)
         // ═════════════════════ narrow / wide primitive ARG recorders ══════════
         // Each marshaller arm (Z / B / C / S / F / D) delivered its arg verbatim.
         ctx.check("mcj_arg_record_runs", g_arg_runs.load() == 6);
-        ctx.check("mcj_arg_bool_body_ran", method_call_jni::arg_bool_called());
-        ctx.check("mcj_arg_bool_true", method_call_jni::arg_bool_value());
-        ctx.check("mcj_arg_byte_body_ran", method_call_jni::arg_byte_called());
-        ctx.check("mcj_arg_byte_sign_extends", method_call_jni::arg_byte_value() == k_arg_byte_int);
-        ctx.check("mcj_arg_char_body_ran", method_call_jni::arg_char_called());
-        ctx.check("mcj_arg_char_zero_extends_65535", method_call_jni::arg_char_value() == k_arg_char_int);
-        ctx.check("mcj_arg_short_body_ran", method_call_jni::arg_short_called());
-        ctx.check("mcj_arg_short_sign_extends", method_call_jni::arg_short_value() == k_arg_short_int);
-        ctx.check("mcj_arg_float_body_ran", method_call_jni::arg_float_called());
+        ctx.check("mcj_arg_bool_body_ran", mcd_fixture::arg_bool_called());
+        ctx.check("mcj_arg_bool_true", mcd_fixture::arg_bool_value());
+        ctx.check("mcj_arg_byte_body_ran", mcd_fixture::arg_byte_called());
+        ctx.check("mcj_arg_byte_sign_extends", mcd_fixture::arg_byte_value() == k_arg_byte_int);
+        ctx.check("mcj_arg_char_body_ran", mcd_fixture::arg_char_called());
+        ctx.check("mcj_arg_char_zero_extends_65535", mcd_fixture::arg_char_value() == k_arg_char_int);
+        ctx.check("mcj_arg_short_body_ran", mcd_fixture::arg_short_called());
+        ctx.check("mcj_arg_short_sign_extends", mcd_fixture::arg_short_value() == k_arg_short_int);
+        ctx.check("mcj_arg_float_body_ran", mcd_fixture::arg_float_called());
         {
             float f{ 0.0f };
-            const std::int32_t raw{ method_call_jni::arg_float_bits() };
+            const std::int32_t raw{ mcd_fixture::arg_float_bits() };
             std::uint32_t b{ 0 };
             std::memcpy(&b, &raw, sizeof(b));
             std::memcpy(&f, &b, sizeof(f));
             ctx.check("mcj_arg_float_value_2_5", f == k_arg_float);
         }
-        ctx.check("mcj_arg_double_body_ran", method_call_jni::arg_double_called());
+        ctx.check("mcj_arg_double_body_ran", mcd_fixture::arg_double_called());
         {
             double d{ 0.0 };
-            const std::int64_t raw{ method_call_jni::arg_double_bits() };
+            const std::int64_t raw{ mcd_fixture::arg_double_bits() };
             std::uint64_t b{ 0 };
             std::memcpy(&b, &raw, sizeof(b));
             std::memcpy(&d, &b, sizeof(d));
@@ -1748,24 +1748,24 @@ VMHOOK_JVM_MODULE(method_call_dispatch)
                                          + k_six_e + static_cast<std::int64_t>(k_six_f) };
         ctx.check("mcj_six_arg_instance_return_correct", g_six_arg_ret.load() == expected_six);
         ctx.check("mcj_six_arg_static_return_correct", g_s_six_arg_ret.load() == expected_six);
-        ctx.check("mcj_six_arg_body_ran", method_call_jni::six_arg_called());
-        ctx.check("mcj_six_arg_body_packed_matches", method_call_jni::six_arg_packed() == expected_six);
+        ctx.check("mcj_six_arg_body_ran", mcd_fixture::six_arg_called());
+        ctx.check("mcj_six_arg_body_packed_matches", mcd_fixture::six_arg_packed() == expected_six);
         // result = a + c + (long)b - (long)d ; four consecutive two-slot args.
         const std::int64_t expected_fw{ k_fw_a + k_fw_c
                                         + static_cast<std::int64_t>(k_fw_b)
                                         - static_cast<std::int64_t>(k_fw_d) };
         ctx.check("mcj_four_wide_return_correct", g_four_wide_ret.load() == expected_fw);
-        ctx.check("mcj_four_wide_body_ran", method_call_jni::four_wide_called());
-        ctx.check("mcj_four_wide_body_result_matches", method_call_jni::four_wide_result() == expected_fw);
+        ctx.check("mcj_four_wide_body_ran", mcd_fixture::four_wide_called());
+        ctx.check("mcj_four_wide_body_result_matches", mcd_fixture::four_wide_result() == expected_fw);
 
         // ═════════════════════ null-reference ARG contract ════════════════════
         // A null const char* and a null unique_ptr reached the JVM as Java null.
         ctx.check("mcj_null_string_arg_ran", g_null_str_ran.load() == 1);
-        ctx.check("mcj_null_string_arg_body_ran", method_call_jni::null_str_called());
-        ctx.check("mcj_null_string_arg_was_null", method_call_jni::null_str_was_null());
+        ctx.check("mcj_null_string_arg_body_ran", mcd_fixture::null_str_called());
+        ctx.check("mcj_null_string_arg_was_null", mcd_fixture::null_str_was_null());
         ctx.check("mcj_null_object_arg_ran", g_null_obj_ran.load() == 1);
-        ctx.check("mcj_null_object_arg_body_ran", method_call_jni::null_obj_called());
-        ctx.check("mcj_null_object_arg_was_null", method_call_jni::null_obj_was_null());
+        ctx.check("mcj_null_object_arg_body_ran", mcd_fixture::null_obj_called());
+        ctx.check("mcj_null_object_arg_was_null", mcd_fixture::null_obj_was_null());
 
         // ═════════════════════ float / double SPECIAL-VALUE returns ═══════════
         // IEEE-754 fidelity of the 'F'/'D' return arm for NaN / inf / -0.0 /
@@ -1878,20 +1878,20 @@ VMHOOK_JVM_MODULE(method_call_dispatch)
 
         // ═════════════════════ String/Object arg -> void body ═════════════════
         ctx.check("mcj_consume_string_is_void", g_consume_str_is_void.load() == 1);
-        ctx.check("mcj_consume_string_called", method_call_jni::string_arg_called());
+        ctx.check("mcj_consume_string_called", mcd_fixture::string_arg_called());
         ctx.check("mcj_consume_string_len_exact",
-                  method_call_jni::string_arg_len() == static_cast<std::int32_t>(std::string{ "void-string-arg-jni" }.size()));
+                  mcd_fixture::string_arg_len() == static_cast<std::int32_t>(std::string{ "void-string-arg-jni" }.size()));
         ctx.check("mcj_consume_string_value_exact",
-                  method_call_jni::string_arg_value() == "void-string-arg-jni");
+                  mcd_fixture::string_arg_value() == "void-string-arg-jni");
 
         ctx.check("mcj_consume_object_is_void", g_consume_obj_is_void.load() == 1);
-        ctx.check("mcj_consume_object_called", method_call_jni::object_arg_called());
-        ctx.check("mcj_consume_object_non_null", method_call_jni::object_arg_non_null());
+        ctx.check("mcj_consume_object_called", mcd_fixture::object_arg_called());
+        ctx.check("mcj_consume_object_non_null", mcd_fixture::object_arg_non_null());
         // The body's identityHashCode of the received object equals the receiver's
         // published identity -> the EXACT receiver object reached the void body.
         ctx.check("mcj_consume_object_identity_matches_receiver",
-                  method_call_jni::object_arg_identity() != 0
-                  && method_call_jni::object_arg_identity() == method_call_jni::self_identity());
+                  mcd_fixture::object_arg_identity() != 0
+                  && mcd_fixture::object_arg_identity() == mcd_fixture::self_identity());
 
         // ═════════════════════ Object returns: null contract (BOTH paths) ══════
         // The most important reference-return invariant: a null Java return must
@@ -2035,11 +2035,11 @@ VMHOOK_JVM_MODULE(method_call_dispatch)
                   g_two_loop_mismatches.load() == 0);
         // The loop body's recorded args (from the last iteration) confirm the
         // two-slot long + double survived marshalling.
-        ctx.check("mcj_two_slot_loop_called", method_call_jni::two_slot_called());
+        ctx.check("mcj_two_slot_loop_called", mcd_fixture::two_slot_called());
         ctx.check("mcj_two_slot_last_long",
-                  method_call_jni::two_slot_last_long() == static_cast<std::int64_t>(0x4242424242424242LL));
+                  mcd_fixture::two_slot_last_long() == static_cast<std::int64_t>(0x4242424242424242LL));
         ctx.check("mcj_two_slot_last_double",
-                  method_call_jni::two_slot_last_double() == 1024.0);
+                  mcd_fixture::two_slot_last_double() == 1024.0);
 
         // ═════════════════════ NON-CORRUPTION after the loops ═════════════════
         // A value-returning call after hundreds of JNI dispatches still works.
