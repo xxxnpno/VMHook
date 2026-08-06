@@ -75,3 +75,14 @@ imgui.ini
 .github/
 .localci/
 tests/
+
+# Developer-only, not part of what a consumer clones: the Java fixtures the JVM
+# harness compiles, the injector, the example/speedtest TUs, and the MSBuild
+# project files that predate the CMake build.
+example/
+injector/
+vmhook/src/
+vmhook.slnx
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user

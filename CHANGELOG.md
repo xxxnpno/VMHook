@@ -6,6 +6,18 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [6.0.0] — 2026-08-06
 
+### Added
+- **A compiled library target, `vmhook.lib` / `libvmhook.a` (`vmhook::compiled`),
+  for build time.**  vmhook is header-only, so the archive is not where the code
+  lives — what the target carries is a precompiled header built from
+  `vmhook.hpp`, which consumers inherit by linking it.  A 7-TU project rebuilding
+  all of its sources: 12.3 s → 2.2 s on MSVC 19.44, 12.1 s → 6.8 s on GCC 15.
+  The PCH costs a few seconds to build once per consuming target, so a one-TU
+  project should keep linking `vmhook::vmhook`; nothing in this repository links
+  the new target.  `vmhook::compiled_version()` / `compiled_version_string()`
+  are the archive's only real symbols and exist to catch a `.lib` built from a
+  different checkout than the header that was included.
+
 ### Fixed
 - **A method that is not compiled publishes its own c2i adapter, and that is
   now the first thing asked.**  While `_code` is null, HotSpot keeps

@@ -501,6 +501,21 @@ namespace vmhook
     inline constexpr std::string_view info_tag{ "[VMHook INFO]" };
 
     /*
+        @brief The version the compiled library (vmhook.lib) was built from.
+        @details
+        Declared here, DEFINED only in vmhook/src/vmhook.cpp — so these two link
+        only if you link vmhook::compiled, and a header-only consumer that never
+        calls them is unaffected.  Comparing compiled_version() with
+        VMHOOK_VERSION catches the one mistake a static library can introduce
+        silently: a .lib built from a different checkout than the header you
+        included.
+    */
+    [[nodiscard]] auto compiled_version() noexcept -> std::uint32_t;
+
+    /* @brief @see compiled_version. */
+    [[nodiscard]] auto compiled_version_string() noexcept -> const char*;
+
+    /*
         @brief Exception type thrown internally by VMHook to report unrecoverable errors.
         @details  All public API functions catch vmhook::exception and log the message
         through VMHOOK_LOG before returning a safe default value, so callers never

@@ -216,6 +216,33 @@ auto ray_trace_blocks_hook(vmhook::return_value& return_value, const std::unique
 // run this once before uninjecting
 vmhook::shutdown_hooks();
 ```
+
+## Faster builds
+
+The header is 27k lines and every one of your TUs parses all of it. Link
+`vmhook::compiled` (`vmhook.lib` / `libvmhook.a`) instead of `vmhook::vmhook`
+and your targets inherit a precompiled header built from it:
+
+```cmake
+add_subdirectory(vmhook)
+target_link_libraries(your_payload PRIVATE vmhook::compiled)
+```
+
+A 7-TU project, rebuilding all of its sources: **12.3 s → 2.2 s** on MSVC 19.44,
+**12.1 s → 6.8 s** on GCC 15. The PCH costs a few seconds to build once, so a
+one-TU project gains nothing — keep `vmhook::vmhook` there.
+
+If you consume an installed vmhook rather than a subdirectory, the PCH cannot
+come with it (it is tied to the exact compiler and flags that made it), so ask
+for one yourself:
+
+```cmake
+target_precompile_headers(your_payload PRIVATE <vmhook/vmhook.hpp>)
+```
+
+`vmhook::compiled_version()` returns the version the `.lib` was built from —
+compare it with `VMHOOK_VERSION` if you ever suspect a stale one.
+
 ## How the hook actually works
 
 Nothing here rewrites your Java method. The bytecode is untouched, the class is

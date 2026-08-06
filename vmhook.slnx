@@ -1,8 +1,0 @@
-<Solution>
-  <Configurations>
-    <Platform Name="x64" />
-    <Platform Name="x86" />
-  </Configurations>
-  <Project Path="injector/injector.vcxproj" Id="7c5bd72d-3b2e-41c3-b809-99df15d9f9af" />
-  <Project Path="vmhook/vmhook.vcxproj" Id="cc01df57-c49c-4a6d-abbd-b7ac9d58482f" />
-</Solution>
