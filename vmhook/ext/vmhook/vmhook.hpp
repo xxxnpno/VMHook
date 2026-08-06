@@ -8874,10 +8874,11 @@ namespace vmhook
         */
         struct method_flags_slot
         {
-            void* address{ nullptr };
-            int   width_bytes{ 0 };
-            int   dont_inline_bit{ 0 };
-            bool  confident{ false };
+            void*         address{ nullptr };
+            int           width_bytes{ 0 };
+            int           dont_inline_bit{ 0 };
+            std::uint32_t not_compilable_mask{ 0 };
+            bool          confident{ false };
         };
 
         /*
@@ -8910,6 +8911,15 @@ namespace vmhook
             std::uint64_t offset{ 0 };
             int           width_bytes{ 0 };
             int           dont_inline_bit{ 0 };
+            /*
+                Bits in the SAME word that make HotSpot refuse to compile the
+                method.  Non-zero only for the JDK 21+ MethodFlags::_status
+                layout, where the compile-control bits live alongside
+                _dont_inline; zero on the JDK 11..20 u2 _flags layout, whose
+                compilability bits are in _access_flags and are handled by the
+                legacy NO_COMPILE mask instead.
+            */
+            std::uint32_t not_compilable_mask{ 0 };
             bool          confident{ false };
         };
 
@@ -8984,6 +8994,7 @@ namespace vmhook
                     evidence.flags_offset,
                     /*width_bytes*/ 2,
                     /*dont_inline_bit*/ 2,
+                    /*not_compilable_mask*/ 0u,
                     /*confident*/ true };
             }
 
@@ -8997,6 +9008,20 @@ namespace vmhook
                     evidence.intrinsic_id_offset - 4,
                     /*width_bytes*/ 4,
                     /*dont_inline_bit*/ 12,
+                    // MethodFlags::_status, from methodFlags.hpp:
+                    //   is_not_c2_compilable      1 << 8
+                    //   is_not_c1_compilable      1 << 9
+                    //   is_not_c2_osr_compilable  1 << 10
+                    // Verified IDENTICAL on jdk-21 and master (JDK 26-era), and
+                    // corroborated by dont_inline landing on bit 12 in the same
+                    // table -- the bit this resolver already derives independently
+                    // and which is exercised on live JDK 21+.
+                    //
+                    // queued_for_compilation (1 << 7) is deliberately NOT set: the
+                    // legacy _access_flags mask included JVM_ACC_QUEUED, but lying
+                    // to the compile broker about a queue entry it never made is a
+                    // different (and unnecessary) claim from "never compile this".
+                    /*not_compilable_mask*/ (1u << 8) | (1u << 9) | (1u << 10),
                     /*confident*/ true };
             }
 
@@ -9055,6 +9080,7 @@ namespace vmhook
                 base + layout.offset,
                 layout.width_bytes,
                 layout.dont_inline_bit,
+                layout.not_compilable_mask,
                 /*confident*/ true };
         }
 
@@ -9261,6 +9287,96 @@ namespace vmhook
                 }
             }
             // Any other width -> unrecognised; no-op (never reached for confident slots).
+        }
+
+        /*
+            @brief Makes HotSpot refuse to JIT-compile a Method, on JDK 21+.
+            @details
+            The companion to the legacy NO_COMPILE mask, and the fix for the case
+            that mask silently stopped covering.
+
+            THE BUG IT CLOSES.  Until JDK 23 the compile-control bits lived in
+            Method::_access_flags, and `*flags |= NO_COMPILE` inhibited the JIT.
+            JDK-8339113 shrank AccessFlags to u2 and RELOCATED those bits into
+            MethodFlags::_status — the same u4 word that already holds
+            _dont_inline.  The u4 OR then lands its high byte in the alignment
+            padding after the u2 _access_flags: it corrupts nothing, and it also
+            does nothing.  A hooked method was therefore free to be recompiled on
+            JDK 24+, which is exactly what the auto-repair watchdog kept catching
+            ("JIT-state drifted ... NO_COMPILE=set") — the flag really was set, in
+            a word HotSpot had stopped reading.
+
+            THE BITS.  is_not_c2_compilable (1<<8), is_not_c1_compilable (1<<9)
+            and is_not_c2_osr_compilable (1<<10), read from methodFlags.hpp and
+            verified IDENTICAL on jdk-21 and master.  They are not guessed
+            positions: the same table places _dont_inline at bit 12, which
+            resolve_method_flags_slot derives INDEPENDENTLY from
+            `_intrinsic_id_offset - 4` and which is exercised on live JDK 21+ —
+            so the table is corroborated by a bit this library already relies on.
+
+            WHERE IT APPLIES.  Only the JDK 21+ MethodFlags layout, which is the
+            only one whose slot carries a non-zero not_compilable_mask.  On the
+            JDK 11..20 u2 `_flags` layout the mask is 0 and this is a no-op,
+            because there the compilability bits genuinely are in _access_flags
+            and the legacy NO_COMPILE still owns them.  On JDK 8 the resolver is
+            not confident and this no-ops, as everything else in this family does.
+
+            SAFETY.  Byte-for-byte the same contract as set_dont_inline, whose
+            slot, alignment gate, cold-page probe, atomic set and fault-safe
+            non-atomic clear this reuses verbatim — it writes different bits in
+            the very same word, through the very same resolver.  A non-confident
+            slot, an unreadable page or a zero mask all no-op.
+        */
+        inline auto set_not_compilable(const vmhook::hotspot::method* const method_pointer,
+                                       const bool enabled) noexcept
+            -> void
+        {
+            if (!method_pointer || !vmhook::hotspot::is_valid_pointer(method_pointer))
+            {
+                return;
+            }
+
+            const vmhook::hotspot::method_flags_slot slot{
+                vmhook::hotspot::resolve_method_flags_slot(method_pointer) };
+            if (!slot.confident || !slot.address || slot.not_compilable_mask == 0u
+                || slot.width_bytes != 4)
+            {
+                return;
+            }
+
+            const std::uintptr_t address_value{ reinterpret_cast<std::uintptr_t>(slot.address) };
+            if ((address_value % alignof(std::uint32_t)) != 0)
+            {
+                return;
+            }
+
+            // Cold-page probe before any raw access, exactly as set_dont_inline
+            // does: this runs on the install path AND on the detached watchdog,
+            // off a STORED Method* that may have been relocated or freed since.
+            std::uint32_t probe_value{ 0 };
+            if (!vmhook::os::safe_read(&probe_value, slot.address, sizeof(probe_value)))
+            {
+                return;
+            }
+
+            if (enabled)
+            {
+                // ATOMIC: HotSpot's compiler threads CAS this same word.
+                std::atomic_ref<std::uint32_t> word{ *static_cast<std::uint32_t*>(slot.address) };
+                word.fetch_or(slot.not_compilable_mask, std::memory_order_acq_rel);
+            }
+            else
+            {
+                // TEARDOWN: driver thread, method already out of dispatch — the
+                // fault-safe non-atomic path, so a cold slot skips instead of AVing.
+                std::uint32_t word{ 0 };
+                if (!vmhook::os::safe_read(&word, slot.address, sizeof(word)))
+                {
+                    return;
+                }
+                word &= ~slot.not_compilable_mask;
+                (void)vmhook::os::safe_write(slot.address, &word, sizeof(word));
+            }
         }
 
         /*
@@ -10454,6 +10570,75 @@ namespace vmhook
     {
         return vmhook::deoptimize_methods_if(
             [](const std::string&, vmhook::hotspot::method*) noexcept { return true; });
+    }
+
+    namespace detail::auto_deopt
+    {
+        inline std::atomic<bool> g_enabled{ true };
+        inline std::once_flag    g_once{};
+
+        /*
+            @brief Flushes JIT-compiled callers ONCE, on the first hook install.
+            @details
+            hook() already deoptimises the method it hooks, sets _dont_inline and
+            (since the MethodFlags fix) makes it genuinely not-compilable — so no
+            FUTURE compile can inline it.  What none of that can undo is a caller
+            that was ALREADY compiled with the target inlined before the hook
+            existed: there is no call left at that site to intercept, and the hook
+            is silently never reached.  Injecting into a running process is
+            precisely the case where that has happened.
+
+            This is why callers used to have to know about
+            vmhook::deoptimize_all_jit_compiled_methods() and remember to call it
+            after installing a hook.  They no longer do: the first successful
+            install does it, once per process, and every install after that is
+            free.
+
+            It is deliberately once-only.  The sweep walks every loaded class's
+            methods and is the single most expensive thing this library does; the
+            inlined-caller problem it solves is a property of code compiled BEFORE
+            hooking began, so repeating it per hook would pay a large cost to
+            re-solve a problem that no longer exists.
+
+            Runtime-disable it with set_auto_deoptimize_callers(false) before
+            installing the first hook — worth doing if a stutter at install time
+            matters more to you than a hook that fires on already-hot code.
+        */
+        inline auto flush_callers_once() noexcept -> void
+        {
+            if (!g_enabled.load(std::memory_order_acquire))
+            {
+                return;
+            }
+            std::call_once(g_once, []() noexcept
+            {
+                const std::size_t deoptimised{ vmhook::deoptimize_all_jit_compiled_methods() };
+                VMHOOK_LOG("{} auto-deopt: flushed {} JIT-compiled method(s) so a caller "
+                           "that already inlined a hooked method stops bypassing it.",
+                           vmhook::info_tag, deoptimised);
+            });
+        }
+    }
+
+    /*
+        @brief Whether hook() flushes JIT-compiled callers on the first install.
+        Defaults to true.  @see detail::auto_deopt::flush_callers_once.
+    */
+    [[nodiscard]] inline auto auto_deoptimize_callers() noexcept
+        -> bool
+    {
+        return vmhook::detail::auto_deopt::g_enabled.load(std::memory_order_acquire);
+    }
+
+    /*
+        @brief Enables/disables the automatic caller flush.
+        @details Only meaningful BEFORE the first hook installs; the sweep runs
+        once and disabling it afterwards does not undo it.
+    */
+    inline auto set_auto_deoptimize_callers(const bool enabled) noexcept
+        -> void
+    {
+        vmhook::detail::auto_deopt::g_enabled.store(enabled, std::memory_order_release);
     }
 
     /*
@@ -12514,6 +12699,10 @@ namespace vmhook
             }
 
             vmhook::hotspot::set_dont_inline(found_method, true);
+            // JDK 21+: the compile-control bits moved out of _access_flags into
+            // MethodFlags::_status, so the NO_COMPILE OR below no longer reaches
+            // them.  This does.  No-op on JDK 8..20, where NO_COMPILE still owns them.
+            vmhook::hotspot::set_not_compilable(found_method, true);
 
             std::uint32_t* const flags{ found_method->get_access_flags() };
             if (!flags)
@@ -12777,6 +12966,11 @@ namespace vmhook
             // them despite our NO_COMPILE flag.  No-op on subsequent calls.
             vmhook::detail::auto_repair::ensure_started();
 
+            // Flush callers that were compiled with this method inlined BEFORE we
+            // hooked it -- otherwise there is no call site left to intercept and
+            // the hook is silently dead.  Once per process; see flush_callers_once.
+            vmhook::detail::auto_deopt::flush_callers_once();
+
             return true;
         }
         catch (const std::exception& exception)
@@ -12922,6 +13116,7 @@ namespace vmhook
                     // anyway — consistent with the rest of the watchdog path and a
                     // no-op cost on a mapped page.
                     vmhook::hotspot::set_dont_inline(new_method, true);
+                    vmhook::hotspot::set_not_compilable(new_method, true);
                     (void)new_method->safe_access_flags_or(vmhook::hotspot::NO_COMPILE);
 
                     // If the new method is already JIT-compiled, deopt it
@@ -13105,6 +13300,7 @@ namespace vmhook
                     }
 
                     vmhook::hotspot::set_dont_inline(hm.method, true);
+                    vmhook::hotspot::set_not_compilable(hm.method, true);
                     // Fault-safe RMW of NO_COMPILE (was a raw `*flags |= …`).  A cold
                     // Method page defers the re-arm to the next tick instead of faulting.
                     (void)hm.method->safe_access_flags_or(vmhook::hotspot::NO_COMPILE);
@@ -13444,6 +13640,7 @@ namespace vmhook
             }
 
             vmhook::hotspot::set_dont_inline(hooked_method_entry.method, false);
+            vmhook::hotspot::set_not_compilable(hooked_method_entry.method, false);
 
             // Fault-safe RMW clear of NO_COMPILE (was a raw `*flags &= ~…` on a
             // STORED Method* that a JVMTI RedefineClasses between install and
@@ -13541,6 +13738,7 @@ namespace vmhook
             // common_detour will simply skip over methods missing
             // from g_hooked_methods.
             vmhook::hotspot::set_dont_inline(entry_it->method, false);
+            vmhook::hotspot::set_not_compilable(entry_it->method, false);
             // Fault-safe RMW clear of NO_COMPILE (was a raw `*flags &= ~…` on a
             // STORED Method* that may be cold/relocated/freed by a JVMTI
             // RedefineClasses between install and this single-handle stop — the raw

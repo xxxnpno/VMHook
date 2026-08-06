@@ -1805,11 +1805,13 @@ namespace mfw_deep
 static_assert(mfw_deep::method_flags_layout{}.offset == 0
               && mfw_deep::method_flags_layout{}.width_bytes == 0
               && mfw_deep::method_flags_layout{}.dont_inline_bit == 0
+              && mfw_deep::method_flags_layout{}.not_compilable_mask == 0u
               && mfw_deep::method_flags_layout{}.confident == false,
               "method_flags_layout default is the all-zero, not-confident 'no guess'");
 static_assert(mfw_deep::method_flags_slot{}.address == nullptr
               && mfw_deep::method_flags_slot{}.width_bytes == 0
               && mfw_deep::method_flags_slot{}.dont_inline_bit == 0
+              && mfw_deep::method_flags_slot{}.not_compilable_mask == 0u
               && mfw_deep::method_flags_slot{}.confident == false,
               "method_flags_slot default is null/zero/not-confident 'no guess'");
 // Every refusing input returns EXACTLY that default (constexpr-checked).
@@ -2097,16 +2099,74 @@ static auto test_mfw_deep_confident_layout_slot_wellformed() -> void
         alignas(16) std::array<std::uint8_t, 128> owned{};
         owned.fill(0x00);
         const vmhook::hotspot::method_flags_slot slot{
-            owned.data() + l.offset, l.width_bytes, l.dont_inline_bit, true };
+            owned.data() + l.offset, l.width_bytes, l.dont_inline_bit,
+            l.not_compilable_mask, true };
         if (!(slot.confident
               && slot.width_bytes == l.width_bytes
               && slot.dont_inline_bit == l.dont_inline_bit
+              && slot.not_compilable_mask == l.not_compilable_mask
               && slot.address == owned.data() + l.offset))
+        {
+            all_wellformed = false; break;
+        }
+
+        // The compile-control bits ride in the SAME word as _dont_inline, so a
+        // non-zero mask must fit the layout's width and must not collide with
+        // the bit the resolver already owns.  Zero is legal: that is the
+        // JDK 11..20 u2 layout, whose compilability bits are in _access_flags.
+        if (l.not_compilable_mask != 0u
+            && ((l.not_compilable_mask & wmask) != l.not_compilable_mask
+                || (l.not_compilable_mask & mask) != 0u
+                || l.width_bytes != 4))
         {
             all_wellformed = false; break;
         }
     }
     check("mfw_deep_confident_layout_yields_wellformed_slot", all_wellformed);
+
+    // ── The JDK 21+ compile-control bits ────────────────────────────────────
+    // MethodFlags::_status, from methodFlags.hpp (identical on jdk-21 and
+    // master): is_not_c2_compilable 1<<8, is_not_c1_compilable 1<<9,
+    // is_not_c2_osr_compilable 1<<10, and _dont_inline 1<<12.  The last one is
+    // the corroboration that matters -- derive_method_flags_layout reaches bit
+    // 12 INDEPENDENTLY, from `_intrinsic_id_offset - 4`, so if the table were
+    // misread the two would disagree.
+    {
+        // A JDK 21+ shape: no exported _flags, u2 _intrinsic_id at a 4-aligned
+        // offset.  Path B derives _status at intrinsic_id_offset - 4.
+        const vmhook::hotspot::method_flags_evidence jdk21{
+            /*flags_present*/ false, nullptr, 0,
+            /*intrinsic_id_present*/ true, "u2", 0x40 };
+        const auto l21{ vmhook::hotspot::derive_method_flags_layout(jdk21) };
+
+        check("mfw_nc_jdk21_confident",     l21.confident);
+        check("mfw_nc_jdk21_width_is_4",    l21.width_bytes == 4);
+        check("mfw_nc_jdk21_dont_inline_12", l21.dont_inline_bit == 12);
+        check("mfw_nc_jdk21_mask_is_c1_c2_osr",
+              l21.not_compilable_mask == ((1u << 8) | (1u << 9) | (1u << 10)));
+        check("mfw_nc_jdk21_mask_excludes_dont_inline",
+              (l21.not_compilable_mask & (1u << l21.dont_inline_bit)) == 0u);
+        check("mfw_nc_jdk21_mask_excludes_queued",
+              (l21.not_compilable_mask & (1u << 7)) == 0u);
+
+        // The JDK 11..20 u2 layout must carry NO mask: its compilability bits
+        // are in _access_flags, and writing 1<<8..10 into a u2 _flags word
+        // would land on is_not_c2_compilable's neighbours or off the end.
+        const vmhook::hotspot::method_flags_evidence jdk11{
+            /*flags_present*/ true, "u2", 0x30,
+            /*intrinsic_id_present*/ true, "u2", 0x40 };
+        const auto l11{ vmhook::hotspot::derive_method_flags_layout(jdk11) };
+        check("mfw_nc_jdk11_confident",  l11.confident);
+        check("mfw_nc_jdk11_width_is_2", l11.width_bytes == 2);
+        check("mfw_nc_jdk11_mask_is_zero", l11.not_compilable_mask == 0u);
+
+        // JDK 8: nothing exported -> not confident -> no mask to write anywhere.
+        const vmhook::hotspot::method_flags_evidence jdk8{
+            false, nullptr, 0, true, "u1", 0x38 };
+        const auto l8{ vmhook::hotspot::derive_method_flags_layout(jdk8) };
+        check("mfw_nc_jdk8_not_confident", !l8.confident);
+        check("mfw_nc_jdk8_mask_is_zero",  l8.not_compilable_mask == 0u);
+    }
 
     // A REFUSED layout must NOT be turned into a confident slot: the default slot
     // (what resolve returns on !confident) is null/zero/not-confident.

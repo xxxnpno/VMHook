@@ -7,6 +7,38 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **`NO_COMPILE` stopped working on JDK 24+, and the hook silently died with
+  it.**  Until JDK 23 the compile-control bits lived in `Method::_access_flags`,
+  so `*flags |= NO_COMPILE` inhibited the JIT.  JDK-8339113 shrank `AccessFlags`
+  to `u2` and RELOCATED those bits into `MethodFlags::_status` — the same `u4`
+  word that already holds `_dont_inline`.  The `u4` OR then landed its high byte
+  in the alignment padding after the `u2` `_access_flags`: it corrupted nothing,
+  and it also did nothing.  A hooked method was free to be recompiled, and the
+  symptom in the field was the auto-repair watchdog reporting *"JIT-state
+  drifted … NO_COMPILE=set"* — the flag really was set, in a word HotSpot had
+  stopped reading.  This was known and documented in-source as an accepted
+  no-op; it is now fixed.  New `hotspot::set_not_compilable()` writes
+  `is_not_c2_compilable` (1<<8), `is_not_c1_compilable` (1<<9) and
+  `is_not_c2_osr_compilable` (1<<10) into `MethodFlags::_status`, through the
+  SAME resolver, alignment gate, cold-page probe and atomic RMW that
+  `set_dont_inline()` already uses on that word.  The bit positions are read
+  from `methodFlags.hpp` and verified identical on jdk-21 and master, and are
+  corroborated by that table placing `_dont_inline` at bit 12 — the bit
+  `derive_method_flags_layout()` derives *independently* from
+  `_intrinsic_id_offset - 4`.  No-op on JDK 8..20, where the legacy
+  `_access_flags` mask still owns those bits.
+- **A hook installed on an already-inlined method silently never fired, and
+  fixing it was the caller's problem.**  `hook()` deoptimises its target, but a
+  caller compiled with that target *already inlined* has no call site left to
+  intercept — the exact case when injecting into a running process.  Callers had
+  to know about `deoptimize_all_jit_compiled_methods()` and remember to call it.
+  They no longer do: the first successful `hook()` flushes JIT-compiled callers
+  once per process.  Once-only by design — the sweep is the most expensive
+  operation in the library, and the problem it solves is a property of code
+  compiled *before* hooking began.  `set_auto_deoptimize_callers(false)` opts
+  out for callers who would rather have no stutter at install time than a hook
+  that fires on already-hot code.
+
 - **CRITICAL**: `method_proxy::call()` never worked, on any JDK.  It resolved the
   call stub by looking up `StubRoutines::_call_stub_entry` in VMStructs — an entry
   HotSpot has never published, on any version.  The in-source claim that "JDK 21+
