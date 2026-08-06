@@ -47,6 +47,65 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `_from_compiled_entry` on every measured JDK, so the first lookup was dead work.
 
 ### Added
+- **Inferred access: `get` / `set` / `call` never take a type argument, and a
+  reference never has to be borrowed by hand.**  The JVM already stores every
+  field's descriptor, so making the caller repeat it was only ever a way for a
+  read to disagree with the field it reads.  What the caller *declares* now
+  decides the shape a reference arrives in:
+
+  ```cpp
+  float health = self->get_field("health")->get();          // was get<float>()
+  std::string n = self->get_field("name")->get();           // was .as_string()
+  auto rider    = self->get_field("passenger")->get();      // was .to_borrowed<entity>()
+  float x       = rider->get_field("posX")->get();          // no wrapper type at all
+
+  entity                   w = self->get_field("passenger")->get();
+  vmhook::borrowed<entity> b = self->get_field("passenger")->get();
+  vmhook::ref<entity>      r = self->get_field("passenger")->get();
+  ```
+
+  Concretely, on both `field_proxy::value_t` and `method_proxy::value_t`:
+  - conversion arms for `borrowed<W>`, `ref<W>` and a wrapper `W`.  Each of those
+    targets **already compiled** — and silently produced a default-constructed
+    empty handle / null wrapper, because the conversion fell through to
+    `target_type{}`.  That is the failure mode this closes: code that reads
+    correctly and is quietly null.  All three now share one decode-and-vet step
+    (`reference_target`) with the existing `unique_ptr` arm, so a Java null, an
+    array descriptor, an address failing the heap-range check, or a proven
+    cross-klass mismatch yields an EMPTY result rather than a handle to
+    reinterpreted bits.
+  - `operator->` / `operator*`, binding a `vmhook::any_object` for one
+    expression, so a reference can be navigated with no type named anywhere.
+- `vmhook::any_object` — a Java object with no C++ type attached.  Fields and
+  methods resolve through the klass read out of the **live object's header**, so
+  the whole hierarchy of whatever the object actually is stays reachable with no
+  `register_class<T>()` and no wrapper declaration.  A null instance degrades to
+  `nullopt` / empty exactly as a typed wrapper on a null oop does, which is what
+  lets `a->call("b")->call("c")` end quietly at the first missing link instead of
+  needing a check between every hop.  Exposes `get_field`, `get_method` (by name
+  or by name + descriptor), `call`, `class_name`, `instance_of`.
+- `borrowed<>`, `ref<>` and `root<>` — the UNTYPED forms — now have `operator->`
+  / `operator*`, binding `any_object`.  They were dead ends before: a caller who
+  had one and wanted a single field had to go and declare a wrapper type first.
+  Revalidation is unchanged, so an expired handle binds a null `any_object`
+  rather than the address it used to have.
+- `field_proxy::set()` now accepts anything that names a live Java object — a
+  `borrowed<W>`, a `ref<W>`, a wrapper, an `any_object`, or the value another
+  `get()` / `call()` produced — so storing a reference is `set(other)` rather
+  than a hand-written `store_object` / raw oop.  Each source is resolved through
+  ITS OWN validity rule first (a borrow revalidates its epoch, a ref re-walks
+  its anchor, a value decodes and vets), so an expired or empty source stores
+  nothing instead of writing a stale address into the heap — the one write that
+  would outlive the mistake and corrupt a later collection.
+- `object<T>::create(args...)` — allocates AND runs the real Java constructor,
+  selecting the `<init>` overload from the C++ argument types.  This is the gap
+  `vmhook::make_unique` left: make_unique allocates a zeroed instance and runs
+  the *C++* wrapper's `construct()`, but never executes the Java `<init>` chain,
+  so any class with constructor logic came back half-built.  Every refusal —
+  unregistered type, unloaded class, non-instantiable klass, no matching
+  `<init>`, no derivable call stub, not on a JavaThread — is detected BEFORE the
+  allocation, so a failure cannot leave a raw constructor-less object on the
+  Java heap; a constructor that throws abandons the instance.
 - `vmhook::vm_capabilities()` — a cached capability gate reporting the live
   collector, barrier shape, `UseCompressedOops` and `UseCompactObjectHeaders`.
   The collector is determined by walking the JVM flag table (`Flag` on JDK 8,
@@ -62,6 +121,21 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   ~0.32 µs per call.
 
 ### Changed
+- **The README documented an API that did not exist.**  `get_field("x")->get<T>()`
+  and `self->call<T>("m")` were never spellings this library had — neither
+  compiles, and never did.  The README is rewritten as a cookbook against the
+  real surface (wrap a class, read/write each kind of field, call, construct,
+  hook) and every snippet in it is compiled under `-Werror` on GCC and
+  `/W4 /WX /permissive-` on MSVC.  The same two fictions appeared in the
+  header's own `java_thread_scope` examples and are fixed there too.
+- `get_field` / `get_method` are stated as the ONE access spelling: each resolves
+  a static or an instance Java member indistinguishably, so `static_field` /
+  `static_method` are only for the no-instance case.  The header's wrapper-class
+  usage example is removed rather than corrected — the README is where examples
+  belong.  Also documented plainly, because it is a language limit and not a
+  choice: from a *static C++ method*, GCC and Clang >= 20 select the non-static
+  candidate on argument match before checking object availability and hard-error,
+  so those toolchains need the `static_*` spelling there.
 - **`vmhook::jni::global_ref` no longer returns a stale address.**  It records the
   GC epoch at capture; `oop()`, `handle()` and `operator bool` now report empty
   once a relocating collection has occurred, and `is_stale()` exposes that

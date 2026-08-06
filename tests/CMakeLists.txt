@@ -241,3 +241,13 @@ vmhook_add_test(borrowed_detour_arg_nojvm      SOURCES test_borrowed_detour_arg_
 # would be strictly weaker -- and the rest verifies the cold path degrades to an
 # honest empty/error rather than to a plausible wrong answer.
 vmhook_add_test(modern_cpp_surface_nojvm       SOURCES test_modern_cpp_surface_nojvm.cpp)
+
+# The INFERRED-ACCESS surface: get / set / call never take a type argument, and
+# a reference read arrives in whatever shape the caller declared -- borrowed<W>,
+# ref<W>, the wrapper itself, or nothing at all (any_object).  Mostly compile-
+# time, and deliberately so: picking the WRONG conversion arm does not fail to
+# compile, it silently hands back a default-constructed value, which is exactly
+# the failure this surface exists to remove.  The runtime half pins the
+# fail-closed paths -- a primitive must never become a handle to its own bits,
+# and a chain through nothing must end quietly instead of faulting.
+vmhook_add_test(inferred_access_nojvm          SOURCES test_inferred_access_nojvm.cpp)

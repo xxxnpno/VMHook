@@ -79,6 +79,7 @@ export namespace vmhook
     using vmhook::object_base;
     using vmhook::object;
     using vmhook::oop_reflective_base;
+    using vmhook::any_object;
 
     // ── proxies ────────────────────────────────────────────────────────────
     using vmhook::field_proxy;

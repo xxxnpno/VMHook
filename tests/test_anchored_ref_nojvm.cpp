@@ -35,6 +35,7 @@
 // ===========================================================================
 #include <vmhook/vmhook.hpp>
 
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -183,21 +184,41 @@ static_assert(std::is_constructible_v<vmhook::root<ar_entity>, std::string_view>
 static_assert(!std::is_convertible_v<std::string_view, vmhook::root<ar_entity>>,
               "the one-argument root constructor must be explicit");
 
-// -- ref<void> is the type-erased form: it still resolves and still has an
-//    identity, but it must NOT offer operator-> (there is no wrapper to bind).
+// -- ref<void> is the type-erased form.  It USED to be a dead end: no
+//    operator->, because there was no wrapper to bind.  That forced a caller
+//    who only wanted one field off an untyped handle to go and declare a
+//    wrapper type first, which is exactly the ceremony this library exists to
+//    remove.  It now binds vmhook::any_object, whose members resolve from the
+//    live object's own klass -- so BOTH the typed and untyped forms bind, and
+//    what differs is only where the members come from.
 //    Expressed through a named concept rather than an inline requires-expression
 //    because GCC diagnoses `r.operator->()` written inline as a hard error.
 template<typename handle_type>
 concept ar_binds_a_wrapper = requires(const handle_type& handle) { *handle; };
 
-static_assert(!ar_binds_a_wrapper<vmhook::ref<void>>,
-              "ref<void> must not bind a wrapper -- there is nothing to bind");
+// What the untyped form binds, spelled out: an any_object, not a wrapper.
+template<typename handle_type>
+concept ar_binds_any_object = requires(const handle_type& handle)
+{
+    { handle.operator->() } -> std::same_as<vmhook::detail::access<vmhook::any_object>>;
+};
+
+static_assert(ar_binds_a_wrapper<vmhook::ref<void>>,
+              "ref<void> must bind -- through any_object, resolved from the live klass");
+static_assert(ar_binds_any_object<vmhook::ref<void>>,
+              "... and what it binds must be any_object, not a wrapper");
 static_assert(ar_binds_a_wrapper<vmhook::ref<ar_entity>>,
               "ref<T> must bind a wrapper for a type constructible from an oop");
-static_assert(!ar_binds_a_wrapper<vmhook::borrowed<void>>,
-              "borrowed<void> must not bind a wrapper either");
+static_assert(!ar_binds_any_object<vmhook::ref<ar_entity>>,
+              "a TYPED ref must still bind its own wrapper, never any_object");
+static_assert(ar_binds_a_wrapper<vmhook::borrowed<void>>,
+              "borrowed<void> must bind through any_object as well");
+static_assert(ar_binds_any_object<vmhook::borrowed<void>>,
+              "... and it must be any_object it binds");
 static_assert(ar_binds_a_wrapper<vmhook::borrowed<ar_entity>>,
               "borrowed<T> must bind a wrapper");
+static_assert(!ar_binds_any_object<vmhook::borrowed<ar_entity>>,
+              "a TYPED borrow must still bind its own wrapper");
 
 int main()
 {
