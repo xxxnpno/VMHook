@@ -10364,6 +10364,186 @@ namespace vmhook
     }
 
     /*
+        @brief The c2i adapter entry for a signature, WITHOUT AdapterHandlerEntry.
+        @details
+        Deoptimising a method means pointing `_from_compiled_entry` at the c2i
+        adapter, so compiled callers land in the interpreter.  vmhook used to
+        find that address by reading `Method::_adapter` and then
+        `AdapterHandlerEntry::_c2i_entry` out of it.  On a modern JVM NEITHER is
+        exported: measured on a JDK 26-era VM, `Method::_adapter`,
+        `AdapterHandlerEntry::_c2i_entry`, `_i2c_entry` and
+        `_c2i_unverified_entry` are ALL absent from gHotSpotVMStructs.  With no
+        way to validate a candidate the heuristic scan returned 0, get_adapter()
+        returned null, and every deoptimisation degraded: hook() fell back to a
+        forced deopt that leaves `_from_compiled_entry` pointing into a stale
+        nmethod, and deoptimize_methods_if skipped outright ("0 deoptimised,
+        5715 skipped").
+
+        This derives the same address from facts that ARE exported, using a
+        property of HotSpot's own adapter library: adapters are SHARED, keyed on
+        the signature.  AdapterHandlerLibrary::get_adapter() looks an adapter up
+        by an AdapterFingerPrint computed from the method's argument BasicTypes
+        (plus the receiver for a non-static method), so every method with the
+        same descriptor and the same static-ness resolves to the SAME adapter.
+        And for a method that is NOT currently compiled, HotSpot leaves
+        `_from_compiled_entry` pointing at exactly that adapter's c2i entry.
+
+        So: find any OTHER method with the same descriptor and static-ness whose
+        `_code` is null, and read its `_from_compiled_entry`.  That is the c2i
+        entry for this signature, straight out of the VM's own bookkeeping.
+
+        Matching on the exact descriptor is deliberately STRICTER than the
+        fingerprint HotSpot uses (which collapses every object argument to one
+        BasicType).  Stricter is the safe direction: an identical descriptor plus
+        identical static-ness ALWAYS implies the same fingerprint, so a match is
+        never wrong -- some correct matches are simply passed over.
+
+        Cached per (descriptor, static): the scan is O(classes x methods) and the
+        answer is a process-lifetime property of the code cache.
+
+        @return The c2i entry, or nullptr when no interpreted donor exists.  A
+                null return leaves every caller on the path it already took.
+    */
+    inline auto find_shared_c2i_entry(const std::string& descriptor,
+                                      const bool wanted_static) noexcept
+        -> void*
+    {
+        struct cache_entry
+        {
+            std::string descriptor;
+            bool        is_static;
+            void*       c2i;
+        };
+        static std::vector<cache_entry> cache{};
+        static std::mutex               cache_mutex{};
+
+        try
+        {
+            {
+                const std::lock_guard<std::mutex> guard{ cache_mutex };
+                for (const cache_entry& entry : cache)
+                {
+                    if (entry.is_static == wanted_static && entry.descriptor == descriptor)
+                    {
+                        return entry.c2i;
+                    }
+                }
+            }
+
+            constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
+            void* found{ nullptr };
+
+            vmhook::for_each_loaded_class(
+                [&](const std::string&, vmhook::hotspot::klass* const k) -> void
+                {
+                    if (found != nullptr || k == nullptr
+                        || !vmhook::hotspot::is_valid_pointer(k))
+                    {
+                        return;
+                    }
+                    const std::int32_t count{ k->get_methods_count() };
+                    vmhook::hotspot::method** const methods{ k->get_methods_ptr() };
+                    if (methods == nullptr || count <= 0)
+                    {
+                        return;
+                    }
+                    for (std::int32_t index{ 0 }; index < count; ++index)
+                    {
+                        vmhook::hotspot::method* const candidate{ methods[index] };
+                        if (candidate == nullptr
+                            || !vmhook::hotspot::is_valid_pointer(candidate))
+                        {
+                            continue;
+                        }
+                        // Only an INTERPRETED method's _from_compiled_entry is the
+                        // adapter; a compiled one points into its own nmethod.
+                        if (candidate->get_code() != nullptr)
+                        {
+                            continue;
+                        }
+                        std::uint32_t* const flags{ candidate->get_access_flags() };
+                        if (flags == nullptr)
+                        {
+                            continue;
+                        }
+                        std::uint32_t access{ 0 };
+                        if (!vmhook::os::safe_read(&access, flags, sizeof(access)))
+                        {
+                            continue;
+                        }
+                        if (((access & JVM_ACC_STATIC_BIT) != 0u) != wanted_static)
+                        {
+                            continue;
+                        }
+                        if (candidate->get_signature() != descriptor)
+                        {
+                            continue;
+                        }
+                        void* const entry{ candidate->get_from_compiled_entry() };
+                        if (entry != nullptr && vmhook::hotspot::is_valid_pointer(entry))
+                        {
+                            found = entry;
+                            return;
+                        }
+                    }
+                });
+
+            {
+                const std::lock_guard<std::mutex> guard{ cache_mutex };
+                cache.push_back(cache_entry{ descriptor, wanted_static, found });
+            }
+
+            VMHOOK_LOG("{} find_shared_c2i_entry('{}', static={}): {}",
+                       found ? vmhook::info_tag : vmhook::warning_tag,
+                       descriptor, wanted_static,
+                       found ? "resolved from an interpreted method of the same signature"
+                             : "no interpreted method of this signature to borrow it from");
+            return found;
+        }
+        catch (const std::exception&)
+        {
+            return nullptr;
+        }
+    }
+
+    /*
+        @brief The c2i entry for a live Method, by whatever means the VM allows.
+        @details Prefers the classic Method::_adapter -> AdapterHandlerEntry
+        route (exported on JDK 8, and cheap wherever the heuristic still finds
+        the slot), and falls back to the signature-shared derivation above when
+        the VM exports neither.  Callers get an address or nullptr and never have
+        to know which JDK they are on.
+    */
+    inline auto resolve_c2i_entry(vmhook::hotspot::method* const target) noexcept
+        -> void*
+    {
+        if (target == nullptr || !vmhook::hotspot::is_valid_pointer(target))
+        {
+            return nullptr;
+        }
+        if (void* const adapter{ target->get_adapter() })
+        {
+            if (void* const c2i{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) })
+            {
+                return c2i;
+            }
+        }
+        constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
+        std::uint32_t* const flags{ target->get_access_flags() };
+        std::uint32_t access{ 0 };
+        if (flags == nullptr || !vmhook::os::safe_read(&access, flags, sizeof(access)))
+        {
+            return nullptr;
+        }
+        const std::string descriptor{ target->get_signature() };
+        if (descriptor.empty())
+        {
+            return nullptr;
+        }
+        return vmhook::find_shared_c2i_entry(descriptor, (access & JVM_ACC_STATIC_BIT) != 0u);
+    }
+
+    /*
         @brief Forces every currently JIT-compiled Java method for which
                `predicate(class_name, method)` returns true to fall back to
                interpreted execution.
@@ -10520,7 +10700,16 @@ namespace vmhook
                     {
                         adapter = m->get_adapter();
                     }
-                    void* const c2i{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+                    void* c2i{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+                    if (!c2i)
+                    {
+                        // A modern JVM exports neither Method::_adapter nor
+                        // AdapterHandlerEntry, so the route above yields nothing
+                        // and this whole sweep used to skip every method it saw.
+                        // Borrow the shared adapter from an interpreted method of
+                        // the same signature instead.
+                        c2i = vmhook::resolve_c2i_entry(m);
+                    }
 
                     if (!c2i || !vmhook::hotspot::is_valid_pointer(c2i))
                     {
@@ -12926,7 +13115,16 @@ namespace vmhook
             if (was_compiled)
             {
                 void* const adapter{ found_method->get_adapter() };
-                void* const c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+                void* c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+                if (!c2i_entry)
+                {
+                    // Modern JVMs export neither Method::_adapter nor
+                    // AdapterHandlerEntry; derive the shared adapter from an
+                    // interpreted method of the same signature rather than
+                    // dropping to the forced deopt that leaves
+                    // _from_compiled_entry aimed at a stale nmethod.
+                    c2i_entry = vmhook::resolve_c2i_entry(found_method);
+                }
 
                 if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
                 {
@@ -13128,7 +13326,11 @@ namespace vmhook
                     if (code_now != nullptr && vmhook::hotspot::is_valid_pointer(code_now))
                     {
                         void* const adapter{ new_method->get_adapter() };
-                        void* const c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+                        void* c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+                        if (!c2i_entry)
+                        {
+                            c2i_entry = vmhook::resolve_c2i_entry(new_method);
+                        }
                         if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
                         {
                             new_method->set_from_compiled_entry(c2i_entry);
@@ -13308,7 +13510,11 @@ namespace vmhook
                     if (code_now != nullptr && vmhook::hotspot::is_valid_pointer(code_now))
                     {
                         void* const adapter{ hm.method->get_adapter() };
-                        void* const c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+                        void* c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+                        if (!c2i_entry)
+                        {
+                            c2i_entry = vmhook::resolve_c2i_entry(hm.method);
+                        }
                         if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
                         {
                             hm.method->set_from_compiled_entry(c2i_entry);

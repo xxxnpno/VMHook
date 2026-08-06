@@ -7,6 +7,30 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **Deoptimisation stopped working entirely on modern JVMs, because
+  `AdapterHandlerEntry` is no longer exported.**  Pointing a method's
+  `_from_compiled_entry` at the c2i adapter is how compiled callers get routed
+  into the interpreter, and therefore into a hook.  vmhook found that address
+  through `Method::_adapter` -> `AdapterHandlerEntry::_c2i_entry`.  Measured on a
+  JDK 26-era VM: `Method::_adapter`, `AdapterHandlerEntry::_c2i_entry`,
+  `_i2c_entry` and `_c2i_unverified_entry` are **all absent** from
+  gHotSpotVMStructs.  With nothing to validate a candidate against, the
+  heuristic scan returned 0, `get_adapter()` returned null, `hook()` fell back to
+  a forced deopt that leaves `_from_compiled_entry` aimed at a stale nmethod, and
+  `deoptimize_methods_if` skipped every method it saw (*"0 deoptimised, 5715
+  skipped"*).  New `vmhook::find_shared_c2i_entry()` derives the same address
+  from facts that ARE exported, using a property of HotSpot's own adapter
+  library: adapters are **shared, keyed on the signature**
+  (`AdapterHandlerLibrary::get_adapter` looks them up by an `AdapterFingerPrint`
+  over argument BasicTypes plus the receiver), and a method that is *not*
+  currently compiled has `_from_compiled_entry` pointing straight at its
+  adapter's c2i entry.  So it borrows the entry from any interpreted method with
+  the same descriptor and static-ness.  Matching on the exact descriptor is
+  deliberately stricter than HotSpot's own fingerprint — identical descriptor and
+  static-ness always implies the same fingerprint, so a match can never be wrong,
+  only conservative.  Cached per signature; `resolve_c2i_entry()` tries the
+  classic route first, so JDK 8 is unchanged.
+
 - **`NO_COMPILE` stopped working on JDK 24+, and the hook silently died with
   it.**  Until JDK 23 the compile-control bits lived in `Method::_access_flags`,
   so `*flags |= NO_COMPILE` inhibited the JIT.  JDK-8339113 shrank `AccessFlags`
