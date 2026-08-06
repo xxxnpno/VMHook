@@ -10572,16 +10572,6 @@ namespace vmhook
             {
                 try
                 {
-                    constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
-                    // ABSTRACT: HotSpot hands every abstract method the shared
-                    // _abstract_method_handler, whose c2i entry IS the
-                    // AbstractMethodError stub -- and an abstract method has
-                    // _code == nullptr, so it looks like a perfect donor.
-                    // Borrowing one points the hooked method at a throw.
-                    // NATIVE: _from_compiled_entry is the native wrapper.
-                    constexpr std::uint32_t JVM_ACC_NATIVE_BIT{ 0x0100u };
-                    constexpr std::uint32_t JVM_ACC_ABSTRACT_BIT{ 0x0400u };
-
                     std::size_t classes{ 0 };
                     std::size_t methods_seen{ 0 };
                     std::size_t skip_compiled{ 0 };
@@ -10612,6 +10602,18 @@ namespace vmhook
                                     continue;
                                 }
                                 ++methods_seen;
+
+                                // ABSTRACT: HotSpot hands every abstract method
+                                // the shared _abstract_method_handler, whose c2i
+                                // entry IS the AbstractMethodError stub -- and an
+                                // abstract method has _code == nullptr, so it
+                                // looks like a perfect donor.  Borrowing one
+                                // points the hooked method at a throw.
+                                // NATIVE: _from_compiled_entry is the native
+                                // wrapper, not a c2i adapter.
+                                constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
+                                constexpr std::uint32_t JVM_ACC_NATIVE_BIT{ 0x0100u };
+                                constexpr std::uint32_t JVM_ACC_ABSTRACT_BIT{ 0x0400u };
 
                                 // Only an INTERPRETED method's
                                 // _from_compiled_entry is the adapter; a
