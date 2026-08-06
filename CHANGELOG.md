@@ -31,6 +31,20 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   only conservative.  Cached per signature; `resolve_c2i_entry()` tries the
   classic route first, so JDK 8 is unchanged.
 
+  The donor must be **concrete and non-native**.  An ABSTRACT method also has
+  `_code == nullptr`, so it passes the "is it interpreted" test and looks like an
+  ideal donor — but HotSpot hands every abstract method the shared
+  `_abstract_method_handler`, whose c2i entry *is* the AbstractMethodError stub.
+  Borrowing it points the hooked method straight at a throw, and did: on
+  Minecraft 26.2 the hook fired correctly and the game then died every time with
+  `java.lang.AbstractMethodError: Receiver class net.minecraft.client.Minecraft
+  does not define or inherit an implementation of the resolved method 'private
+  void runTick(boolean)'` at the first compiled call site.  Abstract and native
+  donors are now excluded, and because a wrong address here is a dead JVM rather
+  than a failed lookup, up to four independent donors are sampled and a majority
+  must agree before the address is used — a lone dissenter refuses the
+  derivation and falls back to the previous (safe) forced-deopt path.
+
 - **`NO_COMPILE` stopped working on JDK 24+, and the hook silently died with
   it.**  Until JDK 23 the compile-control bits lived in `Method::_access_flags`,
   so `*flags |= NO_COMPILE` inhibited the JIT.  JDK-8339113 shrank `AccessFlags`

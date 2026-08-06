@@ -10392,6 +10392,13 @@ namespace vmhook
         `_code` is null, and read its `_from_compiled_entry`.  That is the c2i
         entry for this signature, straight out of the VM's own bookkeeping.
 
+        The donor must be a method the VM gave a REAL adapter to -- concrete and
+        non-native.  An ABSTRACT method also has `_code == nullptr` and so looks
+        like an ideal donor, but HotSpot hands every abstract method the shared
+        `_abstract_method_handler` whose c2i entry is the AbstractMethodError
+        stub; borrowing it points the hooked method straight at a throw.  See the
+        filter below for the measured failure.
+
         Matching on the exact descriptor is deliberately STRICTER than the
         fingerprint HotSpot uses (which collapses every object argument to one
         BasicType).  Stricter is the safe direction: an identical descriptor plus
@@ -10431,12 +10438,39 @@ namespace vmhook
             }
 
             constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
-            void* found{ nullptr };
+            // A donor must be a method HotSpot gave a REAL adapter to.
+            //   ABSTRACT: AdapterHandlerLibrary hands every abstract method the
+            //     shared _abstract_method_handler, whose c2i entry IS the
+            //     AbstractMethodError stub.  An abstract method also has
+            //     _code == nullptr, so it sails through the "is it interpreted"
+            //     test below and looks like a perfect donor -- and borrowing its
+            //     entry points the hooked method at a throw.  Measured: doing so
+            //     on Minecraft 26.2 produced
+            //       java.lang.AbstractMethodError: Receiver class ... does not
+            //       define or inherit an implementation of the resolved method
+            //       'private void runTick(boolean)'
+            //     at the first compiled call, every time.
+            //   NATIVE: a native method's _from_compiled_entry is its native
+            //     wrapper (or the not-yet-linked stub), not a c2i adapter.
+            constexpr std::uint32_t JVM_ACC_NATIVE_BIT{ 0x0100u };
+            constexpr std::uint32_t JVM_ACC_ABSTRACT_BIT{ 0x0400u };
+
+            // CORROBORATION.  This address gets written into a live Method's
+            // _from_compiled_entry, and a wrong one is not a failed lookup -- it
+            // is a JVM that dies at the next compiled call.  So do not trust one
+            // donor: sample several independent methods of the same signature and
+            // require a majority to agree.  Every concrete non-native method of a
+            // given signature shares ONE adapter, so honest donors are unanimous;
+            // a lone dissenter means something in the walk is not what it seems,
+            // and refusing costs only the old (safe) forced-deopt path.
+            std::array<void*, 4> votes{};
+            std::size_t          vote_count{ 0 };
+            void*                found{ nullptr };
 
             vmhook::for_each_loaded_class(
                 [&](const std::string&, vmhook::hotspot::klass* const k) -> void
                 {
-                    if (found != nullptr || k == nullptr
+                    if (vote_count >= votes.size() || k == nullptr
                         || !vmhook::hotspot::is_valid_pointer(k))
                     {
                         return;
@@ -10475,6 +10509,10 @@ namespace vmhook
                         {
                             continue;
                         }
+                        if ((access & (JVM_ACC_NATIVE_BIT | JVM_ACC_ABSTRACT_BIT)) != 0u)
+                        {
+                            continue;
+                        }
                         if (candidate->get_signature() != descriptor)
                         {
                             continue;
@@ -10482,22 +10520,45 @@ namespace vmhook
                         void* const entry{ candidate->get_from_compiled_entry() };
                         if (entry != nullptr && vmhook::hotspot::is_valid_pointer(entry))
                         {
-                            found = entry;
-                            return;
+                            votes[vote_count++] = entry;
+                            if (vote_count >= votes.size())
+                            {
+                                return;
+                            }
                         }
                     }
                 });
+
+            // Majority vote over the sampled donors.
+            for (std::size_t i{ 0 }; i < vote_count && found == nullptr; ++i)
+            {
+                std::size_t agreeing{ 0 };
+                for (std::size_t j{ 0 }; j < vote_count; ++j)
+                {
+                    if (votes[j] == votes[i])
+                    {
+                        ++agreeing;
+                    }
+                }
+                // A single donor is accepted only when it is the ONLY one the VM
+                // has: with two or more samples, one must be corroborated.
+                if (agreeing >= 2 || vote_count == 1)
+                {
+                    found = votes[i];
+                }
+            }
 
             {
                 const std::lock_guard<std::mutex> guard{ cache_mutex };
                 cache.push_back(cache_entry{ descriptor, wanted_static, found });
             }
 
-            VMHOOK_LOG("{} find_shared_c2i_entry('{}', static={}): {}",
+            VMHOOK_LOG("{} find_shared_c2i_entry('{}', static={}): {} ({} donor(s) sampled)",
                        found ? vmhook::info_tag : vmhook::warning_tag,
                        descriptor, wanted_static,
-                       found ? "resolved from an interpreted method of the same signature"
-                             : "no interpreted method of this signature to borrow it from");
+                       found ? "resolved and corroborated across concrete donors"
+                             : "refused - no corroborated donor of this signature",
+                       vote_count);
             return found;
         }
         catch (const std::exception&)
