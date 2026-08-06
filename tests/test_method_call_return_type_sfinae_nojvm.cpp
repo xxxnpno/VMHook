@@ -186,7 +186,8 @@ namespace mcrts_nojvm
         check("monostate_to_string_empty", static_cast<std::string>(v).empty());
         check("monostate_to_voidp_null",   static_cast<void*>(v) == nullptr);
         std::unique_ptr<dummy_wrapper> up{ static_cast<std::unique_ptr<dummy_wrapper>>(v) };
-        check("monostate_to_uniqueptr_null", up.get() == nullptr);
+        check("monostate_to_uniqueptr_empty",
+              up != nullptr && up->vmhook::object_base::get_instance() == nullptr);
     }
 }
 

@@ -489,10 +489,12 @@ int main()
     // =======================================================================
     {
         const std::unique_ptr<ia_entity> made{ ia_entity::create() };
-        check("create_no_vm_null", made == nullptr);
+        check("create_no_vm_wrapper_arrived", made != nullptr);
+        check("create_no_vm_instance_null", made && made->get_instance() == nullptr);
 
         const std::unique_ptr<ia_entity> with_args{ ia_entity::create("Bob", 12) };
-        check("create_args_no_vm_null", with_args == nullptr);
+        check("create_args_no_vm_instance_null",
+              with_args && with_args->get_instance() == nullptr);
     }
 
     std::printf(failures == 0 ? "[PASS] %d checks\n" : "[DONE] %d checks\n", checks);

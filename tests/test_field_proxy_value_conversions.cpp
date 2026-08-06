@@ -29,6 +29,32 @@
 #include <variant>
 #include <vector>
 
+// ---------------------------------------------------------------------------
+// CONTRACT CHANGE: a std::unique_ptr handed out by vmhook is NEVER null.
+// The POINTER is always valid; the OBJECT inside it is absent when the Java
+// reference was null (or could not be decoded).  "Empty" therefore means
+// `p != nullptr && p->get_instance() == nullptr`, and that is what every
+// assertion below that used to read `== nullptr` now checks.
+//
+// Spelled as a comparison against a tag so the assertions stay one line and
+// keep reading as a comparison.  get_instance() is base-qualified because a
+// test wrapper may shadow the name.
+// ---------------------------------------------------------------------------
+namespace
+{
+    struct empty_wrapper_t {};
+    inline constexpr empty_wrapper_t empty_wrapper{};
+
+    template<typename wrapper_t>
+    auto operator==(const std::unique_ptr<wrapper_t>& handle, empty_wrapper_t) noexcept
+        -> bool
+    {
+        return handle != nullptr
+            && handle->vmhook::object_base::get_instance() == nullptr;
+    }
+}
+
+
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
 {
@@ -862,39 +888,39 @@ int main()
         vmhook::field_proxy arr{ storage.data(), "[Ljava/lang/Object;", false };
         auto va = arr.get();
         check("unique_ptr_null_for_array_signature",
-              static_cast<std::unique_ptr<W>>(va) == nullptr);
+              static_cast<std::unique_ptr<W>>(va) == empty_wrapper);
         check("unique_ptr_array_alt_is_uint32", va.data.index() == idx::k_u32);
 
         vmhook::field_proxy arr_prim{ storage.data(), "[I", false };
         check("unique_ptr_null_for_primitive_array_signature",
-              static_cast<std::unique_ptr<W>>(arr_prim.get()) == nullptr);
+              static_cast<std::unique_ptr<W>>(arr_prim.get()) == empty_wrapper);
 
         // Unknown single char "X": get() -> uint32 alt, sig.front() != 'L'.
         vmhook::field_proxy unknown_x{ storage.data(), "X", false };
         auto vx = unknown_x.get();
         check("unique_ptr_null_for_unknown_signature",
-              static_cast<std::unique_ptr<W>>(vx) == nullptr);
+              static_cast<std::unique_ptr<W>>(vx) == empty_wrapper);
         check("unique_ptr_unknown_alt_is_uint32", vx.data.index() == idx::k_u32);
 
         // Empty signature + non-null pointer: get() -> uint32 alt, sig empty.
         vmhook::field_proxy empty_sig{ storage.data(), "", false };
         check("unique_ptr_null_for_empty_signature",
-              static_cast<std::unique_ptr<W>>(empty_sig.get()) == nullptr);
+              static_cast<std::unique_ptr<W>>(empty_sig.get()) == empty_wrapper);
 
         // Non-uint32 alternative (null proxy -> int32) -> nullptr arm.
         vmhook::field_proxy null_ref{ nullptr, "Ljava/lang/String;", false };
         auto vn = null_ref.get();
         check("unique_ptr_null_for_non_uint32_alternative",
-              static_cast<std::unique_ptr<W>>(vn) == nullptr);
+              static_cast<std::unique_ptr<W>>(vn) == empty_wrapper);
         check("unique_ptr_null_proxy_alt_is_int32", vn.data.index() == idx::k_i32);
 
         // A primitive value_t (int alt) -> unique_ptr is the non-uint32 arm.
         check("unique_ptr_null_for_int_alternative",
-              static_cast<std::unique_ptr<W>>(read_back<std::int32_t>("I", 7)) == nullptr);
+              static_cast<std::unique_ptr<W>>(read_back<std::int32_t>("I", 7)) == empty_wrapper);
 
         // The implicit conversion agrees with the static_cast spelling.
         std::unique_ptr<W> implicit_form = read_back<std::int32_t>("I", 7);
-        check("unique_ptr_implicit_matches_static_cast_null", implicit_form == nullptr);
+        check("unique_ptr_implicit_matches_static_cast_null", implicit_form == empty_wrapper);
     }
 
     // ---------------------------------------------------------------------
@@ -1264,14 +1290,14 @@ int main()
         // unique_ptr<W> on a directly-built uint32 alt with EMPTY signature ->
         // FLAW-B guard (signature.empty()) -> nullptr, no decode.
         check("direct_uint32_empty_sig_unique_ptr_null",
-              static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 0u } }) == nullptr);
+              static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 0u } }) == empty_wrapper);
 
         // Explicit signature on a directly-built value_t flows into the
         // unique_ptr signature guard: "[I" (array) -> nullptr.
         value_t arr_alt{ std::uint32_t{ 0u }, std::string{ "[I" } };
         check("direct_value_t_carries_signature", arr_alt.signature == "[I");
         check("direct_uint32_array_sig_unique_ptr_null",
-              static_cast<std::unique_ptr<W>>(arr_alt) == nullptr);
+              static_cast<std::unique_ptr<W>>(arr_alt) == empty_wrapper);
     }
 
     // ---------------------------------------------------------------------
@@ -2127,7 +2153,7 @@ int main()
         for (const char* s : non_L_sigs)
         {
             value_t v{ std::uint32_t{ 0u }, std::string{ s } };
-            if (static_cast<std::unique_ptr<W>>(v) != nullptr) { all_null = false; }
+            if (static_cast<std::unique_ptr<W>>(v) != empty_wrapper) { all_null = false; }
             // The alternative is genuinely uint32 (so the guard, not the
             // non-uint32 else-arm, is what produced the nullptr).
             if (v.data.index() != idx::k_u32) { all_null = false; }
@@ -2139,7 +2165,7 @@ int main()
         // guard passes — proves the guard is first-char only, JVM-free here.
         value_t l_zero{ std::uint32_t{ 0u }, std::string{ "Ljava/lang/String;" } };
         check("unique_ptr_null_for_L_sig_zero_oop",
-              static_cast<std::unique_ptr<W>>(l_zero) == nullptr);
+              static_cast<std::unique_ptr<W>>(l_zero) == empty_wrapper);
         check("unique_ptr_L_sig_zero_oop_alt_is_uint32",
               l_zero.data.index() == idx::k_u32);
     }

@@ -13,9 +13,11 @@ Two rules run through the whole API:
 
 - **No type arguments.** `get`, `set` and `call` never take one. The JVM already
   stores every field's and method's type — vmhook reads it and gives you back
-  what you asked for.
+  what your accessor's return type asks for.
 - **Objects are `std::unique_ptr<T>`.** That is the only object type you ever
-  write, everywhere: fields, arguments, return values, hook parameters.
+  write, everywhere: fields, arguments, return values, hook parameters. It is
+  never null — check `get_instance()` when you need to know whether the Java
+  reference was null.
 
 ```cmake
 add_library(vmhook INTERFACE)
@@ -34,87 +36,136 @@ something callers use.
 ```cpp
 #include <vmhook/vmhook.hpp>
 
-class entity final : public vmhook::object<entity>
+namespace sdk
 {
-public:
-    explicit entity(vmhook::oop_t instance) : vmhook::object<entity>{ instance } {}
-
-    // --- reading -----------------------------------------------------------
-    auto health() -> float       { return get_field("health")->get(); }
-    auto alive()  -> bool        { return get_field("isAlive")->get(); }
-    auto name()   -> std::string { return get_field("name")->get(); }
-
-    // a STATIC Java field — same call, the field itself says which it is
-    auto count()  -> std::int32_t { return get_field("entityCount")->get(); }
-
-    // an object field
-    auto passenger() -> std::unique_ptr<entity> { return get_field("passenger")->get(); }
-
-    // --- writing -----------------------------------------------------------
-    auto set_health(float hp)           -> void { get_field("health")->set(hp); }
-    auto set_name(const std::string& n) -> void { get_field("name")->set(n); }
-    auto set_passenger(const std::unique_ptr<entity>& e) -> void
+    class entity : public vmhook::object<sdk::entity>
     {
-        get_field("passenger")->set(e);
-    }
+    public:
+        explicit entity(const vmhook::oop_t instance) noexcept
+            : vmhook::object<sdk::entity>{ instance }
+        {
+        }
 
-    // --- calling -----------------------------------------------------------
-    auto kill() -> void { get_method("kill")->call(); }
+        auto get_health() const noexcept -> float
+        {
+            return get_field("health")->get();
+        }
 
-    auto distance_to(const std::unique_ptr<entity>& other) -> double
-    {
-        return get_method("distanceTo")->call(other);
-    }
+        auto get_riding_entity() const noexcept -> std::unique_ptr<sdk::entity>
+        {
+            return get_field("ridingEntity")->get();
+        }
 
-    auto add_tag(const std::string& tag, std::int32_t level, bool sticky) -> bool
-    {
-        return get_method("addTag")->call(tag, level, sticky);
-    }
+        auto kill() const noexcept -> void
+        {
+            get_method("kill")->call();
+        }
+    };
+}
 
-    // a method that returns an object
-    auto rider() -> std::unique_ptr<entity> { return get_method("getRidingEntity")->call(); }
-};
-
-vmhook::register_class<entity>("net/minecraft/entity/Entity");
+vmhook::register_class<sdk::entity>("net/minecraft/entity/Entity");
 ```
 
-Register every wrapper before using it.
+Register every wrapper before using it. Wrappers inherit, so
+`class entity_living_base : public sdk::entity` gets everything above.
 
-Notice what is *not* in there: no `<float>`, no `<std::string>`, no cast, no
-extraction call. The return type of your accessor is the whole specification —
-`get()` and `call()` produce whatever it says.
+The accessor's **return type is the whole specification**: no `<float>`, no
+cast, no extraction call. And nothing in there says which *kind* of member it
+is — `get_field` resolves a static or an instance Java field indistinguishably,
+and so does `get_method`.
 
-When two Java overloads differ only in their descriptor, name it:
+The one exception is a **static C++ method**, which has no object to work
+through. Use `static_field` / `static_method` there:
 
 ```cpp
-auto add(const std::unique_ptr<entity>& other) -> bool
+static auto get_minecraft() noexcept -> std::unique_ptr<sdk::minecraft>
 {
-    return get_method("add", "(Ljava/lang/Object;)Z")->call(other);
+    return static_field("theMinecraft")->get();
 }
 ```
 
 ## Using it
 
-Outside the wrapper you only ever see your own methods and `std::unique_ptr`.
+Outside the wrapper you only see your own methods and `std::unique_ptr`.
 
 ```cpp
-float       hp  = e->health();
-std::string n   = e->name();
-std::int32_t all = e->count();
+const auto minecraft = sdk::minecraft::get_minecraft();
+if (!minecraft->get_instance()) { return; }
 
-e->set_health(20.0f);
-e->set_name("Bob");
-e->set_passenger(other);
+const auto player = minecraft->get_the_player();
+if (!player->get_instance()) { return; }
 
-e->kill();
-double d = e->distance_to(other);
-
-std::unique_ptr<entity> p = e->passenger();
-if (p) { p->set_health(1.0f); }
+player->set_health(20.0f);
 ```
 
-A null Java reference comes back as a null `unique_ptr`, so `if (p)` is the only
-check you need.
+The `unique_ptr` is **never null**, so `->` is always safe to write. What can be
+absent is the Java object inside it: `get_instance()` returns `nullptr` when the
+Java reference was null or could not be decoded. That keeps "I got a wrapper"
+and "there was an object" as two separate questions, instead of folding them
+into one null check at every step.
+
+## Getting a value
+
+```cpp
+auto get_health() const noexcept -> float
+{
+    return get_field("health")->get();
+}
+
+auto get_name() const noexcept -> std::string
+{
+    return get_field("name")->get();
+}
+
+auto get_riding_entity() const noexcept -> std::unique_ptr<sdk::entity>
+{
+    return get_field("ridingEntity")->get();
+}
+```
+
+## Setting a value
+
+```cpp
+auto set_health(const float health) const noexcept -> void
+{
+    get_field("health")->set(health);
+}
+
+auto set_name(const std::string& name) const noexcept -> void
+{
+    get_field("name")->set(name);
+}
+
+auto set_riding_entity(const std::unique_ptr<sdk::entity>& entity) const noexcept -> void
+{
+    get_field("ridingEntity")->set(entity);
+}
+```
+
+Writing a string builds a real `java.lang.String` and rebinds the field to it,
+like a Java `field = value;` — the previous String is never mutated, so a shared
+or interned one cannot be corrupted.
+
+## Calling a method
+
+```cpp
+auto kill() const noexcept -> void
+{
+    get_method("kill")->call();
+}
+
+auto get_distance_to_entity(const std::unique_ptr<sdk::entity>& entity) const noexcept -> float
+{
+    return get_method("getDistanceToEntity")->call(entity);
+}
+
+auto add_chat_message(const std::string& message, const std::int32_t id) const noexcept -> bool
+{
+    return get_method("addChatMessage")->call(message, id);
+}
+```
+
+Argument types are deduced and the Java overload is selected from them.
 
 ## Creating objects
 
@@ -122,71 +173,118 @@ check you need.
 overload from the argument types:
 
 ```cpp
-std::unique_ptr<entity> fresh = entity::create();
-std::unique_ptr<entity> named = entity::create("Bob", 12);
+const auto fresh = sdk::entity::create();
+if (fresh->get_instance()) { fresh->set_health(20.0f); }
 ```
 
-If no `<init>` matches, nothing is allocated and you get null — never a
-half-built object.
+If no `<init>` matches, nothing is allocated and `get_instance()` is null —
+never a half-built object.
 
 ## Hooks
 
-A hook replaces a method's interpreter entry, so your lambda runs every time
+A hook replaces a method's interpreter entry, so your function runs every time
 Java calls it. Declare the parameters you want and they are decoded for you:
 primitives by value, objects as `std::unique_ptr`.
 
-```cpp
-auto h = vmhook::scoped_hook<entity>("hurt", "(F)V",
-    [](vmhook::return_value& ret, std::unique_ptr<entity> self, float amount) noexcept {
+vmhook **deoptimises the hooked method itself** on install and holds
+`NO_COMPILE` on it, so hooking a hot method needs no preparation on your part.
+(The one case it cannot reach is a *caller* that already inlined the target;
+those call sites resolve at the next safepoint.)
 
-        if (self) { self->set_health(20.0f); }
-
-        ret.set_arg(0, 0.0f);       // change what the original sees
-        ret.cancel();               // or stop it running at all
-        ret.set(true);              // or force a return value
-
-        const auto who   = ret.caller();       // who called it:
-                                               //   class_name, method_name, valid()
-        const auto stack = ret.stack_trace();  // ...or the whole interpreter stack
-    });
-```
-
-Hook every method matching a descriptor instead of naming one:
+### A basic hook
 
 ```cpp
-vmhook::hook_by_signature<entity>("(F)V", [](vmhook::return_value&) noexcept {});
+auto run_tick_hook(vmhook::return_value& return_value,
+                   const std::unique_ptr<sdk::minecraft>& thizz) -> void
+{
+    // runs on the game thread, inside the call
+}
+
+vmhook::hook<sdk::minecraft>("runTick", &zoo::run_tick_hook);
 ```
 
-Watch a field change, a class load, or a thrown exception:
+Pin an exact overload by descriptor when the name is ambiguous:
 
 ```cpp
-auto w = vmhook::watch_static_field<entity, std::int32_t>("entityCount",
-    [](std::int32_t before, std::int32_t after) noexcept {});
-
-auto c = vmhook::on_class_loaded([](const std::string& name) noexcept {});
-auto e = vmhook::on_exception   ([](const std::string& type) noexcept {});
+vmhook::hook<sdk::entity>("getDistanceToEntity",
+                          "(Lnet/minecraft/entity/Entity;)F",
+                          &zoo::get_distance_hook);
 ```
 
-Manage them:
+### Changing an argument
 
 ```cpp
-vmhook::verify_hooks();     // re-check every installed hook is still in place
-vmhook::shutdown_hooks();   // remove all of them
+auto send_chat_message_hook(vmhook::return_value& return_value,
+                            const std::unique_ptr<sdk::entity>& thizz,
+                            const std::string& message) -> void
+{
+    if (message == "/hi")
+    {
+        return_value.set_arg(0, std::string{ "/hello" });
+    }
+}
 ```
 
-Four things that bite:
+The original method then runs with the replaced argument.
 
-- **`scoped_hook` removes its hook on destruction — do not let that happen
-  during DLL unload.** Removing a hook stops threads *entering* it but cannot
-  evict one already inside, and unloading a module a Java thread is executing
-  takes the process with it. Prefer leaving the module mapped.
-- **Deoptimise a hot method before hooking it**, or the JIT routes around the
-  detour and the hook silently never fires.
-- **No exception may reach the JVM.** Hook bodies are `noexcept`; the frame
-  above you is HotSpot's interpreter and it has no handler.
+### Cancelling the call
+
+```cpp
+auto attack_entity_hook(vmhook::return_value& return_value,
+                        const std::unique_ptr<sdk::entity>& thizz,
+                        const std::unique_ptr<sdk::entity>& target) -> void
+{
+    if (!target->get_instance())
+    {
+        return_value.cancel();
+    }
+}
+```
+
+### Forcing a return value
+
+```cpp
+auto is_singleplayer_hook(vmhook::return_value& return_value,
+                          const std::unique_ptr<sdk::minecraft>& thizz) -> void
+{
+    return_value.set(true);   // the original never runs
+}
+```
+
+### Getting caller info
+
+```cpp
+auto ray_trace_blocks_hook(vmhook::return_value& return_value,
+                           const std::unique_ptr<sdk::entity>& thizz) -> void
+{
+    const auto caller = return_value.caller();
+    if (caller.valid() && caller.method_name == "orientCamera")
+    {
+        return_value.cancel();
+    }
+}
+```
+
+`caller()` gives `class_name`, `method_name`, `signature` and `valid()`.
+`stack_trace()` walks outward from there and returns the same for every frame.
+
+### Removing hooks
+
+```cpp
+vmhook::shutdown_hooks();
+```
+
+**Do not let that happen during DLL unload.** Removing a hook stops threads
+*entering* it but cannot evict one already inside, and unloading a module a Java
+thread is executing takes the process with it. Prefer leaving the module mapped.
+
+Two more things worth knowing:
+
 - **A wrapper is a view for the duration of the call.** It holds a plain
   address, so do not stash one in a global and use it later — the collector
   moves objects. Re-read it from wherever you got it.
+- **No exception may reach the JVM.** The frame above your hook is HotSpot's
+  interpreter and it has no handler.
 
 ## Calling from your own thread
 
@@ -195,11 +293,13 @@ scope — and resolve and call inside the same one, because between two scopes a
 collection can run and move what the first one found.
 
 ```cpp
-void worker() {                       // an ordinary std::thread
+void worker()                         // an ordinary std::thread
+{
     const vmhook::java_thread_scope java{};
     if (!java) { return; }            // ALWAYS check
 
-    e->kill();
+    const auto minecraft = sdk::minecraft::get_minecraft();
+    if (minecraft->get_instance()) { minecraft->get_the_player()->kill(); }
 }
 ```
 

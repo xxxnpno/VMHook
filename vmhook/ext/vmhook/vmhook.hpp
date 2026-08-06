@@ -2057,6 +2057,35 @@ namespace vmhook
         inline constexpr bool is_unique_ptr_v{ is_unique_ptr<std::remove_cvref_t<type>>::value };
 
         /*
+            @brief Wraps an address in a std::unique_ptr that is NEVER null.
+            @details
+            The single place every `std::unique_ptr<W>` a caller receives is
+            built — a field read, a call result, a detour argument, create().
+
+            The contract it exists to enforce: the POINTER is always valid, and
+            the OBJECT may be absent.  `p->get_instance() == nullptr` means the
+            Java reference was null (or could not be decoded); `p` itself is
+            never null, so there is exactly one thing to check and `p->` is
+            always safe to write.
+
+            Folding both cases into a null unique_ptr — which is what this
+            replaced — made the two indistinguishable at the call site and made
+            every access site carry a null test before it could ask anything.
+
+            The one residual null is a failed C++ allocation: `new` is nothrow
+            here because every one of these paths is noexcept, and there is
+            nothing honest to return when the process is out of memory.
+
+            Complexity: O(1) plus one small allocation.  noexcept.
+        */
+        template<typename wrapper_type>
+        [[nodiscard]] inline auto wrap_object(void* const address) noexcept
+            -> std::unique_ptr<wrapper_type>
+        {
+            return std::unique_ptr<wrapper_type>{ new (std::nothrow) wrapper_type{ address } };
+        }
+
+        /*
             @brief The human-readable spelling of a C++ type, for diagnostics.
             @details
             Every "wrapper not registered" warning in this header names the type
@@ -11755,25 +11784,20 @@ namespace vmhook
             }
             else if constexpr (is_unique_ptr_v<base_t>)
             {
+                // A detour argument declared as std::unique_ptr<W> is the same
+                // shape as everywhere else: NEVER a null pointer, and a null
+                // instance when the Java argument was null.
+                //
+                // The wrapper is constructed DIRECTLY rather than through
+                // g_type_factory_map, because W is known statically here.  The
+                // factory route additionally required the wrapper to have been
+                // register_class<>'d, so an unregistered wrapper silently
+                // produced a null argument -- a registration mistake that looked
+                // exactly like a Java null at the call site.  It no longer can:
+                // the wrapper arrives, and a missing registration surfaces where
+                // it actually matters, on the first field or method lookup.
                 using element_t = typename base_t::element_type;
-                void* const oop{ decode_oop(raw_value) };
-                if (!oop)
-                {
-                    return nullptr;
-                }
-                const auto type_it{ vmhook::type_to_class_map.find(std::type_index{ typeid(element_t) }) };
-                if (type_it == vmhook::type_to_class_map.end())
-                {
-                    return nullptr;
-                }
-                const auto factory_it{ vmhook::g_type_factory_map.find(type_it->second) };
-                if (factory_it == vmhook::g_type_factory_map.end())
-                {
-                    return nullptr;
-                }
-                // factory returns object_base*; downcast to element_t* and
-                // hand it to the unique_ptr at the call site.
-                return base_t{ static_cast<element_t*>(factory_it->second(oop)) };
+                return vmhook::detail::wrap_object<element_t>(decode_oop(raw_value));
             }
             else if constexpr (std::is_pointer_v<base_t>)
             {
@@ -15653,45 +15677,40 @@ namespace vmhook
                 }
                 else if constexpr (vmhook::detail::is_unique_ptr_v<clean_target_type>)
                 {
+                    // The unique_ptr is NEVER null; the INSTANCE inside it may be.
+                    // Every refusal below therefore yields a wrapper on a null oop
+                    // rather than a null pointer, so a caller has exactly one thing
+                    // to check (`p->get_instance()`) and `p->` is always safe.
+                    //
+                    // What is refused, and why, is unchanged:
+                    //   - a non-'L' descriptor: an ARRAY field decodes to the ARRAY
+                    //     oop, not an element, so a wrapper on it would resolve
+                    //     every later field at a meaningless offset (read a '[L'
+                    //     field into a std::vector instead);
+                    //   - an address that fails the heap-range check;
+                    //   - a PROVEN cross-klass mismatch.  klass_match_ok is
+                    //     fail-open: unregistered wrappers, unresolvable klasses,
+                    //     interface-registered wrappers and IS-A reads all pass.
+                    using wrapper_type = typename clean_target_type::element_type;
                     if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
                     {
-                        // FLAW B fix: a unique_ptr<T> target reads a SINGLE object
-                        // reference field ('L...;').  If the field is actually an
-                        // ARRAY ('[...;'), decoding its compressed OOP as a single
-                        // wrapper points the wrapper at the ARRAY oop, not an
-                        // element — and any field read through that wrapper is UB.
-                        // Reject non-'L' signatures (arrays / primitives) so the
-                        // mis-typed read yields nullptr instead of a wild wrapper.
-                        // (Use to_vector<T>() to read a '[L' field as elements.)
                         if (this->signature.empty() || this->signature.front() != 'L')
                         {
-                            return nullptr;
+                            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
                         }
-                        using wrapper_type = typename clean_target_type::element_type;
                         void* const decoded{ vmhook::hotspot::decode_oop_pointer(value) };
-                        if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
+                        if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded)
+                            || !klass_match_ok<wrapper_type>(decoded))
                         {
-                            return nullptr;
+                            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
                         }
-                        // FLAW A fix: refuse a CONFIDENT wrapper-klass mismatch.  If the
-                        // live object's runtime klass is provably not a wrapper_type
-                        // (the wrapper's registered class is a non-interface that is
-                        // absent from the OOP's entire superclass chain), wrapping it
-                        // here would resolve every later field/method at a mismatched
-                        // offset — a silent type confusion.  klass_match_ok() is
-                        // fail-open: it only returns false for a proven cross-klass
-                        // mismatch, so unregistered wrappers, unresolvable klasses,
-                        // INTERFACE-registered wrappers, and IS-A (subclass-through-
-                        // base) reads all still go through unchanged.
-                        if (!klass_match_ok<wrapper_type>(decoded))
-                        {
-                            return nullptr;
-                        }
-                        return clean_target_type{ new wrapper_type{ decoded } };
+                        return vmhook::detail::wrap_object<wrapper_type>(decoded);
                     }
                     else
                     {
-                        return nullptr;
+                        // A primitive is not an object: an empty wrapper, never one
+                        // aimed at an address invented from the primitive's bits.
+                        return vmhook::detail::wrap_object<wrapper_type>(nullptr);
                     }
                 }
                 else if constexpr (std::is_same_v<target_type, void*>)
@@ -17670,18 +17689,24 @@ namespace vmhook
                                           "method_proxy::value_t -> std::unique_ptr<T>: T must derive "
                                           "from vmhook::object_base.  Return-by-wrapper only works for "
                                           "registered vmhook wrapper types.");
+                            // NEVER a null unique_ptr; a wrapper on a null oop.
+                            // See detail::wrap_object for why the pointer and the
+                            // object are kept as separate questions.
                             if constexpr (std::is_same_v<stored_type, std::uint32_t>)
                             {
                                 void* const decoded{ vmhook::hotspot::decode_oop_pointer(v) };
-                                if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
+                                if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded)
+                                    || !vmhook::field_proxy::value_t::klass_match_ok<wrapper_type>(decoded))
                                 {
-                                    return target_type{};
+                                    return vmhook::detail::wrap_object<wrapper_type>(nullptr);
                                 }
-                                return target_type{ new wrapper_type{ decoded } };
+                                return vmhook::detail::wrap_object<wrapper_type>(decoded);
                             }
                             else
                             {
-                                return target_type{};
+                                // void, a primitive, or a String the call already
+                                // decoded eagerly - no object to hand back.
+                                return vmhook::detail::wrap_object<wrapper_type>(nullptr);
                             }
                         }
                         // std::string <- either the eagerly-decoded std::string
@@ -20731,9 +20756,10 @@ namespace vmhook
             The overload is selected from the C++ argument types, exactly as
             get_method(name)->call(args...) selects one, so nothing here takes a
             descriptor or a template argument.  A class with no matching `<init>`
-            yields NULL rather than an allocated-but-uninitialised object: a
-            half-constructed instance escaping into Java is worse than no
-            instance at all.
+            yields a wrapper whose get_instance() is null, rather than an
+            allocated-but-uninitialised object: a half-constructed instance
+            escaping into Java is worse than no instance at all.  The unique_ptr
+            itself is never null, exactly as for a field read or a call result.
 
             THREAD / GC CONTRACT, the same one call() has: this allocates and
             then invokes, and the invoke is a safepoint.  Call it from inside a
@@ -26555,7 +26581,8 @@ namespace hotspot
         needs is only complete at this point.
 
         Every failure between the allocation and a successfully-returned
-        constructor abandons the instance and yields NULL.  That is
+        constructor abandons the instance and yields an EMPTY wrapper (a
+        non-null unique_ptr whose get_instance() is null).  That is
         deliberate — an object that was allocated but whose `<init>` did not run
         (or threw) has Java-visible invariants that were never established, and
         handing it back would push a half-built object into code that has no way
@@ -26573,7 +26600,7 @@ namespace hotspot
             VMHOOK_LOG("{} object::create(): type '{}' is not registered - call "
                        "register_class<T>(\"java/lang/Name\") before constructing it.",
                        vmhook::error_tag, vmhook::detail::type_name<derived>());
-            return nullptr;
+            return vmhook::detail::wrap_object<derived>(nullptr);
         }
 
         vmhook::hotspot::klass* const target_klass{ vmhook::find_class(class_name) };
@@ -26581,7 +26608,7 @@ namespace hotspot
         {
             VMHOOK_LOG("{} object::create(): class '{}' is not loaded in this VM.",
                        vmhook::error_tag, class_name);
-            return nullptr;
+            return vmhook::detail::wrap_object<derived>(nullptr);
         }
 
         // A zero instance size means non-instantiable (interface / abstract /
@@ -26593,7 +26620,7 @@ namespace hotspot
             VMHOOK_LOG("{} object::create(): '{}' is not instantiable (interface, "
                        "abstract, or its instance size could not be read).",
                        vmhook::error_tag, class_name);
-            return nullptr;
+            return vmhook::detail::wrap_object<derived>(nullptr);
         }
 
         // Locate ANY <init> on the class first.  The exact overload is chosen
@@ -26627,7 +26654,7 @@ namespace hotspot
             VMHOOK_LOG("{} object::create(): '{}' declares no <init> this library can "
                        "reach - nothing was allocated.",
                        vmhook::error_tag, class_name);
-            return nullptr;
+            return vmhook::detail::wrap_object<derived>(nullptr);
         }
 
         // PRE-FLIGHT the invocability of the call BEFORE allocating.  A refused
@@ -26644,7 +26671,7 @@ namespace hotspot
             VMHOOK_LOG("{} object::create(): no call stub could be derived on this VM, "
                        "so '{}' cannot be constructed - nothing was allocated.",
                        vmhook::error_tag, class_name);
-            return nullptr;
+            return vmhook::detail::wrap_object<derived>(nullptr);
         }
         if (!vmhook::hotspot::ensure_current_java_thread())
         {
@@ -26652,7 +26679,7 @@ namespace hotspot
                        "not be attached, so the constructor of '{}' cannot run - nothing "
                        "was allocated.",
                        vmhook::error_tag, class_name);
-            return nullptr;
+            return vmhook::detail::wrap_object<derived>(nullptr);
         }
 
         // Named `allocated`, not `instance`: object_base has a member of
@@ -26662,7 +26689,7 @@ namespace hotspot
         {
             VMHOOK_LOG("{} object::create(): allocation of {} bytes for '{}' failed.",
                        vmhook::warning_tag, instance_size, class_name);
-            return nullptr;
+            return vmhook::detail::wrap_object<derived>(nullptr);
         }
 
         const vmhook::method_proxy constructor{ allocated, initializer, initializer->get_signature() };
@@ -26673,12 +26700,12 @@ namespace hotspot
                        "instance is abandoned.",
                        vmhook::error_tag, class_name,
                        result.exception_class.empty() ? "an exception" : result.exception_class.c_str());
-            return nullptr;
+            return vmhook::detail::wrap_object<derived>(nullptr);
         }
 
-        // nothrow: this function is noexcept, so a failed wrapper
-        // allocation must degrade to null like every other failure here.
-        return std::unique_ptr<derived>{ new (std::nothrow) derived{ allocated } };
+        // wrap_object never yields a null pointer: a caller checks
+        // get_instance(), exactly as for a field read or a call result.
+        return vmhook::detail::wrap_object<derived>(allocated);
     }
 
     // -------------------------------------------------------------------------

@@ -22,6 +22,22 @@
 #include <utility>
 #include <variant>
 
+// ---------------------------------------------------------------------------
+// CONTRACT CHANGE: a std::unique_ptr handed out by vmhook is NEVER null.  The
+// POINTER is always valid; the OBJECT inside it is absent when there was no
+// Java object.  "null" below therefore means "arrived, holds no instance".
+// ---------------------------------------------------------------------------
+namespace
+{
+    template<typename wrapper_t>
+    auto is_empty_wrapper(const std::unique_ptr<wrapper_t>& handle) noexcept
+        -> bool
+    {
+        return handle != nullptr
+            && handle->vmhook::object_base::get_instance() == nullptr;
+    }
+}
+
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
 {
@@ -96,7 +112,7 @@ int main()
         check("null_method_object_return_not_string", !result.is_string());
 
         std::unique_ptr<test_object> wrapper{ result };
-        check("null_method_object_return_unique_ptr_null", wrapper == nullptr);
+        check("null_method_object_return_unique_ptr_empty", is_empty_wrapper(wrapper));
 
         // void* alternative on the same monostate is nullptr (not a truncated handle).
         void* const raw{ result };
@@ -119,8 +135,8 @@ int main()
 
         std::unique_ptr<test_object> w1{ r1 };
         std::unique_ptr<test_object> w2{ r2 };
-        check("null_method_array1_unique_ptr_null", w1 == nullptr);
-        check("null_method_array2_unique_ptr_null", w2 == nullptr);
+        check("null_method_array1_unique_ptr_empty", is_empty_wrapper(w1));
+        check("null_method_array2_unique_ptr_empty", is_empty_wrapper(w2));
     }
 
     // -------------------------------------------------------------------------
@@ -137,12 +153,12 @@ int main()
                                     std::string{ "carry" }) };
         check("null_method_object_with_args_is_void", r.is_void());
         std::unique_ptr<test_object> wrapper{ r };
-        check("null_method_object_with_args_unique_ptr_null", wrapper == nullptr);
+        check("null_method_object_with_args_unique_ptr_empty", is_empty_wrapper(wrapper));
     }
 
     // -------------------------------------------------------------------------
     // Stability: repeated cold calls on the same Object-returning proxy
-    // always produce a null unique_ptr — never leaks a stale pointer through.
+    // always produce an INSTANCE-LESS wrapper — never leak a stale pointer.
     // -------------------------------------------------------------------------
     {
         const vmhook::method_proxy proxy{ nullptr, nullptr,
@@ -151,9 +167,9 @@ int main()
         for (int i{ 0 }; i < 64; ++i)
         {
             std::unique_ptr<test_object> w{ proxy.call() };
-            if (w) { any_non_null = true; }
+            if (!is_empty_wrapper(w)) { any_non_null = true; }
         }
-        check("cold_call_loop_object_unique_ptr_always_null", !any_non_null);
+        check("cold_call_loop_object_unique_ptr_always_empty", !any_non_null);
     }
 
     // -------------------------------------------------------------------------
@@ -165,7 +181,7 @@ int main()
         const value_t direct{ };  // default-constructed -> monostate
         check("direct_monostate_value_t_is_void", direct.is_void());
         std::unique_ptr<test_object> wrapper{ direct };
-        check("direct_monostate_to_unique_ptr_null", wrapper == nullptr);
+        check("direct_monostate_to_unique_ptr_empty", is_empty_wrapper(wrapper));
     }
 
     // -------------------------------------------------------------------------
@@ -177,7 +193,7 @@ int main()
         value_t numeric{ };
         numeric.data = std::int32_t{ 42 };
         std::unique_ptr<test_object> wrapper{ numeric };
-        check("numeric_value_t_to_unique_ptr_null", wrapper == nullptr);
+        check("numeric_value_t_to_unique_ptr_empty", is_empty_wrapper(wrapper));
         check("numeric_value_t_not_void", !numeric.is_void());
         check("numeric_value_t_not_string", !numeric.is_string());
     }

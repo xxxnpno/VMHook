@@ -35,6 +35,24 @@
 #include <string_view>
 #include <type_traits>
 
+// ---------------------------------------------------------------------------
+// CONTRACT CHANGE: a std::unique_ptr handed out by vmhook is NEVER null.  The
+// POINTER is always valid; the OBJECT inside it is absent when the Java
+// reference was null or could not be decoded.  Every "is null" assertion below
+// therefore now means "the wrapper arrived, and it holds no instance".
+// ---------------------------------------------------------------------------
+namespace
+{
+    template<typename wrapper_t>
+    auto is_empty_wrapper(const std::unique_ptr<wrapper_t>& handle) noexcept
+        -> bool
+    {
+        return handle != nullptr
+            && handle->vmhook::object_base::get_instance() == nullptr;
+    }
+}
+
+
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
 {
@@ -111,8 +129,8 @@ static auto section_null_proxy_L_descriptor() -> void
     // The cast_for_variant int32_t arm of unique_ptr returns nullptr.
     const auto value{ proxy.get() };
     std::unique_ptr<ref_object> wrapper = value;
-    check("null-proxy 'L...;' -> unique_ptr<ref_object> is null",
-          wrapper.get() == nullptr);
+    check("null-proxy 'L...;' -> unique_ptr<ref_object> holds no instance",
+          is_empty_wrapper(wrapper));
 
     // void* conversion from the int32 source alternative also yields nullptr.
     void* const raw = value;
@@ -143,16 +161,16 @@ static auto section_null_proxy_array_descriptor() -> void
 
     const auto value{ proxy.get() };
     std::unique_ptr<ref_object> wrapper = value;
-    check("null-proxy '[L...;' -> unique_ptr<ref_object> is null (FLAW B)",
-          wrapper.get() == nullptr);
+    check("null-proxy '[L...;' -> unique_ptr<ref_object> holds no instance (FLAW B)",
+          is_empty_wrapper(wrapper));
 
     // Multi-bracket too.
     vmhook::field_proxy multi{ nullptr,
                                std::string{ "[[Lref/object;" },
                                /*is_static=*/false };
     std::unique_ptr<ref_object> mw = multi.get();
-    check("null-proxy '[[L...;' -> unique_ptr<ref_object> is null",
-          mw.get() == nullptr);
+    check("null-proxy '[[L...;' -> unique_ptr<ref_object> holds no instance",
+          is_empty_wrapper(mw));
 }
 
 // ---------------------------------------------------------------------------
@@ -174,8 +192,8 @@ static auto section_null_proxy_primitive_descriptor() -> void
               proxy.get_compressed_oop() == 0u);
         const auto value{ proxy.get() };
         std::unique_ptr<ref_object> w = value;
-        check("null-proxy primitive -> unique_ptr<ref_object> is null",
-              w.get() == nullptr);
+        check("null-proxy primitive -> unique_ptr<ref_object> holds no instance",
+              is_empty_wrapper(w));
     }
 }
 
@@ -194,8 +212,8 @@ static auto section_null_proxy_empty_descriptor() -> void
           proxy.get_compressed_oop() == 0u);
     const auto value{ proxy.get() };
     std::unique_ptr<ref_object> w = value;
-    check("null-proxy empty-sig -> unique_ptr<ref_object> is null",
-          w.get() == nullptr);
+    check("null-proxy empty-sig -> unique_ptr<ref_object> holds no instance",
+          is_empty_wrapper(w));
     void* raw = value;
     check("null-proxy empty-sig -> void* is nullptr",
           raw == nullptr);
@@ -203,7 +221,7 @@ static auto section_null_proxy_empty_descriptor() -> void
 
 // ---------------------------------------------------------------------------
 // SECTION 6 — 32-iter idempotency: repeating the null-proxy 'L...;' get()
-// must yield a null wrapper EVERY iteration.  No cached fabrication, no
+// must yield an instance-less wrapper EVERY iteration.  No cached fabrication, no
 // state drift, no descriptor mutation.
 // ---------------------------------------------------------------------------
 
@@ -214,9 +232,9 @@ static auto section_idempotent_null_ref() -> void
     for (int i{ 0 }; i < 32; ++i)
     {
         std::unique_ptr<ref_object> w = proxy.get();
-        if (w) { all_null = false; }
+        if (!is_empty_wrapper(w)) { all_null = false; }
     }
-    check("32 iterations of null-proxy 'L...;' get() all null", all_null);
+    check("32 iterations of null-proxy 'L...;' get() all instance-less", all_null);
 }
 
 int main()

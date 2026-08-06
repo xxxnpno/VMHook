@@ -113,6 +113,20 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Five of those already worked; `create()` was returning a `vmhook::borrowed`
   and was the one place the handle vocabulary leaked into user code.  Pinned by
   static_assert so a future change cannot reopen the gap.
+- **A `std::unique_ptr` handed out by vmhook is never null.**  The POINTER is
+  always valid and the OBJECT inside it is absent when the Java reference was
+  null or could not be decoded, so `p->` is always safe to write and
+  `p->get_instance() == nullptr` is the single question to ask.  Previously both
+  cases collapsed into a null pointer, which made "there was no object" and "the
+  read was refused" indistinguishable and put a null test in front of every
+  access.  Applies to all four producing paths (field read, call result, detour
+  argument, `create()`), each of which keeps its existing refusals — array
+  descriptor, failed heap-range check, proven cross-klass mismatch — and now
+  expresses them as an instance-less wrapper.  The detour path additionally
+  stops routing through `g_type_factory_map`: the wrapper type is known
+  statically there, and the factory route silently produced a null argument for
+  a wrapper that was never `register_class<>`'d — a registration mistake that
+  looked exactly like a Java null at the call site.
 - `vmhook::vm_capabilities()` — a cached capability gate reporting the live
   collector, barrier shape, `UseCompressedOops` and `UseCompactObjectHeaders`.
   The collector is determined by walking the JVM flag table (`Flag` on JDK 8,
@@ -133,9 +147,20 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   compiles, and never did.  The README is rewritten around the shape the library
   is actually for — you describe a Java class once as a C++ wrapper, `get_field`
   / `get_method` live INSIDE it, and callers see only your own accessors and
-  `std::unique_ptr` — and every snippet in it is compiled under `-Werror` on GCC
-  and `/W4 /WX /permissive-` on MSVC.  The same two fictions appeared in the
-  header's own `java_thread_scope` examples and are fixed there too.
+  `std::unique_ptr` — with one code box per operation and one per hook feature,
+  modelled on the real consumer (npnoqol).  Every snippet in it is compiled under
+  `-Werror` on GCC and `/W4 /WX /permissive-` on MSVC.  The same two fictions
+  appeared in the header's own `java_thread_scope` examples and are fixed there
+  too.
+- **Two further README claims were wrong and are removed.**  "Deoptimise a hot
+  method before hooking it, or the hook silently never fires" — `hook()` has
+  always deoptimised its own target on install (it clears `_code`, repoints
+  `_from_compiled_entry` at the c2i adapter and `_from_interpreted_entry` at the
+  i2i stub) and holds `NO_COMPILE`; the only case it cannot reach is a caller
+  that already inlined the target.  And `verify_hooks()` was documented as
+  something a user calls — the auto-repair watchdog has always been spawned on
+  the first successful install and re-verifies every second until shutdown, so
+  it is not part of the user-facing surface.
 - `get_field` / `get_method` are stated as the ONE access spelling: each resolves
   a static or an instance Java member indistinguishably, so `static_field` /
   `static_method` are only for the no-instance case.  The header's wrapper-class

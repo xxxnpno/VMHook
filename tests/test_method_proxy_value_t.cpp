@@ -32,6 +32,32 @@
 #include <variant>
 #include <vector>
 
+// ---------------------------------------------------------------------------
+// CONTRACT CHANGE: a std::unique_ptr handed out by vmhook is NEVER null.
+// The POINTER is always valid; the OBJECT inside it is absent when the Java
+// reference was null (or could not be decoded).  "Empty" therefore means
+// `p != nullptr && p->get_instance() == nullptr`, and that is what every
+// assertion below that used to read `== nullptr` now checks.
+//
+// Spelled as a comparison against a tag so the assertions stay one line and
+// keep reading as a comparison.  get_instance() is base-qualified because a
+// test wrapper may shadow the name.
+// ---------------------------------------------------------------------------
+namespace
+{
+    struct empty_wrapper_t {};
+    inline constexpr empty_wrapper_t empty_wrapper{};
+
+    template<typename wrapper_t>
+    auto operator==(const std::unique_ptr<wrapper_t>& handle, empty_wrapper_t) noexcept
+        -> bool
+    {
+        return handle != nullptr
+            && handle->vmhook::object_base::get_instance() == nullptr;
+    }
+}
+
+
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
 {
@@ -614,25 +640,29 @@ int main()
     static_assert(std::is_convertible_v<value_t, std::unique_ptr<W>>,
                   "value_t -> unique_ptr<wrapper> arm must exist");
     check("unique_ptr_from_uint32_zero_is_null",
-          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 0 } }) == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 0 } }) == empty_wrapper);
     check("unique_ptr_from_uint32_nonzero_is_null_no_jvm",
-          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 42 } }) == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 42 } }) == empty_wrapper);
     check("unique_ptr_from_uint32_sentinel_is_null_no_jvm",
-          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 0xDEADBEEF } }) == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 0xDEADBEEF } }) == empty_wrapper);
     check("unique_ptr_from_int32_alternative_is_null",
-          static_cast<std::unique_ptr<W>>(value_t{ std::int32_t{ 1 } }) == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::int32_t{ 1 } }) == empty_wrapper);
     check("unique_ptr_from_int64_alternative_is_null",
-          static_cast<std::unique_ptr<W>>(value_t{ std::int64_t{ 1 } }) == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::int64_t{ 1 } }) == empty_wrapper);
     check("unique_ptr_from_monostate_is_null",
-          static_cast<std::unique_ptr<W>>(value_t{ std::monostate{} }) == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::monostate{} }) == empty_wrapper);
     check("unique_ptr_from_string_alternative_is_null",
-          static_cast<std::unique_ptr<W>>(value_t{ std::string{ "x" } }) == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::string{ "x" } }) == empty_wrapper);
     check("unique_ptr_from_float_alternative_is_null",
-          static_cast<std::unique_ptr<W>>(value_t{ 1.0f }) == nullptr);
-    // The natural cast and the explicit operator spelling agree (both null here).
+          static_cast<std::unique_ptr<W>>(value_t{ 1.0f }) == empty_wrapper);
+    // The natural cast and the explicit operator spelling agree.  They can no
+    // longer be compared as POINTERS: each now yields its own non-null wrapper,
+    // so two distinct addresses is the correct result and equality would only
+    // hold back when both were null.  What must agree is what they DESCRIBE —
+    // here, that neither holds an instance.
     check("unique_ptr_static_cast_matches_operator",
-          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 42 } })
-              == value_t{ std::uint32_t{ 42 } }.operator std::unique_ptr<W>());
+          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 42 } }) == empty_wrapper
+              && value_t{ std::uint32_t{ 42 } }.operator std::unique_ptr<W>() == empty_wrapper);
 
     // -------------------------------------------------------------------------
     // uint16_t (the Java char alternative) is NOT the uint32_t reference
@@ -651,7 +681,7 @@ int main()
     check("uint16_char_to_voidptr_is_null_not_decoded",
           static_cast<void*>(value_t{ std::uint16_t{ 0x0041 } }) == nullptr);
     check("uint16_char_to_unique_ptr_is_null",
-          static_cast<std::unique_ptr<W>>(value_t{ std::uint16_t{ 0x0041 } }) == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::uint16_t{ 0x0041 } }) == empty_wrapper);
     // And as_string() on a char alternative is "" (only string / uint32 decode).
     check("uint16_char_as_string_is_empty",
           value_t{ std::uint16_t{ 0x0041 } }.as_string().empty());
@@ -914,7 +944,7 @@ int main()
     check("default_value_t_to_voidptr_null", static_cast<void*>(value_t{}) == nullptr);
     check("default_value_t_as_string_empty", value_t{}.as_string().empty());
     check("default_value_t_to_unique_ptr_null",
-          static_cast<std::unique_ptr<W>>(value_t{}) == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{}) == empty_wrapper);
     check("default_value_t_to_string_empty",
           static_cast<std::string>(value_t{}).empty());
 
