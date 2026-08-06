@@ -294,11 +294,18 @@ So on install, for a method that is already compiled, vmhook:
 - clears `_code` last, so the two writes above are visible before anyone
   observes that the compiled version is gone.
 
-The method is now interpreted again, and interpreted means patched. vmhook also
-sets `NO_COMPILE` on it so the JIT does not simply recompile it a second later,
-and a background watchdog re-checks every installed hook once a second and
-re-applies any that HotSpot managed to undo — you never call anything to make
-that happen.
+The method is now interpreted again, and interpreted means patched. On the same
+install `hook()` also sets `NO_COMPILE` in `Method::_access_flags` so the JIT
+does not simply recompile it a second later, and `_dont_inline` in
+`Method::_flags` so it does not get inlined into a future caller. A background
+watchdog then re-checks every installed hook once a second and re-applies any
+that HotSpot managed to undo.
+
+**You never call any of this yourself.** There is no "deoptimise first" step:
+`vmhook::deoptimize_methods_if` and `deoptimize_all_jit_compiled_methods` exist
+for sweeping *other* methods you did not hook, and hooking a hot method needs
+none of it. You also never call `verify_hooks()` — the watchdog is what calls
+it, from the moment your first hook installs.
 
 The one case none of this reaches: a *caller* that was compiled with your method
 **inlined** into it has no call to intercept at all. Those call sites resolve
