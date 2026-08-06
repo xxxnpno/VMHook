@@ -274,7 +274,7 @@ jobs:
 
           Start-Sleep -Seconds 5
 
-          $inject = Start-Process -FilePath "build\bin\injector.exe" `
+          $inject = Start-Process -FilePath "build\injector.exe" `
                                   -ArgumentList "$($java.Id)" `
                                   -PassThru -Wait -WindowStyle Hidden `
                                   -RedirectStandardOutput "injector_stdout.txt" `
@@ -521,7 +521,10 @@ jobs:
         run: |
           # The Android NDK builds for an emulated target by default; we
           # can't execute on the runner.  Just confirm the binaries exist.
-          ls -la build/android-${{ matrix.abi }}/tests/
+          # Binaries land in build/ (see CMAKE_RUNTIME_OUTPUT_DIRECTORY); only
+          # the CMake working files live under build/etc/android-<abi>.
+          ls -la build/
+          test -n "$(find build -maxdepth 1 -name 'vmhook_test_*' -print -quit)"
 
   ios-build:
     name: ios cross-compile (xcode · ${{ matrix.sdk }})

@@ -174,8 +174,8 @@ function Get-CompilerCxx([string] $c) {
 function Build-Compiler([string] $c) {
     $info = Get-CompilerCxx $c
     $buildDir = Join-Path $BuildRoot $c
-    $dll = Join-Path $buildDir 'bin\vmhook.dll'
-    $inj = Join-Path $buildDir 'bin\injector.exe'
+    $dll = Join-Path $buildDir 'vmhook.dll'
+    $inj = Join-Path $buildDir 'injector.exe'
 
     if ($NoBuild -and (Test-Path $dll) -and (Test-Path $inj)) {
         Write-Ok "$c : reusing existing build (-NoBuild)"
@@ -191,7 +191,11 @@ function Build-Compiler([string] $c) {
     }
     Write-Head "BUILD $c (CMake Release -> vmhook.dll + injector.exe)"
     $log = Join-Path $LogDir "build-$c.log"
+    # Pin the binaries into THIS compiler's tree; vmhook defaults them to
+    # <repo>/build, which every compiler would otherwise share.
     $cfgArgs = @('-S', $RepoRoot, '-B', $buildDir, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+                "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$buildDir",
+                "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=$buildDir",
                  "-DCMAKE_C_COMPILER=$($info.cc)", "-DCMAKE_CXX_COMPILER=$($info.cxx)")
     $rc = Invoke-Native -File 'cmake' -Arguments $cfgArgs -Log "$log.configure"
     if ($rc -ne 0) { Write-Bad "$c : cmake configure failed (see $log.configure)"; return @{ ok = $false } }

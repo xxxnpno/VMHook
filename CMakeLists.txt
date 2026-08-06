@@ -19,13 +19,24 @@ project(vmhook
 # pinned.  The per-config variables matter for multi-config generators (Visual
 # Studio, Xcode), which otherwise append Debug/ or Release/ to the path and
 # scatter the binaries again.
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build")
+#
+# Passing -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=... overrides it, which is what any
+# harness building the SAME source tree with several toolchains at once must do
+# -- otherwise every tree writes its vmhook.dll to the one path and they clobber
+# each other.
+if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build")
+endif()
+if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+endif()
+if(NOT CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+endif()
 foreach(_vmhook_cfg IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_vmhook_cfg} "${CMAKE_SOURCE_DIR}/build")
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_vmhook_cfg} "${CMAKE_SOURCE_DIR}/build")
-    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${_vmhook_cfg} "${CMAKE_SOURCE_DIR}/build")
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_vmhook_cfg} "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_vmhook_cfg} "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${_vmhook_cfg} "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}")
 endforeach()
 
 # ── MSVC EH model: drop CMake's default /EHsc so we can pick /EHa per-target ──
