@@ -10411,155 +10411,217 @@ namespace vmhook
         @return The c2i entry, or nullptr when no interpreted donor exists.  A
                 null return leaves every caller on the path it already took.
     */
+    namespace detail
+    {
+        /*
+            @brief One signature's worth of borrowed-adapter evidence.
+        */
+        struct c2i_vote
+        {
+            void*       candidate{ nullptr };
+            std::size_t agreeing{ 0 };
+            std::size_t total{ 0 };
+        };
+
+        /*
+            @brief Every c2i adapter the VM can tell us about, built in ONE pass.
+            @details
+            The first version of this asked the question per signature, and each
+            question walked the whole ClassLoaderDataGraph.  Hooking one method
+            plus its class-scoped auto-deopt asked it 24 times on a live
+            Minecraft, and the payload sat for ~3 seconds before the first hook
+            fired -- 24 full walks over every loaded class and method.
+
+            The graph does not change between those questions, so it is walked
+            ONCE and every answer harvested together: for each concrete,
+            non-native, currently-interpreted method, its `_from_compiled_entry`
+            is a vote for the adapter shared by its (descriptor, static-ness).
+            Every later lookup is a hash probe.
+
+            The counters exist because a silent zero is what sent the previous
+            version wrong: signatures as common as `()V` reported no donor at
+            all, which is not a plausible property of a running JVM and pointed
+            at the WALK rather than at the filters.  They are logged once, so a
+            future zero says which filter ate the candidates instead of leaving
+            it to inference.
+        */
+        inline auto c2i_index() noexcept
+            -> const std::unordered_map<std::string, vmhook::detail::c2i_vote>&
+        {
+            static std::unordered_map<std::string, vmhook::detail::c2i_vote> index{};
+            static std::once_flag built{};
+
+            std::call_once(built, []() noexcept
+            {
+                try
+                {
+                    constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
+                    // ABSTRACT: HotSpot hands every abstract method the shared
+                    // _abstract_method_handler, whose c2i entry IS the
+                    // AbstractMethodError stub -- and an abstract method has
+                    // _code == nullptr, so it looks like a perfect donor.
+                    // Borrowing one points the hooked method at a throw.
+                    // NATIVE: _from_compiled_entry is the native wrapper.
+                    constexpr std::uint32_t JVM_ACC_NATIVE_BIT{ 0x0100u };
+                    constexpr std::uint32_t JVM_ACC_ABSTRACT_BIT{ 0x0400u };
+
+                    std::size_t classes{ 0 };
+                    std::size_t methods_seen{ 0 };
+                    std::size_t skip_compiled{ 0 };
+                    std::size_t skip_flags{ 0 };
+                    std::size_t skip_abstract_native{ 0 };
+                    std::size_t skip_no_entry{ 0 };
+                    std::size_t recorded{ 0 };
+
+                    vmhook::for_each_loaded_class(
+                        [&](const std::string&, vmhook::hotspot::klass* const k) -> void
+                        {
+                            if (k == nullptr || !vmhook::hotspot::is_valid_pointer(k))
+                            {
+                                return;
+                            }
+                            ++classes;
+                            const std::int32_t count{ k->get_methods_count() };
+                            vmhook::hotspot::method** const list{ k->get_methods_ptr() };
+                            if (list == nullptr || count <= 0)
+                            {
+                                return;
+                            }
+                            for (std::int32_t i{ 0 }; i < count; ++i)
+                            {
+                                vmhook::hotspot::method* const m{ list[i] };
+                                if (m == nullptr || !vmhook::hotspot::is_valid_pointer(m))
+                                {
+                                    continue;
+                                }
+                                ++methods_seen;
+
+                                // Only an INTERPRETED method's
+                                // _from_compiled_entry is the adapter; a
+                                // compiled one points into its own nmethod.
+                                if (m->get_code() != nullptr)
+                                {
+                                    ++skip_compiled;
+                                    continue;
+                                }
+                                std::uint32_t* const flags{ m->get_access_flags() };
+                                std::uint32_t access{ 0 };
+                                if (flags == nullptr
+                                    || !vmhook::os::safe_read(&access, flags, sizeof(access)))
+                                {
+                                    ++skip_flags;
+                                    continue;
+                                }
+                                if ((access & (JVM_ACC_NATIVE_BIT | JVM_ACC_ABSTRACT_BIT)) != 0u)
+                                {
+                                    ++skip_abstract_native;
+                                    continue;
+                                }
+                                void* const entry{ m->get_from_compiled_entry() };
+                                if (entry == nullptr || !vmhook::hotspot::is_valid_pointer(entry))
+                                {
+                                    ++skip_no_entry;
+                                    continue;
+                                }
+                                std::string signature{ m->get_signature() };
+                                if (signature.empty())
+                                {
+                                    continue;
+                                }
+                                signature.push_back(
+                                    (access & JVM_ACC_STATIC_BIT) != 0u ? 'S' : 'I');
+
+                                vmhook::detail::c2i_vote& vote{ index[signature] };
+                                ++vote.total;
+                                if (vote.candidate == nullptr)
+                                {
+                                    vote.candidate = entry;
+                                    vote.agreeing  = 1;
+                                }
+                                else if (vote.candidate == entry)
+                                {
+                                    ++vote.agreeing;
+                                }
+                                ++recorded;
+                            }
+                        });
+
+                    VMHOOK_LOG("{} c2i index: {} signature(s) from {} donor(s) over {} class(es), "
+                               "{} method(s) seen (skipped: {} compiled, {} unreadable flags, "
+                               "{} abstract/native, {} no entry).",
+                               vmhook::info_tag, index.size(), recorded, classes, methods_seen,
+                               skip_compiled, skip_flags, skip_abstract_native, skip_no_entry);
+                }
+                catch (const std::exception&)
+                {
+                    // A partial index is still useful; every miss just declines.
+                }
+            });
+
+            return index;
+        }
+    }
+
+    /*
+        @brief The c2i adapter entry for a signature, WITHOUT AdapterHandlerEntry.
+        @details
+        Deoptimising a method means pointing `_from_compiled_entry` at the c2i
+        adapter, so compiled callers land in the interpreter.  vmhook used to
+        find that address by reading `Method::_adapter` and then
+        `AdapterHandlerEntry::_c2i_entry` out of it.  On a modern JVM NEITHER is
+        exported: measured on a JDK 26-era VM, `Method::_adapter`,
+        `AdapterHandlerEntry::_c2i_entry`, `_i2c_entry` and
+        `_c2i_unverified_entry` are ALL absent from gHotSpotVMStructs.  With no
+        way to validate a candidate the heuristic scan returned 0, get_adapter()
+        returned null, and every deoptimisation degraded.
+
+        This derives the same address from facts that ARE exported, using a
+        property of HotSpot's own adapter library: adapters are SHARED, keyed on
+        the signature.  AdapterHandlerLibrary::get_adapter() looks an adapter up
+        by an AdapterFingerPrint computed from the method's argument BasicTypes
+        (plus the receiver for a non-static method), so every method with the
+        same descriptor and the same static-ness resolves to the SAME adapter.
+        And for a method that is NOT currently compiled, HotSpot leaves
+        `_from_compiled_entry` pointing at exactly that adapter's c2i entry.
+
+        Matching on the exact descriptor is deliberately STRICTER than the
+        fingerprint HotSpot uses (which collapses every object argument to one
+        BasicType).  Stricter is the safe direction: an identical descriptor plus
+        identical static-ness ALWAYS implies the same fingerprint, so a match is
+        never wrong -- some correct matches are simply passed over.
+
+        CORROBORATION.  This address is written into a live Method's
+        `_from_compiled_entry`, and a wrong one is not a failed lookup -- it is a
+        JVM that dies at the next compiled call.  So a lone donor is only trusted
+        when it is the only one the VM has; with two or more, one must agree with
+        another.  Refusing costs nothing but the older, safer path.
+
+        @return The c2i entry, or nullptr when no corroborated donor exists.
+    */
     inline auto find_shared_c2i_entry(const std::string& descriptor,
                                       const bool wanted_static) noexcept
         -> void*
     {
-        struct cache_entry
-        {
-            std::string descriptor;
-            bool        is_static;
-            void*       c2i;
-        };
-        static std::vector<cache_entry> cache{};
-        static std::mutex               cache_mutex{};
-
         try
         {
+            std::string key{ descriptor };
+            key.push_back(wanted_static ? 'S' : 'I');
+
+            const auto& index{ vmhook::detail::c2i_index() };
+            const auto  it{ index.find(key) };
+            if (it == index.end())
             {
-                const std::lock_guard<std::mutex> guard{ cache_mutex };
-                for (const cache_entry& entry : cache)
-                {
-                    if (entry.is_static == wanted_static && entry.descriptor == descriptor)
-                    {
-                        return entry.c2i;
-                    }
-                }
+                return nullptr;
             }
-
-            constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
-            // A donor must be a method HotSpot gave a REAL adapter to.
-            //   ABSTRACT: AdapterHandlerLibrary hands every abstract method the
-            //     shared _abstract_method_handler, whose c2i entry IS the
-            //     AbstractMethodError stub.  An abstract method also has
-            //     _code == nullptr, so it sails through the "is it interpreted"
-            //     test below and looks like a perfect donor -- and borrowing its
-            //     entry points the hooked method at a throw.  Measured: doing so
-            //     on Minecraft 26.2 produced
-            //       java.lang.AbstractMethodError: Receiver class ... does not
-            //       define or inherit an implementation of the resolved method
-            //       'private void runTick(boolean)'
-            //     at the first compiled call, every time.
-            //   NATIVE: a native method's _from_compiled_entry is its native
-            //     wrapper (or the not-yet-linked stub), not a c2i adapter.
-            constexpr std::uint32_t JVM_ACC_NATIVE_BIT{ 0x0100u };
-            constexpr std::uint32_t JVM_ACC_ABSTRACT_BIT{ 0x0400u };
-
-            // CORROBORATION.  This address gets written into a live Method's
-            // _from_compiled_entry, and a wrong one is not a failed lookup -- it
-            // is a JVM that dies at the next compiled call.  So do not trust one
-            // donor: sample several independent methods of the same signature and
-            // require a majority to agree.  Every concrete non-native method of a
-            // given signature shares ONE adapter, so honest donors are unanimous;
-            // a lone dissenter means something in the walk is not what it seems,
-            // and refusing costs only the old (safe) forced-deopt path.
-            std::array<void*, 4> votes{};
-            std::size_t          vote_count{ 0 };
-            void*                found{ nullptr };
-
-            vmhook::for_each_loaded_class(
-                [&](const std::string&, vmhook::hotspot::klass* const k) -> void
-                {
-                    if (vote_count >= votes.size() || k == nullptr
-                        || !vmhook::hotspot::is_valid_pointer(k))
-                    {
-                        return;
-                    }
-                    const std::int32_t count{ k->get_methods_count() };
-                    vmhook::hotspot::method** const methods{ k->get_methods_ptr() };
-                    if (methods == nullptr || count <= 0)
-                    {
-                        return;
-                    }
-                    for (std::int32_t index{ 0 }; index < count; ++index)
-                    {
-                        vmhook::hotspot::method* const candidate{ methods[index] };
-                        if (candidate == nullptr
-                            || !vmhook::hotspot::is_valid_pointer(candidate))
-                        {
-                            continue;
-                        }
-                        // Only an INTERPRETED method's _from_compiled_entry is the
-                        // adapter; a compiled one points into its own nmethod.
-                        if (candidate->get_code() != nullptr)
-                        {
-                            continue;
-                        }
-                        std::uint32_t* const flags{ candidate->get_access_flags() };
-                        if (flags == nullptr)
-                        {
-                            continue;
-                        }
-                        std::uint32_t access{ 0 };
-                        if (!vmhook::os::safe_read(&access, flags, sizeof(access)))
-                        {
-                            continue;
-                        }
-                        if (((access & JVM_ACC_STATIC_BIT) != 0u) != wanted_static)
-                        {
-                            continue;
-                        }
-                        if ((access & (JVM_ACC_NATIVE_BIT | JVM_ACC_ABSTRACT_BIT)) != 0u)
-                        {
-                            continue;
-                        }
-                        if (candidate->get_signature() != descriptor)
-                        {
-                            continue;
-                        }
-                        void* const entry{ candidate->get_from_compiled_entry() };
-                        if (entry != nullptr && vmhook::hotspot::is_valid_pointer(entry))
-                        {
-                            votes[vote_count++] = entry;
-                            if (vote_count >= votes.size())
-                            {
-                                return;
-                            }
-                        }
-                    }
-                });
-
-            // Majority vote over the sampled donors.
-            for (std::size_t i{ 0 }; i < vote_count && found == nullptr; ++i)
+            const vmhook::detail::c2i_vote& vote{ it->second };
+            if (vote.agreeing >= 2 || vote.total == 1)
             {
-                std::size_t agreeing{ 0 };
-                for (std::size_t j{ 0 }; j < vote_count; ++j)
-                {
-                    if (votes[j] == votes[i])
-                    {
-                        ++agreeing;
-                    }
-                }
-                // A single donor is accepted only when it is the ONLY one the VM
-                // has: with two or more samples, one must be corroborated.
-                if (agreeing >= 2 || vote_count == 1)
-                {
-                    found = votes[i];
-                }
+                return vote.candidate;
             }
-
-            {
-                const std::lock_guard<std::mutex> guard{ cache_mutex };
-                cache.push_back(cache_entry{ descriptor, wanted_static, found });
-            }
-
-            VMHOOK_LOG("{} find_shared_c2i_entry('{}', static={}): {} ({} donor(s) sampled)",
-                       found ? vmhook::info_tag : vmhook::warning_tag,
-                       descriptor, wanted_static,
-                       found ? "resolved and corroborated across concrete donors"
-                             : "refused - no corroborated donor of this signature",
-                       vote_count);
-            return found;
+            VMHOOK_LOG("{} find_shared_c2i_entry('{}', static={}): {} donor(s) disagreed - "
+                       "refusing rather than writing a guess.",
+                       vmhook::warning_tag, descriptor, wanted_static, vote.total);
+            return nullptr;
         }
         catch (const std::exception&)
         {
@@ -13233,23 +13295,33 @@ namespace vmhook
                 }
                 else
                 {
-                    // c2i adapter unrecoverable.  The upstream-conservative
-                    // policy is to leave _code intact and accept that compiled
-                    // callers bypass the hook, but that defeats the entire
-                    // point of installing the hook in the first place for
-                    // hot methods like runTick.  Match the older vmhook
-                    // behaviour: redirect the interpreted entry to the i2i
-                    // stub and clear _code so subsequent dispatch falls back
-                    // through the interpreter and hits the hook.  Compiled
-                    // callers with stale inline caches still reach the old
-                    // nmethod for one cycle, but the cache is repaired at
-                    // the next safepoint when the IC re-resolves and finds
-                    // _code == nullptr.
+                    // c2i adapter unrecoverable, on BOTH routes: no exported
+                    // AdapterHandlerEntry, and no corroborated donor of this
+                    // signature to borrow one from.
+                    //
+                    // This used to clear _code anyway and redirect only
+                    // _from_interpreted_entry, on the reasoning that compiled
+                    // inline caches would repair themselves at the next
+                    // safepoint.  That leaves the VM in exactly the state the
+                    // deoptimize_methods_if comment calls out as fatal --
+                    // _code == nullptr while _from_compiled_entry still points
+                    // into the now-stale nmethod -- and it was observed killing
+                    // a JDK 26 Minecraft outright: no crash report, no hs_err,
+                    // the log simply stops mid-tick.
+                    //
+                    // So do not.  The interpreted entry is still patched, so the
+                    // hook fires for every interpreted call and for anything
+                    // that deoptimises later; what is given up is compiled
+                    // callers, which is the upstream-conservative policy and the
+                    // only one that cannot corrupt the VM.  A caller who needs
+                    // more can keep the method interpreted from the start with
+                    //     -XX:CompileCommand=exclude,the/Class.method
                     found_method->set_from_interpreted_entry(i2i);
-                    found_method->set_code(nullptr);
-                    VMHOOK_LOG("{} hook():   c2i adapter unrecoverable for '{}'; forced deopt - _code cleared, "
-                               "_from_interpreted_entry redirected to i2i.  Compiled inline caches will repair "
-                               "themselves at the next safepoint.", vmhook::warning_tag, method_name);
+                    VMHOOK_LOG("{} hook():   no c2i adapter for '{}' on this VM - leaving _code intact.  "
+                               "The hook fires on interpreted calls; calls from JIT-compiled callers will "
+                               "bypass it until they deoptimise.  Clearing _code without a valid "
+                               "_from_compiled_entry crashes the VM, so it is not done.",
+                               vmhook::warning_tag, method_name);
                 }
             }
 

@@ -7,6 +7,27 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **`hook()` no longer clears `_code` when it cannot find a c2i adapter.**  The
+  fallback used to clear it anyway and redirect only `_from_interpreted_entry`,
+  reasoning that compiled inline caches would repair themselves at the next
+  safepoint.  That leaves the VM in precisely the state
+  `deoptimize_methods_if`'s own comment calls fatal — `_code == nullptr` while
+  `_from_compiled_entry` still points into the now-stale nmethod — and it was
+  observed killing a JDK 26 Minecraft outright: no crash report, no `hs_err`,
+  the game log simply stops mid-tick.  The interpreted entry is still patched,
+  so the hook fires for interpreted calls and for anything that deoptimises
+  later; what is given up is calls from JIT-compiled callers, which is the
+  conservative policy and the only one that cannot corrupt the VM.
+- **The borrowed-adapter lookup walked the whole class graph per signature.**
+  Hooking one method plus its class-scoped auto-deopt asked 24 separate
+  questions on a live Minecraft, each a full walk over every loaded class and
+  method — about three seconds before the first hook fired.  The graph does not
+  change between those questions, so it is now walked ONCE and every signature's
+  answer harvested together; later lookups are hash probes.  The pass also
+  counts what it rejects and why, and logs it: the previous version reported no
+  donor for signatures as common as `()V`, which is not a plausible property of
+  a running JVM, and a silent zero gave nothing to reason from.
+
 - **Deoptimisation stopped working entirely on modern JVMs, because
   `AdapterHandlerEntry` is no longer exported.**  Pointing a method's
   `_from_compiled_entry` at the c2i adapter is how compiled callers get routed
