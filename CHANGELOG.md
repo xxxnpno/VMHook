@@ -97,7 +97,30 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   its anchor, a value decodes and vets), so an expired or empty source stores
   nothing instead of writing a stale address into the heap — the one write that
   would outlive the mistake and corrupt a later collection.
-- `object<T>::create(args...)` — allocates AND runs the real Java constructor,
+- **`vmhook::make_unique<T>(args...)` now runs the real Java constructor.**  It
+  allocated a zeroed instance and ran the *C++* wrapper's `construct()`, but
+  never executed the Java `<init>` chain — so a class with any constructor logic
+  came back half-built, and the function's own documentation called this "a
+  minimal implementation".  It now selects the `<init>` overload from the C++
+  argument types (the same way `get_method(name)->call(args...)` selects one),
+  invokes it, and returns a never-null `std::unique_ptr<T>` whose
+  `get_instance()` is null when the object could not be built.  Nothing has to
+  be added to a wrapper: the oop constructor and `register_class<T>()` every
+  wrapper already has are enough.  The optional `construct(args...)` hook is
+  preserved and now runs *after* the Java constructor.  Every refusal —
+  unregistered type, unloaded class, non-instantiable klass, no matching
+  `<init>`, more than the 8 arguments the interpreter's locals[] array holds, no
+  derivable call stub, not on a JavaThread — is detected BEFORE anything is
+  allocated, so a failure cannot leave a raw constructor-less object on the Java
+  heap, and a constructor that throws abandons the instance.
+- `return_value::set_arg(0, "/hello")` — a STRING LITERAL now builds a
+  `java.lang.String`.  `set_arg` classified its argument with `remove_cvref_t`,
+  which leaves a literal as `char[N]`; that matched none of the string arms, so
+  it fell through to the trivially-copyable arm and wrote the array's first
+  bytes into the interpreter slot.  It now decays, so a literal takes the same
+  path a `const char*` variable always did.
+- ~~`object<T>::create(args...)`~~ — folded into `make_unique` above rather than
+  shipped as a second spelling for the same thing.  Originally added as:
   selecting the `<init>` overload from the C++ argument types, and returning the
   same `std::unique_ptr<T>` every other object in the API is spelled with.  This
   is the gap `vmhook::make_unique` left: make_unique allocates a zeroed instance

@@ -75,6 +75,23 @@
 #include <unordered_map>
 #include <utility>
 
+// ---------------------------------------------------------------------------
+// CONTRACT: make_unique<W>() NEVER returns a null unique_ptr.  The pointer is
+// always valid; the OBJECT inside it is absent when the object could not be
+// built (which, with no JVM in this process, is always).  "failed" therefore
+// means "the wrapper arrived and holds no instance".
+// ---------------------------------------------------------------------------
+namespace
+{
+    template<typename wrapper_t>
+    auto is_empty_wrapper(const std::unique_ptr<wrapper_t>& handle) noexcept
+        -> bool
+    {
+        return handle != nullptr
+            && handle->vmhook::object_base::get_instance() == nullptr;
+    }
+}
+
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
 {
@@ -312,7 +329,7 @@ static auto make_unique_is_null_and_safe(args_t&&... args) -> bool
     bool threw{ false };
     try { obj = vmhook::make_unique<wrapper_type>(std::forward<args_t>(args)...); }
     catch (...) { threw = true; }
-    return obj == nullptr && !threw;
+    return is_empty_wrapper(obj) && !threw;
 }
 
 // Construct a wrapper DIRECTLY over a given (null or sentinel) oop the way
@@ -1211,27 +1228,33 @@ int main()
         check("F_type_map_restored_to_prior_state",
               registered_after_restore == was_registered_before);
 
-        // (2) Owned-pointer semantics on the (null) return value.
+        // (2) Owned-pointer semantics on the return value.  It is a REAL owning
+        // pointer now, not a null one: make_unique always hands back a wrapper,
+        // and it is the wrapper's INSTANCE that is absent here (no JVM).  So the
+        // unique_ptr contract is exercised on a live object rather than on null.
         std::unique_ptr<plain_wrapper> p{ vmhook::make_unique<plain_wrapper>() };
-        check("F_null_return_is_falsey", !p);
-        check("F_null_return_get_is_null", p.get() == nullptr);
+        check("F_return_is_a_live_owning_pointer", static_cast<bool>(p));
+        check("F_return_holds_no_instance", is_empty_wrapper(p));
 
-        // Move-construct from the null owning pointer (must compile + stay null).
+        // Move-construct: ownership transfers, the source is emptied.
+        plain_wrapper* const owned{ p.get() };
         std::unique_ptr<plain_wrapper> q{ std::move(p) };
-        check("F_move_constructed_is_null", q == nullptr);
+        check("F_move_transfers_ownership", q.get() == owned && p == nullptr);
 
-        // reset() and swap() on owning pointers.
+        // reset() releases it.
         q.reset();
         check("F_reset_is_null", q == nullptr);
 
         std::unique_ptr<plain_wrapper> r{ vmhook::make_unique<plain_wrapper>() };
+        plain_wrapper* const r_owned{ r.get() };
         q.swap(r);
-        check("F_swap_both_null", q == nullptr && r == nullptr);
+        check("F_swap_exchanges", q.get() == r_owned && r == nullptr);
 
-        // release() on a null owning pointer yields null and leaves it null.
+        // release() hands the raw pointer over and empties the unique_ptr.
         std::unique_ptr<plain_wrapper> rel{ vmhook::make_unique<plain_wrapper>() };
         plain_wrapper* raw{ rel.release() };
-        check("F_release_null_pointer", raw == nullptr && rel == nullptr);
+        check("F_release_yields_the_object", raw != nullptr && rel == nullptr);
+        delete raw;
     }
 
     // =====================================================================
@@ -1599,14 +1622,14 @@ int main()
         // FALSE noexcept value is what the ledger wants — a future change that
         // accidentally marks make_unique noexcept would silently swallow the
         // exception escape route and break callers' RAII expectations.
-        static_assert(!noexcept(vmhook::make_unique<plain_wrapper>()),
-                      "make_unique<W>() is NOT noexcept (can propagate bad_alloc)");
-        static_assert(!noexcept(vmhook::make_unique<plain_wrapper>(7)),
-                      "make_unique<W>(arg) is NOT noexcept");
+        static_assert(noexcept(vmhook::make_unique<plain_wrapper>()),
+                      "make_unique<W>() is noexcept - every failure is a logged empty wrapper");
+        static_assert(noexcept(vmhook::make_unique<plain_wrapper>(7)),
+                      "make_unique<W>(arg) is noexcept too");
         static_assert(!noexcept(vmhook::make_unique<ctor_wrapper>(1, std::string{ "y" })),
                       "make_unique<W>(many...) is NOT noexcept");
-        static_assert(!noexcept(vmhook::make_unique<noarg_ctor_wrapper>()),
-                      "make_unique<W>() with construct() detected is NOT noexcept");
+        static_assert(noexcept(vmhook::make_unique<noarg_ctor_wrapper>()),
+                      "... including with the optional construct() hook detected");
         check("I4_make_unique_not_noexcept_compile_time", true);
 
         // ----- (I5) DELETER-IDENTITY pin ------------------------------------
@@ -1637,8 +1660,9 @@ int main()
                       "deleter must not be a custom function-pointer deleter");
         check("I5_deleter_is_default_delete_compile_time", true);
         // Runtime sanity: the live owning pointers are all null (no JVM).
-        check("I5_live_owning_pointers_null_no_jvm",
-              !p_plain && !p_ctor && !p_ijd && !p_bool);
+        check("I5_live_owning_pointers_are_empty_wrappers_no_jvm",
+              is_empty_wrapper(p_plain) && is_empty_wrapper(p_ctor)
+                  && is_empty_wrapper(p_ijd) && is_empty_wrapper(p_bool));
 
         // ----- (I1) VARIADIC ctor forwarding ---------------------------------
         // The ledger asks for (int, std::string, double, oop_t).  oop_t is
@@ -1759,21 +1783,24 @@ int main()
         std::unique_ptr<plain_wrapper> zN{ vmhook::make_unique<plain_wrapper>(
             true, std::int8_t{ 1 }, std::int16_t{ 2 }, std::uint16_t{ 3 },
             4, std::int64_t{ 5 }, 6.0f, 7.0, std::string{ "x" }) };
-        check("I3_zero_arg_null_default", z0 == nullptr);
-        check("I3_one_arg_null_default",  z1 == nullptr);
-        check("I3_three_arg_null_default", z3 == nullptr);
-        check("I3_nine_arg_null_default", zN == nullptr);
-        // Cross-arity identity: all four are .get() == nullptr, all four are
-        // mutually equal (both null pointers compare equal).
-        check("I3_all_arities_get_null",
-              z0.get() == nullptr && z1.get() == nullptr
-                  && z3.get() == nullptr && zN.get() == nullptr);
-        check("I3_zero_vs_N_owning_pointers_equal",
-              z0.get() == zN.get() && z1.get() == z3.get()
-                  && z0.get() == z3.get());
-        // Bool-conversion contract is uniform across arity (all false).
+        check("I3_zero_arg_empty_default", is_empty_wrapper(z0));
+        check("I3_one_arg_empty_default",  is_empty_wrapper(z1));
+        check("I3_three_arg_empty_default", is_empty_wrapper(z3));
+        check("I3_nine_arg_empty_default", is_empty_wrapper(zN));
+        // Cross-arity identity: every arity yields an arrived-but-instance-less
+        // wrapper, and no arity is special.
+        check("I3_all_arities_empty",
+              is_empty_wrapper(z0) && is_empty_wrapper(z1)
+                  && is_empty_wrapper(z3) && is_empty_wrapper(zN));
+        // Each arity yields its OWN wrapper, so the pointers are DISTINCT --
+        // they used to compare equal only because all four were null.
+        check("I3_each_arity_owns_a_distinct_wrapper",
+              z0.get() != z1.get() && z1.get() != z3.get()
+                  && z3.get() != zN.get() && z0.get() != zN.get());
+        // Bool-conversion contract is uniform across arity (all true: a wrapper
+        // always arrives; what is absent is the instance, asserted above).
         check("I3_bool_conversion_uniform",
-              !z0 && !z1 && !z3 && !zN);
+              z0 && z1 && z3 && zN);
         // The RETURN TYPE is identical across arity (re-affirm at the live
         // call site, complementing Section A's static_assert via decltype).
         static_assert(std::is_same_v<decltype(z0), decltype(z1)>);

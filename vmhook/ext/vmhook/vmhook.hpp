@@ -12153,7 +12153,15 @@ namespace vmhook
             return false;
         }
 
-        using clean_value_type = std::remove_cvref_t<value_type>;
+        // std::decay_t, not remove_cvref_t: a STRING LITERAL is `const char(&)[N]`,
+        // and remove_cvref_t leaves it as `char[N]` -- which matched none of the
+        // string arms below, so `set_arg(0, "/hello")` silently fell through to
+        // the trivially-copyable arm and wrote the array's first bytes into the
+        // interpreter slot instead of building a java.lang.String.  Decaying to
+        // `const char*` routes a literal through the same arm a `const char*`
+        // variable already took.  Every non-array type decays to itself, so no
+        // other arm moves.
+        using clean_value_type = std::decay_t<std::remove_reference_t<value_type>>;
 
         // Fault-safe slot writer.  Every store this function makes goes through
         // here so the dangerous part — writing THROUGH a pointer derived from a
@@ -12259,7 +12267,20 @@ namespace vmhook
             // const char* is a C string (no interior NULs), but can still hold
             // standard-UTF-8 astral bytes, so it goes through the same
             // length-counted UTF-16 encoder to avoid modified-UTF-8 mangling.
-            const std::string_view text{ value ? std::string_view{ value } : std::string_view{} };
+            //
+            // The null test is compiled out for a STRING LITERAL: an array
+            // reference can never be null, and testing it is a -Waddress error
+            // under -Werror.  A genuine `const char*` still gets checked.
+            std::string_view text{};
+            if constexpr (std::is_array_v<std::remove_reference_t<value_type>>)
+            {
+                text = std::string_view{ value };
+            }
+            else
+            {
+                const clean_value_type pointer{ value };
+                text = pointer ? std::string_view{ pointer } : std::string_view{};
+            }
             void* const string_oop{ vmhook::make_java_string(text) };
             if (!string_oop)
             {
@@ -14308,91 +14329,37 @@ namespace vmhook
     inline auto make_java_object(vmhook::hotspot::klass* klass, std::size_t requested_size) noexcept -> void*;
 
     /*
-        @brief Constructs a new Java object and returns a C++ wrapper.
-        @tparam T The C++ wrapper class (must derive from vmhook::object).
-        @param args Arguments to pass to the Java constructor.
-        @return A std::unique_ptr<T> wrapping the new Java object, or nullptr on failure.
+        @brief `new Java(args...)` — allocates AND runs the real Java constructor.
         @details
-        Looks up the Java class for type T (via register_class<T>()), allocates a new
-        instance, and calls the appropriate constructor with the provided arguments.
+            const auto player{ vmhook::make_unique<sdk::player>("Bob", 12) };
+            if (player->get_instance()) { ... }
 
-        Usage:
-            vmhook::register_class<player>("com/example/Player");
-            auto p = vmhook::make_unique<player>("Bob", 12);
+        The wrapper needs nothing added to it beyond what every wrapper already
+        has: a constructor taking a vmhook::oop_t, and a register_class<T>().
+        The Java `<init>` overload is selected from the C++ argument types, the
+        same way get_method(name)->call(args...) selects one, so nothing here
+        takes a descriptor or a template argument.
 
-        @note This is a minimal implementation. Full constructor dispatch requires
-              parsing method descriptors and setting up interpreter frames.
+        A wrapper MAY additionally define `construct(args...)`; it is a C++-side
+        hook that runs after the Java constructor, and it is optional.
+
+        The returned unique_ptr is never null; `get_instance()` is null when the
+        object could not be built.  Every refusal — unregistered type, unloaded
+        class, non-instantiable klass, no matching `<init>`, no derivable call
+        stub, not on a JavaThread — is detected BEFORE anything is allocated, so
+        a failure cannot leave a raw, constructor-less object on the Java heap.
+        A constructor that throws abandons the instance for the same reason: a
+        half-built object escaping into Java is worse than no object.
+
+        Defined out-of-line, after the invocation machinery is complete.
+
+        Complexity: O(instance size) + O(M) over the class's methods + the
+        constructor's own cost.  Exception safety: noexcept.
     */
     template<typename wrapper_type, typename... args_t>
-    inline auto make_unique(args_t&&... args)
-        -> std::unique_ptr<wrapper_type>
-    {
-        if (!vmhook::hotspot::ensure_current_java_thread())
-        {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): failed to attach current native thread to the JVM.", vmhook::error_tag, vmhook::detail::type_name<wrapper_type>());
-            return nullptr;
-        }
+    [[nodiscard]] inline auto make_unique(args_t&&... args) noexcept
+        -> std::unique_ptr<wrapper_type>;
 
-        auto map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
-        if (map_entry == vmhook::type_to_class_map.end())
-        {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): type not registered.", vmhook::error_tag, vmhook::detail::type_name<wrapper_type>());
-            return nullptr;
-        }
-
-        // Construction is allocate + stamp the object header via make_java_object
-        // (TLAB path), then run the wrapper's C++-side construct() for field
-        // initialisation.  IMPORTANT: the Java <init> chain is NOT executed —
-        // nothing here invokes a constructor — so a wrapper that depends on
-        // constructor side effects must reproduce them in construct().
-        vmhook::hotspot::klass* const klass{ vmhook::find_class(map_entry->second) };
-        if (!klass)
-        {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): find_class('{}') returned null - class not loaded.",
-                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(), map_entry->second);
-            return nullptr;
-        }
-
-        const std::size_t raw_size{ klass->get_instance_size() };
-        if (raw_size == 0)
-        {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): failed to read HotSpot instance size.", vmhook::error_tag, vmhook::detail::type_name<wrapper_type>());
-            return nullptr;
-        }
-
-        // Allocate + zero + stamp the oopDesc header via the shared allocation
-        // primitive.  make_java_object() rounds raw_size up to 8-byte alignment,
-        // performs the same find_allocation_thread()->allocate_tlab fast path,
-        // the same 256-thread walk + allocate_from_threads_list() fallbacks, the
-        // same std::memset, and the same mark-word / (compressed) klass-pointer
-        // header stamping this path used to hand-roll inline.  Delegating keeps
-        // make_unique on the one allocation path the library maintains (so any
-        // future hardening of make_java_object — e.g. a GC-aware slow path — is
-        // inherited here for free) instead of a near-identical copy.  Failure
-        // contract is unchanged: a null return becomes a null unique_ptr.
-        void* const object_pointer{ vmhook::make_java_object(klass, raw_size) };
-        if (!object_pointer)
-        {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): make_java_object() failed to allocate {} bytes.", vmhook::warning_tag, vmhook::detail::type_name<wrapper_type>(), raw_size);
-            return nullptr;
-        }
-
-        auto result{ std::make_unique<wrapper_type>(object_pointer) };
-
-        if constexpr (requires(wrapper_type & wrapper, args_t&&... construct_args)
-        {
-            wrapper.construct(std::forward<args_t>(construct_args)...);
-        })
-        {
-            result->construct(std::forward<args_t>(args)...);
-        }
-        else if constexpr (sizeof...(args_t) > 0)
-        {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): object allocated, but wrapper has no matching construct(...) method for the provided arguments.", vmhook::warning_tag, vmhook::detail::type_name<wrapper_type>());
-        }
-
-        return result;
-    }
 
     // --- Field access ---------------------------------------------------------
 
@@ -20737,47 +20704,6 @@ namespace vmhook
             return object_base::get_method(std::type_index{ typeid(derived) }, name, signature);
         }
 
-        /*
-            @brief `new Java(args...)` — allocates AND runs the Java constructor.
-            @details
-                std::unique_ptr<player> p = player::create("Bob", 12);
-                if (p) { p->get_health(); }
-
-            It hands back the same std::unique_ptr<derived> every other object
-            in this API is spelled with, so a caller never meets a second
-            reference type just to construct something.
-
-            The distinction from vmhook::make_unique matters and was easy to
-            miss: make_unique allocates a zeroed instance and runs the C++
-            wrapper's own construct(), but NEVER executes the Java `<init>`
-            chain, so a class with any constructor logic came back half-built.
-            This runs the real constructor.
-
-            The overload is selected from the C++ argument types, exactly as
-            get_method(name)->call(args...) selects one, so nothing here takes a
-            descriptor or a template argument.  A class with no matching `<init>`
-            yields a wrapper whose get_instance() is null, rather than an
-            allocated-but-uninitialised object: a half-constructed instance
-            escaping into Java is worse than no instance at all.  The unique_ptr
-            itself is never null, exactly as for a field read or a call result.
-
-            THREAD / GC CONTRACT, the same one call() has: this allocates and
-            then invokes, and the invoke is a safepoint.  Call it from inside a
-            hook detour, or under a vmhook::java_thread_scope, where no
-            collection can begin between the two.  The wrapper holds a plain
-            address and is NOT rooted: it is good for the current call, and the
-            object is garbage the moment the collector looks unless it has been
-            stored somewhere Java can reach.
-
-            Declared here and defined out-of-line, where the allocation and
-            invocation machinery is complete.
-
-            Complexity: O(instance size) + O(M) over the class's methods + the
-            constructor's own cost.  Exception safety: noexcept.
-        */
-        template<typename... args_t>
-        [[nodiscard]] static auto create(args_t&&... args) noexcept
-            -> std::unique_ptr<derived>;
     };
 
     // --- Built-in Java collection wrappers ------------------------------------
@@ -26575,7 +26501,7 @@ namespace hotspot
     }
 
     /*
-        @brief Out-of-line definition of object<derived>::create(args...).
+        @brief Out-of-line definition of vmhook::make_unique<W>(args...).
         @details
         Deferred to here because the allocation and invocation machinery it
         needs is only complete at this point.
@@ -26589,26 +26515,25 @@ namespace hotspot
         to tell.  Abandoning it costs one dead object the collector reclaims;
         returning it costs whatever that class's constructor was for.
     */
-    template<typename derived>
-    template<typename... args_t>
-    auto object<derived>::create(args_t&&... args) noexcept
-        -> std::unique_ptr<derived>
+    template<typename wrapper_type, typename... args_t>
+    inline auto make_unique(args_t&&... args) noexcept
+        -> std::unique_ptr<wrapper_type>
     {
-        const std::string class_name{ vmhook::detail::registered_class_name<derived>() };
+        const std::string class_name{ vmhook::detail::registered_class_name<wrapper_type>() };
         if (class_name.empty())
         {
-            VMHOOK_LOG("{} object::create(): type '{}' is not registered - call "
+            VMHOOK_LOG("{} make_unique(): type '{}' is not registered - call "
                        "register_class<T>(\"java/lang/Name\") before constructing it.",
-                       vmhook::error_tag, vmhook::detail::type_name<derived>());
-            return vmhook::detail::wrap_object<derived>(nullptr);
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>());
+            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
         }
 
         vmhook::hotspot::klass* const target_klass{ vmhook::find_class(class_name) };
         if (!target_klass || !vmhook::hotspot::is_valid_pointer(target_klass))
         {
-            VMHOOK_LOG("{} object::create(): class '{}' is not loaded in this VM.",
+            VMHOOK_LOG("{} make_unique(): class '{}' is not loaded in this VM.",
                        vmhook::error_tag, class_name);
-            return vmhook::detail::wrap_object<derived>(nullptr);
+            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
         }
 
         // A zero instance size means non-instantiable (interface / abstract /
@@ -26617,10 +26542,10 @@ namespace hotspot
         const std::size_t instance_size{ target_klass->get_instance_size() };
         if (instance_size == 0)
         {
-            VMHOOK_LOG("{} object::create(): '{}' is not instantiable (interface, "
+            VMHOOK_LOG("{} make_unique(): '{}' is not instantiable (interface, "
                        "abstract, or its instance size could not be read).",
                        vmhook::error_tag, class_name);
-            return vmhook::detail::wrap_object<derived>(nullptr);
+            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
         }
 
         // Locate ANY <init> on the class first.  The exact overload is chosen
@@ -26651,10 +26576,10 @@ namespace hotspot
         }
         if (!initializer)
         {
-            VMHOOK_LOG("{} object::create(): '{}' declares no <init> this library can "
+            VMHOOK_LOG("{} make_unique(): '{}' declares no <init> this library can "
                        "reach - nothing was allocated.",
                        vmhook::error_tag, class_name);
-            return vmhook::detail::wrap_object<derived>(nullptr);
+            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
         }
 
         // PRE-FLIGHT the invocability of the call BEFORE allocating.  A refused
@@ -26668,18 +26593,18 @@ namespace hotspot
         // removes the two that are knowable in advance.
         if (!vmhook::detail::find_call_stub_entry())
         {
-            VMHOOK_LOG("{} object::create(): no call stub could be derived on this VM, "
+            VMHOOK_LOG("{} make_unique(): no call stub could be derived on this VM, "
                        "so '{}' cannot be constructed - nothing was allocated.",
                        vmhook::error_tag, class_name);
-            return vmhook::detail::wrap_object<derived>(nullptr);
+            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
         }
         if (!vmhook::hotspot::ensure_current_java_thread())
         {
-            VMHOOK_LOG("{} object::create(): this thread is not a JavaThread and could "
+            VMHOOK_LOG("{} make_unique(): this thread is not a JavaThread and could "
                        "not be attached, so the constructor of '{}' cannot run - nothing "
                        "was allocated.",
                        vmhook::error_tag, class_name);
-            return vmhook::detail::wrap_object<derived>(nullptr);
+            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
         }
 
         // Named `allocated`, not `instance`: object_base has a member of
@@ -26687,25 +26612,55 @@ namespace hotspot
         void* const allocated{ vmhook::make_java_object(target_klass, instance_size) };
         if (!allocated)
         {
-            VMHOOK_LOG("{} object::create(): allocation of {} bytes for '{}' failed.",
+            VMHOOK_LOG("{} make_unique(): allocation of {} bytes for '{}' failed.",
                        vmhook::warning_tag, instance_size, class_name);
-            return vmhook::detail::wrap_object<derived>(nullptr);
+            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
         }
 
-        const vmhook::method_proxy constructor{ allocated, initializer, initializer->get_signature() };
-        const auto result{ constructor.call(std::forward<args_t>(args)...) };
-        if (result.threw())
+        // The interpreter locals[] array method_proxy::call packs into is sized
+        // for 8 arguments, and exceeding it is a hard static_assert INSIDE call().
+        // Refuse here instead of instantiating it: a caller with a 9-argument
+        // constructor deserves a logged failure, not a compile error from the
+        // middle of a template they never named.
+        if constexpr (sizeof...(args_t) > 8)
         {
-            VMHOOK_LOG("{} object::create(): the constructor of '{}' threw {} - the "
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): {} constructor arguments exceeds the "
+                       "8 the interpreter locals[] array holds - nothing was allocated.",
+                       vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(),
+                       sizeof...(args_t));
+            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+        }
+        else
+        {
+        const vmhook::method_proxy constructor{ allocated, initializer, initializer->get_signature() };
+        const auto call_result{ constructor.call(std::forward<args_t>(args)...) };
+        if (call_result.threw())
+        {
+            VMHOOK_LOG("{} make_unique(): the constructor of '{}' threw {} - the "
                        "instance is abandoned.",
                        vmhook::error_tag, class_name,
-                       result.exception_class.empty() ? "an exception" : result.exception_class.c_str());
-            return vmhook::detail::wrap_object<derived>(nullptr);
+                       call_result.exception_class.empty()
+                           ? "an exception" : call_result.exception_class.c_str());
+            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
         }
 
         // wrap_object never yields a null pointer: a caller checks
         // get_instance(), exactly as for a field read or a call result.
-        return vmhook::detail::wrap_object<derived>(allocated);
+        auto result{ vmhook::detail::wrap_object<wrapper_type>(allocated) };
+
+        // OPTIONAL C++-side hook.  It runs AFTER the Java constructor, so a
+        // wrapper that wants to stamp extra state can, and one that does not
+        // need it (the common case) declares nothing.
+        if constexpr (requires(wrapper_type& wrapper, args_t&&... hook_args)
+                      { wrapper.construct(std::forward<args_t>(hook_args)...); })
+        {
+            if (result)
+            {
+                result->construct(std::forward<args_t>(args)...);
+            }
+        }
+        return result;
+        }
     }
 
     // -------------------------------------------------------------------------

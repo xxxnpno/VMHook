@@ -46,6 +46,23 @@
 #include <variant>
 #include <vector>
 
+// ---------------------------------------------------------------------------
+// CONTRACT: make_unique<W>() NEVER returns a null unique_ptr.  The pointer is
+// always valid; the OBJECT inside it is absent when the object could not be
+// built (with no JVM in this process, that is always).  "failed" therefore
+// means "the wrapper arrived and holds no instance".
+// ---------------------------------------------------------------------------
+namespace
+{
+    template<typename wrapper_t>
+    auto is_empty_wrapper(const std::unique_ptr<wrapper_t>& handle) noexcept
+        -> bool
+    {
+        return handle != nullptr
+            && handle->vmhook::object_base::get_instance() == nullptr;
+    }
+}
+
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
 {
@@ -1165,7 +1182,7 @@ int main()
         bool threw{ false };
         try { obj = vmhook::make_unique<dummy_wrapper>(); }
         catch (...) { threw = true; }
-        check("make_unique_returns_null_without_jvm", obj == nullptr);
+        check("make_unique_returns_empty_wrapper_without_jvm", is_empty_wrapper(obj));
         check("make_unique_does_not_throw_without_jvm", !threw);
     }
 

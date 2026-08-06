@@ -84,6 +84,23 @@
 #include <thread>
 #include <vector>
 
+// ---------------------------------------------------------------------------
+// CONTRACT: make_unique<W>() NEVER returns a null unique_ptr.  The pointer is
+// always valid; the OBJECT inside it is absent when the object could not be
+// built (with no JVM in this process, that is always).  "failed" therefore
+// means "the wrapper arrived and holds no instance".
+// ---------------------------------------------------------------------------
+namespace
+{
+    template<typename wrapper_t>
+    auto is_empty_wrapper(const std::unique_ptr<wrapper_t>& handle) noexcept
+        -> bool
+    {
+        return handle != nullptr
+            && handle->vmhook::object_base::get_instance() == nullptr;
+    }
+}
+
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
 {
@@ -843,7 +860,7 @@ int main()
         bool threw{ false };
         try { obj = vmhook::make_unique<factory_wrapper>(); }
         catch (...) { threw = true; }
-        check("make_unique_no_args_unregistered_no_jvm_returns_null", obj == nullptr);
+        check("make_unique_no_args_unregistered_no_jvm_returns_null", is_empty_wrapper(obj));
         check("make_unique_no_args_unregistered_does_not_throw", !threw);
     }
 
@@ -864,7 +881,7 @@ int main()
         bool threw{ false };
         try { obj = vmhook::make_unique<factory_wrapper>(); }
         catch (...) { threw = true; }
-        check("make_unique_no_args_after_register_no_jvm_returns_null", obj == nullptr);
+        check("make_unique_no_args_after_register_no_jvm_returns_null", is_empty_wrapper(obj));
         check("make_unique_no_args_after_register_does_not_throw", !threw);
     }
     {
@@ -874,7 +891,7 @@ int main()
         bool threw{ false };
         try { obj = vmhook::make_unique<factory_wrapper_with_ctor>(7, std::string{ "name" }); }
         catch (...) { threw = true; }
-        check("make_unique_with_ctor_args_no_jvm_returns_null", obj == nullptr);
+        check("make_unique_with_ctor_args_no_jvm_returns_null", is_empty_wrapper(obj));
         check("make_unique_with_ctor_args_does_not_throw", !threw);
     }
     {
@@ -885,7 +902,7 @@ int main()
         bool threw{ false };
         try { obj = vmhook::make_unique<factory_wrapper>(123); }
         catch (...) { threw = true; }
-        check("make_unique_args_without_construct_no_jvm_returns_null", obj == nullptr);
+        check("make_unique_args_without_construct_no_jvm_returns_null", is_empty_wrapper(obj));
         check("make_unique_args_without_construct_does_not_throw", !threw);
     }
 
@@ -1307,7 +1324,7 @@ int main()
         bool threw{ false };
         try { obj = vmhook::make_unique<registry_unmapped>(); }
         catch (...) { threw = true; }
-        check("R14_make_unique_registered_no_jvm_still_null", obj == nullptr);
+        check("R14_make_unique_registered_no_jvm_still_null", is_empty_wrapper(obj));
         check("R14_make_unique_registered_no_jvm_does_not_throw", !threw);
     }
 
@@ -1646,7 +1663,7 @@ int main()
         bool threw{ false };
         try { a = vmhook::make_unique<registry_alpha>(std::string{ "vmhook/test/ByName" }); }
         catch (...) { threw = true; }
-        check("R20_by_name_no_args_no_jvm_null", a == nullptr);
+        check("R20_by_name_no_args_no_jvm_null", is_empty_wrapper(a));
         check("R20_by_name_no_args_does_not_throw", !threw);
     }
     {
@@ -1657,7 +1674,7 @@ int main()
         bool threw{ false };
         try { w = vmhook::make_unique<factory_wrapper_with_ctor>(std::string{ "vmhook/test/ByName2" }, 42, std::string{ "x" }); }
         catch (...) { threw = true; }
-        check("R20_by_name_with_args_no_jvm_null", w == nullptr);
+        check("R20_by_name_with_args_no_jvm_null", is_empty_wrapper(w));
         check("R20_by_name_with_args_does_not_throw", !threw);
     }
     {
@@ -1670,7 +1687,7 @@ int main()
         bool threw{ false };
         try { g = vmhook::make_unique<registry_gamma>(std::string{ "vmhook/test/ByName3" }); }
         catch (...) { threw = true; }
-        check("R20_by_name_registered_no_jvm_null", g == nullptr);
+        check("R20_by_name_registered_no_jvm_null", is_empty_wrapper(g));
         check("R20_by_name_registered_does_not_throw", !threw);
     }
 
@@ -1691,7 +1708,7 @@ int main()
             bool threw{ false };
             try { d = vmhook::make_unique<registry_delta>(); }
             catch (...) { threw = true; }
-            check("R21_no_args_null", d == nullptr);
+            check("R21_no_args_null", is_empty_wrapper(d));
             check("R21_no_args_no_throw", !threw);
         }
         // Single int arg.
@@ -1700,7 +1717,7 @@ int main()
             bool threw{ false };
             try { d = vmhook::make_unique<registry_delta>(1); }
             catch (...) { threw = true; }
-            check("R21_one_arg_null", d == nullptr);
+            check("R21_one_arg_null", is_empty_wrapper(d));
             check("R21_one_arg_no_throw", !threw);
         }
         // Several heterogeneous args (int, bool, double, long).
@@ -1709,7 +1726,7 @@ int main()
             bool threw{ false };
             try { d = vmhook::make_unique<registry_delta>(1, true, 2.0, std::int64_t{ 3 }); }
             catch (...) { threw = true; }
-            check("R21_many_args_null", d == nullptr);
+            check("R21_many_args_null", is_empty_wrapper(d));
             check("R21_many_args_no_throw", !threw);
         }
     }

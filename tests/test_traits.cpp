@@ -45,6 +45,23 @@
 #include <typeinfo>
 #include <vector>
 
+// ---------------------------------------------------------------------------
+// CONTRACT: make_unique<W>() NEVER returns a null unique_ptr.  The pointer is
+// always valid; the OBJECT inside it is absent when the object could not be
+// built (with no JVM in this process, that is always).  "failed" therefore
+// means "the wrapper arrived and holds no instance".
+// ---------------------------------------------------------------------------
+namespace
+{
+    template<typename wrapper_t>
+    auto is_empty_wrapper(const std::unique_ptr<wrapper_t>& handle) noexcept
+        -> bool
+    {
+        return handle != nullptr
+            && handle->vmhook::object_base::get_instance() == nullptr;
+    }
+}
+
 // -----------------------------------------------------------------------------
 // is_vector
 // -----------------------------------------------------------------------------
@@ -1212,7 +1229,7 @@ int main()
               vmhook::register_class<zoo::wrapper_b>("") == false);
         // make_unique on an unregistered type returns null (no JVM, no factory).
         const std::unique_ptr<zoo::wrapper_a> made{ vmhook::make_unique<zoo::wrapper_a>() };
-        check("make_unique(unregistered, no JVM) == nullptr", made == nullptr);
+        check("make_unique(unregistered, no JVM) -> empty wrapper", is_empty_wrapper(made));
     }
 
     // find_class("") is the pure-logic empty-name fast-reject (no JVM deref).

@@ -32,6 +32,23 @@
 #include <type_traits>
 #include <utility>
 
+// ---------------------------------------------------------------------------
+// CONTRACT: make_unique<W>() NEVER returns a null unique_ptr.  The pointer is
+// always valid; the OBJECT inside it is absent when the object could not be
+// built (with no JVM in this process, that is always).  "failed" therefore
+// means "the wrapper arrived and holds no instance".
+// ---------------------------------------------------------------------------
+namespace
+{
+    template<typename wrapper_t>
+    auto is_empty_wrapper(const std::unique_ptr<wrapper_t>& handle) noexcept
+        -> bool
+    {
+        return handle != nullptr
+            && handle->vmhook::object_base::get_instance() == nullptr;
+    }
+}
+
 static int failures{ 0 };
 static auto check(char const* name, bool ok) -> void
 {
@@ -163,7 +180,7 @@ int main()
         // above).
         auto u{ vmhook::make_unique<Color>() };
         check("cold_state_make_unique_returns_safe_default",
-              u == nullptr);
+              is_empty_wrapper(u));
     }
     {
         // Instance-context get_field on a null-OOP-wrapped Color: the

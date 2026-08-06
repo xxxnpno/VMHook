@@ -243,14 +243,14 @@ static_assert(requires { { ia_entity::static_field("k") } -> std::same_as<std::o
 static_assert(requires { { ia_entity::static_method("m") } -> std::same_as<std::optional<vmhook::method_proxy>>; },
               "static_method(name) likewise");
 
-// -- create() runs a real Java constructor -----------------------------------
+// -- make_unique() runs a real Java constructor ------------------------------
 // It hands back a std::unique_ptr, not a handle type: an object is ALWAYS a
 // unique_ptr in this API, so constructing one must not introduce a second
 // reference type the caller would otherwise never meet.
-static_assert(requires { { ia_entity::create() } -> std::same_as<std::unique_ptr<ia_entity>>; },
-              "create() must hand back std::unique_ptr, like every other object");
-static_assert(requires { { ia_entity::create("Bob", 12) } -> std::same_as<std::unique_ptr<ia_entity>>; },
-              "create(args...) must deduce the <init> overload from the arguments");
+static_assert(requires { { vmhook::make_unique<ia_entity>() } -> std::same_as<std::unique_ptr<ia_entity>>; },
+              "make_unique<W>() must hand back std::unique_ptr, like every other object");
+static_assert(requires { { vmhook::make_unique<ia_entity>("Bob", 12) } -> std::same_as<std::unique_ptr<ia_entity>>; },
+              "make_unique<W>(args...) must deduce the <init> overload from the arguments");
 
 // ===========================================================================
 // THE UNIQUE_PTR-ONLY SURFACE.
@@ -271,7 +271,7 @@ static_assert(requires(const vmhook::method_proxy& m, const std::unique_ptr<ia_e
 static_assert(requires(const vmhook::field_proxy& f, const std::unique_ptr<ia_entity>& o)
               { f.set(o); },
               "4. a unique_ptr is accepted by set()");
-static_assert(requires { { ia_entity::create() } -> std::same_as<std::unique_ptr<ia_entity>>; },
+static_assert(requires { { vmhook::make_unique<ia_entity>() } -> std::same_as<std::unique_ptr<ia_entity>>; },
               "5. construction yields a unique_ptr");
 static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<ia_entity>>,
               "6. and the detour-argument extractor recognises the same shape");
@@ -478,7 +478,7 @@ int main()
     }
 
     // =======================================================================
-    // SECTION 8 — create() refuses BEFORE allocating.
+    // SECTION 8 — make_unique() refuses BEFORE allocating.
     //
     // The order matters more than the result: an unregistered type, an unloaded
     // class, a missing <init> and an unavailable call stub must each be found
@@ -488,12 +488,12 @@ int main()
     // never borrowed.
     // =======================================================================
     {
-        const std::unique_ptr<ia_entity> made{ ia_entity::create() };
-        check("create_no_vm_wrapper_arrived", made != nullptr);
-        check("create_no_vm_instance_null", made && made->get_instance() == nullptr);
+        const std::unique_ptr<ia_entity> made{ vmhook::make_unique<ia_entity>() };
+        check("make_unique_no_vm_wrapper_arrived", made != nullptr);
+        check("make_unique_no_vm_instance_null", made && made->get_instance() == nullptr);
 
-        const std::unique_ptr<ia_entity> with_args{ ia_entity::create("Bob", 12) };
-        check("create_args_no_vm_instance_null",
+        const std::unique_ptr<ia_entity> with_args{ vmhook::make_unique<ia_entity>("Bob", 12) };
+        check("make_unique_args_no_vm_instance_null",
               with_args && with_args->get_instance() == nullptr);
     }
 

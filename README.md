@@ -1,20 +1,20 @@
 # vmhook
 
-Read fields, call methods, construct objects and hook methods in a **running HotSpot JVM**, from C++, without asking the permission to the JVM. No JVMTI, minimal JNI.
+Read fields, call methods, construct objects and hook methods in a **running HotSpot JVM**, from C++, without asking the JVM's permission. No JVMTI, minimal JNI.
 
 ---
 
 ## Wrapping a class
 
-When you want to work with a java class, reproduice the elements you want to work with in cpp.
+When you want to work with a java class, reproduce the elements you want to work with in cpp.
 
 ```cpp
 #include <vmhook/vmhook.hpp>
 
 namespace sdk
 {
-    // if you want to work the the java Entity class
-    // reproduice this template for every class you'll work with
+    // if you want to work with the java Entity class
+    // reproduce this template for every class you'll work with
     class entity : public vmhook::object<sdk::entity>
     {
     public:
@@ -32,7 +32,7 @@ vmhook::register_class<sdk::entity>("net/minecraft/entity/Entity");
 ## Getting a value
 
 ```cpp
-// Entity class has a field named health, here is how to obtrain it
+// Entity class has a field named health, here is how to obtain it
 auto get_health()
      -> float
 {
@@ -46,7 +46,7 @@ auto get_name()
     return get_field("name")->get();
 }
 
-// for other objects then string always return unique_ptr not just the object
+// for objects other than string always return a unique_ptr, not the object itself
 auto get_riding_entity()
     -> std::unique_ptr<sdk::entity>
 {
@@ -102,11 +102,11 @@ auto add_chat_message(const std::string& message, const std::int32_t id)
 ## Creating objects
 
 ```cpp
-// creating objects using a java constructor (vmhook_make_unique not std::make_unique!!!)
-const std::unique_ptr<sdk::entity>& fresh{ vmhook::make_unique<sdk::entity>() };
+// creating objects using a java constructor (vmhook::make_unique, NOT std::make_unique!!!)
+const std::unique_ptr<sdk::entity> fresh{ vmhook::make_unique<sdk::entity>() };
 
 // the unique_ptr is never nullptr (unless no more ram ofc), but if the java object is null, ->get_instance() will return nullptr
-// the unique_ptr is NOT the java onject 
+// the unique_ptr is NOT the java object
 if (fresh->get_instance())
 {
     fresh->set_health(20.0f);
@@ -116,7 +116,7 @@ if (fresh->get_instance())
 ### A basic hook
 
 ```cpp
-// reproduice the java args with cpp ones and add vmhook::return_value& return_value as the first one
+// reproduce the java args with cpp ones and add vmhook::return_value& return_value as the first one
 // no thizz in static methods ofc
 auto run_tick_hook(vmhook::return_value& return_value, const std::unique_ptr<sdk::minecraft>& thizz)
     -> void
@@ -136,7 +136,7 @@ auto send_chat_message_hook(vmhook::return_value& return_value, const std::uniqu
 {
     if (message == "/hi")
     {
-        // 0 is NOT thizz becarful
+        // 0 is NOT thizz, be careful
         return_value.set_arg(0, "/hello");
     }
 
@@ -153,7 +153,7 @@ auto attack_entity_hook(vmhook::return_value& return_value, const std::unique_pt
     // the java method will not run
     if (!target->get_instance())
     {
-        // only work for java void methods 
+        // only works for java void methods
         return_value.cancel();
     }
 }
@@ -179,7 +179,7 @@ auto is_singleplayer_hook(vmhook::return_value& return_value, const std::unique_
 auto ray_trace_blocks_hook(vmhook::return_value& return_value, const std::unique_ptr<sdk::entity>& thizz)
     -> void
 {
-    const auto caller = return_value.caller();
+    const vmhook::return_value::caller_info caller{ return_value.caller() };
 
     // if you want to hook a method but only when it's called from "orientCamera"
     // check caller struct for more tools
@@ -195,4 +195,101 @@ auto ray_trace_blocks_hook(vmhook::return_value& return_value, const std::unique
 // run this once before uninjecting
 vmhook::shutdown_hooks();
 ```
-<here explain how the i2i hook works>
+## How the hook actually works
+
+Nothing here rewrites your Java method. The bytecode is untouched, the class is
+never redefined, and the JVM is never told anything happened.
+
+### 1. Every method has an entry point, and it is a pointer
+
+A HotSpot `Method` is a metadata object, and three of its fields are addresses
+the VM jumps to when someone calls that method:
+
+```
+Method
+  _i2i_entry             <- the interpreter's entry for this method
+  _from_interpreted_entry <- what interpreted callers jump to
+  _from_compiled_entry    <- what JIT-compiled callers jump to
+  _code                   <- the compiled nmethod, or null if not JIT'd yet
+```
+
+`_i2i_entry` points into the "interpreter to interpreter" stub — the machine
+code that runs when a Java method starts executing interpreted. vmhook reads all
+of these through VMStructs, by name, so no offset is hardcoded.
+
+One thing that matters later: **that stub is shared**. HotSpot generates one per
+method *shape*, not one per method, so many methods enter through the same
+address.
+
+### 2. vmhook writes a jump inside that stub
+
+`vmhook::hook<T>("name", &fn)` finds the `Method`, then scans its i2i stub for an
+injection point — a specific `mov BYTE PTR [r15+imm32], imm8` (the thread-state
+write) that sits after the frame is built and the arguments are laid out, but
+before the first bytecode runs. That is the moment where `thizz` and every
+argument are already in place.
+
+There it saves the original 5 bytes and writes `E9 <rel32>` — a jump to a small
+trampoline vmhook generated itself. The trampoline is allocated *within ±2GB* of
+the stub on purpose, because a 5-byte relative jump cannot reach further.
+
+The trampoline:
+
+- saves the interpreter's register state,
+- hands the frame pointer (`rbp`) and the `JavaThread` (`r15`) to vmhook's C++
+  dispatcher,
+- the dispatcher reads the **real `Method*` out of the frame** — remember the
+  stub is shared, so most calls arriving here belong to methods you never hooked,
+  and those are passed straight through,
+- for a hooked one, it walks the frame to `locals[]`, where `thizz` and the
+  arguments live, and decodes them into the C++ parameter types you declared,
+- it calls your function,
+- then either continues into the real method, or — if you called `cancel()` or
+  `set()` — writes the return slot and returns to the caller without the Java
+  method ever running.
+
+That is why your parameters mirror the Java signature: they are read
+positionally out of interpreter slots. A `long` or a `double` occupies **two**
+slots, which vmhook works out from the method's descriptor rather than from your
+C++ types.
+
+If another tool already patched that injection point (the first byte is already
+`E9`), vmhook chains in front of it rather than overwriting it, so both hooks
+still fire.
+
+### 3. The JIT has to be pushed out of the way
+
+Patching `_i2i_entry` only affects the *interpreted* path. A method HotSpot has
+already compiled does not go through the interpreter at all — `_code` points at
+an nmethod and callers jump straight into machine code. The hook would install
+successfully and never fire.
+
+So on install, for a method that is already compiled, vmhook:
+
+- points `_from_interpreted_entry` back at the (now patched) `_i2i_entry`,
+- points `_from_compiled_entry` at the **c2i adapter**, the stub that converts a
+  compiled call frame into an interpreter frame,
+- clears `_code` last, so the two writes above are visible before anyone
+  observes that the compiled version is gone.
+
+The method is now interpreted again, and interpreted means patched. vmhook also
+sets `NO_COMPILE` on it so the JIT does not simply recompile it a second later,
+and a background watchdog re-checks every installed hook once a second and
+re-applies any that HotSpot managed to undo — you never call anything to make
+that happen.
+
+The one case none of this reaches: a *caller* that was compiled with your method
+**inlined** into it has no call to intercept at all. Those call sites resolve
+themselves the next time HotSpot reaches a safepoint and re-evaluates the
+inline cache.
+
+### 4. Removing them
+
+`shutdown_hooks()` writes the saved original bytes back over every patched
+entry and stops the watchdog.
+
+Removing a hook stops threads from *entering* it. It cannot evict a thread that
+is already inside one, and vmhook keeps no in-flight count — so unloading your
+DLL right after is how you kill the process. If your tool supports detaching,
+prefer leaving the module mapped.
+
