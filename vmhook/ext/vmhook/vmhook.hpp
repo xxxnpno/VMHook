@@ -1915,6 +1915,10 @@ namespace vmhook
 
     class object_base;
     template<typename derived = void> class object;
+
+    /* Defined further down; object_base::resolve_klass() needs it to ask an oop
+       what class it REALLY is.  @see vmhook::klass_from_oop. */
+    [[nodiscard]] inline auto klass_from_oop(void* const oop) noexcept -> vmhook::hotspot::klass*;
     class field_proxy;
     // The untyped wrapper every reference value can be navigated through
     // without naming a type.  Defined after oop_reflective_base, which
@@ -6287,12 +6291,18 @@ namespace vmhook
         inline constexpr std::size_t slot_get_static_field_id{ 144 };
         inline constexpr std::size_t slot_get_static_object_field{ 145 };
         inline constexpr std::size_t slot_delete_local_ref{ 23 };
+        inline constexpr std::size_t slot_call_int_method_a{ 51 };
+        inline constexpr std::size_t slot_get_string_utf{ 169 };
+        inline constexpr std::size_t slot_release_string_utf{ 170 };
 
         using get_class_fn_t      = void* (VMHOOK_JNICALL*)(env_handle_t, void*);
         using get_id_fn_t         = void* (VMHOOK_JNICALL*)(env_handle_t, void*, const char*, const char*);
         using get_obj_field_fn_t  = void* (VMHOOK_JNICALL*)(env_handle_t, void*, void*);
         using new_object_fn_t     = void* (VMHOOK_JNICALL*)(env_handle_t, void*, void*, const void*);
         using delete_ref_fn_t     = void  (VMHOOK_JNICALL*)(env_handle_t, void*);
+        using call_int_fn_t       = std::int32_t (VMHOOK_JNICALL*)(env_handle_t, void*, void*, const void*);
+        using get_utf_fn_t        = const char* (VMHOOK_JNICALL*)(env_handle_t, void*, unsigned char*);
+        using release_utf_fn_t    = void  (VMHOOK_JNICALL*)(env_handle_t, void*, const char*);
 
         /* @brief The function at `slot`, or nullptr when there is no env. */
         [[nodiscard]] inline auto fn(const std::size_t slot) noexcept -> void*
@@ -9942,6 +9952,92 @@ namespace vmhook
             arguments.empty() ? nullptr : arguments.data()) };
         if (vmhook::hotspot::jni::clear_exception()) { return nullptr; }
         return created;
+    }
+
+    /*
+        @brief Calls a reference-returning method on `instance`.
+        @details
+        The returned reference is the caller's to release with jni_release.
+    */
+    [[nodiscard]] inline auto jni_call_object(void* const instance,
+                                              const char* const name,
+                                              const char* const signature,
+                                              const std::vector<void*>& arguments = {}) noexcept
+        -> void*
+    {
+        void* const get_class{ vmhook::hotspot::jni::fn(vmhook::hotspot::jni::slot_get_object_class) };
+        void* const get_id{ vmhook::hotspot::jni::fn(vmhook::hotspot::jni::slot_get_method_id) };
+        void* const call{ vmhook::hotspot::jni::fn(vmhook::hotspot::jni::slot_call_object_method_a) };
+        if (!instance || !get_class || !get_id || !call) { return nullptr; }
+
+        void* const clazz{ reinterpret_cast<vmhook::hotspot::jni::get_class_fn_t>(get_class)(
+            vmhook::hotspot::jni::env(), instance) };
+        if (!clazz) { return nullptr; }
+
+        void* const method{ reinterpret_cast<vmhook::hotspot::jni::get_id_fn_t>(get_id)(
+            vmhook::hotspot::jni::env(), clazz, name, signature) };
+        if (!method) { (void)vmhook::hotspot::jni::clear_exception(); return nullptr; }
+
+        void* const result{ reinterpret_cast<vmhook::hotspot::jni::call_object_fn_t>(call)(
+            vmhook::hotspot::jni::env(), instance, method,
+            arguments.empty() ? nullptr : arguments.data()) };
+        if (vmhook::hotspot::jni::clear_exception()) { return nullptr; }
+        return result;
+    }
+
+    /* @brief Calls an int-returning method on `instance`.  `fallback` on failure. */
+    [[nodiscard]] inline auto jni_call_int(void* const instance,
+                                           const char* const name,
+                                           const char* const signature,
+                                           const std::vector<void*>& arguments = {},
+                                           const std::int32_t fallback = -1) noexcept
+        -> std::int32_t
+    {
+        void* const get_class{ vmhook::hotspot::jni::fn(vmhook::hotspot::jni::slot_get_object_class) };
+        void* const get_id{ vmhook::hotspot::jni::fn(vmhook::hotspot::jni::slot_get_method_id) };
+        void* const call{ vmhook::hotspot::jni::fn(vmhook::hotspot::jni::slot_call_int_method_a) };
+        if (!instance || !get_class || !get_id || !call) { return fallback; }
+
+        void* const clazz{ reinterpret_cast<vmhook::hotspot::jni::get_class_fn_t>(get_class)(
+            vmhook::hotspot::jni::env(), instance) };
+        if (!clazz) { return fallback; }
+
+        void* const method{ reinterpret_cast<vmhook::hotspot::jni::get_id_fn_t>(get_id)(
+            vmhook::hotspot::jni::env(), clazz, name, signature) };
+        if (!method) { (void)vmhook::hotspot::jni::clear_exception(); return fallback; }
+
+        const std::int32_t result{
+            reinterpret_cast<vmhook::hotspot::jni::call_int_fn_t>(call)(
+                vmhook::hotspot::jni::env(), instance, method,
+                arguments.empty() ? nullptr : arguments.data()) };
+        if (vmhook::hotspot::jni::clear_exception()) { return fallback; }
+        return result;
+    }
+
+    /*
+        @brief Reads a java.lang.String reference into a std::string.
+        @details
+        UTF-8 via GetStringUTFChars, which is modified UTF-8 -- fine for the ASCII
+        and BMP text this is used for, and the buffer is always released.
+        Returns "" for a null reference rather than failing, because a null String
+        field is a normal thing for Java to hold.
+    */
+    [[nodiscard]] inline auto jni_to_string(void* const text) noexcept -> std::string
+    {
+        if (!text) { return {}; }
+        void* const get{ vmhook::hotspot::jni::fn(vmhook::hotspot::jni::slot_get_string_utf) };
+        void* const release{ vmhook::hotspot::jni::fn(vmhook::hotspot::jni::slot_release_string_utf) };
+        if (!get || !release) { return {}; }
+
+        const char* const raw{ reinterpret_cast<vmhook::hotspot::jni::get_utf_fn_t>(get)(
+            vmhook::hotspot::jni::env(), text, nullptr) };
+        if (!raw) { (void)vmhook::hotspot::jni::clear_exception(); return {}; }
+
+        std::string out;
+        try { out.assign(raw); } catch (...) { out.clear(); }
+        reinterpret_cast<vmhook::hotspot::jni::release_utf_fn_t>(release)(
+            vmhook::hotspot::jni::env(), text, raw);
+        return out;
     }
 
     /* @brief Releases a local reference.  Optional; the frame drops them anyway. */
@@ -20656,6 +20752,32 @@ namespace vmhook
                     return get_method("takeValues")->call(a, b);
                 }
         */
+        /*
+            @brief Whether this candidate must NOT be handed back as a method to call.
+            @details
+            An ABSTRACT method has no body: HotSpot gives it the shared
+            _abstract_method_handler, whose entry throws AbstractMethodError.
+            Calling it through a synthetic frame does not raise a Java exception a
+            caller can see -- it tears the VM down.  A class can also carry an
+            abstract re-declaration of a method its own superclass implements, so
+            "first name match wins" is not enough; the first NON-abstract match is
+            what virtual dispatch would pick, and it is what these overloads
+            return.
+
+            An unreadable flags word counts as unusable too.  This runs on live
+            metadata, where a Method* left cold by a deopt or a class unload is a
+            fault rather than an exception, and a method whose flags cannot be read
+            is not one to invoke.
+        */
+        [[nodiscard]] static auto is_uncallable(vmhook::hotspot::method* const candidate) noexcept
+            -> bool
+        {
+            constexpr std::uint32_t k_acc_abstract{ 0x0400u };
+            bool readable{ false };
+            const bool abstract{ candidate->safe_access_flags_test(k_acc_abstract, readable) };
+            return !readable || abstract;
+        }
+
         auto get_method(const std::string_view method_name) const
             -> std::optional<vmhook::method_proxy>
         {
@@ -20682,7 +20804,8 @@ namespace vmhook
                 {
                     vmhook::hotspot::method* const current_method{ methods_array[method_index] };
                     if (current_method && vmhook::hotspot::is_valid_pointer(current_method)
-                        && current_method->get_name() == method_name)
+                        && current_method->get_name() == method_name
+                        && !is_uncallable(current_method))
                     {
                         return vmhook::method_proxy{ this->instance, current_method, current_method->get_signature() };
                     }
@@ -20752,7 +20875,8 @@ namespace vmhook
                     }
 
                     const std::string current_signature{ current_method->get_signature() };
-                    if (current_method->get_name() == method_name && current_signature == method_signature)
+                    if (current_method->get_name() == method_name && current_signature == method_signature
+                        && !is_uncallable(current_method))
                     {
                         return vmhook::method_proxy{ this->instance, current_method, current_signature,
                                                      /*signature_pinned=*/true };
@@ -21038,6 +21162,32 @@ namespace vmhook
         auto resolve_klass() const
             -> vmhook::hotspot::klass*
         {
+            // THE OBJECT IS ASKED WHAT IT IS, not the wrapper.  A wrapper is
+            // registered as the type its call site DECLARES -- a parameter typed
+            // IChatComponent, a field typed Entity -- and the object that turns up
+            // is a subclass of it.  Resolving from the registered name finds the
+            // DECLARATION; resolving from the oop's own klass finds the
+            // IMPLEMENTATION, which is what Java's own dispatch would pick.
+            //
+            // That difference has already killed a VM.  A wrapper registered as an
+            // INTERFACE resolved getFormattedText to the interface's abstract
+            // declaration, whose interpreted entry is HotSpot's
+            // AbstractMethodError stub, and invoking it through a synthetic frame
+            // took Minecraft down every time.
+            //
+            // Falls back to the registered class whenever the oop cannot answer:
+            // a null instance (a static access, which has no object), or a header
+            // that will not decode.
+            if (this->instance)
+            {
+                if (vmhook::hotspot::klass* const concrete{ vmhook::klass_from_oop(this->instance) })
+                {
+                    if (vmhook::hotspot::is_valid_pointer(concrete))
+                    {
+                        return concrete;
+                    }
+                }
+            }
             return resolve_klass(std::type_index{ typeid(*this) });
         }
 
@@ -21672,7 +21822,7 @@ namespace vmhook
 
         Returns nullptr if the pointer is invalid or decoding fails.
     */
-    inline auto klass_from_oop(void* const oop) noexcept -> vmhook::hotspot::klass*
+    [[nodiscard]] inline auto klass_from_oop(void* const oop) noexcept -> vmhook::hotspot::klass*
     {
         if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
         {

@@ -6,6 +6,21 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [6.0.0] — 2026-08-06
 
+### Fixed (before Added, because this one crashes VMs)
+- **`get_method()` resolved from the class you REGISTERED, not from the object
+  you have, and would hand back an ABSTRACT method.**  A wrapper is registered
+  as the type its call site declares — a parameter typed `IChatComponent`, a
+  field typed `Entity` — and the object that turns up is a subclass.  Resolving
+  from the registered name finds the DECLARATION; on an interface that
+  declaration is abstract, HotSpot gives it the `AbstractMethodError` stub, and
+  invoking that stub through a synthetic frame does not raise a Java exception —
+  it takes the VM down.  Measured: a chat wrapper registered as
+  `IChatComponent` killed Minecraft 1.8.9 on every `getFormattedText()`.  An
+  object is now asked what class it actually is (`klass_from_oop`) and the walk
+  skips abstract candidates, so the first NON-abstract match wins — which is
+  what Java's own dispatch picks.  A null instance (a static access, no object
+  to ask) still resolves from the registered class.
+
 ### Added
 - **A compiled library target, `vmhook.lib` / `libvmhook.a` (`vmhook::compiled`),
   for build time.**  vmhook is header-only, so the archive is not where the code
