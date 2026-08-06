@@ -93,6 +93,7 @@
 #include <unordered_set>
 #include <typeindex>
 #include <memory>
+#include <new>          // std::nothrow — object<T>::create() is noexcept
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -20714,7 +20715,12 @@ namespace vmhook
         /*
             @brief `new Java(args...)` — allocates AND runs the Java constructor.
             @details
-                auto p = player::create("Bob", 12);
+                std::unique_ptr<player> p = player::create("Bob", 12);
+                if (p) { p->get_health(); }
+
+            It hands back the same std::unique_ptr<derived> every other object
+            in this API is spelled with, so a caller never meets a second
+            reference type just to construct something.
 
             The distinction from vmhook::make_unique matters and was easy to
             miss: make_unique allocates a zeroed instance and runs the C++
@@ -20725,25 +20731,27 @@ namespace vmhook
             The overload is selected from the C++ argument types, exactly as
             get_method(name)->call(args...) selects one, so nothing here takes a
             descriptor or a template argument.  A class with no matching `<init>`
-            yields an EMPTY handle rather than an allocated-but-uninitialised
-            object: a half-constructed instance escaping into Java is worse than
-            no instance at all.
+            yields NULL rather than an allocated-but-uninitialised object: a
+            half-constructed instance escaping into Java is worse than no
+            instance at all.
 
             THREAD / GC CONTRACT, the same one call() has: this allocates and
             then invokes, and the invoke is a safepoint.  Call it from inside a
             hook detour, or under a vmhook::java_thread_scope, where no
-            collection can begin between the two.  The result is stamped with
-            the epoch it was made in; it is NOT rooted, and is garbage the
-            moment the collector looks unless it is stored somewhere reachable.
+            collection can begin between the two.  The wrapper holds a plain
+            address and is NOT rooted: it is good for the current call, and the
+            object is garbage the moment the collector looks unless it has been
+            stored somewhere Java can reach.
 
-            Declared here and defined out-of-line, after vmhook::borrowed.
+            Declared here and defined out-of-line, where the allocation and
+            invocation machinery is complete.
 
             Complexity: O(instance size) + O(M) over the class's methods + the
             constructor's own cost.  Exception safety: noexcept.
         */
         template<typename... args_t>
         [[nodiscard]] static auto create(args_t&&... args) noexcept
-            -> vmhook::borrowed<derived>;
+            -> std::unique_ptr<derived>;
     };
 
     // --- Built-in Java collection wrappers ------------------------------------
@@ -26543,11 +26551,11 @@ namespace hotspot
     /*
         @brief Out-of-line definition of object<derived>::create(args...).
         @details
-        Deferred for the same reason as self(): it hands back a
-        vmhook::borrowed, which is only complete at this point.
+        Deferred to here because the allocation and invocation machinery it
+        needs is only complete at this point.
 
         Every failure between the allocation and a successfully-returned
-        constructor abandons the instance and yields an EMPTY handle.  That is
+        constructor abandons the instance and yields NULL.  That is
         deliberate — an object that was allocated but whose `<init>` did not run
         (or threw) has Java-visible invariants that were never established, and
         handing it back would push a half-built object into code that has no way
@@ -26557,7 +26565,7 @@ namespace hotspot
     template<typename derived>
     template<typename... args_t>
     auto object<derived>::create(args_t&&... args) noexcept
-        -> vmhook::borrowed<derived>
+        -> std::unique_ptr<derived>
     {
         const std::string class_name{ vmhook::detail::registered_class_name<derived>() };
         if (class_name.empty())
@@ -26565,7 +26573,7 @@ namespace hotspot
             VMHOOK_LOG("{} object::create(): type '{}' is not registered - call "
                        "register_class<T>(\"java/lang/Name\") before constructing it.",
                        vmhook::error_tag, vmhook::detail::type_name<derived>());
-            return vmhook::borrowed<derived>{};
+            return nullptr;
         }
 
         vmhook::hotspot::klass* const target_klass{ vmhook::find_class(class_name) };
@@ -26573,7 +26581,7 @@ namespace hotspot
         {
             VMHOOK_LOG("{} object::create(): class '{}' is not loaded in this VM.",
                        vmhook::error_tag, class_name);
-            return vmhook::borrowed<derived>{};
+            return nullptr;
         }
 
         // A zero instance size means non-instantiable (interface / abstract /
@@ -26585,7 +26593,7 @@ namespace hotspot
             VMHOOK_LOG("{} object::create(): '{}' is not instantiable (interface, "
                        "abstract, or its instance size could not be read).",
                        vmhook::error_tag, class_name);
-            return vmhook::borrowed<derived>{};
+            return nullptr;
         }
 
         // Locate ANY <init> on the class first.  The exact overload is chosen
@@ -26619,7 +26627,7 @@ namespace hotspot
             VMHOOK_LOG("{} object::create(): '{}' declares no <init> this library can "
                        "reach - nothing was allocated.",
                        vmhook::error_tag, class_name);
-            return vmhook::borrowed<derived>{};
+            return nullptr;
         }
 
         // PRE-FLIGHT the invocability of the call BEFORE allocating.  A refused
@@ -26636,7 +26644,7 @@ namespace hotspot
             VMHOOK_LOG("{} object::create(): no call stub could be derived on this VM, "
                        "so '{}' cannot be constructed - nothing was allocated.",
                        vmhook::error_tag, class_name);
-            return vmhook::borrowed<derived>{};
+            return nullptr;
         }
         if (!vmhook::hotspot::ensure_current_java_thread())
         {
@@ -26644,7 +26652,7 @@ namespace hotspot
                        "not be attached, so the constructor of '{}' cannot run - nothing "
                        "was allocated.",
                        vmhook::error_tag, class_name);
-            return vmhook::borrowed<derived>{};
+            return nullptr;
         }
 
         // Named `allocated`, not `instance`: object_base has a member of
@@ -26654,7 +26662,7 @@ namespace hotspot
         {
             VMHOOK_LOG("{} object::create(): allocation of {} bytes for '{}' failed.",
                        vmhook::warning_tag, instance_size, class_name);
-            return vmhook::borrowed<derived>{};
+            return nullptr;
         }
 
         const vmhook::method_proxy constructor{ allocated, initializer, initializer->get_signature() };
@@ -26665,10 +26673,12 @@ namespace hotspot
                        "instance is abandoned.",
                        vmhook::error_tag, class_name,
                        result.exception_class.empty() ? "an exception" : result.exception_class.c_str());
-            return vmhook::borrowed<derived>{};
+            return nullptr;
         }
 
-        return vmhook::borrowed<derived>{ allocated };
+        // nothrow: this function is noexcept, so a failed wrapper
+        // allocation must degrade to null like every other failure here.
+        return std::unique_ptr<derived>{ new (std::nothrow) derived{ allocated } };
     }
 
     // -------------------------------------------------------------------------

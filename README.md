@@ -9,9 +9,13 @@ Read fields, call methods, construct objects and hook methods in a **running
 HotSpot JVM**, from C++ inside the same process. One header, no JVMTI agent, no
 launch flags, no cooperation from the target.
 
-You never write a type argument to `get`, `set` or `call`. The JVM already
-stores every field's and method's type; vmhook reads it and gives you back what
-you asked for.
+Two rules run through the whole API:
+
+- **No type arguments.** `get`, `set` and `call` never take one. The JVM already
+  stores every field's and method's type — vmhook reads it and gives you back
+  what you asked for.
+- **Objects are `std::unique_ptr<T>`.** That is the only object type you ever
+  write, everywhere: fields, arguments, return values, hook parameters.
 
 ```cmake
 add_library(vmhook INTERFACE)
@@ -23,150 +27,119 @@ target_link_libraries(your_target PRIVATE vmhook)
 
 ## Wrapping a class
 
+You describe a Java class once, as a C++ class. `get_field` and `get_method`
+live **inside** it — they are how a wrapper reaches its own object, not
+something callers use.
+
 ```cpp
 #include <vmhook/vmhook.hpp>
 
-class entity : public vmhook::object<entity> { using object::object; };
+class entity final : public vmhook::object<entity>
+{
+public:
+    explicit entity(vmhook::oop_t instance) : vmhook::object<entity>{ instance } {}
+
+    // --- reading -----------------------------------------------------------
+    auto health() -> float       { return get_field("health")->get(); }
+    auto alive()  -> bool        { return get_field("isAlive")->get(); }
+    auto name()   -> std::string { return get_field("name")->get(); }
+
+    // a STATIC Java field — same call, the field itself says which it is
+    auto count()  -> std::int32_t { return get_field("entityCount")->get(); }
+
+    // an object field
+    auto passenger() -> std::unique_ptr<entity> { return get_field("passenger")->get(); }
+
+    // --- writing -----------------------------------------------------------
+    auto set_health(float hp)           -> void { get_field("health")->set(hp); }
+    auto set_name(const std::string& n) -> void { get_field("name")->set(n); }
+    auto set_passenger(const std::unique_ptr<entity>& e) -> void
+    {
+        get_field("passenger")->set(e);
+    }
+
+    // --- calling -----------------------------------------------------------
+    auto kill() -> void { get_method("kill")->call(); }
+
+    auto distance_to(const std::unique_ptr<entity>& other) -> double
+    {
+        return get_method("distanceTo")->call(other);
+    }
+
+    auto add_tag(const std::string& tag, std::int32_t level, bool sticky) -> bool
+    {
+        return get_method("addTag")->call(tag, level, sticky);
+    }
+
+    // a method that returns an object
+    auto rider() -> std::unique_ptr<entity> { return get_method("getRidingEntity")->call(); }
+};
 
 vmhook::register_class<entity>("net/minecraft/entity/Entity");
 ```
 
-Register before using fields, methods, construction or hooks.
+Register every wrapper before using it.
 
-## Getting a primitive field
+Notice what is *not* in there: no `<float>`, no `<std::string>`, no cast, no
+extraction call. The return type of your accessor is the whole specification —
+`get()` and `call()` produce whatever it says.
 
-`get_field` resolves **instance and static** fields the same way — the field
-itself says which it is, so you never pick a spelling.
-
-```cpp
-float health = self->get_field("health")->get();
-bool  alive  = self->get_field("isAlive")->get();
-int   count  = self->get_field("entityCount")->get();   // a static Java field
-```
-
-Without an instance, go through the type:
+When two Java overloads differ only in their descriptor, name it:
 
 ```cpp
-int count = entity::static_field("entityCount")->get();
+auto add(const std::unique_ptr<entity>& other) -> bool
+{
+    return get_method("add", "(Ljava/lang/Object;)Z")->call(other);
+}
 ```
 
-Use `float f = ...->get();`, not `float f{ ...->get() };` — brace-init
-reconsiders the target's own constructors and picks surprising ones.
+## Using it
 
-## Getting a string
+Outside the wrapper you only ever see your own methods and `std::unique_ptr`.
 
 ```cpp
-std::string name = self->get_field("name")->get();
+float       hp  = e->health();
+std::string n   = e->name();
+std::int32_t all = e->count();
+
+e->set_health(20.0f);
+e->set_name("Bob");
+e->set_passenger(other);
+
+e->kill();
+double d = e->distance_to(other);
+
+std::unique_ptr<entity> p = e->passenger();
+if (p) { p->set_health(1.0f); }
 ```
 
-## Getting an object
-
-```cpp
-auto rider = self->get_field("passenger")->get();
-
-float x           = rider->get_field("posX")->get();
-std::string label = rider->get_field("name")->get();
-```
-
-No type is named and nothing is borrowed. `rider` resolves its members from the
-**live object's own class**, so this works even for a class you never wrapped.
-A Java null ends the chain quietly instead of faulting.
-
-Name a type when you want one — the declaration alone is enough:
-
-```cpp
-entity typed = self->get_field("passenger")->get();
-```
-
-## Setting a primitive field
-
-```cpp
-self->get_field("health")->set(20.0f);
-self->get_field("isAlive")->set(true);
-self->get_field("entityCount")->set(0);        // static field, same call
-```
-
-## Setting a string
-
-```cpp
-self->get_field("name")->set("Bob");
-```
-
-Builds a real `java.lang.String` and rebinds the field to it, like a Java
-`field = value;`. The previous String is never mutated, so a shared or interned
-one cannot be corrupted.
-
-## Setting an object
-
-```cpp
-self->get_field("passenger")->set(other);
-self->get_field("passenger")->set(other->get_field("passenger")->get());
-```
-
-Anything that names a live object is accepted. Each is revalidated before the
-write, so an expired or empty source stores nothing rather than writing a stale
-address into the heap.
-
-## Calling a method
-
-```cpp
-self->get_method("kill")->call();
-double d = self->get_method("distanceTo")->call(other);
-```
-
-Without an instance:
-
-```cpp
-int n = entity::static_method("countAll")->call();
-```
-
-## Calling with arguments
-
-Argument types are deduced, and the overload is selected from them.
-
-```cpp
-self->get_method("setName")->call("Bob");                       // string
-self->get_method("mount")->call(other);                         // object
-bool ok = self->get_method("addTag")->call("hostile", 3, true);  // mixed
-```
-
-The result behaves like a field read — it is whatever you assign it to, and it
-chains:
-
-```cpp
-auto held         = self->get_method("getHeldItem")->call();
-std::string label = held->get_method("getDisplayName")->call();
-```
-
-When two overloads differ only in their descriptor, name it:
-
-```cpp
-self->get_method("add", "(Ljava/lang/Object;)Z")->call(other);
-```
+A null Java reference comes back as a null `unique_ptr`, so `if (p)` is the only
+check you need.
 
 ## Creating objects
 
-`create` allocates **and runs the real Java constructor**, picking the
-`<init>` overload from the argument types:
+`create` allocates **and runs the real Java constructor**, picking the `<init>`
+overload from the argument types:
 
 ```cpp
-auto p = player::create("Bob", 12);
-if (p) { p->get_field("name")->get(); }
-
-auto blank = item::create();     // no-arg constructor
+std::unique_ptr<entity> fresh = entity::create();
+std::unique_ptr<entity> named = entity::create("Bob", 12);
 ```
 
-If no `<init>` matches, nothing is allocated and you get an empty handle — never
-a half-built object.
+If no `<init>` matches, nothing is allocated and you get null — never a
+half-built object.
 
 ## Hooks
 
 A hook replaces a method's interpreter entry, so your lambda runs every time
-Java calls it.
+Java calls it. Declare the parameters you want and they are decoded for you:
+primitives by value, objects as `std::unique_ptr`.
 
 ```cpp
 auto h = vmhook::scoped_hook<entity>("hurt", "(F)V",
-    [](vmhook::return_value& ret, vmhook::borrowed<entity> self, float amount) noexcept {
+    [](vmhook::return_value& ret, std::unique_ptr<entity> self, float amount) noexcept {
+
+        if (self) { self->set_health(20.0f); }
 
         ret.set_arg(0, 0.0f);       // change what the original sees
         ret.cancel();               // or stop it running at all
@@ -178,9 +151,6 @@ auto h = vmhook::scoped_hook<entity>("hurt", "(F)V",
     });
 ```
 
-Arguments are declared on the lambda and decoded for you: primitives by value,
-objects as handles.
-
 Hook every method matching a descriptor instead of naming one:
 
 ```cpp
@@ -190,8 +160,8 @@ vmhook::hook_by_signature<entity>("(F)V", [](vmhook::return_value&) noexcept {})
 Watch a field change, a class load, or a thrown exception:
 
 ```cpp
-auto w = vmhook::watch_static_field<entity, int>("entityCount",
-    [](int before, int after) noexcept {});
+auto w = vmhook::watch_static_field<entity, std::int32_t>("entityCount",
+    [](std::int32_t before, std::int32_t after) noexcept {});
 
 auto c = vmhook::on_class_loaded([](const std::string& name) noexcept {});
 auto e = vmhook::on_exception   ([](const std::string& type) noexcept {});
@@ -204,17 +174,36 @@ vmhook::verify_hooks();     // re-check every installed hook is still in place
 vmhook::shutdown_hooks();   // remove all of them
 ```
 
-`scoped_hook` removes its hook on destruction. **Do not let that happen during
-DLL unload** — removing a hook stops threads *entering* it, but cannot evict one
-already inside, and unloading a module a Java thread is executing takes the
-process with it. Prefer leaving the module mapped.
+Four things that bite:
 
-Two more things that bite:
-
+- **`scoped_hook` removes its hook on destruction — do not let that happen
+  during DLL unload.** Removing a hook stops threads *entering* it but cannot
+  evict one already inside, and unloading a module a Java thread is executing
+  takes the process with it. Prefer leaving the module mapped.
 - **Deoptimise a hot method before hooking it**, or the JIT routes around the
   detour and the hook silently never fires.
 - **No exception may reach the JVM.** Hook bodies are `noexcept`; the frame
   above you is HotSpot's interpreter and it has no handler.
+- **A wrapper is a view for the duration of the call.** It holds a plain
+  address, so do not stash one in a global and use it later — the collector
+  moves objects. Re-read it from wherever you got it.
+
+## Calling from your own thread
+
+Reading a field works from any thread. *Calling* needs a `JavaThread`, so take a
+scope — and resolve and call inside the same one, because between two scopes a
+collection can run and move what the first one found.
+
+```cpp
+void worker() {                       // an ordinary std::thread
+    const vmhook::java_thread_scope java{};
+    if (!java) { return; }            // ALWAYS check
+
+    e->kill();
+}
+```
+
+Keep it short: while it is open, the VM waits for this thread at safepoints.
 
 ## Licence
 

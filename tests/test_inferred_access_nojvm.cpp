@@ -243,11 +243,38 @@ static_assert(requires { { ia_entity::static_field("k") } -> std::same_as<std::o
 static_assert(requires { { ia_entity::static_method("m") } -> std::same_as<std::optional<vmhook::method_proxy>>; },
               "static_method(name) likewise");
 
-// -- construct() runs a real Java constructor --------------------------------
-static_assert(requires { { ia_entity::create() } -> std::same_as<vmhook::borrowed<ia_entity>>; },
-              "create() must exist and hand back a lifetime-checked handle");
-static_assert(requires { { ia_entity::create("Bob", 12) } -> std::same_as<vmhook::borrowed<ia_entity>>; },
+// -- create() runs a real Java constructor -----------------------------------
+// It hands back a std::unique_ptr, not a handle type: an object is ALWAYS a
+// unique_ptr in this API, so constructing one must not introduce a second
+// reference type the caller would otherwise never meet.
+static_assert(requires { { ia_entity::create() } -> std::same_as<std::unique_ptr<ia_entity>>; },
+              "create() must hand back std::unique_ptr, like every other object");
+static_assert(requires { { ia_entity::create("Bob", 12) } -> std::same_as<std::unique_ptr<ia_entity>>; },
               "create(args...) must deduce the <init> overload from the arguments");
+
+// ===========================================================================
+// THE UNIQUE_PTR-ONLY SURFACE.
+//
+// A user never writes `borrowed` anywhere: an object is a std::unique_ptr<T>
+// when it is read from a field, returned from a call, passed as an argument,
+// stored into a field, constructed, or received as a hook parameter.  These
+// assert that every one of those six positions accepts it, because a single
+// gap forces the whole vocabulary back into user code.
+// ===========================================================================
+static_assert(std::is_convertible_v<field_value, std::unique_ptr<ia_entity>>,
+              "1. an object FIELD reads as unique_ptr");
+static_assert(std::is_convertible_v<method_value, std::unique_ptr<ia_entity>>,
+              "2. an object RESULT reads as unique_ptr");
+static_assert(requires(const vmhook::method_proxy& m, const std::unique_ptr<ia_entity>& o)
+              { m.call(o); },
+              "3. a unique_ptr is accepted as a call ARGUMENT");
+static_assert(requires(const vmhook::field_proxy& f, const std::unique_ptr<ia_entity>& o)
+              { f.set(o); },
+              "4. a unique_ptr is accepted by set()");
+static_assert(requires { { ia_entity::create() } -> std::same_as<std::unique_ptr<ia_entity>>; },
+              "5. construction yields a unique_ptr");
+static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<ia_entity>>,
+              "6. and the detour-argument extractor recognises the same shape");
 
 // -- set() accepts anything that names a live object -------------------------
 static_assert(requires(const vmhook::field_proxy& f, const vmhook::borrowed<ia_entity>& b) { f.set(b); },
@@ -461,13 +488,11 @@ int main()
     // never borrowed.
     // =======================================================================
     {
-        const vmhook::borrowed<ia_entity> made{ ia_entity::create() };
-        check("create_no_vm_empty",       !static_cast<bool>(made));
-        check("create_no_vm_not_expired", !made.expired());
-        check("create_no_vm_no_address",  made.raw_unsafe() == nullptr);
+        const std::unique_ptr<ia_entity> made{ ia_entity::create() };
+        check("create_no_vm_null", made == nullptr);
 
-        const vmhook::borrowed<ia_entity> with_args{ ia_entity::create("Bob", 12) };
-        check("create_args_no_vm_empty", !static_cast<bool>(with_args));
+        const std::unique_ptr<ia_entity> with_args{ ia_entity::create("Bob", 12) };
+        check("create_args_no_vm_null", with_args == nullptr);
     }
 
     std::printf(failures == 0 ? "[PASS] %d checks\n" : "[DONE] %d checks\n", checks);

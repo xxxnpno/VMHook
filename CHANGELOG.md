@@ -98,14 +98,21 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   nothing instead of writing a stale address into the heap — the one write that
   would outlive the mistake and corrupt a later collection.
 - `object<T>::create(args...)` — allocates AND runs the real Java constructor,
-  selecting the `<init>` overload from the C++ argument types.  This is the gap
-  `vmhook::make_unique` left: make_unique allocates a zeroed instance and runs
-  the *C++* wrapper's `construct()`, but never executes the Java `<init>` chain,
-  so any class with constructor logic came back half-built.  Every refusal —
-  unregistered type, unloaded class, non-instantiable klass, no matching
-  `<init>`, no derivable call stub, not on a JavaThread — is detected BEFORE the
-  allocation, so a failure cannot leave a raw constructor-less object on the
-  Java heap; a constructor that throws abandons the instance.
+  selecting the `<init>` overload from the C++ argument types, and returning the
+  same `std::unique_ptr<T>` every other object in the API is spelled with.  This
+  is the gap `vmhook::make_unique` left: make_unique allocates a zeroed instance
+  and runs the *C++* wrapper's `construct()`, but never executes the Java
+  `<init>` chain, so any class with constructor logic came back half-built.
+  Every refusal — unregistered type, unloaded class, non-instantiable klass, no
+  matching `<init>`, no derivable call stub, not on a JavaThread — is detected
+  BEFORE the allocation, so a failure cannot leave a raw constructor-less object
+  on the Java heap; a constructor that throws abandons the instance.
+- **`std::unique_ptr<T>` is now the only object type a user writes**, in all six
+  positions: read from a field, returned from a call, passed as a call argument,
+  stored by `set()`, produced by `create()`, and received as a hook parameter.
+  Five of those already worked; `create()` was returning a `vmhook::borrowed`
+  and was the one place the handle vocabulary leaked into user code.  Pinned by
+  static_assert so a future change cannot reopen the gap.
 - `vmhook::vm_capabilities()` — a cached capability gate reporting the live
   collector, barrier shape, `UseCompressedOops` and `UseCompactObjectHeaders`.
   The collector is determined by walking the JVM flag table (`Flag` on JDK 8,
@@ -123,10 +130,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 - **The README documented an API that did not exist.**  `get_field("x")->get<T>()`
   and `self->call<T>("m")` were never spellings this library had — neither
-  compiles, and never did.  The README is rewritten as a cookbook against the
-  real surface (wrap a class, read/write each kind of field, call, construct,
-  hook) and every snippet in it is compiled under `-Werror` on GCC and
-  `/W4 /WX /permissive-` on MSVC.  The same two fictions appeared in the
+  compiles, and never did.  The README is rewritten around the shape the library
+  is actually for — you describe a Java class once as a C++ wrapper, `get_field`
+  / `get_method` live INSIDE it, and callers see only your own accessors and
+  `std::unique_ptr` — and every snippet in it is compiled under `-Werror` on GCC
+  and `/W4 /WX /permissive-` on MSVC.  The same two fictions appeared in the
   header's own `java_thread_scope` examples and are fixed there too.
 - `get_field` / `get_method` are stated as the ONE access spelling: each resolves
   a static or an instance Java member indistinguishably, so `static_field` /
