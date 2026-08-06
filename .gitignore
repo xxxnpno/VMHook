@@ -63,3 +63,8 @@ viewer/test/sleeper.log
 
 viewer/example/out/
 viewer/example/app.log
+
+# Working notes and local UI state — not part of the shipped library.
+docs/
+_surface.txt
+imgui.ini

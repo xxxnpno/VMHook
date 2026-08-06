@@ -19,6 +19,9 @@ Two rules run through the whole API:
   never null — check `get_instance()` when you need to know whether the Java
   reference was null.
 
+Threading is vmhook's problem, not yours: reading works from any thread, and a
+call from a thread the VM has never seen attaches it first.
+
 ```cmake
 add_library(vmhook INTERFACE)
 target_include_directories(vmhook INTERFACE path/to/vmhook/ext)
@@ -74,14 +77,34 @@ cast, no extraction call. And nothing in there says which *kind* of member it
 is — `get_field` resolves a static or an instance Java field indistinguishably,
 and so does `get_method`.
 
-The one exception is a **static C++ method**, which has no object to work
-through. Use `static_field` / `static_method` there:
+A **static** Java field is read the same way, which is how you reach a
+singleton. Give the wrapper a defaulted constructor so it can be named without
+an object yet:
 
 ```cpp
-static auto get_minecraft() noexcept -> std::unique_ptr<sdk::minecraft>
+namespace sdk
 {
-    return static_field("theMinecraft")->get();
+    class minecraft final : public vmhook::object<sdk::minecraft>
+    {
+    public:
+        explicit minecraft(const vmhook::oop_t instance = nullptr) noexcept
+            : vmhook::object<sdk::minecraft>{ instance }
+        {
+        }
+
+        auto get_the_minecraft() const noexcept -> std::unique_ptr<sdk::minecraft>
+        {
+            return get_field("theMinecraft")->get();
+        }
+
+        auto get_the_player() const noexcept -> std::unique_ptr<sdk::entity>
+        {
+            return get_field("thePlayer")->get();
+        }
+    };
 }
+
+const auto minecraft = sdk::minecraft{}.get_the_minecraft();
 ```
 
 ## Using it
@@ -89,7 +112,7 @@ static auto get_minecraft() noexcept -> std::unique_ptr<sdk::minecraft>
 Outside the wrapper you only see your own methods and `std::unique_ptr`.
 
 ```cpp
-const auto minecraft = sdk::minecraft::get_minecraft();
+const auto minecraft = sdk::minecraft{}.get_the_minecraft();
 if (!minecraft->get_instance()) { return; }
 
 const auto player = minecraft->get_the_player();
@@ -285,25 +308,6 @@ Two more things worth knowing:
   moves objects. Re-read it from wherever you got it.
 - **No exception may reach the JVM.** The frame above your hook is HotSpot's
   interpreter and it has no handler.
-
-## Calling from your own thread
-
-Reading a field works from any thread. *Calling* needs a `JavaThread`, so take a
-scope — and resolve and call inside the same one, because between two scopes a
-collection can run and move what the first one found.
-
-```cpp
-void worker()                         // an ordinary std::thread
-{
-    const vmhook::java_thread_scope java{};
-    if (!java) { return; }            // ALWAYS check
-
-    const auto minecraft = sdk::minecraft::get_minecraft();
-    if (minecraft->get_instance()) { minecraft->get_the_player()->kill(); }
-}
-```
-
-Keep it short: while it is open, the VM waits for this thread at safepoints.
 
 ## Licence
 
