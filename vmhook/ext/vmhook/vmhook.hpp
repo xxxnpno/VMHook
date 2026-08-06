@@ -10548,6 +10548,8 @@ namespace vmhook
                 std::size_t skip_abstract_native{ 0 };
                 std::size_t skip_no_entry{ 0 };
                 std::size_t recorded{ 0 };
+                std::size_t donors_static{ 0 };
+                std::size_t donors_instance{ 0 };
                 bool        stopped_early{ false };
 
                 const auto satisfied = [&]() noexcept -> bool
@@ -10645,6 +10647,9 @@ namespace vmhook
                                 continue;
                             }
 
+                            if ((access & JVM_ACC_STATIC_BIT) != 0u) { ++donors_static; }
+                            else { ++donors_instance; }
+
                             vmhook::detail::c2i_vote& vote{ state.votes[key] };
                             ++vote.total;
                             if (vote.candidate == nullptr)
@@ -10670,6 +10675,35 @@ namespace vmhook
                 {
                     state.complete = true;
                 }
+
+                // The shapes actually harvested, most common first.  A lookup
+                // that misses a shape this list says is plentiful means the two
+                // sides are computing different keys -- which is exactly the bug
+                // this exists to make visible rather than infer.
+                // Whenever the graph was EXHAUSTED -- not only when the sweep
+                // was keyless.  Gating on stop_key.empty() printed nothing at
+                // all, because the sweep that completes is the one that went
+                // looking for a specific key and never found it, which is
+                // precisely the case worth dumping.
+                if (!stopped_early)
+                {
+                    std::vector<std::pair<std::string, vmhook::detail::c2i_vote>> ranked{
+                        state.votes.begin(), state.votes.end() };
+                    std::sort(ranked.begin(), ranked.end(),
+                              [](const auto& left, const auto& right) noexcept
+                              {
+                                  return left.second.total > right.second.total;
+                              });
+                    for (std::size_t i{ 0 }; i < ranked.size() && i < 12; ++i)
+                    {
+                        VMHOOK_LOG("{} c2i shape [{}] '{}' total={} agreeing={}",
+                                   vmhook::info_tag, i, ranked[i].first,
+                                   ranked[i].second.total, ranked[i].second.agreeing);
+                    }
+                }
+
+                VMHOOK_LOG("{} c2i donors by kind: {} instance, {} static.",
+                           vmhook::info_tag, donors_instance, donors_static);
 
                 VMHOOK_LOG("{} c2i harvest ({}): {} signature(s), {} donor(s), {} class(es), "
                            "{} method(s) (skipped: {} compiled, {} unreadable flags, "
@@ -10784,10 +10818,10 @@ namespace vmhook
             }
 
             const auto it{ state.votes.find(key) };
-            VMHOOK_LOG("{} find_shared_c2i_entry('{}', static={}): refusing - {}.",
-                       vmhook::warning_tag, descriptor, wanted_static,
+            VMHOOK_LOG("{} find_shared_c2i_entry('{}', static={}) -> key '{}': refusing - {}.",
+                       vmhook::warning_tag, descriptor, wanted_static, key,
                        it == state.votes.end()
-                           ? "no concrete donor of this shape exists"
+                           ? "no donor of this shape exists"
                            : "donors disagreed, which means one of them is not what it seems");
             return nullptr;
         }
