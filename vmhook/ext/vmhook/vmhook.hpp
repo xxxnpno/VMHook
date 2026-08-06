@@ -10370,54 +10370,6 @@ namespace vmhook
         }
     }
 
-    /*
-        @brief The c2i adapter entry for a signature, WITHOUT AdapterHandlerEntry.
-        @details
-        Deoptimising a method means pointing `_from_compiled_entry` at the c2i
-        adapter, so compiled callers land in the interpreter.  vmhook used to
-        find that address by reading `Method::_adapter` and then
-        `AdapterHandlerEntry::_c2i_entry` out of it.  On a modern JVM NEITHER is
-        exported: measured on a JDK 26-era VM, `Method::_adapter`,
-        `AdapterHandlerEntry::_c2i_entry`, `_i2c_entry` and
-        `_c2i_unverified_entry` are ALL absent from gHotSpotVMStructs.  With no
-        way to validate a candidate the heuristic scan returned 0, get_adapter()
-        returned null, and every deoptimisation degraded: hook() fell back to a
-        forced deopt that leaves `_from_compiled_entry` pointing into a stale
-        nmethod, and deoptimize_methods_if skipped outright ("0 deoptimised,
-        5715 skipped").
-
-        This derives the same address from facts that ARE exported, using a
-        property of HotSpot's own adapter library: adapters are SHARED, keyed on
-        the signature.  AdapterHandlerLibrary::get_adapter() looks an adapter up
-        by an AdapterFingerPrint computed from the method's argument BasicTypes
-        (plus the receiver for a non-static method), so every method with the
-        same descriptor and the same static-ness resolves to the SAME adapter.
-        And for a method that is NOT currently compiled, HotSpot leaves
-        `_from_compiled_entry` pointing at exactly that adapter's c2i entry.
-
-        So: find any OTHER method with the same descriptor and static-ness whose
-        `_code` is null, and read its `_from_compiled_entry`.  That is the c2i
-        entry for this signature, straight out of the VM's own bookkeeping.
-
-        The donor must be a method the VM gave a REAL adapter to -- concrete and
-        non-native.  An ABSTRACT method also has `_code == nullptr` and so looks
-        like an ideal donor, but HotSpot hands every abstract method the shared
-        `_abstract_method_handler` whose c2i entry is the AbstractMethodError
-        stub; borrowing it points the hooked method straight at a throw.  See the
-        filter below for the measured failure.
-
-        Matching on the exact descriptor is deliberately STRICTER than the
-        fingerprint HotSpot uses (which collapses every object argument to one
-        BasicType).  Stricter is the safe direction: an identical descriptor plus
-        identical static-ness ALWAYS implies the same fingerprint, so a match is
-        never wrong -- some correct matches are simply passed over.
-
-        Cached per (descriptor, static): the scan is O(classes x methods) and the
-        answer is a process-lifetime property of the code cache.
-
-        @return The c2i entry, or nullptr when no interpreted donor exists.  A
-                null return leaves every caller on the path it already took.
-    */
     namespace detail
     {
         /*
@@ -10541,147 +10493,196 @@ namespace vmhook
         };
 
         /*
-            @brief Every c2i adapter the VM can tell us about, built in ONE pass.
+            @brief Harvests borrowed-adapter evidence, stopping as soon as it can.
             @details
-            The first version of this asked the question per signature, and each
-            question walked the whole ClassLoaderDataGraph.  Hooking one method
-            plus its class-scoped auto-deopt asked it 24 times on a live
-            Minecraft, and the payload sat for ~3 seconds before the first hook
-            fired -- 24 full walks over every loaded class and method.
+            Every read here is os::safe_read, which on Windows is a
+            ReadProcessMemory SYSCALL.  A full sweep of a running Minecraft is
+            223,016 methods, and touching _code, the access flags and
+            _from_compiled_entry on each is on the order of 450,000 syscalls --
+            about three seconds, paid before the first hook fires.
 
-            The graph does not change between those questions, so it is walked
-            ONCE and every answer harvested together: for each concrete,
-            non-native, currently-interpreted method, its `_from_compiled_entry`
-            is a vote for the adapter shared by its (descriptor, static-ness).
-            Every later lookup is a hash probe.
+            Almost all of it is wasted.  A hook needs the adapter for ONE
+            signature, and common shapes are found within the first handful of
+            classes.  So the walk takes the key it is looking for and stops the
+            moment that key has two corroborating votes; everything harvested on
+            the way is kept, because it is free and the next lookup may want it.
 
-            The counters exist because a silent zero is what sent the previous
-            version wrong: signatures as common as `()V` reported no donor at
-            all, which is not a plausible property of a running JVM and pointed
-            at the WALK rather than at the filters.  They are logged once, so a
-            future zero says which filter ate the candidates instead of leaving
-            it to inference.
+            `complete` records whether the graph was exhausted.  Only then is a
+            missing key known to be genuinely absent -- before that, a miss just
+            means the early exit stopped somewhere else.  A lookup that misses an
+            incomplete index therefore re-runs the walk with no stop key, once,
+            and from then on the answer is authoritative.
+
+            The counters are logged whenever a walk runs, because a silent zero
+            is what made the previous version's failure invisible.
         */
-        inline auto c2i_index() noexcept
-            -> const std::unordered_map<std::string, vmhook::detail::c2i_vote>&
+        struct c2i_index_state
         {
-            static std::unordered_map<std::string, vmhook::detail::c2i_vote> index{};
-            static std::once_flag built{};
+            std::unordered_map<std::string, vmhook::detail::c2i_vote> votes{};
+            bool                                                     complete{ false };
+            std::mutex                                               guard{};
+        };
 
-            std::call_once(built, []() noexcept
+        inline auto c2i_state() noexcept
+            -> vmhook::detail::c2i_index_state&
+        {
+            static vmhook::detail::c2i_index_state state{};
+            return state;
+        }
+
+        /*
+            @brief One pass over the class graph.  Caller holds state.guard.
+            @param stop_key  Stop once this key has 2 votes; empty means "sweep
+                             everything and mark the index complete".
+        */
+        inline auto harvest_c2i(vmhook::detail::c2i_index_state& state,
+                                const std::string& stop_key) noexcept
+            -> void
+        {
+            try
             {
-                try
-                {
-                    std::size_t classes{ 0 };
-                    std::size_t methods_seen{ 0 };
-                    std::size_t skip_compiled{ 0 };
-                    std::size_t skip_flags{ 0 };
-                    std::size_t skip_abstract_native{ 0 };
-                    std::size_t skip_no_entry{ 0 };
-                    std::size_t recorded{ 0 };
+                std::size_t classes{ 0 };
+                std::size_t methods_seen{ 0 };
+                std::size_t skip_compiled{ 0 };
+                std::size_t skip_flags{ 0 };
+                std::size_t skip_abstract_native{ 0 };
+                std::size_t skip_no_entry{ 0 };
+                std::size_t recorded{ 0 };
+                bool        stopped_early{ false };
 
-                    vmhook::for_each_loaded_class(
-                        [&](const std::string&, vmhook::hotspot::klass* const k) -> void
+                const auto satisfied = [&]() noexcept -> bool
+                {
+                    if (stop_key.empty())
+                    {
+                        return false;
+                    }
+                    const auto it{ state.votes.find(stop_key) };
+                    return it != state.votes.end() && it->second.agreeing >= 2;
+                };
+
+                vmhook::for_each_loaded_class(
+                    [&](const std::string&, vmhook::hotspot::klass* const k) -> void
+                    {
+                        // The visitor cannot break out of the graph walk, but it
+                        // can decline to do any work -- and the work is what
+                        // costs, not the iteration.
+                        if (stopped_early)
                         {
-                            if (k == nullptr || !vmhook::hotspot::is_valid_pointer(k))
+                            return;
+                        }
+                        if (satisfied())
+                        {
+                            stopped_early = true;
+                            return;
+                        }
+                        if (k == nullptr || !vmhook::hotspot::is_valid_pointer(k))
+                        {
+                            return;
+                        }
+                        ++classes;
+                        const std::int32_t count{ k->get_methods_count() };
+                        vmhook::hotspot::method** const list{ k->get_methods_ptr() };
+                        if (list == nullptr || count <= 0)
+                        {
+                            return;
+                        }
+                        for (std::int32_t i{ 0 }; i < count; ++i)
+                        {
+                            vmhook::hotspot::method* const m{ list[i] };
+                            if (m == nullptr || !vmhook::hotspot::is_valid_pointer(m))
                             {
+                                continue;
+                            }
+                            ++methods_seen;
+
+                            // ABSTRACT: HotSpot hands every abstract method the
+                            // shared _abstract_method_handler, whose c2i entry IS
+                            // the AbstractMethodError stub -- and an abstract
+                            // method has _code == nullptr, so it looks like a
+                            // perfect donor.  Borrowing one points the hooked
+                            // method at a throw.
+                            // NATIVE: _from_compiled_entry is the native wrapper.
+                            constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
+                            constexpr std::uint32_t JVM_ACC_NATIVE_BIT{ 0x0100u };
+                            constexpr std::uint32_t JVM_ACC_ABSTRACT_BIT{ 0x0400u };
+
+                            // Cheapest discriminators first: every one of these
+                            // is a syscall, and the signature read below also
+                            // allocates.
+                            if (m->get_code() != nullptr)
+                            {
+                                ++skip_compiled;
+                                continue;
+                            }
+                            std::uint32_t* const flags{ m->get_access_flags() };
+                            std::uint32_t access{ 0 };
+                            if (flags == nullptr
+                                || !vmhook::os::safe_read(&access, flags, sizeof(access)))
+                            {
+                                ++skip_flags;
+                                continue;
+                            }
+                            if ((access & (JVM_ACC_NATIVE_BIT | JVM_ACC_ABSTRACT_BIT)) != 0u)
+                            {
+                                ++skip_abstract_native;
+                                continue;
+                            }
+                            void* const entry{ m->get_from_compiled_entry() };
+                            if (entry == nullptr || !vmhook::hotspot::is_valid_pointer(entry))
+                            {
+                                ++skip_no_entry;
+                                continue;
+                            }
+                            const std::string signature{ m->get_signature() };
+                            if (signature.empty())
+                            {
+                                continue;
+                            }
+                            const std::string key{ vmhook::detail::adapter_fingerprint(
+                                signature, (access & JVM_ACC_STATIC_BIT) != 0u) };
+                            if (key.empty())
+                            {
+                                continue;
+                            }
+
+                            vmhook::detail::c2i_vote& vote{ state.votes[key] };
+                            ++vote.total;
+                            if (vote.candidate == nullptr)
+                            {
+                                vote.candidate = entry;
+                                vote.agreeing  = 1;
+                            }
+                            else if (vote.candidate == entry)
+                            {
+                                ++vote.agreeing;
+                            }
+                            ++recorded;
+
+                            if (satisfied())
+                            {
+                                stopped_early = true;
                                 return;
                             }
-                            ++classes;
-                            const std::int32_t count{ k->get_methods_count() };
-                            vmhook::hotspot::method** const list{ k->get_methods_ptr() };
-                            if (list == nullptr || count <= 0)
-                            {
-                                return;
-                            }
-                            for (std::int32_t i{ 0 }; i < count; ++i)
-                            {
-                                vmhook::hotspot::method* const m{ list[i] };
-                                if (m == nullptr || !vmhook::hotspot::is_valid_pointer(m))
-                                {
-                                    continue;
-                                }
-                                ++methods_seen;
+                        }
+                    });
 
-                                // ABSTRACT: HotSpot hands every abstract method
-                                // the shared _abstract_method_handler, whose c2i
-                                // entry IS the AbstractMethodError stub -- and an
-                                // abstract method has _code == nullptr, so it
-                                // looks like a perfect donor.  Borrowing one
-                                // points the hooked method at a throw.
-                                // NATIVE: _from_compiled_entry is the native
-                                // wrapper, not a c2i adapter.
-                                constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
-                                constexpr std::uint32_t JVM_ACC_NATIVE_BIT{ 0x0100u };
-                                constexpr std::uint32_t JVM_ACC_ABSTRACT_BIT{ 0x0400u };
-
-                                // Only an INTERPRETED method's
-                                // _from_compiled_entry is the adapter; a
-                                // compiled one points into its own nmethod.
-                                if (m->get_code() != nullptr)
-                                {
-                                    ++skip_compiled;
-                                    continue;
-                                }
-                                std::uint32_t* const flags{ m->get_access_flags() };
-                                std::uint32_t access{ 0 };
-                                if (flags == nullptr
-                                    || !vmhook::os::safe_read(&access, flags, sizeof(access)))
-                                {
-                                    ++skip_flags;
-                                    continue;
-                                }
-                                if ((access & (JVM_ACC_NATIVE_BIT | JVM_ACC_ABSTRACT_BIT)) != 0u)
-                                {
-                                    ++skip_abstract_native;
-                                    continue;
-                                }
-                                void* const entry{ m->get_from_compiled_entry() };
-                                if (entry == nullptr || !vmhook::hotspot::is_valid_pointer(entry))
-                                {
-                                    ++skip_no_entry;
-                                    continue;
-                                }
-                                const std::string signature{ m->get_signature() };
-                                if (signature.empty())
-                                {
-                                    continue;
-                                }
-                                const std::string key{ vmhook::detail::adapter_fingerprint(
-                                    signature, (access & JVM_ACC_STATIC_BIT) != 0u) };
-                                if (key.empty())
-                                {
-                                    continue;
-                                }
-
-                                vmhook::detail::c2i_vote& vote{ index[key] };
-                                ++vote.total;
-                                if (vote.candidate == nullptr)
-                                {
-                                    vote.candidate = entry;
-                                    vote.agreeing  = 1;
-                                }
-                                else if (vote.candidate == entry)
-                                {
-                                    ++vote.agreeing;
-                                }
-                                ++recorded;
-                            }
-                        });
-
-                    VMHOOK_LOG("{} c2i index: {} signature(s) from {} donor(s) over {} class(es), "
-                               "{} method(s) seen (skipped: {} compiled, {} unreadable flags, "
-                               "{} abstract/native, {} no entry).",
-                               vmhook::info_tag, index.size(), recorded, classes, methods_seen,
-                               skip_compiled, skip_flags, skip_abstract_native, skip_no_entry);
-                }
-                catch (const std::exception&)
+                if (!stopped_early)
                 {
-                    // A partial index is still useful; every miss just declines.
+                    state.complete = true;
                 }
-            });
 
-            return index;
+                VMHOOK_LOG("{} c2i harvest ({}): {} signature(s), {} donor(s), {} class(es), "
+                           "{} method(s) (skipped: {} compiled, {} unreadable flags, "
+                           "{} abstract/native, {} no entry).",
+                           vmhook::info_tag,
+                           stopped_early ? "stopped early" : "complete",
+                           state.votes.size(), recorded, classes, methods_seen,
+                           skip_compiled, skip_flags, skip_abstract_native, skip_no_entry);
+            }
+            catch (const std::exception&)
+            {
+                // A partial index is still useful; every miss just declines.
+            }
         }
     }
 
@@ -10734,20 +10735,60 @@ namespace vmhook
                 return nullptr;
             }
 
-            const auto& index{ vmhook::detail::c2i_index() };
-            const auto  it{ index.find(key) };
-            if (it == index.end())
+            vmhook::detail::c2i_index_state& state{ vmhook::detail::c2i_state() };
+            const std::lock_guard<std::mutex> guard{ state.guard };
+
+            const auto accept = [&]() noexcept -> void*
             {
+                const auto it{ state.votes.find(key) };
+                if (it == state.votes.end())
+                {
+                    return nullptr;
+                }
+                const vmhook::detail::c2i_vote& vote{ it->second };
+                // Corroborated, or the only donor the VM has.  "Only" is a claim
+                // about the WHOLE graph, so it may only be made once the index is
+                // complete -- an early-exited walk that saw one donor has not
+                // finished looking.
+                if (vote.agreeing >= 2 || (state.complete && vote.total == 1))
+                {
+                    return vote.candidate;
+                }
                 return nullptr;
-            }
-            const vmhook::detail::c2i_vote& vote{ it->second };
-            if (vote.agreeing >= 2 || vote.total == 1)
+            };
+
+            if (void* const early{ accept() })
             {
-                return vote.candidate;
+                return early;
             }
-            VMHOOK_LOG("{} find_shared_c2i_entry('{}', static={}): {} donor(s) disagreed - "
-                       "refusing rather than writing a guess.",
-                       vmhook::warning_tag, descriptor, wanted_static, vote.total);
+
+            // Not known yet: harvest, stopping as soon as THIS key is settled.
+            if (!state.complete)
+            {
+                vmhook::detail::harvest_c2i(state, key);
+                if (void* const found{ accept() })
+                {
+                    return found;
+                }
+            }
+
+            // Still nothing, and the walk stopped early for some other reason:
+            // sweep the whole graph once so a miss becomes authoritative.
+            if (!state.complete)
+            {
+                vmhook::detail::harvest_c2i(state, std::string{});
+                if (void* const found{ accept() })
+                {
+                    return found;
+                }
+            }
+
+            const auto it{ state.votes.find(key) };
+            VMHOOK_LOG("{} find_shared_c2i_entry('{}', static={}): refusing - {}.",
+                       vmhook::warning_tag, descriptor, wanted_static,
+                       it == state.votes.end()
+                           ? "no concrete donor of this shape exists"
+                           : "donors disagreed, which means one of them is not what it seems");
             return nullptr;
         }
         catch (const std::exception&)
