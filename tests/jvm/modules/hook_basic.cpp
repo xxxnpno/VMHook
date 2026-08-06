@@ -1487,7 +1487,7 @@ VMHOOK_JVM_MODULE(hook_basic)
             {
                 g_fire_count.fetch_add(1, std::memory_order_relaxed);
                 g_nullref_string_empty.store(s.empty(), std::memory_order_relaxed);
-                g_nullref_obj_null.store(obj == nullptr, std::memory_order_relaxed);
+                g_nullref_obj_null.store(vmhook_test::no_object(obj), std::memory_order_relaxed);
             }) };
 
         ctx.check("nullref_scoped_hook_installed", handle.installed());

@@ -1152,7 +1152,7 @@ namespace
         }
         {
             std::unique_ptr<mcd_fixture> np = s.get_method("retNullObject")->call();  // copy-init (MSVC C2440)
-            g_null_obj_is_null.store(np == nullptr);
+            g_null_obj_is_null.store(vmhook_test::no_object(np));
             auto p{ s.get_method("retNullObject") };
             if (p.has_value())
             {
@@ -1175,7 +1175,7 @@ namespace
             if (sn.has_value())
             {
                 std::unique_ptr<mcd_fixture> sp = sn->call();
-                g_static_null_is_null.store(sp == nullptr);
+                g_static_null_is_null.store(vmhook_test::no_object(sp));
             }
         }
         // Array reference return ('[' descriptor): decode to a non-null oop via

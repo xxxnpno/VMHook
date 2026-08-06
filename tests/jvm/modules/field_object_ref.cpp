@@ -573,7 +573,7 @@ namespace
                     // asserted post-probe in PART 3.
                     const auto n{ r->next() };
                     ctx.check("nested_ref_slot_null_pre_probe_decodes_to_nullptr",
-                              n == nullptr);
+                              vmhook_test::no_object(n));
                     const auto next_proxy{ r->get_field("next") };
                     ctx.check("nested_ref_slot_compressed_zero_pre_probe",
                               next_proxy.has_value()
@@ -596,7 +596,7 @@ namespace
                               && r->get_field("owner")->is_reference());
                     const auto own_pre{ r->owner() };
                     ctx.check("inherited_owner_null_pre_probe_decodes_to_nullptr",
-                              own_pre == nullptr);
+                              vmhook_test::no_object(own_pre));
                     ctx.check("inherited_owner_field_oop_nullptr_pre_probe",
                               r->field_oop_of("owner") == nullptr);
                     ctx.record("[INFO] inherited object field `owner` (declared on Ref) "
@@ -616,21 +616,21 @@ namespace
                 if (cyc)
                 {
                     ctx.check("cycle_ref_seed_value", cyc->val() == CYCLE_REF_VAL);
-                    ctx.check("cycle_ref_next_null_pre_probe", cyc->next() == nullptr);
+                    ctx.check("cycle_ref_next_null_pre_probe", vmhook_test::no_object(cyc->next()));
                 }
                 const auto ch{ holder->chain_head() };
-                ctx.check("chain_head_seed_non_null_pre_probe", ch != nullptr);
+                ctx.check("chain_head_seed_non_null_pre_probe", vmhook_test::has_object(ch));
                 if (ch)
                 {
                     ctx.check("chain_head_seed_value", ch->val() == CHAIN_HEAD_VAL);
-                    ctx.check("chain_head_next_null_pre_probe", ch->next() == nullptr);
+                    ctx.check("chain_head_next_null_pre_probe", vmhook_test::no_object(ch->next()));
                 }
             }
 
             // ── NULL instance ref -> null unique_ptr ───────────────────────
             {
                 const auto nr{ holder->null_ref() };
-                ctx.check("instance_null_ref_decodes_to_nullptr", nr == nullptr);
+                ctx.check("instance_null_ref_decodes_to_nullptr", vmhook_test::no_object(nr));
                 ctx.check("instance_null_ref_compressed_is_zero",
                           holder->ref_compressed("nullRef") == 0u);
                 ctx.check("instance_null_ref_field_oop_is_nullptr",
@@ -980,7 +980,7 @@ namespace
 
                 const auto as_ref{ holder->ref_array_as_ref() };
                 ctx.check("array_as_object_wrapper_rejected_returns_null",
-                          as_ref == nullptr);
+                          vmhook_test::no_object(as_ref));
                 ctx.record("[INFO] FLAW B FIXED (signature-shape guard): a '[' field "
                            "decoded as a single unique_ptr is rejected (nullptr), not a "
                            "wrapper around the array oop. Read elements via the array oop.");
@@ -1096,10 +1096,10 @@ namespace
                               holder->ref_value_as_voidp(c.name) == nullptr);
                 }
                 // The typed wrappers / string read of the same null slots.
-                ctx.check("null_shape_obj_wrapper_nullptr",   holder->null_obj()   == nullptr);
-                ctx.check("null_shape_tag_wrapper_nullptr",   holder->null_tag()   == nullptr);
-                ctx.check("null_shape_array_wrapper_nullptr", holder->null_array() == nullptr);
-                ctx.check("null_shape_boxed_wrapper_nullptr", holder->null_boxed() == nullptr);
+                ctx.check("null_shape_obj_wrapper_nullptr",   vmhook_test::no_object(holder->null_obj()));
+                ctx.check("null_shape_tag_wrapper_nullptr",   vmhook_test::no_object(holder->null_tag()));
+                ctx.check("null_shape_array_wrapper_nullptr", vmhook_test::no_object(holder->null_array()));
+                ctx.check("null_shape_boxed_wrapper_nullptr", vmhook_test::no_object(holder->null_boxed()));
                 ctx.check("null_shape_str_empty_string",      holder->null_str().empty());
             }
 
@@ -1216,7 +1216,7 @@ namespace
                     holder->set_writable_ref(nothing);
                     const auto after_null{ holder->writable_ref() };
                     ctx.check("set_get_after_null_set_decodes_to_nullptr",
-                              after_null == nullptr);
+                              vmhook_test::no_object(after_null));
                     ctx.check("set_get_after_null_set_compressed_zero",
                               holder->ref_compressed("writableRef") == 0u);
                     ctx.check("set_get_after_null_set_field_oop_nullptr",
@@ -1280,7 +1280,7 @@ namespace
             }
 
             const auto snr{ holder_object::static_null_ref() };
-            ctx.check("static_null_ref_decodes_to_nullptr", snr == nullptr);
+            ctx.check("static_null_ref_decodes_to_nullptr", vmhook_test::no_object(snr));
 
             // ── STATIC-SLOT introspection + compressed-OOP ROUND-TRIP ──────────
             // The static path resolves the slot through the java.lang.Class mirror
@@ -1607,7 +1607,7 @@ namespace
                                       tail->compute() == CHAIN_TAIL_VAL * 2 + 1);
                             // The deepest level is unterminated (tail.next is null).
                             ctx.check("chain_tail_next_is_null",
-                                      tail->next() == nullptr);
+                                      vmhook_test::no_object(tail->next()));
                         }
                     }
                 }

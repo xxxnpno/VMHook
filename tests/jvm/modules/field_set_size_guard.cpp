@@ -931,7 +931,7 @@ VMHOOK_JVM_MODULE(field_set_size_guard)
             const std::unique_ptr<fsg> empty{};
             ctx.check("set_refSlot_to_null", fsg::set_ref("refSlot", empty));
             const auto rN{ fsg::acquire("refSlot") };
-            ctx.check("refSlot_now_null", rN == nullptr);
+            ctx.check("refSlot_now_null", vmhook_test::no_object(rN));
         }
         // Put it back to refB so the Java snapshot (phase 9) sees non-null == B.
         ctx.check("set_refSlot_back_to_B", fsg::set_ref("refSlot", refB));

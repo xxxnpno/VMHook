@@ -14,10 +14,38 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace vmhook_test
 {
+    // ----------------------------------------------------------------------
+    // A std::unique_ptr handed out by vmhook is NEVER null: the POINTER always
+    // arrives, and the OBJECT inside it is absent when the Java reference was
+    // null (or could not be decoded).  So "this decoded to nothing" is spelled
+    //
+    //     no_object(p)      instead of   p == nullptr
+    //     has_object(p)     instead of   p != nullptr / if (p)
+    //
+    // Both tolerate a genuinely null pointer so a call site does not have to
+    // care which vmhook API produced the handle.  get_instance() is
+    // base-qualified because a wrapper is free to shadow the name.
+    // ----------------------------------------------------------------------
+    template<typename wrapper_t>
+    inline auto has_object(const std::unique_ptr<wrapper_t>& handle) noexcept
+        -> bool
+    {
+        return handle != nullptr
+            && handle->vmhook::object_base::get_instance() != nullptr;
+    }
+
+    template<typename wrapper_t>
+    inline auto no_object(const std::unique_ptr<wrapper_t>& handle) noexcept
+        -> bool
+    {
+        return !has_object(handle);
+    }
+
     // The result sink + Java coordination handed to every module.  Implemented
     // by the driver (example.cpp) so modules never touch the ofstream directly.
     struct context

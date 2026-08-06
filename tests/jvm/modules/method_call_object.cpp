@@ -634,7 +634,7 @@ namespace
                 // CHAINED NULL: a null reference return THROUGH the method-decoded
                 // receiver still yields a null unique_ptr (the chained null path).
                 std::unique_ptr<child_object> null_sib{ mc->make_null_sibling() };
-                g_null_sibling_is_null.store(null_sib == nullptr, std::memory_order_relaxed);
+                g_null_sibling_is_null.store(vmhook_test::no_object(null_sib), std::memory_order_relaxed);
 
                 // SELF through a method-returned wrapper: Child.self() returns
                 // `this`, so the returned wrapper decodes to the SAME Child OOP.
@@ -722,13 +722,13 @@ namespace
                 g_maybe_true_tag.store(present->get_tag(), std::memory_order_relaxed);
             }
             std::unique_ptr<child_object> absent{ self->maybe_child(false) };
-            g_maybe_false_null.store(absent == nullptr, std::memory_order_relaxed);
+            g_maybe_false_null.store(vmhook_test::no_object(absent), std::memory_order_relaxed);
         }
 
         // ── unconditional null return ──────────────────────────────────────
         {
             std::unique_ptr<child_object> nc{ self->null_child() };
-            g_nullchild_null.store(nc == nullptr, std::memory_order_relaxed);
+            g_nullchild_null.store(vmhook_test::no_object(nc), std::memory_order_relaxed);
 
             // is_void() must be true for a null reference return (call stores
             // monostate when the OOP is null).
@@ -759,7 +759,7 @@ namespace
             if (sn)
             {
                 std::unique_ptr<child_object> sc = sn->call();
-                g_static_null_is_null.store(sc == nullptr, std::memory_order_relaxed);
+                g_static_null_is_null.store(vmhook_test::no_object(sc), std::memory_order_relaxed);
             }
         }
 
@@ -940,7 +940,7 @@ namespace
                 i0 != 0 && i1 != 0 && i2 != 0 && i0 != i1 && i1 != i2 && i0 != i2,
                 std::memory_order_relaxed);
             std::unique_ptr<child_object> oob{ self->pick_child(99) };
-            g_pick_oob_null.store(oob == nullptr, std::memory_order_relaxed);
+            g_pick_oob_null.store(vmhook_test::no_object(oob), std::memory_order_relaxed);
         }
 
         // ── CROSS-METHOD identity: sameStaticChild() == staticMakeChild() OOP ──
@@ -1104,15 +1104,15 @@ namespace
         {
             std::unique_ptr<integer_object> bl{ self->boxed_long() };
             g_boxed_long_nonnull.store(bl != nullptr, std::memory_order_relaxed);
-            if (bl) { g_boxed_long_klass = runtime_klass_name(bl->get_instance()); }
+            if (vmhook_test::has_object(bl)) { g_boxed_long_klass = runtime_klass_name(bl->get_instance()); }
 
             std::unique_ptr<integer_object> bb{ self->boxed_bool() };
             g_boxed_bool_nonnull.store(bb != nullptr, std::memory_order_relaxed);
-            if (bb) { g_boxed_bool_klass = runtime_klass_name(bb->get_instance()); }
+            if (vmhook_test::has_object(bb)) { g_boxed_bool_klass = runtime_klass_name(bb->get_instance()); }
 
             std::unique_ptr<integer_object> bd{ self->boxed_double() };
             g_boxed_double_nonnull.store(bd != nullptr, std::memory_order_relaxed);
-            if (bd) { g_boxed_double_klass = runtime_klass_name(bd->get_instance()); }
+            if (vmhook_test::has_object(bd)) { g_boxed_double_klass = runtime_klass_name(bd->get_instance()); }
         }
 
         // ── ARG-DRIVEN NULL on a reference (String) arg ────────────────────────
@@ -1135,11 +1135,11 @@ namespace
         {
             const std::unique_ptr<child_object> null_child_arg{};
             std::unique_ptr<child_object> echoed_null{ self->echo_child(null_child_arg) };
-            g_echo_null_child_is_null.store(echoed_null == nullptr, std::memory_order_relaxed);
+            g_echo_null_child_is_null.store(vmhook_test::no_object(echoed_null), std::memory_order_relaxed);
 
             const std::unique_ptr<child_object> null_object_arg{};
             std::unique_ptr<child_object> echoed_null_obj{ self->echo_object(null_object_arg) };
-            g_echo_null_object_is_null.store(echoed_null_obj == nullptr, std::memory_order_relaxed);
+            g_echo_null_object_is_null.store(vmhook_test::no_object(echoed_null_obj), std::memory_order_relaxed);
         }
 
         // ── SUBTYPE passed as a BASE-typed (Animal) arg, returned unchanged ─────

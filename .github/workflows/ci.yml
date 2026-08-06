@@ -122,17 +122,17 @@ jobs:
       - name: Configure, build, test (non-MSYS2)
         if: matrix.cc != 'gcc' || matrix.os != 'windows-latest'
         run: |
-          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release --parallel
-          ctest --test-dir build --output-on-failure -C Release
+          cmake -S . -B build/etc -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/etc --config Release --parallel
+          ctest --test-dir build/etc --output-on-failure -C Release
 
       - name: Configure, build, test (MSYS2 MinGW)
         if: matrix.os == 'windows-latest' && matrix.cc == 'gcc'
         shell: msys2 {0}
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --parallel
-          ctest --test-dir build --output-on-failure
+          cmake -S . -B build/etc -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/etc --parallel
+          ctest --test-dir build/etc --output-on-failure
 
       # ── Upload built artefacts so the JVM jobs can reuse them ──────────
       - name: Upload artefacts (Windows MSVC)
@@ -141,10 +141,10 @@ jobs:
         with:
           name: vmhook-windows-msvc
           path: |
-            build/bin/vmhook.dll
-            build/bin/vmhook.pdb
-            build/bin/injector.exe
-            build/bin/injector.pdb
+            build/vmhook.dll
+            build/vmhook.pdb
+            build/injector.exe
+            build/injector.pdb
 
       - name: Upload artefacts (Windows clang)
         if: matrix.os == 'windows-latest' && matrix.cc == 'clang'
@@ -152,8 +152,8 @@ jobs:
         with:
           name: vmhook-windows-clang
           path: |
-            build/bin/vmhook.dll
-            build/bin/injector.exe
+            build/vmhook.dll
+            build/injector.exe
 
       - name: Upload artefacts (Windows MinGW)
         if: matrix.os == 'windows-latest' && matrix.cc == 'gcc'
@@ -161,22 +161,22 @@ jobs:
         with:
           name: vmhook-windows-mingw
           path: |
-            build/bin/vmhook.dll
-            build/bin/injector.exe
+            build/vmhook.dll
+            build/injector.exe
 
       - name: Upload artefacts (Linux gcc)
         if: matrix.os == 'ubuntu-latest' && matrix.cc == 'gcc'
         uses: actions/upload-artifact@v4
         with:
           name: vmhook-linux-gcc
-          path: build/bin/libvmhook.so
+          path: build/libvmhook.so
 
       - name: Upload artefacts (Linux clang)
         if: matrix.os == 'ubuntu-latest' && matrix.cc == 'clang'
         uses: actions/upload-artifact@v4
         with:
           name: vmhook-linux-clang
-          path: build/bin/libvmhook.so
+          path: build/libvmhook.so
 
       - name: Upload artefacts (macOS clang)
         if: matrix.os == 'macos-latest'
@@ -187,8 +187,8 @@ jobs:
           # Apple platforms that is .dylib (.bundle is also possible if
           # we tweak SUFFIX in CMakeLists.txt, but the default suits us).
           path: |
-            build/bin/libvmhook.dylib
-            build/bin/libvmhook.so
+            build/libvmhook.dylib
+            build/libvmhook.so
 
   # ─────────────────────────────────────────────────────────────────────────
   # 2. JVM integration tests — every Java version × every compiler that
@@ -231,7 +231,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: vmhook-windows-${{ matrix.compiler }}
-          path: build/bin
+          path: build
 
       - name: Set up Java ${{ matrix.java }}
         uses: actions/setup-java@v4
@@ -368,7 +368,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: vmhook-linux-${{ matrix.compiler }}
-          path: build/bin
+          path: build
 
       - name: Set up Java ${{ matrix.java }}
         uses: actions/setup-java@v4
@@ -383,20 +383,20 @@ jobs:
 
       - name: Run JNI integration test
         env:
-          LD_LIBRARY_PATH: build/bin
+          LD_LIBRARY_PATH: build
         run: |
           set -euo pipefail
           echo "=== Java ${{ matrix.java }} · Linux / ${{ matrix.compiler }} ==="
-          chmod +x build/bin/libvmhook.so
+          chmod +x build/libvmhook.so
           # Launch java with the shared library on the load path; the loader
           # constructor in libvmhook.so will start the test worker thread.
-          java -cp out -Djava.library.path=build/bin vmhook.Main &
+          java -cp out -Djava.library.path=build vmhook.Main &
           JAVA_PID=$!
 
           # Trigger load explicitly via JVMTI agent attach.
           sleep 3
           if command -v jcmd >/dev/null 2>&1; then
-            jcmd "$JAVA_PID" JVMTI.agent_load build/bin/libvmhook.so || true
+            jcmd "$JAVA_PID" JVMTI.agent_load build/libvmhook.so || true
           fi
 
           waited=0
@@ -440,7 +440,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: vmhook-macos-clang
-          path: build/bin
+          path: build
 
       - name: Set up Java ${{ matrix.java }}
         uses: actions/setup-java@v4
@@ -457,22 +457,22 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Java ${{ matrix.java }} · macOS / clang ==="
-          chmod +x build/bin/libvmhook.dylib build/bin/libvmhook.so 2>/dev/null || true
+          chmod +x build/libvmhook.dylib build/libvmhook.so 2>/dev/null || true
           # System.loadLibrary needs `lib<name>.dylib` on macOS but our
           # CMake configuration may emit either suffix depending on the
           # generator.  Symlink one to the other so the search path
           # works regardless.
-          if [ -f build/bin/libvmhook.dylib ] && [ ! -f build/bin/libvmhook.so ]; then
-            ln -s libvmhook.dylib build/bin/libvmhook.so
+          if [ -f build/libvmhook.dylib ] && [ ! -f build/libvmhook.so ]; then
+            ln -s libvmhook.dylib build/libvmhook.so
           fi
-          if [ -f build/bin/libvmhook.so ] && [ ! -f build/bin/libvmhook.dylib ]; then
-            ln -s libvmhook.so build/bin/libvmhook.dylib
+          if [ -f build/libvmhook.so ] && [ ! -f build/libvmhook.dylib ]; then
+            ln -s libvmhook.so build/libvmhook.dylib
           fi
           # macOS runners ship Apple Silicon (arm64); HotSpot is present but
           # the vmhook trampoline is x86_64 only, so the runtime hook step
           # will degrade gracefully.  We still exercise the OS layer and
           # the JNI_OnLoad entrypoint.
-          DYLD_LIBRARY_PATH=build/bin java -cp out -Djava.library.path=build/bin vmhook.Main &
+          DYLD_LIBRARY_PATH=build java -cp out -Djava.library.path=build vmhook.Main &
           JAVA_PID=$!
           sleep 3
           waited=0
@@ -508,14 +508,14 @@ jobs:
         run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
       - name: Configure + build (Android ${{ matrix.abi }})
         run: |
-          cmake -S . -B build/android-${{ matrix.abi }} -G Ninja \
+          cmake -S . -B build/etc/android-${{ matrix.abi }} -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=${{ matrix.abi }} \
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
             -DVMHOOK_BUILD_EXAMPLE=OFF \
             -DVMHOOK_BUILD_INJECTOR=OFF
-          cmake --build build/android-${{ matrix.abi }} --parallel
+          cmake --build build/etc/android-${{ matrix.abi }} --parallel
       - name: Run host-runnable unit tests (only when ABI matches host)
         if: matrix.abi == 'x86_64'
         run: |
@@ -539,7 +539,7 @@ jobs:
             iphonesimulator)  PLATFORM=SIMULATOR64 ;;
           esac
           # Use CMake's built-in iOS toolchain handling.
-          cmake -S . -B build/ios-${{ matrix.sdk }} -G Xcode \
+          cmake -S . -B build/etc/ios-${{ matrix.sdk }} -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=${{ matrix.sdk }} \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -548,7 +548,7 @@ jobs:
             -DVMHOOK_BUILD_EXAMPLE=OFF \
             -DVMHOOK_BUILD_INJECTOR=OFF \
             -DVMHOOK_BUILD_TESTS=ON
-          cmake --build build/ios-${{ matrix.sdk }} --config Release
+          cmake --build build/etc/ios-${{ matrix.sdk }} --config Release
 
   # ─────────────────────────────────────────────────────────────────────────
   # 4. Strict warnings-as-errors build on the primary Linux compilers.
@@ -581,9 +581,9 @@ jobs:
         env:
           CXX: ${{ matrix.cxx }}
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVMHOOK_WARNINGS_AS_ERRORS=ON
-          cmake --build build --parallel
-          ctest --test-dir build --output-on-failure
+          cmake -S . -B build/etc -G Ninja -DCMAKE_BUILD_TYPE=Release -DVMHOOK_WARNINGS_AS_ERRORS=ON
+          cmake --build build/etc --parallel
+          ctest --test-dir build/etc --output-on-failure
 
   # ─────────────────────────────────────────────────────────────────────────
   # 5. Legacy MSBuild build of the historic vmhook.slnx — kept so existing

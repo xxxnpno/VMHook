@@ -1234,7 +1234,7 @@ VMHOOK_JVM_MODULE(hook_signature)
                const std::unique_ptr<hook_sig_fixture>& o)
             {
                 g_fire_ref_obj_null.fetch_add(1, std::memory_order_relaxed);
-                g_ref_obj_null_was_null.store(o == nullptr, std::memory_order_relaxed);
+                g_ref_obj_null_was_null.store(vmhook_test::no_object(o), std::memory_order_relaxed);
             }) };
         auto h_str{ vmhook::scoped_hook<hook_sig_fixture>(
             "refTake", "(Ljava/lang/String;)I",

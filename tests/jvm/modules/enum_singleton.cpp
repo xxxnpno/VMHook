@@ -1164,7 +1164,7 @@ namespace
             if (m_value_of.has_value())
             {
                 std::unique_ptr<enum_color> got{ m_value_of->call(std::string{ "BLUE" }) };
-                if (!got)
+                if (vmhook_test::no_object(got))
                 {
                     ctx.record("[INFO] enum_singleton: native Color.valueOf(\"BLUE\") had no live "
                                "call gate (or the JDK call path truncated the returned handle); "
@@ -1421,7 +1421,7 @@ namespace
                 if (m_value_of.has_value() && live(plus))
                 {
                     std::unique_ptr<op_enum> got{ m_value_of->call(std::string{ "PLUS" }) };
-                    if (!got)
+                    if (vmhook_test::no_object(got))
                     {
                         ctx.record("[INFO] enum_singleton: native Op.valueOf(\"PLUS\") had no live "
                                    "call gate; identity proven via the Java witness "
@@ -1685,7 +1685,7 @@ namespace
                       classic_singleton::get_instance_method_resolves());
             {
                 auto via_call{ classic_singleton::get_instance_native() };
-                if (!via_call)
+                if (vmhook_test::no_object(via_call))
                 {
                     ctx.record("[INFO] enum_singleton: native ClassicSingleton.getInstance() had no "
                                "live call gate; idempotence + identity proven via the Java witness "

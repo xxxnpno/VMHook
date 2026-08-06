@@ -951,7 +951,7 @@ namespace
             if (m_value_of.has_value())
             {
                 std::unique_ptr<suit_enum> got{ m_value_of->call(std::string{ "HEARTS" }) };
-                if (!got)
+                if (vmhook_test::no_object(got))
                 {
                     ctx.record("[INFO] enum_shapes: native Suit.valueOf(\"HEARTS\") had no live call "
                                "gate; valueOf identity is proven via the Java witness "

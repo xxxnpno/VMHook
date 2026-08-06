@@ -31,7 +31,9 @@ endif()
 
 # Both binaries land in the same directory so the viewer finds the payload DLL
 # next to its own exe.
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+# Binaries go to <repo>/build like every other vmhook target; the CMake
+# working files stay in whatever binary dir was configured.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../build")
 
 set(VMHOOK_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../vmhook/ext")
 set(IMGUI_DIR      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui")

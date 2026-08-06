@@ -899,7 +899,7 @@ namespace
             const std::unique_ptr<fs> empty{};
             ctx.check("set_ref_to_null_resolved", fs::set_ref("objRef", empty));
             const auto refN{ fs::acquire("objRef") };
-            ctx.check("objRef_now_null_native_reread", refN == nullptr);
+            ctx.check("objRef_now_null_native_reread", vmhook_test::no_object(refN));
         }
 
         // Put it back to objB so the Java snapshot sees a non-null, identity==B.
@@ -1841,7 +1841,7 @@ namespace
                 const std::unique_ptr<fsb> empty{};
                 ctx.check("fstat_inh_set_ref_null", fsb::set_ref("inhRef", empty));
                 const auto refN{ fsb::acquire("inhRef") };
-                ctx.check("fstat_inh_ref_now_null_native", refN == nullptr);
+                ctx.check("fstat_inh_ref_now_null_native", vmhook_test::no_object(refN));
             }
             // Put it back to B so the mode-5 snapshot sees non-null, identity B.
             ctx.check("fstat_inh_set_ref_back_to_B", fsb::set_ref("inhRef", baseB));

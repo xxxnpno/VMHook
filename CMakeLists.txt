@@ -5,6 +5,29 @@ project(vmhook
     DESCRIPTION "Single-header HotSpot JVM hooking library"
     LANGUAGES CXX)
 
+# ── Where things land ───────────────────────────────────────────────────────
+# Everything you might actually want ends up in ONE place, <repo>/build:
+# vmhook.dll, injector.exe, libvmhook.so, the test executables, the viewer.
+# Everything you do not care about — CMakeCache, CMakeFiles, ninja files, .obj
+# — stays in whatever binary dir you configured, which is conventionally
+# <repo>/build/etc:
+#
+#     cmake -S . -B build/etc && cmake --build build/etc
+#     ctest --test-dir build/etc
+#
+# Configuring somewhere else still works; only the BINARY destination is
+# pinned.  The per-config variables matter for multi-config generators (Visual
+# Studio, Xcode), which otherwise append Debug/ or Release/ to the path and
+# scatter the binaries again.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build")
+foreach(_vmhook_cfg IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_vmhook_cfg} "${CMAKE_SOURCE_DIR}/build")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_vmhook_cfg} "${CMAKE_SOURCE_DIR}/build")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${_vmhook_cfg} "${CMAKE_SOURCE_DIR}/build")
+endforeach()
+
 # ── MSVC EH model: drop CMake's default /EHsc so we can pick /EHa per-target ──
 # CMake injects /EHsc into CMAKE_CXX_FLAGS for every MSVC build.  vmhook's
 # seh_invoke_detour needs ASYNC exception unwinding (/EHa) so a hardware
@@ -294,9 +317,6 @@ if(VMHOOK_BUILD_EXAMPLE)
     # Self-contained on MinGW: java.exe's LoadLibraryW must resolve this DLL with
     # no external libstdc++-6 / libgcc_s_seh-1 / libwinpthread-1 on its search path.
     vmhook_static_runtime(vmhook_example)
-    set_target_properties(vmhook_example PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
 
 # ── Windows-only injector (CreateRemoteThread + LoadLibraryW) ───────────────
@@ -307,8 +327,6 @@ if(VMHOOK_BUILD_INJECTOR AND VMHOOK_PLATFORM_WINDOWS)
     vmhook_apply_warnings(vmhook_injector)
     # Self-contained on MinGW: the JVM runner has no MinGW runtime on PATH.
     vmhook_static_runtime(vmhook_injector)
-    set_target_properties(vmhook_injector PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
 
 # ── Standalone tests (header compiles + smoke-level pure-logic tests) ───────
