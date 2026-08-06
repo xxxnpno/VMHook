@@ -10839,6 +10839,70 @@ namespace vmhook
         the VM exports neither.  Callers get an address or nullptr and never have
         to know which JDK they are on.
     */
+    namespace detail
+    {
+        /*
+            @brief c2i adapters already proven for a specific Method.
+            @details
+            A hooked method is deoptimised over and over: once at install, then
+            again every time HotSpot re-JITs it.  The FIRST of those may have no
+            adapter available -- the method is compiled, so it cannot tell us its
+            own, and the borrowed-donor route may have no method of its shape to
+            borrow from.  Every subsequent one can be exact, because by then the
+            method has been interpreted and has published its own adapter.
+
+            So remember it.  Keyed on the Method*, which is what the caller has,
+            and re-validated on read: a class redefinition can recycle a Method*,
+            and an address that used to be an adapter is exactly the kind of
+            stale value that must not be written into a live method.
+        */
+        inline std::unordered_map<const void*, void*> g_proven_c2i{};
+        inline std::mutex                             g_proven_c2i_mutex{};
+    }
+
+    namespace detail
+    {
+        /*
+            @brief Whether a hook may deoptimise a method it has no adapter for.
+            @details
+            Clearing Method::_code makes HotSpot dispatch through the interpreter,
+            which is the only way a hook on an already-JIT-compiled method fires
+            at all.  Normally _from_compiled_entry is repointed at the c2i adapter
+            first; when no adapter can be found, clearing anyway leaves compiled
+            callers aimed at a stale nmethod until their inline caches re-resolve.
+
+            That is a real risk and it is not hypothetical -- it has killed a JVM
+            in testing.  But refusing outright is not free either: the hook then
+            stops firing the moment HotSpot recompiles the method, which on a
+            20 Hz game method is a couple of minutes.  Measured on JDK 26
+            Minecraft: deoptimising regardless survived 500,000 ticks; refusing
+            died at ~50,000.
+
+            So it is a choice, and the default is the one that makes hooks work.
+            set_deoptimise_without_adapter(false) takes the other side.
+
+            It also matters less over time than it looks: the FIRST deopt of a
+            compiled method is the one with no adapter, and once the method has
+            been interpreted it publishes its own (see resolve_and_cache_c2i), so
+            later deopts of the same method are exact.
+        */
+        inline std::atomic<bool> g_deopt_without_adapter{ true };
+    }
+
+    /* @brief @see detail::g_deopt_without_adapter. */
+    [[nodiscard]] inline auto deoptimise_without_adapter() noexcept
+        -> bool
+    {
+        return vmhook::detail::g_deopt_without_adapter.load(std::memory_order_acquire);
+    }
+
+    /* @brief @see detail::g_deopt_without_adapter. */
+    inline auto set_deoptimise_without_adapter(const bool enabled) noexcept
+        -> void
+    {
+        vmhook::detail::g_deopt_without_adapter.store(enabled, std::memory_order_release);
+    }
+
     inline auto resolve_c2i_entry(vmhook::hotspot::method* const target) noexcept
         -> void*
     {
@@ -10846,6 +10910,28 @@ namespace vmhook
         {
             return nullptr;
         }
+
+        // FIRST: ask the method itself.  While a method is NOT compiled, HotSpot
+        // keeps _from_compiled_entry pointing at that method's own c2i adapter --
+        // so a method that is currently deoptimised hands over the exact address,
+        // with no borrowing, no fingerprint and no chance of picking the wrong
+        // shape.  This is strictly better than every route below and should have
+        // been tried first.
+        //
+        // It does not help at the moment of hooking an already-compiled method,
+        // which is why the other routes exist.  But it converges: once a hooked
+        // method has been deoptimised even once, the watchdog sees _code null and
+        // this returns its real adapter, so every LATER re-deopt is exact.
+        // resolve_and_cache_c2i() is what keeps that answer.
+        if (target->get_code() == nullptr)
+        {
+            void* const own{ target->get_from_compiled_entry() };
+            if (own != nullptr && vmhook::hotspot::is_valid_pointer(own))
+            {
+                return own;
+            }
+        }
+
         if (void* const adapter{ target->get_adapter() })
         {
             if (void* const c2i{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) })
@@ -10866,6 +10952,57 @@ namespace vmhook
             return nullptr;
         }
         return vmhook::find_shared_c2i_entry(descriptor, (access & JVM_ACC_STATIC_BIT) != 0u);
+    }
+
+    /*
+        @brief resolve_c2i_entry(), remembering what it proves.
+        @details
+        The install-time deopt of an already-compiled method often cannot find
+        an adapter, while every later deopt of the SAME method can -- by then it
+        has run interpreted and published its own.  Caching that turns a method
+        that was once unsafe to deoptimise into one that is exact from then on.
+
+        Use this, not resolve_c2i_entry, from anything that deoptimises.
+    */
+    inline auto resolve_and_cache_c2i(vmhook::hotspot::method* const target) noexcept
+        -> void*
+    {
+        if (target == nullptr || !vmhook::hotspot::is_valid_pointer(target))
+        {
+            return nullptr;
+        }
+
+        if (void* const fresh{ vmhook::resolve_c2i_entry(target) })
+        {
+            try
+            {
+                const std::lock_guard<std::mutex> guard{ vmhook::detail::g_proven_c2i_mutex };
+                vmhook::detail::g_proven_c2i[target] = fresh;
+            }
+            catch (const std::exception&)
+            {
+                // Caching is an optimisation; failing to cache is not an error.
+            }
+            return fresh;
+        }
+
+        try
+        {
+            const std::lock_guard<std::mutex> guard{ vmhook::detail::g_proven_c2i_mutex };
+            const auto it{ vmhook::detail::g_proven_c2i.find(target) };
+            if (it != vmhook::detail::g_proven_c2i.end()
+                && it->second != nullptr
+                && vmhook::hotspot::is_valid_pointer(it->second))
+            {
+                VMHOOK_LOG("{} resolve_c2i_entry: reusing the adapter this method published "
+                           "the last time it was interpreted.", vmhook::info_tag);
+                return it->second;
+            }
+        }
+        catch (const std::exception&)
+        {
+        }
+        return nullptr;
     }
 
     /*
@@ -11033,7 +11170,7 @@ namespace vmhook
                         // and this whole sweep used to skip every method it saw.
                         // Borrow the shared adapter from an interpreted method of
                         // the same signature instead.
-                        c2i = vmhook::resolve_c2i_entry(m);
+                        c2i = vmhook::resolve_and_cache_c2i(m);
                     }
 
                     if (!c2i || !vmhook::hotspot::is_valid_pointer(c2i))
@@ -13481,7 +13618,7 @@ namespace vmhook
                     // interpreted method of the same signature rather than
                     // dropping to the forced deopt that leaves
                     // _from_compiled_entry aimed at a stale nmethod.
-                    c2i_entry = vmhook::resolve_c2i_entry(found_method);
+                    c2i_entry = vmhook::resolve_and_cache_c2i(found_method);
                 }
 
                 if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
@@ -13519,11 +13656,23 @@ namespace vmhook
                     // more can keep the method interpreted from the start with
                     //     -XX:CompileCommand=exclude,the/Class.method
                     found_method->set_from_interpreted_entry(i2i);
-                    VMHOOK_LOG("{} hook():   no c2i adapter for '{}' on this VM - leaving _code intact.  "
-                               "The hook fires on interpreted calls; calls from JIT-compiled callers will "
-                               "bypass it until they deoptimise.  Clearing _code without a valid "
-                               "_from_compiled_entry crashes the VM, so it is not done.",
-                               vmhook::warning_tag, method_name);
+                    if (vmhook::deoptimise_without_adapter())
+                    {
+                        found_method->set_code(nullptr);
+                        VMHOOK_LOG("{} hook():   no c2i adapter for '{}' on this VM - deoptimising "
+                                   "anyway so the hook actually fires.  Compiled callers stay aimed "
+                                   "at the old nmethod until their inline caches re-resolve; the "
+                                   "method publishes its own adapter once interpreted, so the next "
+                                   "deopt is exact.  set_deoptimise_without_adapter(false) to refuse.",
+                                   vmhook::warning_tag, method_name);
+                    }
+                    else
+                    {
+                        VMHOOK_LOG("{} hook():   no c2i adapter for '{}' and deoptimising without one "
+                                   "is disabled - leaving _code intact.  The hook fires on interpreted "
+                                   "calls only, and stops once HotSpot recompiles the method.",
+                                   vmhook::warning_tag, method_name);
+                    }
                 }
             }
 
@@ -13702,7 +13851,7 @@ namespace vmhook
                         void* c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
                         if (!c2i_entry)
                         {
-                            c2i_entry = vmhook::resolve_c2i_entry(new_method);
+                            c2i_entry = vmhook::resolve_and_cache_c2i(new_method);
                         }
                         // Restore the interpreted entry either way: it costs
                         // nothing and interpreted dispatch must reach the detour.
@@ -13715,13 +13864,9 @@ namespace vmhook
                             new_method->set_from_compiled_entry(c2i_entry);
                             new_method->set_code(nullptr);
                         }
-                        else
+                        else if (vmhook::deoptimise_without_adapter())
                         {
-                            VMHOOK_LOG("{} verify_hooks: no c2i adapter on re-anchor - leaving _code "
-                                       "intact.  Compiled callers bypass the hook until they "
-                                       "deoptimise; clearing _code without a valid "
-                                       "_from_compiled_entry crashes the VM.",
-                                       vmhook::warning_tag);
+                            new_method->set_code(nullptr);
                         }
                     }
 
@@ -13890,7 +14035,7 @@ namespace vmhook
                         void* c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
                         if (!c2i_entry)
                         {
-                            c2i_entry = vmhook::resolve_c2i_entry(hm.method);
+                            c2i_entry = vmhook::resolve_and_cache_c2i(hm.method);
                         }
                         if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
                         {
@@ -13915,11 +14060,11 @@ namespace vmhook
                         {
                             hm.method->set_code(nullptr);
                         }
-                        else
+                        else if (vmhook::deoptimise_without_adapter())
                         {
-                            VMHOOK_LOG("{} verify_hooks: no c2i adapter for the re-JITted '{}' - "
-                                       "leaving _code intact rather than crashing the VM.",
-                                       vmhook::warning_tag, hm.expected_method_name);
+                            // The re-JIT case: refusing here is what makes a hook
+                            // on a hot method die a couple of minutes in.
+                            hm.method->set_code(nullptr);
                         }
                     }
 
