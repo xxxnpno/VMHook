@@ -251,3 +251,9 @@ vmhook_add_test(modern_cpp_surface_nojvm       SOURCES test_modern_cpp_surface_n
 # fail-closed paths -- a primitive must never become a handle to its own bits,
 # and a chain through nothing must end quietly instead of faulting.
 vmhook_add_test(inferred_access_nojvm          SOURCES test_inferred_access_nojvm.cpp)
+
+# detail::adapter_fingerprint -- the rule deciding which methods may lend their
+# c2i adapter to which.  Pure, so every case is exact without a JVM.  Too STRICT
+# a key makes vmhook refuse to deoptimise; too LOOSE writes another signature's
+# adapter into a live Method and kills the VM at the next compiled call.
+vmhook_add_test(adapter_fingerprint_nojvm   SOURCES test_adapter_fingerprint_nojvm.cpp)

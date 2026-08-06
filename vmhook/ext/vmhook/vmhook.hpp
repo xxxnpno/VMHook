@@ -9103,11 +9103,18 @@ namespace vmhook
             2 bytes of alignment padding that sit between the u2 _access_flags and the
             4-byte-aligned _flags that follows it (verified field order:
             _vtable_index, _access_flags(u2), _flags(u4)), so it corrupts NOTHING but
-            is also a no-op for JIT inhibition on JDK 24+.  This is intentionally left
-            as-is: the deopt/settle path the hook modules rely on keeps a hooked
-            method interpreted regardless, and routing NO_COMPILE into MethodFlags on
-            JDK 24+ would require mutating the install/teardown call sites (outside the
-            flag-accessor surface).  No behavioural change on JDK 8..23.
+            is also a no-op for JIT inhibition on JDK 24+.
+
+            THAT GAP IS NOW CLOSED ELSEWHERE, and this mask is no longer the whole
+            story: hotspot::set_not_compilable() writes the relocated bits into
+            MethodFlags::_status, and every call site that ORs this mask calls it
+            too.  This mask is kept because it is still the ONLY route on
+            JDK 8..23, where those bits really do live here.
+
+            Do not "fix" this constant by adding the MethodFlags bit numbers to
+            it.  They are bits 8..10 of a DIFFERENT word; OR-ing them here would
+            write them into _access_flags, where on JDK 8..23 they collide with
+            real class-file flags.
         */
         inline constexpr std::int32_t NO_COMPILE =
             0x02000000 |
@@ -10414,6 +10421,116 @@ namespace vmhook
     namespace detail
     {
         /*
+            @brief HotSpot's adapter key for a method, as a comparable string.
+            @details
+            Adapters are shared, and this is the rule by which they are shared.
+            AdapterFingerPrint is built from the ARGUMENT BasicTypes only -- the
+            return type is not part of it -- and each type is normalised by
+            SharedRuntime's adapter_encoding():
+
+                Z B S C I     -> int      (all promoted in the calling convention)
+                object array  -> long     (both are one 64-bit word on LP64)
+                J             -> long
+                F             -> float
+                D             -> double
+
+            plus a leading receiver word for a non-static method.
+
+            Matching on the raw descriptor instead -- which is what this did
+            first -- is far stricter than the thing it is modelling, and the cost
+            is not theoretical: on a live JDK 26 Minecraft it found donors for 1
+            signature out of 24 and refused the rest, because it treated
+            `()Lnet/minecraft/client/Minecraft;` and `()V` as different keys when
+            HotSpot gives them the SAME adapter.  Every refusal then fell through
+            to a path that could not deoptimise.
+
+            Encoded as a small string ("I", "L", "F", "D" per word) purely so it
+            can key a map; the letters are the normalised classes above, not the
+            descriptor characters they came from -- note that an object argument
+            encodes as 'L' *because it is long-sized*, which is why `J` encodes
+            the same way.
+
+            Pure: no JVM, no live Method, so the whole table is unit-testable.
+
+            @return The key, or an empty string if the descriptor is malformed.
+        */
+        inline auto adapter_fingerprint(const std::string_view descriptor,
+                                        const bool is_static) noexcept
+            -> std::string
+        {
+            const std::size_t open{ descriptor.find('(') };
+            const std::size_t close{ descriptor.find(')') };
+            if (open == std::string_view::npos || close == std::string_view::npos
+                || close < open)
+            {
+                return {};
+            }
+
+            std::string key{};
+            if (!is_static)
+            {
+                key.push_back('L');   // the receiver: one object-sized word
+            }
+
+            for (std::size_t i{ open + 1 }; i < close; ++i)
+            {
+                switch (descriptor[i])
+                {
+                    case 'Z': case 'B': case 'S': case 'C': case 'I':
+                        key.push_back('I');
+                        break;
+                    case 'J':
+                        key.push_back('L');
+                        break;
+                    case 'F':
+                        key.push_back('F');
+                        break;
+                    case 'D':
+                        key.push_back('D');
+                        break;
+                    case 'L':
+                    {
+                        const std::size_t end{ descriptor.find(';', i) };
+                        if (end == std::string_view::npos || end > close)
+                        {
+                            return {};
+                        }
+                        i = end;
+                        key.push_back('L');
+                        break;
+                    }
+                    case '[':
+                    {
+                        // Skip the (possibly nested) array prefix, then the
+                        // element type; the whole thing is one reference word.
+                        while (i < close && descriptor[i] == '[')
+                        {
+                            ++i;
+                        }
+                        if (i >= close)
+                        {
+                            return {};
+                        }
+                        if (descriptor[i] == 'L')
+                        {
+                            const std::size_t end{ descriptor.find(';', i) };
+                            if (end == std::string_view::npos || end > close)
+                            {
+                                return {};
+                            }
+                            i = end;
+                        }
+                        key.push_back('L');
+                        break;
+                    }
+                    default:
+                        return {};
+                }
+            }
+            return key;
+        }
+
+        /*
             @brief One signature's worth of borrowed-adapter evidence.
         */
         struct c2i_vote
@@ -10523,15 +10640,19 @@ namespace vmhook
                                     ++skip_no_entry;
                                     continue;
                                 }
-                                std::string signature{ m->get_signature() };
+                                const std::string signature{ m->get_signature() };
                                 if (signature.empty())
                                 {
                                     continue;
                                 }
-                                signature.push_back(
-                                    (access & JVM_ACC_STATIC_BIT) != 0u ? 'S' : 'I');
+                                const std::string key{ vmhook::detail::adapter_fingerprint(
+                                    signature, (access & JVM_ACC_STATIC_BIT) != 0u) };
+                                if (key.empty())
+                                {
+                                    continue;
+                                }
 
-                                vmhook::detail::c2i_vote& vote{ index[signature] };
+                                vmhook::detail::c2i_vote& vote{ index[key] };
                                 ++vote.total;
                                 if (vote.candidate == nullptr)
                                 {
@@ -10604,8 +10725,12 @@ namespace vmhook
     {
         try
         {
-            std::string key{ descriptor };
-            key.push_back(wanted_static ? 'S' : 'I');
+            const std::string key{
+                vmhook::detail::adapter_fingerprint(descriptor, wanted_static) };
+            if (key.empty())
+            {
+                return nullptr;
+            }
 
             const auto& index{ vmhook::detail::c2i_index() };
             const auto  it{ index.find(key) };
@@ -13484,11 +13609,15 @@ namespace vmhook
                     vmhook::hotspot::set_not_compilable(new_method, true);
                     (void)new_method->safe_access_flags_or(vmhook::hotspot::NO_COMPILE);
 
-                    // If the new method is already JIT-compiled, deopt it
-                    // the same way the install path does.  c2i recovery is
-                    // best-effort; on failure we still clear _code so the
-                    // method falls back to interpreted dispatch through
-                    // the (still-patched) shared i2i.
+                    // If the new method is already JIT-compiled, deopt it the
+                    // same way the install path does -- INCLUDING its refusal to
+                    // clear _code without a valid _from_compiled_entry.  This
+                    // used to clear it regardless, calling c2i recovery
+                    // "best-effort"; that leaves _code null while
+                    // _from_compiled_entry still points into the stale nmethod,
+                    // which is the combination that kills the VM.  Observed on
+                    // JDK 26 as a hard process kill about a minute in -- the
+                    // watchdog tick after HotSpot re-JITted the method.
                     void* const code_now{ new_method->get_code() };
                     if (code_now != nullptr && vmhook::hotspot::is_valid_pointer(code_now))
                     {
@@ -13498,21 +13627,25 @@ namespace vmhook
                         {
                             c2i_entry = vmhook::resolve_c2i_entry(new_method);
                         }
-                        if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
-                        {
-                            new_method->set_from_compiled_entry(c2i_entry);
-                        }
-                        // Restore the interpreted entry to the i2i stub, mirroring
-                        // the install path.  Re-anchoring onto a freshly-resolved
-                        // Method whose _code is set means _from_interpreted_entry
-                        // points at the i2c adapter; clearing _code below without
-                        // this leaves interpreted dispatch bypassing the detour, so
-                        // the re-installed hook would never fire.
+                        // Restore the interpreted entry either way: it costs
+                        // nothing and interpreted dispatch must reach the detour.
                         if (void* const i2i{ new_method->get_i2i_entry() })
                         {
                             new_method->set_from_interpreted_entry(i2i);
                         }
-                        new_method->set_code(nullptr);
+                        if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
+                        {
+                            new_method->set_from_compiled_entry(c2i_entry);
+                            new_method->set_code(nullptr);
+                        }
+                        else
+                        {
+                            VMHOOK_LOG("{} verify_hooks: no c2i adapter on re-anchor - leaving _code "
+                                       "intact.  Compiled callers bypass the hook until they "
+                                       "deoptimise; clearing _code without a valid "
+                                       "_from_compiled_entry crashes the VM.",
+                                       vmhook::warning_tag);
+                        }
                     }
 
                     // Re-arm drift detection so the next time anything
@@ -13698,7 +13831,19 @@ namespace vmhook
                         {
                             hm.method->set_from_interpreted_entry(i2i);
                         }
-                        hm.method->set_code(nullptr);
+                        // Same refusal as the install path: _code may only be
+                        // cleared once _from_compiled_entry points somewhere the
+                        // VM can survive.  See the install-path comment.
+                        if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
+                        {
+                            hm.method->set_code(nullptr);
+                        }
+                        else
+                        {
+                            VMHOOK_LOG("{} verify_hooks: no c2i adapter for the re-JITted '{}' - "
+                                       "leaving _code intact rather than crashing the VM.",
+                                       vmhook::warning_tag, hm.expected_method_name);
+                        }
                     }
 
                     ++repaired;
