@@ -4,20 +4,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [6.0.0] — 2026-08-06
 
 ### Fixed
-- **`hook()` no longer clears `_code` when it cannot find a c2i adapter.**  The
-  fallback used to clear it anyway and redirect only `_from_interpreted_entry`,
-  reasoning that compiled inline caches would repair themselves at the next
-  safepoint.  That leaves the VM in precisely the state
-  `deoptimize_methods_if`'s own comment calls fatal — `_code == nullptr` while
-  `_from_compiled_entry` still points into the now-stale nmethod — and it was
-  observed killing a JDK 26 Minecraft outright: no crash report, no `hs_err`,
-  the game log simply stops mid-tick.  The interpreted entry is still patched,
-  so the hook fires for interpreted calls and for anything that deoptimises
-  later; what is given up is calls from JIT-compiled callers, which is the
-  conservative policy and the only one that cannot corrupt the VM.
+- **A method that is not compiled publishes its own c2i adapter, and that is
+  now the first thing asked.**  While `_code` is null, HotSpot keeps
+  `_from_compiled_entry` pointing at that method's own c2i adapter — the exact
+  address, with no donor to borrow from and no fingerprint to match.  It does
+  not help at the moment a still-compiled method is hooked, which is why the
+  borrowed-donor route remains, but it converges: the first deopt of a method
+  may have to be taken without an adapter, after which the method has run
+  interpreted and every later re-deopt is exact.  `resolve_and_cache_c2i()`
+  remembers the answer per `Method*` (re-validated on read, because a class
+  redefinition can recycle the pointer).
+- **A hook with no adapter deoptimises anyway, by default.**  Refusing looks
+  safer — clearing `_code` leaves compiled callers aimed at a stale nmethod
+  until their inline caches re-resolve — but it means the hook silently stops
+  the moment HotSpot recompiles the method, which on a 20 Hz game method is a
+  couple of minutes.  Measured on JDK 26 Minecraft: deoptimising regardless
+  survived 500,000 ticks; refusing died at ~50,000.  The default is the one
+  that makes hooks work; `set_deoptimise_without_adapter(false)` takes the
+  other side.
 - **The borrowed-adapter lookup walked the whole class graph per signature.**
   Hooking one method plus its class-scoped auto-deopt asked 24 separate
   questions on a live Minecraft, each a full walk over every loaded class and

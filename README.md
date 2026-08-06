@@ -293,12 +293,18 @@ So on install, for a method that is already compiled, vmhook:
 - clears `_code` last, so the two writes above are visible before anyone
   observes that the compiled version is gone.
 
+The c2i adapter is not always available to ask for: `AdapterHandlerEntry` is not
+exported by any JDK's VMStructs. vmhook derives it instead — adapters are shared
+per signature, so any interpreted method with the same descriptor and
+static-ness has the right one in its `_from_compiled_entry`, and a method that
+has itself been deoptimised once publishes its own from then on.
+
 The method is now interpreted again, and interpreted means patched. On the same
-install `hook()` also sets `NO_COMPILE` in `Method::_access_flags` so the JIT
-does not simply recompile it a second later, and `_dont_inline` in
-`Method::_flags` so it does not get inlined into a future caller. A background
-watchdog then re-checks every installed hook once a second and re-applies any
-that HotSpot managed to undo.
+install `hook()` also marks the method not-compilable so the JIT does not simply
+recompile it a second later (that bit lives in `Method::_access_flags` up to JDK
+23 and in `MethodFlags::_status` from JDK 24), and `_dont_inline` so it does not
+get inlined into a future caller. A background watchdog then re-checks every
+installed hook once a second and re-applies any that HotSpot managed to undo.
 
 **You never call any of this yourself.** There is no "deoptimise first" step:
 `vmhook::deoptimize_methods_if` and `deoptimize_all_jit_compiled_methods` exist

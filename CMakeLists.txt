@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(vmhook
-    VERSION 0.5.3
+    VERSION 6.0.0
     DESCRIPTION "Single-header HotSpot JVM hooking library"
     LANGUAGES CXX)
 
@@ -279,6 +279,13 @@ function(vmhook_static_runtime target)
 endfunction()
 
 # ── Example DLL / shared library that drives the JVM tests ──────────────────
+# The example DLL is the JVM test harness, which lives under tests/jvm/ and is
+# likewise developer-only.  Without it there is nothing to build here.
+if(VMHOOK_BUILD_EXAMPLE AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/jvm/harness.cpp")
+    message(STATUS "vmhook: tests/jvm/ is not present in this checkout — skipping the example DLL")
+    set(VMHOOK_BUILD_EXAMPLE OFF)
+endif()
+
 if(VMHOOK_BUILD_EXAMPLE)
     set(_vmhook_example_sources vmhook/src/example.cpp)
 
@@ -341,9 +348,15 @@ if(VMHOOK_BUILD_INJECTOR AND VMHOOK_PLATFORM_WINDOWS)
 endif()
 
 # ── Standalone tests (header compiles + smoke-level pure-logic tests) ───────
-if(VMHOOK_BUILD_TESTS)
+# The test suite and the JVM harness are developer-only and are not published
+# with the library, so a consumer's checkout simply will not have tests/.
+# Default the option to whether the directory is actually there: a clone builds
+# the library, and a working copy that has the tests still builds them.
+if(VMHOOK_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     enable_testing()
     add_subdirectory(tests)
+elseif(VMHOOK_BUILD_TESTS)
+    message(STATUS "vmhook: tests/ is not present in this checkout — skipping the test suite")
 endif()
 
 # ── Install support ─────────────────────────────────────────────────────────

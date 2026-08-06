@@ -64,9 +64,9 @@
 // fixes.  The packed VMHOOK_VERSION integer makes it easy to gate consumer
 // code on a minimum version via `#if VMHOOK_VERSION >= VMHOOK_MAKE_VERSION(0,3,0)`.
 // ---------------------------------------------------------------------------
-#define VMHOOK_VERSION_MAJOR 0
-#define VMHOOK_VERSION_MINOR 5
-#define VMHOOK_VERSION_PATCH 3
+#define VMHOOK_VERSION_MAJOR 6
+#define VMHOOK_VERSION_MINOR 0
+#define VMHOOK_VERSION_PATCH 0
 
 #define VMHOOK_MAKE_VERSION(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
@@ -27430,12 +27430,14 @@ namespace hotspot
     auto object<derived>::self() const noexcept
         -> vmhook::borrowed<derived>
     {
-        vmhook::oop_t const instance{ this->get_instance() };
-        if (!instance)
+        // Named `held`, not `instance`: object_base has a member of that name
+        // in scope here, and shadowing it trips MSVC C4458.
+        vmhook::oop_t const held{ this->get_instance() };
+        if (!held)
         {
             return vmhook::borrowed<derived>{};
         }
-        return vmhook::borrowed<derived>{ instance };
+        return vmhook::borrowed<derived>{ held };
     }
 
     /*
@@ -27562,6 +27564,9 @@ namespace hotspot
         // middle of a template they never named.
         if constexpr (sizeof...(args_t) > 8)
         {
+            // Nothing is constructed on this path, so the pack is otherwise
+            // unread and MSVC reports every element as an unused parameter.
+            ((void)args, ...);
             VMHOOK_LOG("{} vmhook::make_unique<{}>(): {} constructor arguments exceeds the "
                        "8 the interpreter locals[] array holds - nothing was allocated.",
                        vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(),

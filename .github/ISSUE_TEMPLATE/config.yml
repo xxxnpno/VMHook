@@ -1,5 +1,0 @@
-blank_issues_enabled: false
-contact_links:
-  - name: Coding-style questions
-    url: https://github.com/xxxnpno/vmhook/blob/master/CONTRIBUTING.md
-    about: Refer to CONTRIBUTING.md for the C++ and Java conventions vmhook follows.

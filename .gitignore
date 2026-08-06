@@ -68,3 +68,10 @@ viewer/example/app.log
 docs/
 _surface.txt
 imgui.ini
+
+# Developer-only, deliberately not published with the library: the test suite
+# and JVM harness, the GitHub workflows, and the local CI runner.  CMakeLists
+# skips the test/example targets when these are absent, so a clone still builds.
+.github/
+.localci/
+tests/
