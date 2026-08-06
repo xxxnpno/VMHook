@@ -53,12 +53,11 @@ auto get_riding_entity()
     return get_field("ridingEntity")->get();
 }
 
-// a STATIC cpp method has no object, so name the wrapper to reach the class
-// this reads a static java field; an instance field has no object to read from
-static auto get_entity_count()
+// a STATIC java field reads exactly like an instance one, nothing extra
+auto get_entity_count()
     -> std::int32_t
 {
-    return sdk::entity{ nullptr }.get_field("entityCount")->get();
+    return get_field("entityCount")->get();
 }
 ```
 
@@ -84,11 +83,11 @@ auto set_riding_entity(const std::unique_ptr<sdk::entity>& entity)
     get_field("ridingEntity")->set(entity);
 }
 
-// same thing from a static cpp method
-static auto set_entity_count(std::int32_t count)
+// a STATIC java field writes exactly like an instance one
+auto set_entity_count(std::int32_t count)
     -> void
 {
-    sdk::entity{ nullptr }.get_field("entityCount")->set(count);
+    get_field("entityCount")->set(count);
 }
 ```
 ## Calling a method
@@ -113,11 +112,11 @@ auto add_chat_message(const std::string& message, const std::int32_t id)
     return get_method("addChatMessage")->call(message, id);
 }
 
-// a static java method, called from a static cpp method
-static auto count_all()
+// a STATIC java method calls exactly like an instance one
+auto count_all()
     -> std::int32_t
 {
-    return sdk::entity{ nullptr }.get_method("countAll")->call();
+    return get_method("countAll")->call();
 }
 ```
 
