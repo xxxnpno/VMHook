@@ -10754,6 +10754,20 @@ namespace vmhook
             vmhook::deoptimize_all_jit_compiled_methods();
         @endcode
     */
+    /*
+        DANGER, measured: sweeping the WHOLE VM is not the same operation as
+        deoptimising one method.  Clearing Method::_code is not HotSpot's own
+        make_not_entrant() -- it consults no on-stack frames, no inline-cache
+        references and no dependency lists.  One method is a small risk; on a
+        live JDK 26 VM this deoptimised 5715 nmethods in a single pass and the
+        JVM died roughly twenty seconds later, which is the profile of the
+        code-cache sweeper reclaiming an nmethod a frame was still executing in.
+
+        hook() therefore does NOT call this.  It flushes only the hooked method's
+        own declaring class, which is where an inlining caller almost always
+        lives.  Reach for this only if you know you need a VM-wide flush and can
+        accept that outcome.
+    */
     inline auto deoptimize_all_jit_compiled_methods() noexcept
         -> std::size_t
     {
@@ -10767,44 +10781,63 @@ namespace vmhook
         inline std::once_flag    g_once{};
 
         /*
-            @brief Flushes JIT-compiled callers ONCE, on the first hook install.
+            @brief Flushes the JIT-compiled methods that could have inlined a
+                   freshly-hooked method -- its OWN class, and only once.
             @details
-            hook() already deoptimises the method it hooks, sets _dont_inline and
-            (since the MethodFlags fix) makes it genuinely not-compilable — so no
-            FUTURE compile can inline it.  What none of that can undo is a caller
-            that was ALREADY compiled with the target inlined before the hook
-            existed: there is no call left at that site to intercept, and the hook
-            is silently never reached.  Injecting into a running process is
-            precisely the case where that has happened.
+            hook() deoptimises the method it hooks, and (since the MethodFlags
+            fix) makes it genuinely not-compilable and not-inlinable, so no
+            FUTURE compile can inline it.  What none of that undoes is a caller
+            already compiled with the target inlined: there is no call left at
+            that site to intercept.  Injecting into a running process is exactly
+            when that has happened, which is why callers used to have to know
+            about deoptimize_all_jit_compiled_methods() and remember to call it.
 
-            This is why callers used to have to know about
-            vmhook::deoptimize_all_jit_compiled_methods() and remember to call it
-            after installing a hook.  They no longer do: the first successful
-            install does it, once per process, and every install after that is
-            free.
+            SCOPE, AND WHY IT IS NOT THE WHOLE VM.  This deliberately sweeps only
+            the hooked method's OWN declaring class.  A first version swept every
+            loaded method; on a live JDK 26 VM that deoptimised 5715 nmethods in
+            one pass and the JVM died about twenty seconds later -- the profile of
+            the code-cache sweeper reclaiming an nmethod that a frame was still
+            executing in.  Clearing Method::_code is not the VM's own
+            make_not_entrant(): it does not consult on-stack frames, inline-cache
+            references or dependency lists, so every method swept is a small risk
+            and thousands of them is a large one.
 
-            It is deliberately once-only.  The sweep walks every loaded class's
-            methods and is the single most expensive thing this library does; the
-            inlined-caller problem it solves is a property of code compiled BEFORE
-            hooking began, so repeating it per hook would pay a large cost to
-            re-solve a problem that no longer exists.
+            The narrow scope keeps almost all of the benefit.  Inlining happens in
+            the CALLER, and a caller that inlined a method is overwhelmingly
+            likely to be a sibling in the same class -- Minecraft.run() inlining
+            Minecraft.runTick() is the case that motivated this. A couple of
+            hundred methods instead of several thousand is the same fix with a
+            fraction of the exposure.
 
-            Runtime-disable it with set_auto_deoptimize_callers(false) before
-            installing the first hook — worth doing if a stutter at install time
-            matters more to you than a hook that fires on already-hot code.
+            Once per process: the sweep is expensive and the problem it solves is
+            a property of code compiled BEFORE hooking began.
+
+            set_auto_deoptimize_callers(false) opts out entirely.  Callers who
+            genuinely need a VM-wide flush can still call
+            deoptimize_all_jit_compiled_methods() themselves and accept the risk
+            documented there.
         */
-        inline auto flush_callers_once() noexcept -> void
+        inline auto flush_callers_once(const std::string& class_name) noexcept -> void
         {
             if (!g_enabled.load(std::memory_order_acquire))
             {
                 return;
             }
-            std::call_once(g_once, []() noexcept
+            std::call_once(g_once, [&class_name]() noexcept
             {
-                const std::size_t deoptimised{ vmhook::deoptimize_all_jit_compiled_methods() };
-                VMHOOK_LOG("{} auto-deopt: flushed {} JIT-compiled method(s) so a caller "
-                           "that already inlined a hooked method stops bypassing it.",
-                           vmhook::info_tag, deoptimised);
+                if (class_name.empty())
+                {
+                    return;
+                }
+                const std::size_t deoptimised{ vmhook::deoptimize_methods_if(
+                    [&class_name](const std::string& owner,
+                                  vmhook::hotspot::method*) noexcept -> bool
+                    {
+                        return owner == class_name;
+                    }) };
+                VMHOOK_LOG("{} auto-deopt: flushed {} JIT-compiled method(s) in '{}' so a "
+                           "caller that already inlined the hooked method stops bypassing it.",
+                           vmhook::info_tag, deoptimised, class_name);
             });
         }
     }
@@ -13166,8 +13199,9 @@ namespace vmhook
 
             // Flush callers that were compiled with this method inlined BEFORE we
             // hooked it -- otherwise there is no call site left to intercept and
-            // the hook is silently dead.  Once per process; see flush_callers_once.
-            vmhook::detail::auto_deopt::flush_callers_once();
+            // the hook is silently dead.  Scoped to this class, once per process;
+            // see flush_callers_once for why it is not the whole VM.
+            vmhook::detail::auto_deopt::flush_callers_once(type_map_entry->second);
 
             return true;
         }

@@ -63,6 +63,20 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   out for callers who would rather have no stutter at install time than a hook
   that fires on already-hot code.
 
+  **Scoped to the hooked method's own class, not the whole VM.**  The first
+  version swept every loaded method; on a live JDK 26 VM that deoptimised 5715
+  nmethods in one pass and the JVM died about twenty seconds later — the profile
+  of the code-cache sweeper reclaiming an nmethod a frame was still executing
+  in.  Clearing `Method::_code` is not HotSpot's own `make_not_entrant()`: it
+  consults no on-stack frames, no inline-cache references and no dependency
+  lists, so one method is a small risk and thousands is a large one.  Inlining
+  happens in the *caller*, and a caller that inlined a method is overwhelmingly
+  likely to be a sibling in the same class (`Minecraft.run()` inlining
+  `Minecraft.runTick()` is the case that motivated this), so a couple of hundred
+  methods instead of several thousand is the same fix with a fraction of the
+  exposure.  `deoptimize_all_jit_compiled_methods()` keeps the VM-wide behaviour
+  and now documents that hazard.
+
 - **CRITICAL**: `method_proxy::call()` never worked, on any JDK.  It resolved the
   call stub by looking up `StubRoutines::_call_stub_entry` in VMStructs — an entry
   HotSpot has never published, on any version.  The in-source claim that "JDK 21+
