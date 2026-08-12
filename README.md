@@ -1,6 +1,34 @@
 # vmhook
 
-Read fields, call methods, construct objects and hook methods in a **running HotSpot JVM**, from C++, without asking the JVM's permission. No JVMTI, minimal JNI.
+Read fields, call methods, construct objects and hook methods in a **running HotSpot JVM**, from C++, without asking the JVM's permission. No JVMTI, no JNI.
+
+**A C++26 module, and g++ only.** `import vmhook;` — there is no header any more, and no
+preprocessor in the library beyond the global module fragment that `<windows.h>` requires.
+The portability branches for MSVC, clang, Linux, macOS, iOS, Android and aarch64 are gone: this
+targets the newest g++ on Windows x86-64 and nothing else.
+
+```bash
+g++ -std=c++26 -fmodules -c vmhook/ext/vmhook/vmhook.ixx -o vmhook.o
+g++ -std=c++26 -fmodules your.cpp vmhook.o -o your.exe -Wl,--allow-multiple-definition
+```
+
+That link flag is working around a **GCC 16.2 bug**, not a design choice: a function-local
+`static` inside an inline function in a module's purview is emitted into the module's object
+*and* into every consumer's, so the linker sees the same symbol twice. It happens inside
+libstdc++'s own `std::format` as well as in vmhook, so no source change avoids it. The
+definitions are identical, which is why letting the linker pick one is safe.
+
+What used to be a macro is now a value or a function template — macros do not cross a module
+boundary, so a consumer would never have seen them:
+
+| was | is |
+|---|---|
+| `VMHOOK_VERSION_MAJOR` … | `vmhook::version_major`, `version_minor`, `version_patch`, `version`, `version_string` |
+| `VMHOOK_DEBUG_LOGS` | `vmhook::debug_logs` — a `constexpr bool` behind `if constexpr` |
+| `VMHOOK_LOG_FILE` | `vmhook::log_file_path` — a **run-time** path, settable after the fact |
+| `VMHOOK_AUTO_ATTACH_THREADS` | `vmhook::auto_attach_threads` |
+| `VMHOOK_DISABLE_AUTO_REPAIR` | `vmhook::auto_repair` |
+| `VMHOOK_LOG(...)` | `vmhook::detail::log_line(...)` — a variadic function template |
 
 ---
 
@@ -9,7 +37,7 @@ Read fields, call methods, construct objects and hook methods in a **running Hot
 When you want to work with a java class, reproduce the elements you want to work with in cpp.
 
 ```cpp
-#include <vmhook/vmhook.hpp>
+import vmhook;
 
 namespace sdk
 {

@@ -58,6 +58,13 @@ KNOWN: dict[str, int] = {
     "VMHOOK_RUNTIME_HOOKING_AVAILABLE": 1,
     "VMHOOK_CPLUSPLUS": 202400,
     "__cplusplus": 202400,
+    # Second pass, after the macros became values: the feature probes vmhook
+    # runs on itself, measured the same way as the rest.
+    "__cpp_lib_print": 202207, "__cpp_explicit_this_parameter": 0,
+    "__cpp_lib_expected": 0, "VMHOOK_OS_APPLE": 0, "VMHOOK_OS_POSIX": 0,
+    "NDEBUG": 1, "VMHOOK_DISABLE_AUTO_REPAIR": 0, "VMHOOK_LOG_FILE": 0,
+    "__clang_major__": 0,
+
     # NOT here, deliberately: VMHOOK_DEBUG_LOGS and VMHOOK_LOG_FILE.  They are
     # set by the BUILD (NDEBUG, or the consumer defining them before including),
     # so they have no single value to collapse to and are left as directives.
@@ -94,6 +101,10 @@ def evaluate(condition: str) -> bool:
     # Every header vmhook probes for exists in GCC 16's libstdc++; the ones it
     # does not probe for are not mentioned.
     text = HAS_INCLUDE.sub("1", text)
+    # Integer suffixes: 202207L is a number, and the L is not an identifier this
+    # should be asked about.  Without this every probe against a feature-test
+    # macro came out unevaluable and was left in place.
+    text = re.sub(r"(\d+)[uUlL]+", lambda m: m.group(1), text)
     text = re.sub(r"defined\s*\(\s*([A-Za-z_]\w*)\s*\)", r"__defined_\1", text)
     text = re.sub(r"defined\s+([A-Za-z_]\w*)", r"__defined_\1", text)
 
