@@ -68,18 +68,13 @@
 #define VMHOOK_VERSION_MINOR 0
 #define VMHOOK_VERSION_PATCH 0
 
-#define VMHOOK_MAKE_VERSION(major, minor, patch) \
-    (((major) * 1000000) + ((minor) * 1000) + (patch))
+#define VMHOOK_MAKE_VERSION(major, minor, patch)     (((major) * 1000000) + ((minor) * 1000) + (patch))
 
-#define VMHOOK_VERSION \
-    VMHOOK_MAKE_VERSION(VMHOOK_VERSION_MAJOR, VMHOOK_VERSION_MINOR, VMHOOK_VERSION_PATCH)
+#define VMHOOK_VERSION     VMHOOK_MAKE_VERSION(VMHOOK_VERSION_MAJOR, VMHOOK_VERSION_MINOR, VMHOOK_VERSION_PATCH)
 
 #define VMHOOK_VERSION_STRING_HELPER2(x) #x
 #define VMHOOK_VERSION_STRING_HELPER(x) VMHOOK_VERSION_STRING_HELPER2(x)
-#define VMHOOK_VERSION_STRING                                    \
-    VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MAJOR) "."        \
-    VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MINOR) "."        \
-    VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_PATCH)
+#define VMHOOK_VERSION_STRING                                        VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MAJOR) "."            VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MINOR) "."            VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_PATCH)
 
 #include <array>
 #include <cstdint>
@@ -127,62 +122,8 @@
 // platform-capability matrix.
 // ---------------------------------------------------------------------------
 
-#if defined(__ANDROID__)
-    #define VMHOOK_OS_WINDOWS 0
-    #define VMHOOK_OS_LINUX   0
-    #define VMHOOK_OS_MACOS   0
-    #define VMHOOK_OS_IOS     0
-    #define VMHOOK_OS_ANDROID 1
-#elif defined(_WIN32) || defined(_WIN64)
-    #define VMHOOK_OS_WINDOWS 1
-    #define VMHOOK_OS_LINUX   0
-    #define VMHOOK_OS_MACOS   0
-    #define VMHOOK_OS_IOS     0
-    #define VMHOOK_OS_ANDROID 0
-#elif defined(__APPLE__)
-    #include <TargetConditionals.h>
-    #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-        #define VMHOOK_OS_WINDOWS 0
-        #define VMHOOK_OS_LINUX   0
-        #define VMHOOK_OS_MACOS   0
-        #define VMHOOK_OS_IOS     1
-        #define VMHOOK_OS_ANDROID 0
-    #else
-        #define VMHOOK_OS_WINDOWS 0
-        #define VMHOOK_OS_LINUX   0
-        #define VMHOOK_OS_MACOS   1
-        #define VMHOOK_OS_IOS     0
-        #define VMHOOK_OS_ANDROID 0
-    #endif
-#elif defined(__linux__)
-    #define VMHOOK_OS_WINDOWS 0
-    #define VMHOOK_OS_LINUX   1
-    #define VMHOOK_OS_MACOS   0
-    #define VMHOOK_OS_IOS     0
-    #define VMHOOK_OS_ANDROID 0
-#else
-    #define VMHOOK_OS_WINDOWS 0
-    #define VMHOOK_OS_LINUX   0
-    #define VMHOOK_OS_MACOS   0
-    #define VMHOOK_OS_IOS     0
-    #define VMHOOK_OS_ANDROID 0
-    #error "vmhook supports Windows, Linux, macOS, iOS, or Android (x86_64 / arm64)."
-#endif
 
-#define VMHOOK_OS_POSIX (VMHOOK_OS_LINUX | VMHOOK_OS_MACOS | VMHOOK_OS_IOS | VMHOOK_OS_ANDROID)
-#define VMHOOK_OS_APPLE (VMHOOK_OS_MACOS | VMHOOK_OS_IOS)
 
-#if defined(__x86_64__) || defined(_M_X64)
-    #define VMHOOK_ARCH_X86_64 1
-    #define VMHOOK_ARCH_ARM64  0
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    #define VMHOOK_ARCH_X86_64 0
-    #define VMHOOK_ARCH_ARM64  1
-#else
-    #define VMHOOK_ARCH_X86_64 0
-    #define VMHOOK_ARCH_ARM64  0
-    #error "vmhook supports x86_64 or arm64 only."
-#endif
 
 // HotSpot runtime hooking is x86_64-only: the trampoline emits Microsoft
 // x64 / System V AMD64 bytes and walks the HotSpot interpreter frame
@@ -191,44 +132,17 @@
 // returns false at runtime.  Set VMHOOK_RUNTIME_HOOKING_AVAILABLE to 0
 // in that build configuration so consumers can gate their use of the
 // runtime API.
-#if VMHOOK_ARCH_X86_64 && !VMHOOK_OS_IOS
-    #define VMHOOK_RUNTIME_HOOKING_AVAILABLE 1
-#else
-    #define VMHOOK_RUNTIME_HOOKING_AVAILABLE 0
-#endif
 
-#if defined(_MSC_VER) && !defined(__clang__)
-    #define VMHOOK_COMPILER_MSVC 1
-#else
-    #define VMHOOK_COMPILER_MSVC 0
-#endif
 
-#if defined(__clang__)
-    #define VMHOOK_COMPILER_CLANG 1
-#else
-    #define VMHOOK_COMPILER_CLANG 0
-#endif
 
-#if defined(__GNUC__) && !defined(__clang__)
-    #define VMHOOK_COMPILER_GCC 1
-#else
-    #define VMHOOK_COMPILER_GCC 0
-#endif
 
 // std::format requires GCC 13+ / Clang 14+ / MSVC 19.29+
-#if __has_include(<format>)
     #include <format>
-    #define VMHOOK_HAS_STD_FORMAT 1
-#else
-    #define VMHOOK_HAS_STD_FORMAT 0
-#endif
 
 // std::print/std::println require GCC 14+ / Clang 18+ (libc++) / MSVC 19.37+
 #if __has_include(<print>) && (defined(__cpp_lib_print) && __cpp_lib_print >= 202207L)
     #include <print>
-    #define VMHOOK_HAS_STD_PRINT 1
 #else
-    #define VMHOOK_HAS_STD_PRINT 0
 #endif
 
 // C++23 deducing-this support test.  The feature itself is implemented in
@@ -254,13 +168,8 @@
 // STL1000.)  On clang >= 20 we therefore fall back to the gcc-style path:
 // instance-context get_field/get_method via the inherited using-declarations,
 // and static-context access via the always-available static_field/static_method.
-#if defined(__cpp_explicit_this_parameter) && __cpp_explicit_this_parameter >= 202110L \
-    && (defined(__clang__) || defined(_MSC_VER)) \
-    && !defined(__ANDROID__) \
-    && !(defined(__clang__) && __clang_major__ >= 20)
-    #define VMHOOK_HAS_DEDUCING_THIS 1
+#if defined(__cpp_explicit_this_parameter) && __cpp_explicit_this_parameter >= 202110L     && (defined(__clang__) || defined(_MSC_VER))     && !defined(__ANDROID__)     && !(defined(__clang__) && __clang_major__ >= 20)
 #else
-    #define VMHOOK_HAS_DEDUCING_THIS 0
 #endif
 
 // std::expected requires GCC 12+ / Clang 16+ (libc++ 16) / MSVC 19.33+.  Used
@@ -268,9 +177,7 @@
 // collapsing every cause into an empty optional.
 #if __has_include(<expected>) && (defined(__cpp_lib_expected) && __cpp_lib_expected >= 202202L)
     #include <expected>
-    #define VMHOOK_HAS_STD_EXPECTED 1
 #else
-    #define VMHOOK_HAS_STD_EXPECTED 0
 #endif
 
 // C++26 `= delete("reason")` (P2573).  Several of this header's design rules are
@@ -323,12 +230,9 @@
 // true in some in-progress builds where <meta> is absent or incomplete.
 #if VMHOOK_CPLUSPLUS > 202302L     && defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202506L     && defined(__cpp_lib_reflection) && __cpp_lib_reflection >= 202506L     && __has_include(<meta>)
     #include <meta>
-    #define VMHOOK_HAS_REFLECTION 1
 #else
-    #define VMHOOK_HAS_REFLECTION 0
 #endif
 
-#if VMHOOK_OS_WINDOWS
     // <windows.h> defines macros (min, max, ERROR, etc.) that clash with C++.
     // We guard them and undefine the worst offenders right after include.
     #ifndef WIN32_LEAN_AND_MEAN
@@ -339,33 +243,8 @@
     #endif
     #include <windows.h>
     #include <tlhelp32.h>   // CreateToolhelp32Snapshot, THREADENTRY32, ...
-#elif VMHOOK_OS_POSIX
-    #include <cerrno>
-    #include <cstdio>
-    #include <dlfcn.h>
-    #include <fcntl.h>
-    #include <setjmp.h>     // sigjmp_buf, sigsetjmp, siglongjmp — POSIX (not in <csetjmp>)
-    #include <signal.h>     // POSIX sigaction, SIGSEGV, etc. (not in <csignal> for SA_*)
-    #include <sys/mman.h>
-    #include <unistd.h>
-    #if VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
-        // Linux-and-Android-only helpers we use for fast safe memory reads.
-        #include <sys/syscall.h>
-        #include <sys/uio.h>
-    #endif
     #if VMHOOK_OS_APPLE
-        #include <mach/mach.h>
-        #include <pthread.h>
-        #include <libkern/OSCacheControl.h>   // sys_icache_invalidate
-        // mach_vm.h is "unsupported" in the iOS SDK (it builds but the
-        // mach_vm_* APIs are not callable from a user-space iOS process).
-        // On macOS the same header lives at <mach/mach_vm.h>.  Only include
-        // it when we are actually going to call it.
-        #if VMHOOK_OS_MACOS
-            #include <mach/mach_vm.h>
-        #endif
     #endif
-#endif
 
 #ifndef VMHOOK_DEBUG_LOGS
     #ifdef NDEBUG
@@ -426,7 +305,6 @@ namespace vmhook::detail
         present we use it; otherwise we ignore the format specifiers and concatenate
         the format string verbatim, which is enough for diagnostic output.
     */
-#if VMHOOK_HAS_STD_FORMAT
     template <typename... args_t>
     inline auto format_log(std::string_view fmt, args_t&&... args)
         -> std::string
@@ -440,14 +318,6 @@ namespace vmhook::detail
             return std::string{ fmt };
         }
     }
-#else
-    template <typename... args_t>
-    inline auto format_log(std::string_view fmt, args_t&&...)
-        -> std::string
-    {
-        return std::string{ fmt };
-    }
-#endif
 
     inline auto emit_log_line(std::string const& line) noexcept
         -> void
@@ -549,13 +419,8 @@ namespace vmhook
     // -------------------------------------------------------------------------
     namespace os
     {
-#if VMHOOK_OS_WINDOWS
         using module_handle = ::HMODULE;
         using thread_id_t   = ::DWORD;
-#else
-        using module_handle = void*;
-        using thread_id_t   = std::uint64_t;
-#endif
 
         /*
             @brief Memory-protection flags expressed in portable terms.
@@ -591,14 +456,9 @@ namespace vmhook
         */
         inline auto page_size() noexcept -> std::size_t
         {
-#if VMHOOK_OS_WINDOWS
             SYSTEM_INFO si{};
             ::GetSystemInfo(&si);
             return static_cast<std::size_t>(si.dwPageSize);
-#else
-            const long ps{ ::sysconf(_SC_PAGESIZE) };
-            return ps > 0 ? static_cast<std::size_t>(ps) : static_cast<std::size_t>(4096);
-#endif
         }
 
         /*
@@ -606,13 +466,9 @@ namespace vmhook
         */
         inline auto allocation_granularity() noexcept -> std::size_t
         {
-#if VMHOOK_OS_WINDOWS
             SYSTEM_INFO si{};
             ::GetSystemInfo(&si);
             return static_cast<std::size_t>(si.dwAllocationGranularity);
-#else
-            return page_size();
-#endif
         }
 
         /*
@@ -634,17 +490,7 @@ namespace vmhook
         */
         inline auto find_loaded_module(const char* name) noexcept -> module_handle
         {
-#if VMHOOK_OS_WINDOWS
             return ::GetModuleHandleA(name);
-#else
-            // RTLD_NOLOAD: only return handle if already loaded.  glibc
-            // increments the soname refcount on a successful RTLD_NOLOAD probe.
-            // We deliberately do NOT dlclose the result here: that would
-            // dangle the handle if we ever happen to hold the last ref.
-            // The JVM lives for the process lifetime in every supported use
-            // case, so the per-call refcount bump is a benign no-op.
-            return ::dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
-#endif
         }
 
         /*
@@ -658,19 +504,7 @@ namespace vmhook
         */
         inline auto find_jvm_module() noexcept -> module_handle
         {
-#if VMHOOK_OS_WINDOWS
             static const char* const candidates[]{ "jvm.dll" };
-#elif VMHOOK_OS_MACOS
-            static const char* const candidates[]{
-                "libjvm.dylib",
-                "@rpath/libjvm.dylib",
-                "libjvm.so",
-            };
-#elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
-            static const char* const candidates[]{ "libjvm.so", "libjvm.so.0" };
-#else
-            static const char* const candidates[]{ "libjvm.dylib", "libjvm.so" };
-#endif
             for (const char* name : candidates)
             {
                 if (module_handle const handle{ find_loaded_module(name) })
@@ -690,11 +524,7 @@ namespace vmhook
             {
                 return nullptr;
             }
-#if VMHOOK_OS_WINDOWS
             return reinterpret_cast<void*>(::GetProcAddress(module, symbol));
-#else
-            return ::dlsym(module, symbol);
-#endif
         }
 
         /*
@@ -706,20 +536,9 @@ namespace vmhook
         */
         inline auto current_thread_id() noexcept -> thread_id_t
         {
-#if VMHOOK_OS_WINDOWS
             return ::GetCurrentThreadId();
-#elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
-            return static_cast<thread_id_t>(::syscall(SYS_gettid));
-#elif VMHOOK_OS_APPLE
-            std::uint64_t tid{ 0 };
-            ::pthread_threadid_np(nullptr, &tid);
-            return static_cast<thread_id_t>(tid);
-#else
-            return 0;
-#endif
         }
 
-#if VMHOOK_OS_WINDOWS
         inline auto to_native_protect(memory_protection prot) noexcept -> DWORD
         {
             switch (prot)
@@ -732,20 +551,6 @@ namespace vmhook
             }
             return PAGE_NOACCESS;
         }
-#else
-        inline auto to_native_protect(memory_protection prot) noexcept -> int
-        {
-            switch (prot)
-            {
-            case memory_protection::no_access:    return PROT_NONE;
-            case memory_protection::read:         return PROT_READ;
-            case memory_protection::read_write:   return PROT_READ | PROT_WRITE;
-            case memory_protection::execute_read: return PROT_READ | PROT_EXEC;
-            case memory_protection::execute_rw:   return PROT_READ | PROT_WRITE | PROT_EXEC;
-            }
-            return PROT_NONE;
-        }
-#endif
 
         /*
             @brief Changes the protection of a memory region in place.
@@ -775,7 +580,6 @@ namespace vmhook
                     return false;
                 }
             }
-#if VMHOOK_OS_WINDOWS
             DWORD prev{};
             const BOOL ok{ ::VirtualProtect(address, size, to_native_protect(prot), &prev) };
             if (ok && old_prot)
@@ -783,20 +587,6 @@ namespace vmhook
                 *old_prot = static_cast<std::uint32_t>(prev);
             }
             return ok != 0;
-#else
-            // mprotect requires page-aligned base + length.
-            const std::size_t ps{ page_size() };
-            std::uintptr_t base{ reinterpret_cast<std::uintptr_t>(address) };
-            const std::uintptr_t end{ base + size };
-            base &= ~(static_cast<std::uintptr_t>(ps) - 1);
-            const std::size_t aligned_size{ static_cast<std::size_t>(end - base + ps - 1) & ~(ps - 1) };
-            const int rc{ ::mprotect(reinterpret_cast<void*>(base), aligned_size, to_native_protect(prot)) };
-            if (rc == 0 && old_prot)
-            {
-                *old_prot = 0;
-            }
-            return rc == 0;
-#endif
         }
 
         /*
@@ -812,7 +602,6 @@ namespace vmhook
             {
                 return nullptr;
             }
-#if VMHOOK_OS_WINDOWS
             void* result{ ::VirtualAlloc(address_hint, size,
                                          MEM_COMMIT | MEM_RESERVE,
                                          PAGE_EXECUTE_READWRITE) };
@@ -831,28 +620,6 @@ namespace vmhook
                                         PAGE_EXECUTE_READWRITE);
             }
             return result;
-#else
-            // Try RWX first (succeeds on Linux, Android, x86_64 macOS, and
-            // older iOS).  On Apple arm64 / current iOS the kernel enforces
-            // W^X and refuses PROT_WRITE | PROT_EXEC simultaneously without
-            // the JIT entitlement; fall back to RW so the caller at least
-            // gets a usable buffer (the caller can mprotect to RX later via
-            // os::protect, which is also entitlement-gated on Apple).
-            void* result{ ::mmap(address_hint, size,
-                                 PROT_READ | PROT_WRITE | PROT_EXEC,
-                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
-            if (result == MAP_FAILED)
-            {
-                result = ::mmap(address_hint, size,
-                                PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (result == MAP_FAILED)
-                {
-                    return nullptr;
-                }
-            }
-            return result;
-#endif
         }
 
         /*
@@ -883,12 +650,8 @@ namespace vmhook
             {
                 return;
             }
-#if VMHOOK_OS_WINDOWS
             (void)size;
             ::VirtualFree(address, 0, MEM_RELEASE);
-#else
-            ::munmap(address, size);
-#endif
         }
 
         /*
@@ -903,7 +666,6 @@ namespace vmhook
             {
                 return info;
             }
-#if VMHOOK_OS_WINDOWS
             MEMORY_BASIC_INFORMATION mbi{};
             if (::VirtualQuery(address, &mbi, sizeof(mbi)) == 0)
             {
@@ -921,165 +683,8 @@ namespace vmhook
                                        | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
             info.guarded = (prot & PAGE_GUARD) != 0;
             return info;
-#elif VMHOOK_OS_MACOS
-            // Use mach_vm_region to walk the task's memory map.  Apple has no
-            // /proc filesystem; mach_vm_region is the supported API on macOS.
-            mach_vm_address_t region_addr{ reinterpret_cast<mach_vm_address_t>(address) };
-            mach_vm_size_t    region_size{ 0 };
-            vm_region_basic_info_data_64_t mach_info{};
-            mach_msg_type_number_t info_count{ VM_REGION_BASIC_INFO_COUNT_64 };
-            mach_port_t object_name{};
-            const kern_return_t rc{
-                ::mach_vm_region(::mach_task_self(),
-                                 &region_addr,
-                                 &region_size,
-                                 VM_REGION_BASIC_INFO_64,
-                                 reinterpret_cast<vm_region_info_t>(&mach_info),
-                                 &info_count,
-                                 &object_name) };
-            if (rc != KERN_SUCCESS)
-            {
-                return info;
-            }
-            info.base = reinterpret_cast<void*>(region_addr);
-            info.size = static_cast<std::size_t>(region_size);
-            info.committed = true;
-            info.readable  = (mach_info.protection & VM_PROT_READ)    != 0;
-            info.executable= (mach_info.protection & VM_PROT_EXECUTE) != 0;
-            return info;
-#elif VMHOOK_OS_IOS
-            // iOS does not expose mach_vm_region / /proc/self/maps.  Return
-            // a permissive "looks committed" result so the higher-level
-            // validity checks defer to the user-supplied pointer rather
-            // than rejecting everything.
-            info.base = const_cast<void*>(address);
-            info.size = vmhook::os::page_size();
-            info.committed = true;
-            info.readable  = true;
-            return info;
-#else
-            // Linux and Android both expose /proc/self/maps.
-            const std::uintptr_t target{ reinterpret_cast<std::uintptr_t>(address) };
-            std::ifstream maps{ "/proc/self/maps" };
-            std::string line;
-            std::uintptr_t prev_end{ 0 };
-            while (std::getline(maps, line))
-            {
-                if (line.empty())
-                {
-                    continue;
-                }
-                std::uintptr_t begin{ 0 };
-                std::uintptr_t end{ 0 };
-                char perms[5]{};
-                const int parsed{ std::sscanf(line.c_str(), "%lx-%lx %4s",
-                                              &begin, &end, perms) };
-                if (parsed < 3)
-                {
-                    continue;
-                }
-                if (target < begin)
-                {
-                    info.base = reinterpret_cast<void*>(prev_end);
-                    info.size = static_cast<std::size_t>(begin - prev_end);
-                    info.free = true;
-                    return info;
-                }
-                if (target >= begin && target < end)
-                {
-                    info.base = reinterpret_cast<void*>(begin);
-                    info.size = static_cast<std::size_t>(end - begin);
-                    info.committed = true;
-                    info.readable   = perms[0] == 'r';
-                    info.executable = perms[2] == 'x';
-                    return info;
-                }
-                prev_end = end;
-            }
-            info.base = reinterpret_cast<void*>(prev_end);
-            info.size = (std::numeric_limits<std::uintptr_t>::max)() - prev_end;
-            info.free = true;
-            return info;
-#endif
         }
 
-#if VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
-        namespace detail_signal
-        {
-            // Thread-local jmp-buf machinery to recover from SIGSEGV during
-            // the safe_read sigsetjmp fallback on Linux / Android.  macOS
-            // and iOS use mach_vm_read_overwrite so the signal machinery
-            // is not needed there; Windows uses ReadProcessMemory.
-            struct probe_state
-            {
-                bool          active{ false };
-                volatile bool fault{ false };
-                sigjmp_buf    env{};
-            };
-
-            inline thread_local probe_state* active_state{ nullptr };
-
-            // Previously-installed handlers (HotSpot's SIGSEGV/SIGBUS) captured
-            // by install_once and CHAINED on non-probe faults so JVM-internal
-            // implicit-null-checks, safepoint polls, and stack-bang->SOE keep
-            // working.  Without this the original code reset SIG_DFL on the
-            // first stray non-probe fault, aborting the whole process instead
-            // of letting HotSpot synthesize an NPE / poll a safepoint.
-            inline struct sigaction previous_segv{};
-            inline struct sigaction previous_bus{};
-
-            inline auto chain_to_previous(int sig, siginfo_t* info, void* ctx) -> void
-            {
-                const struct sigaction& prev{ (sig == SIGBUS) ? previous_bus : previous_segv };
-                if ((prev.sa_flags & SA_SIGINFO) && prev.sa_sigaction)
-                {
-                    prev.sa_sigaction(sig, info, ctx);
-                    return;
-                }
-                if (prev.sa_handler && prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN)
-                {
-                    prev.sa_handler(sig);
-                    return;
-                }
-                // No previous user handler — reinstall SIG_DFL and let the
-                // faulting instruction re-execute, which aborts the process
-                // with the original signal (same as the pre-fix behaviour
-                // when nothing else was installed).
-                struct sigaction sa{};
-                sa.sa_handler = SIG_DFL;
-                ::sigaction(sig, &sa, nullptr);
-            }
-
-            inline auto handler(int sig, siginfo_t* info, void* ctx) -> void
-            {
-                if (active_state)
-                {
-                    active_state->fault = true;
-                    ::siglongjmp(active_state->env, 1);
-                }
-                // Not in a probe: a legitimate JVM fault (HotSpot implicit
-                // null-check / safepoint poll / stack-bang).  Chain to the
-                // handler that was installed BEFORE vmhook instead of
-                // resetting to SIG_DFL and aborting the process.
-                chain_to_previous(sig, info, ctx);
-            }
-
-            inline auto install_once() noexcept -> bool
-            {
-                static const bool installed{ []() noexcept
-                {
-                    struct sigaction sa{};
-                    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-                    sa.sa_sigaction = &handler;
-                    ::sigemptyset(&sa.sa_mask);
-                    const bool ok_segv{ ::sigaction(SIGSEGV, &sa, &previous_segv) == 0 };
-                    const bool ok_bus { ::sigaction(SIGBUS,  &sa, &previous_bus ) == 0 };
-                    return ok_segv && ok_bus;
-                }() };
-                return installed;
-            }
-        } // namespace detail_signal
-#endif
 
         /*
             @brief Reads `size` bytes from `src` into `dst` without faulting on bad pointers.
@@ -1108,54 +713,10 @@ namespace vmhook
             {
                 return false;
             }
-#if VMHOOK_OS_WINDOWS
             SIZE_T transferred{ 0 };
             const BOOL ok{ ::ReadProcessMemory(::GetCurrentProcess(), src, dst,
                                                size, &transferred) };
             return ok && transferred == size;
-#elif VMHOOK_OS_MACOS
-            mach_vm_size_t transferred{ 0 };
-            const kern_return_t rc{ ::mach_vm_read_overwrite(
-                ::mach_task_self(),
-                reinterpret_cast<mach_vm_address_t>(src),
-                static_cast<mach_vm_size_t>(size),
-                reinterpret_cast<mach_vm_address_t>(dst),
-                &transferred) };
-            return rc == KERN_SUCCESS && transferred == size;
-#elif VMHOOK_OS_IOS
-            // No mach_vm on iOS; do a best-effort memcpy.  Bad pointers
-            // will fault — there is no user-callable fault-safe read API
-            // on iOS without entitlements.
-            std::memcpy(dst, src, size);
-            return true;
-#elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
-            iovec local{ dst, size };
-            iovec remote{ const_cast<void*>(src), size };
-            const ssize_t n{ ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) };
-            if (n == static_cast<ssize_t>(size))
-            {
-                return true;
-            }
-            // Fall back to signal-protected read.
-            if (!detail_signal::install_once())
-            {
-                return false;
-            }
-            detail_signal::probe_state state{};
-            state.active = true;
-            detail_signal::active_state = &state;
-            bool success{ false };
-            if (::sigsetjmp(state.env, 1) == 0)
-            {
-                std::memcpy(dst, src, size);
-                success = true;
-            }
-            detail_signal::active_state = nullptr;
-            return success && !state.fault;
-#else
-            (void)dst; (void)src; (void)size;
-            return false;
-#endif
         }
 
         /*
@@ -1190,58 +751,12 @@ namespace vmhook
             {
                 return false;
             }
-#if VMHOOK_OS_WINDOWS
             SIZE_T transferred{ 0 };
             const BOOL ok{ ::WriteProcessMemory(::GetCurrentProcess(), dst, src,
                                                 size, &transferred) };
             return ok && transferred == size;
-#elif VMHOOK_OS_MACOS
-            const kern_return_t rc{ ::mach_vm_write(
-                ::mach_task_self(),
-                reinterpret_cast<mach_vm_address_t>(dst),
-                reinterpret_cast<vm_offset_t>(const_cast<void*>(src)),
-                static_cast<mach_msg_type_number_t>(size)) };
-            return rc == KERN_SUCCESS;
-#elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
-            iovec local{ const_cast<void*>(src), size };
-            iovec remote{ dst, size };
-            const ssize_t n{ ::process_vm_writev(::getpid(), &local, 1, &remote, 1, 0) };
-            return n == static_cast<ssize_t>(size);
-#else
-            (void)dst; (void)src; (void)size;
-            return false;
-#endif
         }
 
-#if defined(_MSC_VER) && !defined(__clang__)
-        /*
-            @brief MSVC-cl-only SEH-guarded raw copy used by safe_read_fast.
-            @details
-            Gated to *real* MSVC (cl.exe): `defined(_MSC_VER) && !defined(__clang__)`.
-            clang-cl / clang-on-windows also define `_MSC_VER`, but their `__try` /
-            `__except` does NOT reliably trap a hardware access violation — an AV on
-            a bad `src` escapes the handler and crashes the process — so they are
-            EXCLUDED here and route through the safe_read delegate in safe_read_fast
-            instead.  On cl.exe, EXCEPTION_EXECUTE_HANDLER catches the AV a bad `src`
-            raises and turns it into a clean `false`; on the no-fault path this is a
-            plain memcpy with zero syscall and only the table-based SEH prologue cost.
-
-            Kept in its own tiny function whose only locals are PODs so the compiler
-            never needs C++ object unwinding inside the __try block (MSVC C2712).
-        */
-        inline auto seh_guarded_copy(void* dst, const void* src, std::size_t size) noexcept -> bool
-        {
-            __try
-            {
-                std::memcpy(dst, src, size);
-                return true;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                return false;
-            }
-        }
-#endif
 
         /*
             @brief Fault-safe read that favours the cheapest no-fault path, with a
@@ -1280,21 +795,10 @@ namespace vmhook
             {
                 return false;
             }
-#if defined(_MSC_VER) && !defined(__clang__)
-            if (seh_guarded_copy(dst, src, size))
-            {
-                return true;
-            }
-            // SEH caught a fault: fall back to the kernel-validated read so the
-            // result (false on a genuinely bad pointer) is authoritative and dst is
-            // left exactly as safe_read would leave it.
-            return safe_read(dst, src, size);
-#else
             // clang-windows / MinGW / Linux / Android / macOS / iOS / unknown: no
             // PROVEN cheaper fault-safe primitive on this config, so use the
             // kernel-validated path that already never faults.
             return safe_read(dst, src, size);
-#endif
         }
 
         /*
@@ -1306,20 +810,7 @@ namespace vmhook
             {
                 return;
             }
-#if VMHOOK_OS_WINDOWS
             ::FlushInstructionCache(::GetCurrentProcess(), address, size);
-#elif VMHOOK_OS_APPLE
-            // Apple ships sys_icache_invalidate as the user-callable API.
-            // __builtin___clear_cache emits a reference to compiler-rt's
-            // ___clear_cache, which iOS does not link by default.
-            ::sys_icache_invalidate(address, size);
-#elif defined(__GNUC__) || defined(__clang__)
-            __builtin___clear_cache(static_cast<char*>(address),
-                                    static_cast<char*>(address) + size);
-#else
-            (void)address;
-            (void)size;
-#endif
         }
 
         // ------------------------------------------------------------
@@ -1337,11 +828,6 @@ namespace vmhook
         // The capability flag below lets callers query support at
         // compile time.
 
-#if VMHOOK_OS_WINDOWS && VMHOOK_ARCH_X86_64
-        #define VMHOOK_HAS_HW_DATA_BREAKPOINTS 1
-#else
-        #define VMHOOK_HAS_HW_DATA_BREAKPOINTS 0
-#endif
 
         /*
             @brief Type of memory access the breakpoint should trap on.
@@ -1363,7 +849,6 @@ namespace vmhook
             four_bytes  = 0b11,
         };
 
-#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
         namespace detail_dr
         {
             /*
@@ -1428,7 +913,6 @@ namespace vmhook
                 ::CloseHandle(snap);
             }
         } // namespace detail_dr
-#endif
     } // namespace os
 
     namespace hotspot
@@ -2130,14 +1614,7 @@ namespace vmhook
         inline auto type_name() noexcept
             -> std::string
         {
-#if VMHOOK_HAS_REFLECTION
-            // display_string_of() over identifier_of(): the former handles
-            // unnamed and closure types, which a wrapper never is but a
-            // mis-instantiated template argument can be.
-            return std::string{ std::meta::display_string_of(^^type) };
-#else
             return std::string{ typeid(type).name() };
-#endif
         }
 
         /*
@@ -2160,30 +1637,11 @@ namespace vmhook
             Complexity: O(annotations) at compile time, zero at runtime.
         */
         template<typename wrapper_type>
-#if VMHOOK_HAS_REFLECTION
-        consteval auto annotated_class_name() noexcept
-            -> std::string_view
-        {
-            // A type may carry several annotations; take the first java_class.
-            // More than one is a user error we cannot diagnose from here without
-            // making this a hard compile failure for a merely redundant tag, so
-            // first-wins is the forgiving reading.
-            for (const std::meta::info annotation : std::meta::annotations_of(^^wrapper_type))
-            {
-                if (std::meta::type_of(annotation) == ^^vmhook::java_class)
-                {
-                    return std::meta::extract<vmhook::java_class>(annotation).name;
-                }
-            }
-            return {};
-        }
-#else
         constexpr auto annotated_class_name() noexcept
             -> std::string_view
         {
             return {};
         }
-#endif
 
         /*
             @brief True when `wrapper_type` carries a vmhook::java_class annotation.
@@ -2825,16 +2283,12 @@ namespace vmhook
         inline auto cold_read_frame_pointer(const void* const slot) noexcept
             -> void*
         {
-#if defined(_WIN32)
             void* value{ nullptr };
             if (!vmhook::os::safe_read(&value, slot, sizeof(value)))
             {
                 return nullptr;
             }
             return value;
-#else
-            return *reinterpret_cast<void* const*>(slot);
-#endif
         }
 
         /*
@@ -6135,11 +5589,7 @@ namespace vmhook
             // one convention and this expands to nothing; it matters only for a
             // 32-bit Windows build, where getting it wrong corrupts the stack
             // rather than failing to link.
-#if defined(_WIN32) && !defined(_WIN64)
-    #define VMHOOK_JNICALL __stdcall
-#else
     #define VMHOOK_JNICALL
-#endif
 
             using vm_table_t   = void**;
             using vm_handle_t  = vm_table_t*;
@@ -7521,7 +6971,6 @@ namespace vmhook
                 // intercepted call is negligible beside the user detour it gates,
                 // and the value-comparison scan over g_hooked_methods that follows
                 // stays a raw, lock-free loop over our own (always-mapped) heap.
-#if defined(_WIN32)
                 // Windows-only: the uncontained no-SEH access violation is a Windows
                 // phenomenon (MinGW / clang-on-Windows have no __try AV trap).  Gate
                 // on is_valid_pointer, then read the Method* slot through os::safe_read
@@ -7539,18 +6988,6 @@ namespace vmhook
                     return nullptr;
                 }
                 return method_pointer;
-#else
-                // POSIX (Linux/macOS): the raw read never faulted on the detour path,
-                // and guarding it regressed return_value::stack_trace — which reaches
-                // this accessor for EVERY caller frame in its multi-frame walk: the
-                // is_valid_pointer range check can reject a legitimate deep stack rbp,
-                // and routing the read through process_vm_readv changed the walk's
-                // result (stk_* failed on linux·gcc·java21+).  A stray AV here is
-                // contained by the JVM's own POSIX signal handling, not by this
-                // accessor, so keep the direct read.
-                return *reinterpret_cast<vmhook::hotspot::method* const*>(
-                    reinterpret_cast<const std::uint8_t*>(this) - 24);
-#endif
             }
 
             /*
@@ -7745,15 +7182,11 @@ namespace vmhook
                         // so it yields a zeroed (null-oop) slot instead of faulting
                         // the JVM uncontained on the no-SEH legs.  POSIX keeps the
                         // raw read (never faulted there; see extract_frame_arg).
-#if defined(_WIN32)
                         void* raw_value{ nullptr };
                         if (!vmhook::os::safe_read(&raw_value, &locals[-slot_index], sizeof(raw_value)))
                         {
                             raw_value = nullptr;
                         }
-#else
-                        void* raw_value{ locals[-slot_index] };
-#endif
                         void* decoded{ nullptr };
                         if (raw_value)
                         {
@@ -7860,16 +7293,12 @@ namespace vmhook
                 // discipline as detail::extract_frame_arg.
                 const auto read_slot = [locals](const std::int32_t slot_index) noexcept -> void*
                 {
-#if defined(_WIN32)
                     void* slot_value{ nullptr };
                     if (!vmhook::os::safe_read(&slot_value, &locals[-slot_index], sizeof(slot_value)))
                     {
                         return nullptr;
                     }
                     return slot_value;
-#else
-                    return locals[-slot_index];
-#endif
                 };
 
                 void* raw_value{ read_slot(index) };
@@ -7971,20 +7400,10 @@ namespace vmhook
                                              : nullptr }
                 , error{ true }
             {
-#if !VMHOOK_RUNTIME_HOOKING_AVAILABLE
-                // The trampoline emits Windows/SysV x64 bytes and depends on
-                // the HotSpot interpreter frame layout for that ABI.  arm64
-                // and iOS (no JIT, no HotSpot) cannot use this path; leave
-                // the hook in its error state so callers see a clean false.
-                (void)target;
-                (void)detour;
-                return;
-#else  // VMHOOK_RUNTIME_HOOKING_AVAILABLE
                 static constexpr std::int32_t HOOK_SIZE{ 8 };
                 static constexpr std::int32_t JMP_SIZE{ 5 };
                 static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
-#if defined(_WIN32)
                 // ------------------------------------------------------------
                 // Microsoft x64 calling convention trampoline.
                 // Args: rcx, rdx, r8, r9.  Shadow space: 32 bytes.
@@ -8073,108 +7492,6 @@ namespace vmhook
                     // data slot: detour function pointer
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
                 };
-#else  // !_WIN32
-                // ------------------------------------------------------------
-                // System V AMD64 calling convention trampoline.
-                // Args: rdi, rsi, rdx, rcx, r8, r9.  No shadow space.
-                // Caller-saved: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11.
-                //
-                // Byte layout (the offsets below are runtime constants; the
-                // values match the cumulative widths of the instructions
-                // above each landmark):
-                //
-                //   off 0   push rax/rdi/rsi/rdx/rcx/r8/r9/r10/r11/rbp  (14)
-                //   off 14  push 0, push 0                              (4)
-                //   off 18  mov rdi,rbp ; mov rsi,r15 ; mov rdx,rsp     (9)
-                //   off 27  mov rbp,rsp ; and rsp,-16                   (7)
-                //   off 34  call [rip+disp32]                           (6)
-                //   off 40  mov rsp,rbp                                 (3)
-                //   off 43  cmp byte [rsp],0                            (4)
-                //   off 47  je rel32                                    (6)  <- JE_OFFSET
-                //   off 53  cancel path                                 (45)
-                //   off 98  resume path                                 (23) <- RESUME_OFFSET
-                //   off 116 jmp rel32 (inside resume path)              (5)  <- RESUME_JMP_OFFSET
-                //   off 121 detour-function-pointer slot                (8)  <- DETOUR_ADDRESS_OFFSET
-                //   off 129 end
-                //
-                // The 6-byte call uses disp32 = 121 − 40 = 81 = 0x51 so
-                // [rip+0x51] dereferences the detour function pointer.
-                // ------------------------------------------------------------
-                static constexpr std::int32_t JE_OFFSET{ 0x2F };
-                static constexpr std::int32_t JE_SIZE{ 6 };
-                static constexpr std::int32_t RESUME_OFFSET{ 0x62 };
-                static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x74 };
-                static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
-                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x79 };
-
-                std::uint8_t assembly[]
-                {
-                    0x50,                                           // push rax
-                    0x57,                                           // push rdi
-                    0x56,                                           // push rsi
-                    0x52,                                           // push rdx
-                    0x51,                                           // push rcx
-                    0x41, 0x50,                                     // push r8
-                    0x41, 0x51,                                     // push r9
-                    0x41, 0x52,                                     // push r10
-                    0x41, 0x53,                                     // push r11
-                    0x55,                                           // push rbp
-                    0x6A, 0x00,                                     // push 0  ; retval
-                    0x6A, 0x00,                                     // push 0  ; cancel
-
-                    0x48, 0x89, 0xEF,                               // mov rdi, rbp   ; arg1 frame*
-                    0x4C, 0x89, 0xFE,                               // mov rsi, r15   ; arg2 java_thread*
-                    0x48, 0x89, 0xE2,                               // mov rdx, rsp   ; arg3 return_slot*
-
-                    0x48, 0x89, 0xE5,                               // mov rbp, rsp
-                    0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16
-
-                    0xFF, 0x15, 0x51, 0x00, 0x00, 0x00,             // call [rip+0x51]
-
-                    0x48, 0x89, 0xEC,                               // mov rsp, rbp
-
-                    0x80, 0x3C, 0x24, 0x00,                         // cmp byte ptr [rsp], 0
-                    0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je resume  (offset filled below)
-
-                    // cancel path (offset 0x35..0x61, 45 bytes):
-                    0x48, 0x8B, 0x44, 0x24, 0x08,                   // mov rax, [rsp+8]
-                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax
-                    0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10
-                    0x5D,                                           // pop rbp
-                    0x41, 0x5B,                                     // pop r11
-                    0x41, 0x5A,                                     // pop r10
-                    0x41, 0x59,                                     // pop r9
-                    0x41, 0x58,                                     // pop r8
-                    0x59,                                           // pop rcx
-                    0x5A,                                           // pop rdx
-                    0x5E,                                           // pop rsi
-                    0x5F,                                           // pop rdi
-                    0x48, 0x83, 0xC4, 0x08,                         // add rsp, 0x8 ; discard saved rax
-                    0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8]
-                    0x48, 0x89, 0xEC,                               // mov rsp, rbp
-                    0x5D,                                           // pop rbp
-                    0x5E,                                           // pop rsi
-                    0x48, 0x89, 0xDC,                               // mov rsp, rbx
-                    0xFF, 0xE6,                                     // jmp rsi
-
-                    // resume path (offset 0x62..0x78, 23 bytes):
-                    0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10
-                    0x5D,                                           // pop rbp
-                    0x41, 0x5B,                                     // pop r11
-                    0x41, 0x5A,                                     // pop r10
-                    0x41, 0x59,                                     // pop r9
-                    0x41, 0x58,                                     // pop r8
-                    0x59,                                           // pop rcx
-                    0x5A,                                           // pop rdx
-                    0x5E,                                           // pop rsi
-                    0x5F,                                           // pop rdi
-                    0x58,                                           // pop rax
-                    0xE9, 0x00, 0x00, 0x00, 0x00,                   // jmp target+HOOK_SIZE
-
-                    // data slot (offset 0x79..0x80):
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-                };
-#endif  // _WIN32
 
                 const std::size_t total_size{ static_cast<std::size_t>(HOOK_SIZE) + sizeof(assembly) };
                 this->allocated = vmhook::hotspot::allocate_nearby_memory(target, total_size);
@@ -8218,16 +7535,7 @@ namespace vmhook
                 // 6-byte 0F 84 xx xx xx xx; its rel32 lives at JE_OFFSET+2.
                 const std::int32_t je_delta{ static_cast<std::int32_t>(
                     RESUME_OFFSET - (JE_OFFSET + JE_SIZE)) };
-#if defined(_WIN32)
                 *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 2) = je_delta;
-#else
-                // Preserve the exact byte pattern the SysV path has been shipping
-                // with (offset +1 into 0F 84 xx xx xx xx).  Correcting this to +2
-                // is a separate SysV-only follow-up; changing it in the same
-                // commit that fixes the Windows regression risks disturbing the
-                // currently-green Linux/macOS matrix.
-                *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 1) = je_delta;
-#endif
 
                 // Patch the resume-stub's jmp to point at effective_resume.
                 const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(
@@ -8292,7 +7600,6 @@ namespace vmhook
                 vmhook::os::flush_instruction_cache(this->allocated, total_size);
 
                 this->error = false;
-#endif  // VMHOOK_RUNTIME_HOOKING_AVAILABLE
             }
 
             /*
@@ -8476,18 +7783,9 @@ namespace vmhook
             // both build paths get the right values.
             auto rewrite_chain_resume(void* const new_target) noexcept -> void
             {
-#if !VMHOOK_RUNTIME_HOOKING_AVAILABLE
-                (void)new_target;
-                return;
-#else
                 static constexpr std::int32_t HOOK_SIZE{ 8 };
-#if VMHOOK_OS_WINDOWS
                 static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x73 };
                 static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
-#else
-                static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x74 };
-                static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
-#endif
                 std::uint8_t* const resume_rel_addr{
                     this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + 1 };
                 const std::uint8_t* const next_instruction_addr{
@@ -8505,7 +7803,6 @@ namespace vmhook
                 vmhook::os::protect(this->allocated, this->allocated_size,
                                     vmhook::os::memory_protection::execute_read, &old_protect);
                 vmhook::os::flush_instruction_cache(resume_rel_addr, sizeof(new_rel));
-#endif
             }
 
         private:
@@ -8642,29 +7939,6 @@ namespace vmhook
                                       vmhook::hotspot::return_slot* const slot) noexcept
             -> bool
         {
-#if defined(_MSC_VER) && !defined(__clang__)
-            // SEH filter: blacklist EXCEPTION_STACK_OVERFLOW (0xC00000FD).
-            // Swallowing that without resetting the thread guard page leaves
-            // the next deep call to fault again with the guard gone (UB).
-            // EXCEPTION_EXECUTE_HANDLER for everything else — that retains the
-            // original wide net that catches the four real shapes seen in the
-            // wild: (1) hardware AV / IN_PAGE_ERROR from a stale-OOP or unmapped
-            // deref inside the user detour, (2) C++ throws raised through the
-            // MSVC C++-EH SEH code 0xE06D7363, (3) integer/FP traps from
-            // genuine detour bugs (logged as 'skipped detour' — better than a
-            // crash), (4) std::bad_function_call from an unbound std::function.
-            __try
-            {
-                detour_fn(frame_pointer, thread, slot);
-                return true;
-            }
-            __except (GetExceptionCode() == EXCEPTION_STACK_OVERFLOW
-                      ? EXCEPTION_CONTINUE_SEARCH
-                      : EXCEPTION_EXECUTE_HANDLER)
-            {
-                return false;
-            }
-#else
             try
             {
                 detour_fn(frame_pointer, thread, slot);
@@ -8674,7 +7948,6 @@ namespace vmhook
             {
                 return false;
             }
-#endif
         }
 
         /*
@@ -8770,11 +8043,7 @@ namespace vmhook
             property of the SAME assembly both read; if that assembly gains or loses a
             push, this constant moves with it.
         */
-#if defined(_WIN32)
         inline constexpr std::size_t trampoline_pushed_words{ 10 };
-#else
-        inline constexpr std::size_t trampoline_pushed_words{ 12 };
-#endif
 
         inline auto common_detour(vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread* const thread, vmhook::hotspot::return_slot* const slot)
             -> std::int64_t
@@ -12057,17 +11326,6 @@ namespace vmhook
         AVAILABILITY: C++26 reflection only.  On a C++23 toolchain this overload
         does not exist and the string form is the only spelling.
     */
-#if VMHOOK_HAS_REFLECTION
-    template<typename wrapper_type>
-        requires (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
-    inline auto register_class() noexcept
-        -> bool
-    {
-        constexpr std::string_view annotated{
-            vmhook::detail::annotated_class_name<wrapper_type>() };
-        return vmhook::register_class<wrapper_type>(annotated);
-    }
-#endif
 
     // -------------------------------------------------------------------------
     // Method enumeration / introspection.
@@ -12518,14 +11776,7 @@ namespace vmhook
         // irrelevant to the Java parameter list).  C-style variadic member forms
         // (R(C::*)(Args..., ...)) remain an intentional gap — the trailing
         // ellipsis is part of the type and matches no specialisation.
-#define VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(QUALIFIERS)                          \
-        template<typename class_type, typename return_type,                    \
-                 typename... argument_types>                                   \
-        struct function_traits<                                                \
-            return_type(class_type::*)(argument_types...) QUALIFIERS>          \
-        {                                                                      \
-            using args_tuple_t = std::tuple<argument_types...>;                \
-        }
+#define VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(QUALIFIERS)                                  template<typename class_type, typename return_type,                                     typename... argument_types>                                           struct function_traits<                                                            return_type(class_type::*)(argument_types...) QUALIFIERS>                  {                                                                                  using args_tuple_t = std::tuple<argument_types...>;                        }
         VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(volatile);
         VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(const volatile);
         VMHOOK_FUNCTION_TRAITS_MEMBER_SPEC(&);
@@ -12738,7 +11989,6 @@ namespace vmhook
             // so the warm path is unchanged on both platforms.
             const auto read_slot = [locals](const std::int32_t slot_index) noexcept -> void*
             {
-#if defined(_WIN32)
                 void* slot_value{ nullptr };
                 if (!vmhook::os::safe_read(&slot_value,
                                            &locals[-slot_index],
@@ -12747,9 +11997,6 @@ namespace vmhook
                     return nullptr;
                 }
                 return slot_value;
-#else
-                return locals[-slot_index];
-#endif
             };
 
             void* const raw_value{ read_slot(index) };
@@ -17942,7 +17189,6 @@ namespace vmhook
                                              const vmhook::detail::code_cache_bounds_t& bounds) noexcept
             -> bool
         {
-#if VMHOOK_ARCH_X86_64
             if (candidate == 0 || return_address == 0 || candidate >= return_address)
             {
                 return false;
@@ -17979,17 +17225,7 @@ namespace vmhook
             {
                 return false;
             }
-#if VMHOOK_OS_WINDOWS
             return dispatch[0] == 0xFFu && dispatch[1] == 0xD2u;        // call rdx
-#else
-            return dispatch[0] == 0xFFu && dispatch[1] == 0xD6u;        // call rsi
-#endif
-#else
-            (void)candidate;
-            (void)return_address;
-            (void)bounds;
-            return false;
-#endif
         }
 
         /*
@@ -21056,121 +20292,6 @@ namespace vmhook
         }
 
 
-#if VMHOOK_HAS_STD_EXPECTED
-        /*
-            @brief get_field() with the REASON for a failure.
-            @details
-            Same lookup, same result on success.  The difference is the failure
-            channel: an empty optional says only "no", while an access_error says
-            whether to fix your setup, wait for the class to load, or fix the
-            name.  @see vmhook::access_error for why those three want different
-            responses and what conflating them has already cost.
-
-                if (auto f = obj.try_field("health"))          { use(f->get()); }
-                else if (f.error() == access_error::class_not_loaded) { retry_later(); }
-                else { report(vmhook::error_message(f.error())); }
-
-            Deliberately does NOT log.  get_field() logs on every failure because
-            the optional carries nothing; here the caller has the reason in hand,
-            so logging too would double-report an outcome the caller may be
-            handling deliberately (probing whether a class is loaded yet is a
-            legitimate thing to do in a loop).
-
-            Complexity: O(1) after the first lookup per (klass, name).
-            Exception safety: does not throw.
-        */
-        [[nodiscard]] auto try_field(const std::string_view name) const
-            -> std::expected<vmhook::field_proxy, vmhook::access_error>
-        {
-            const auto type_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(*this) }) };
-            if (type_entry == vmhook::type_to_class_map.end())
-            {
-                return std::unexpected{ vmhook::access_error::wrapper_not_registered };
-            }
-            if (!vmhook::find_class(type_entry->second))
-            {
-                return std::unexpected{ vmhook::access_error::class_not_loaded };
-            }
-
-            // The klass resolves, so any remaining failure is about the MEMBER
-            // or the receiver, and get_field can distinguish those two by
-            // whether an instance was needed.
-            const auto entry{ vmhook::find_field(this->resolve_klass(), name) };
-            if (!entry)
-            {
-                return std::unexpected{ vmhook::access_error::member_not_found };
-            }
-            if (!entry->is_static && !this->instance)
-            {
-                return std::unexpected{ vmhook::access_error::null_instance };
-            }
-
-            auto proxy{ this->get_field(name) };
-            if (!proxy)
-            {
-                // find_field succeeded and the receiver is fine, so the only
-                // remaining way get_field bails is an unreadable mirror.
-                return std::unexpected{ vmhook::access_error::mirror_unreadable };
-            }
-            return std::expected<vmhook::field_proxy, vmhook::access_error>{ *std::move(proxy) };
-        }
-
-        /*
-            @brief get_method() with the REASON for a failure.
-            @details The method twin of try_field; see it for the rationale.
-            null_instance is never reported here - a method proxy on a null
-            receiver is legal to build (a static method has no receiver, and an
-            instance call through a null receiver fails at call() time with its
-            own diagnostic).
-        */
-        [[nodiscard]] auto try_method(const std::string_view name) const
-            -> std::expected<vmhook::method_proxy, vmhook::access_error>
-        {
-            const auto type_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(*this) }) };
-            if (type_entry == vmhook::type_to_class_map.end())
-            {
-                return std::unexpected{ vmhook::access_error::wrapper_not_registered };
-            }
-            if (!vmhook::find_class(type_entry->second))
-            {
-                return std::unexpected{ vmhook::access_error::class_not_loaded };
-            }
-
-            auto proxy{ this->get_method(name) };
-            if (!proxy)
-            {
-                return std::unexpected{ vmhook::access_error::member_not_found };
-            }
-            return std::expected<vmhook::method_proxy, vmhook::access_error>{ *std::move(proxy) };
-        }
-
-        /*
-            @brief try_method() for an explicitly-descriptored overload.
-            @details Use when the name is overloaded and the descriptor selects
-            which one; member_not_found covers "no overload with that descriptor".
-        */
-        [[nodiscard]] auto try_method(const std::string_view name,
-                                      const std::string_view descriptor) const
-            -> std::expected<vmhook::method_proxy, vmhook::access_error>
-        {
-            const auto type_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(*this) }) };
-            if (type_entry == vmhook::type_to_class_map.end())
-            {
-                return std::unexpected{ vmhook::access_error::wrapper_not_registered };
-            }
-            if (!vmhook::find_class(type_entry->second))
-            {
-                return std::unexpected{ vmhook::access_error::class_not_loaded };
-            }
-
-            auto proxy{ this->get_method(name, descriptor) };
-            if (!proxy)
-            {
-                return std::unexpected{ vmhook::access_error::member_not_found };
-            }
-            return std::expected<vmhook::method_proxy, vmhook::access_error>{ *std::move(proxy) };
-        }
-#endif  // VMHOOK_HAS_STD_EXPECTED
     protected:
         /*
             @brief The raw decoded OOP pointer to the wrapped Java object.
@@ -21748,25 +20869,6 @@ namespace vmhook
         // GCC should call `static_field("name")` explicitly from static
         // methods; that name is always available below.
         // -------------------------------------------------------------------
-#if VMHOOK_HAS_DEDUCING_THIS
-        auto get_field(this object_base const& self, char const* name)
-            -> std::optional<vmhook::field_proxy>
-        {
-            return self.object_base::get_field(name);
-        }
-
-        auto get_method(this object_base const& self, char const* name)
-            -> std::optional<vmhook::method_proxy>
-        {
-            return self.object_base::get_method(name);
-        }
-
-        auto get_method(this object_base const& self, char const* name, char const* signature)
-            -> std::optional<vmhook::method_proxy>
-        {
-            return self.object_base::get_method(name, signature);
-        }
-#else
         // Pre-C++23 fallback: forward via the inherited non-static overloads.
         // Brought in with using-declarations.  These cover instance-context
         // get_field("name") / get_method("name") on compilers that don't
@@ -21776,7 +20878,6 @@ namespace vmhook
         // implicit object parameter.
         using object_base::get_field;
         using object_base::get_method;
-#endif
 
         // -------------------------------------------------------------------
         // Static-context fallbacks for `get_field` / `get_method`.
@@ -21787,25 +20888,6 @@ namespace vmhook
         // break instance-context access.  On those compilers users still
         // call `static_field` / `static_method` (always available below).
         // -------------------------------------------------------------------
-#if VMHOOK_HAS_DEDUCING_THIS
-        static auto get_field(std::string_view name)
-            -> std::optional<vmhook::field_proxy>
-        {
-            return object_base::get_field(std::type_index{ typeid(derived) }, name);
-        }
-
-        static auto get_method(std::string_view name)
-            -> std::optional<vmhook::method_proxy>
-        {
-            return object_base::get_method(std::type_index{ typeid(derived) }, name);
-        }
-
-        static auto get_method(std::string_view name, std::string_view signature)
-            -> std::optional<vmhook::method_proxy>
-        {
-            return object_base::get_method(std::type_index{ typeid(derived) }, name, signature);
-        }
-#endif
 
         /*
             @brief Explicit static field accessor.  Portable across compilers.
@@ -23984,7 +23066,6 @@ namespace vmhook
                trap-based watch_static_field path.  At most four
                simultaneous watches per process (the CPU exposes DR0-DR3).
     */
-#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
     namespace detail
     {
         struct dr_slot
@@ -24171,7 +23252,6 @@ namespace vmhook
         }
 
     } // namespace detail
-#endif // VMHOOK_HAS_HW_DATA_BREAKPOINTS
 
     /*
         @brief Watches a Java static field and invokes a callback when it changes.
@@ -24210,7 +23290,6 @@ namespace vmhook
         std::string_view field_name,
         callback_type    on_change) -> watch_handle
     {
-#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
         const auto proxy{ vmhook::object_base::get_field(
             std::type_index{ typeid(wrapper_type) }, field_name) };
         if (!proxy.has_value())
@@ -24295,14 +23374,6 @@ namespace vmhook
             detail::dr_unarm_one();
         };
         return watch_handle{ std::move(block) };
-#else
-        (void)field_name;
-        (void)on_change;
-        VMHOOK_LOG("{} watch_static_field<{}>('{}'): hardware data breakpoints "
-                   "are unsupported on this platform; the watch was not armed",
-                   vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(), field_name);
-        return watch_handle{};
-#endif
     }
 
     /*
