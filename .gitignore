@@ -86,3 +86,11 @@ vmhook.slnx
 *.vcxproj
 *.vcxproj.filters
 *.vcxproj.user
+
+# One-shot migration scripts (the g++-only collapse and the de-macro passes).
+# They ran once; what they produced is the library, which is what belongs here.
+tools/
+
+# Python leaves these next to anything it imports.
+__pycache__/
+*.pyc
