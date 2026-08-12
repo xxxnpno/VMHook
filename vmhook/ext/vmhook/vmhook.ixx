@@ -60,9 +60,9 @@ module;
 
     Exception safety:
         - All public API functions catch vmhook::exception internally and report
-          the message through VMHOOK_LOG before returning a safe default value
+          the message through log_line() before returning a safe default value
           (nullptr, std::nullopt, false, or T{}). Release builds compile
-          VMHOOK_LOG to a no-op unless vmhook::debug_logs is overridden.
+          log_line() to a no-op unless vmhook::debug_logs is overridden.
         - Internal helpers (iterate_struct_entries, iterate_type_entries, etc.)
           are noexcept and return nullptr on failure.
         - midi2i_hook constructor may throw vmhook::exception on allocation failure;
@@ -72,8 +72,8 @@ module;
 // ---------------------------------------------------------------------------
 // Library version.  Bump these macros for every released change.  Semantic
 // versioning: MAJOR for API breaks, MINOR for additive features, PATCH for
-// fixes.  The packed VMHOOK_VERSION integer makes it easy to gate consumer
-// code on a minimum version via `#if VMHOOK_VERSION >= VMHOOK_MAKE_VERSION(0,3,0)`.
+// fixes.  The packed vmhook::version integer makes it easy to gate consumer
+// code on a minimum version: `if constexpr (vmhook::version >= vmhook::make_version(6,0,0))`.
 // ---------------------------------------------------------------------------
 
 
@@ -92,6 +92,11 @@ module;
 // <typeindex>; in a module's global module fragment that no longer reaches the
 // purview, and every typeid() below fails to compile.
 #include <typeinfo>
+// <meta>: reflection is used UNCONDITIONALLY now.  It was optional and gated on
+// __cpp_impl_reflection, which GCC does not define even with -freflection, so the
+// reflected branch was dead everywhere -- and a collapse pass then deleted it as
+// unreachable.  One toolchain means it is simply on.
+#include <meta>
 #include <memory>
 #include <new>          // std::nothrow — object<T>::create() is noexcept
 #include <mutex>
@@ -110,109 +115,42 @@ module;
 #include <limits>
 
 // ---------------------------------------------------------------------------
-// Platform / compiler detection
+// THE GLOBAL MODULE FRAGMENT, and the only preprocessor left in this library.
 //
-// Five OS macros are exposed.  Exactly one is set to 1; the others are 0.
-// Two convenience aggregates are also defined:
+// Everything above is an `#include`, because a header is the only way to reach
+// the standard library and Win32 from a module: `import std;` would cover the
+// first, but <windows.h> has no module and never will.  The two `#define`s
+// below configure that header and MUST be macros -- they are read by the
+// preprocessor while it is expanding it, which is not a thing a `constexpr` can
+// participate in.
 //
-//   VMHOOK_OS_POSIX   = Linux | macOS | iOS | Android  (true POSIX backends)
-//   VMHOOK_OS_APPLE   = macOS | iOS
+// Everything that used to live here is gone.  There is no compiler detection,
+// no OS detection, no architecture check and no feature probe, because this
+// library targets the newest g++ on Windows x86-64 and nothing else:
 //
-// The header is callable (and the standalone unit tests run) on every
-// platform listed here.  Runtime functionality (HotSpot interpreter
-// hooking, gHotSpotVMStructs lookup) requires a HotSpot JVM in-process;
-// that exists on Windows / Linux / macOS desktop JDKs but not on iOS or
-// Android, where the platform VMs (Apple's restricted no-JIT environment
-// and Android's ART) replace HotSpot.  See README / CONTRIBUTING for the
-// platform-capability matrix.
+//   the removed OS macros*, the removed ARCH macros*, the removed COMPILER macros*   deleted; one answer each
+//   std::format support / _PRINT / _EXPECTED      deleted; measured, not guessed
+//   deducing-this support                        deleted
+//   the removed VERSION macros*                                vmhook::version_major, ...
+//   vmhook::debug_logs                               vmhook::debug_logs
+//   vmhook::log_file_path                                 vmhook::log_file_path, run-time
+//   vmhook::auto_attach_threads                      vmhook::auto_attach_threads
+//   vmhook::auto_repair                      vmhook::auto_repair
+//   log_line()(...)                                 vmhook::detail::log_line(...)
+//   the calling convention                                  nothing; one calling convention
+//   = delete(reason)(reason)                          `= delete(reason)` written out
+//
+// `= delete("reason")` is worth a word because several of this library's design
+// rules are expressed as DELETIONS -- a ref_vector that cannot be built from raw
+// addresses, an access proxy that cannot be hoisted out of its expression, a
+// hook_handle that cannot be copied.  Deleting the operation is what makes the
+// rule unbreakable; the reason string is what makes the compiler explain it
+// rather than emit a bare "use of deleted function".
 // ---------------------------------------------------------------------------
 
-
-
-
-// HotSpot runtime hooking is x86_64-only: the trampoline emits Microsoft
-// x64 / System V AMD64 bytes and walks the HotSpot interpreter frame
-// layout, which differs on arm64.  On arm64 hosts the header still
-// compiles and the OS layer is fully functional, but `vmhook::hook<T>`
-// returns false at runtime.  Set VMHOOK_RUNTIME_HOOKING_AVAILABLE to 0
-// in that build configuration so consumers can gate their use of the
-// runtime API.
-
-
-
-
-// std::format requires GCC 13+ / Clang 14+ / MSVC 19.29+
-    #include <format>
-
-// std::print/std::println require GCC 14+ / Clang 18+ (libc++) / MSVC 19.37+
-    #include <print>
-
-// C++23 deducing-this support test.  The feature itself is implemented in
-// MSVC 19.32+ / GCC 14+ / Clang 18+, but GCC's overload resolution still
-// considers explicit-object member functions in *static-call* contexts
-// (where no implicit object is available) and then errors with "cannot
-// call without object".  Upstream LLVM Clang and MSVC correctly exclude
-// them from static-call overload resolution.
-//
-// The Android NDK Clang shows the same overload-resolution behavior as
-// GCC here even though it self-identifies as Clang, so we also exclude
-// __ANDROID__.
-//
-// The deducing-this path is therefore enabled only on MSVC and non-NDK
-// Clang < 20 — that is where vmhook::object<T>::get_field can be invoked from
-// both instance and static methods uniformly.
-//
-// Clang 20 changed overload resolution: a static-context `get_field("x")` now
-// binds the string literal to the deducing-this overload's explicit-object
-// parameter ("too few non-object arguments") instead of selecting the static
-// `std::string_view` overload, so the uniform static-context call no longer
-// compiles there.  (The VS18 / MSVC 14.51 runner image forces clang >= 20 via
-// STL1000.)  On clang >= 20 we therefore fall back to the gcc-style path:
-// instance-context get_field/get_method via the inherited using-declarations,
-// and static-context access via the always-available static_field/static_method.
-
-// std::expected requires GCC 12+ / Clang 16+ (libc++ 16) / MSVC 19.33+.  Used
-// for the try_* accessors, which report WHY a lookup failed instead of
-// collapsing every cause into an empty optional.
-
-// C++26 `= delete("reason")` (P2573).  Several of this header's design rules are
-// expressed as DELETIONS -- a ref_vector that cannot be built from raw addresses,
-// an access proxy that cannot be hoisted out of its expression, a hook_handle
-// that cannot be copied.  Deleting the operation is what makes the rule
-// unbreakable; the reason string is what makes the compiler explain it instead
-// of emitting a bare "use of deleted function" and leaving the user to guess
-// which invariant they just hit.
-//
-// GCC 15+ and Clang 19+ accept it in C++26 mode; everything else gets the plain
-// deletion, which enforces exactly the same rule with a worse message.
-// The language-mode check is NOT redundant.  Clang defines
-// __cpp_deleted_function even in C++23 mode, where it accepts the syntax as an
-// EXTENSION and then warns about it -- which is an error under the project's
-// -Werror.  Requiring C++26 proper is what keeps the feature genuinely opt-in.
-// MSVC reports the mode in _MSVC_LANG rather than __cplusplus.
-// ---------------------------------------------------------------------------
-// C++26 static reflection (P2996) — OPTIONAL, and additive wherever it is used.
-//
-// vmhook has to describe C++ types to a JVM: a wrapper class needs a Java class
-// name, an argument type needs a descriptor, and a failure needs to say WHICH
-// type it was talking about.  Today all three go through either a string the
-// user hands over (`register_class<T>("com/example/Foo")`) or `typeid(T).name()`,
-// which is implementation-defined and in practice emits a mangled identifier
-// ("5playerE") into user-facing warnings.  Reflection replaces the second with
-// the actual spelling of the type, and lets the first be derived.
-//
-// SHIPPING REALITY: P2996 landed in C++26 but is implemented almost nowhere.
-// Clang 21+ has it behind -freflection with -std=c++2c; GCC has not merged it;
-// MSVC has not shipped it.  vmhook's CI builds -std=c++23 on GCC, Clang and
-// MSVC, so NOTHING here may depend on reflection being present.  Every use is
-// gated and every gate has a C++23 fallback that behaves the same, only with a
-// worse diagnostic string.  This mirrors how VMHOOK_HAS_DEDUCING_THIS and
-// VMHOOK_HAS_STD_FORMAT are handled.
-//
-// Gate on BOTH feature-test macros plus the header: the language macro alone is
-// true in some in-progress builds where <meta> is absent or incomplete.
-    // <windows.h> defines macros (min, max, ERROR, etc.) that clash with C++.
-    // We guard them and undefine the worst offenders right after include.
+    // <windows.h> defines macros (min, max, ERROR) that clash with C++, and
+    // reads these two while it is being expanded -- which is why they are still
+    // macros and cannot be anything else.
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
     #endif
@@ -246,20 +184,19 @@ export module vmhook;
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// VMHOOK_LOG_FILE - opt-in file logging.
+// vmhook::log_file_path - opt-in file logging.
 //
-// Define VMHOOK_LOG_FILE before including this header (or via the build system,
-// e.g. -DVMHOOK_LOG_FILE=\"vmhook.log\") to a string literal containing the
-// path of the log file.  When set, every ::vmhook::detail::log_line() call (errors, warnings,
-// info) is appended to that file instead of being written to std::cout.  The
-// stream is opened lazily on first use, kept open for the lifetime of the
-// process, and writes are serialised with a mutex so concurrent log lines from
-// different threads cannot interleave.  Falls back to std::cout silently if
-// the file cannot be opened.
+// A RUN-TIME path, not a macro a consumer defines before an include: a module
+// cannot see one of those at all, and a compile-time answer was never the right
+// shape for this question anyway.
 //
-// Example:
-//   #define VMHOOK_LOG_FILE "vmhook.log"
-//   #include <vmhook/vmhook.hpp>
+//     vmhook::log_file_path = "vmhook.log";
+//
+// Set it before the first line is written.  Every log_line() call -- errors,
+// warnings, info -- is then appended to that file instead of going to
+// std::cout.  The stream is opened once, kept open for the lifetime of the
+// process, and writes are serialised so concurrent lines cannot interleave.
+// Falls back to std::cout silently if the file cannot be opened.
 // ---------------------------------------------------------------------------
 
 
@@ -290,7 +227,7 @@ export namespace vmhook
     /*
         @brief Whether the library emits its diagnostic trace.
         @details
-        Was `#if VMHOOK_DEBUG_LOGS`, defaulting off under NDEBUG.  A
+        Was `#if vmhook::debug_logs`, defaulting off under NDEBUG.  A
         `constexpr bool` behind `if constexpr` emits exactly as little code, and
         is a value the rest of the program can read.
     */
@@ -335,7 +272,7 @@ export namespace vmhook::detail
     /*
         @brief Format a log line using std::format if available, otherwise stream-format.
         @details
-        Provides a single API used by VMHOOK_LOG so callers do not need to know whether
+        Provides a single API used by log_line() so callers do not need to know whether
         the host toolchain has shipped std::format / std::print.  When std::format is
         present we use it; otherwise we ignore the format specifiers and concatenate
         the format string verbatim, which is enough for diagnostic output.
@@ -391,7 +328,7 @@ export namespace vmhook::detail
 export namespace vmhook::detail
 {
     /*
-        @brief One diagnostic line.  Was the VMHOOK_LOG macro.
+        @brief One diagnostic line.  Was the log_line() macro.
         @details
         A function template rather than a macro, so its arguments are type
         checked, it has a name a debugger can break on, and it survives being
@@ -437,7 +374,7 @@ export namespace vmhook
         Declared here, DEFINED only in vmhook/src/vmhook.cpp — so these two link
         only if you link vmhook::compiled, and a header-only consumer that never
         calls them is unaffected.  Comparing compiled_version() with
-        VMHOOK_VERSION catches the one mistake a static library can introduce
+        vmhook::version catches the one mistake a static library can introduce
         silently: a .lib built from a different checkout than the header you
         included.
     */
@@ -449,7 +386,7 @@ export namespace vmhook
     /*
         @brief Exception type thrown internally by VMHook to report unrecoverable errors.
         @details  All public API functions catch vmhook::exception and log the message
-        through VMHOOK_LOG before returning a safe default value, so callers never
+        through log_line() before returning a safe default value, so callers never
         see uncaught exceptions escaping the library boundary.
     */
     class exception final : public std::exception
@@ -1446,7 +1383,7 @@ export namespace vmhook
         a C++23 toolchain this type is still declared - so the annotation syntax
         is not the thing that breaks - but nothing reads it, and the no-argument
         register_class<T>() overload does not exist.  Use the string form there.
-        See VMHOOK_HAS_REFLECTION.
+        See reflection support.
     */
     struct java_class
     {
@@ -1666,7 +1603,7 @@ export namespace vmhook
 
             Returns std::string rather than string_view because the reflection
             branch produces a string_view into a value that does not outlive the
-            call, and every caller feeds it straight into VMHOOK_LOG anyway.
+            call, and every caller feeds it straight into log_line() anyway.
 
             Complexity: O(1) reflected / O(name length) fallback.
             Exception safety: may allocate (the string).  Thread safety: safe.
@@ -1675,7 +1612,12 @@ export namespace vmhook
         inline auto type_name() noexcept
             -> std::string
         {
-            return std::string{ typeid(type).name() };
+            // display_string_of() over identifier_of(): the former handles
+            // unnamed and closure types, which a wrapper never is but a
+            // mis-instantiated template argument can be.  This used to fall back
+            // to typeid(type).name(), which emits a mangled identifier
+            // ("5playerE") into a user-facing warning.
+            return std::string{ std::meta::display_string_of(^^type) };
         }
 
         /*
@@ -1698,9 +1640,24 @@ export namespace vmhook
             Complexity: O(annotations) at compile time, zero at runtime.
         */
         template<typename wrapper_type>
-        constexpr auto annotated_class_name() noexcept
+        consteval auto annotated_class_name() noexcept
             -> std::string_view
         {
+            // A type may carry several annotations; take the first java_class.
+            // More than one is a user error we cannot diagnose from here without
+            // making this a hard compile failure for a merely redundant tag, so
+            // first-wins is the forgiving reading.
+            //
+            // consteval: an annotated wrapper's descriptor becomes a
+            // compile-time constant, so it cannot drift from the registry and
+            // cannot silently degrade to Ljava/lang/Object;.
+            for (const std::meta::info annotation : std::meta::annotations_of(^^wrapper_type))
+            {
+                if (std::meta::type_of(annotation) == ^^vmhook::java_class)
+                {
+                    return std::meta::extract<vmhook::java_class>(annotation).name;
+                }
+            }
             return {};
         }
 
@@ -11518,8 +11475,8 @@ export namespace vmhook
     }
 
     /*
-        @brief Debug convenience: VMHOOK_LOGs every (name, descriptor) of T's class.
-        @details Compiled out in release (VMHOOK_LOG is a no-op); use
+        @brief Debug convenience: log_line()s every (name, descriptor) of T's class.
+        @details Compiled out in release (log_line() is a no-op); use
         get_class_methods<T>() for a release-safe data channel.
     */
     template<class wrapper_type>
@@ -13636,8 +13593,8 @@ export namespace vmhook
     // nmethod - "everything worked, then after an hour it stopped".
     //
     // Controls:
-    //   VMHOOK_DISABLE_AUTO_REPAIR        — compile-time: define to opt out entirely.
-    //   VMHOOK_AUTO_REPAIR_INTERVAL_MS    — repair-pass interval (default 1000ms).
+    //   vmhook::auto_repair        — compile-time: define to opt out entirely.
+    //   vmhook::auto_repair_interval_ms    — repair-pass interval (default 1000ms).
     //   vmhook::set_auto_repair_enabled() — run-time: enable/disable the watchdog.
     //                                        Disabling while it is already running
     //                                        stops the live thread (see below).
@@ -13647,7 +13604,7 @@ export namespace vmhook
     // user forgets to call shutdown_hooks().  shutdown_hooks() raises
     // g_shutdown_requested and notifies the cv before taking the install
     // mutex; the watchdog observes the flag at its next wake (within
-    // VMHOOK_AUTO_REPAIR_INTERVAL_MS) and returns.
+    // vmhook::auto_repair_interval_ms) and returns.
     // -------------------------------------------------------------------
     namespace detail::auto_repair
     {
@@ -13773,7 +13730,7 @@ export namespace vmhook
                 has been disabled via set_auto_repair_enabled(false).
         @details Reflects only the run-time master switch — it does NOT report
                  whether a watchdog thread is live at this instant.  Compiling
-                 with VMHOOK_DISABLE_AUTO_REPAIR removes the watchdog entirely
+                 with vmhook::auto_repair removes the watchdog entirely
                  regardless of this flag.
     */
     inline auto auto_repair_enabled() noexcept -> bool
@@ -13810,7 +13767,7 @@ export namespace vmhook
         Thread-safety: safe to call from the driver/main thread.  Like the rest of
         the teardown machinery it must NOT be called while holding
         g_hooked_methods_mutex (the watchdog may be mid-verify_hooks() under it).
-        No-op if compiled with VMHOOK_DISABLE_AUTO_REPAIR.
+        No-op if compiled with vmhook::auto_repair.
     */
     inline auto set_auto_repair_enabled(const bool enabled) noexcept -> void
     {
@@ -23564,7 +23521,7 @@ export namespace vmhook
             defineClass is not yet hooked.
 
         Exception safety: noexcept boundary — callback exceptions are caught
-            and logged through VMHOOK_LOG.
+            and logged through log_line().
         Thread safety: the callback runs on the Java thread that triggered
             the class definition.
 
@@ -23735,7 +23692,7 @@ export namespace vmhook
         Event-driven: zero polling, zero idle cost.
 
         Exception safety: noexcept boundary — callback exceptions are
-            caught and logged through VMHOOK_LOG.
+            caught and logged through log_line().
         Thread safety: the callback runs on the Java thread that
             constructed the throwable.
 
@@ -25929,7 +25886,7 @@ namespace hotspot
             Returns an empty ref (never a broken one) when the class is not
             loaded, the field does not exist, the field is not static, or the
             field is a primitive rather than a reference.  Each failure is logged
-            once through VMHOOK_LOG, so a typo is observable rather than silent.
+            once through log_line(), so a typo is observable rather than silent.
         */
         static auto at_static(const std::string_view class_name,
                               const std::string_view field_name) noexcept
