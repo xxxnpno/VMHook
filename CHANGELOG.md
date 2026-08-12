@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **The JDK 8-17 class lookup found roughly one class per hash bucket instead of
+  all of them.**  `BasicHashtableEntry` keeps `_hash` at +0 and `_next` at +8;
+  the per-CLD and SystemDictionary walks read `_next` from +0.  That is `_hash`,
+  a 32-bit value whose high half is padding, so the resulting "next" pointer was
+  garbage — and `is_valid_pointer` rejected it, which is why this never crashed
+  and never logged.  Every bucket chain simply ended at its first entry.
+
+  Measured on a live Minecraft 1.8.9 client on JDK 8: `find_class` and
+  `for_each_loaded_class` saw **1015 of 5000** loaded classes, which is almost
+  exactly the JDK 8 SystemDictionary's 1009 buckets.  `java/lang/String` happened
+  to be among the reachable ones; the class the consumer actually wanted usually
+  was not, so `find_class` returned null for classes that were plainly loaded.
+
+  Invisible until now because JDK 21+ exports `ClassLoaderData::_klasses` and
+  takes the linked-list path instead — so this code only runs on JDK 8-17, which
+  in practice means Minecraft.  Found from chatwire, which could not attach to
+  any 1.8.9 client at all.
+
 ## [6.0.0] — 2026-08-06
 
 ### Added

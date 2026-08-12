@@ -5250,10 +5250,33 @@ namespace vmhook
 
                     while (vmhook::hotspot::is_valid_pointer(dict_entry))
                     {
-                        // DictionaryEntry (extends HashtableEntry<InstanceKlass*, mtClass>) layout:
-                        //   +0   void*       _next    (next entry in the chain)
-                        //   +8   uint32_t    _hash    (pre-computed hash, 4 bytes + 4 padding)
-                        //   +16  Klass*      _literal, the actual class pointer
+                        // DictionaryEntry extends HashtableEntry<Klass*, mtClass>
+                        // extends BasicHashtableEntry<F>, whose x64 layout is:
+                        //
+                        //   +0   unsigned int _hash     (4 bytes + 4 padding)
+                        //   +8   void*        _next     (next entry in this bucket)
+                        //   +16  Klass*       _literal  (the class itself)
+                        //
+                        // _hash FIRST -- that is the declaration order in
+                        // hashtable.hpp, unchanged from JDK 8 through 25, and
+                        // CHeapObj adds no vptr in front of it.
+                        //
+                        // This read _next from +0 for a long time, and the
+                        // symptom was not a crash: +0 is _hash, a 32-bit value
+                        // whose high half is padding, so the "next" pointer was
+                        // garbage that is_valid_pointer rejected -- and every
+                        // bucket chain therefore ended at its FIRST entry.  The
+                        // walk still worked, still returned real klasses, and
+                        // silently saw about one class per bucket: 1015 of a
+                        // live 1.8.9 client's 5000, which is the JDK 8
+                        // SystemDictionary's 1009 buckets almost exactly.
+                        // java/lang/String happened to be among them; the class
+                        // anyone actually wanted usually was not.
+                        //
+                        // It stayed invisible because JDK 21+ exports
+                        // ClassLoaderData::_klasses and takes the linked-list
+                        // path above instead, so this code only ever runs on
+                        // JDK 8-17 -- which for this library means Minecraft.
                         const void* const raw_klass{ vmhook::hotspot::safe_read_pointer(dict_entry + 16) };
                         const vmhook::hotspot::klass* const candidate_klass{ reinterpret_cast<const vmhook::hotspot::klass*>(vmhook::hotspot::untag_pointer(raw_klass)) };
 
@@ -5266,7 +5289,7 @@ namespace vmhook
                             }
                         }
 
-                        dict_entry = reinterpret_cast<const std::uint8_t*>(untag_chain(vmhook::hotspot::safe_read_pointer(dict_entry)));
+                        dict_entry = reinterpret_cast<const std::uint8_t*>(untag_chain(vmhook::hotspot::safe_read_pointer(dict_entry + 8)));
                     }
                 }
 
@@ -5309,6 +5332,10 @@ namespace vmhook
                     while (vmhook::hotspot::is_valid_pointer(dict_entry) && chain_visited < 1048576)
                     {
                         ++chain_visited;
+                        // _hash +0, _next +8, _literal +16 -- see the note in
+                        // find_klass above.  Reading _next from +0 ended every
+                        // chain at its first entry and made this enumeration
+                        // report roughly one class per bucket.
                         const void* const raw_klass{ vmhook::hotspot::safe_read_pointer(dict_entry + 16) };
                         auto* const candidate_klass{ reinterpret_cast<vmhook::hotspot::klass*>(
                             const_cast<void*>(vmhook::hotspot::untag_pointer(raw_klass))) };
@@ -5322,7 +5349,7 @@ namespace vmhook
                             }
                         }
 
-                        dict_entry = reinterpret_cast<const std::uint8_t*>(untag_chain(vmhook::hotspot::safe_read_pointer(dict_entry)));
+                        dict_entry = reinterpret_cast<const std::uint8_t*>(untag_chain(vmhook::hotspot::safe_read_pointer(dict_entry + 8)));
                     }
                 }
             }
