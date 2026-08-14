@@ -404,9 +404,19 @@ void* oop = decodeOopPointer(compressed);
 
 ### C++ Header-Only Library
 
-For `vmhook.hpp` and related C++ files:
+> **Edit `vmhook.ixx`, never `vmhook.hpp`.** The module is the library; the header
+> is derived from it by `tools/make_header.py`, which strips every C++26 construct
+> and substitutes a C++23 answer. An edit made in the header is lost at the next
+> regeneration, and the two files silently disagreeing is the failure mode the
+> generator exists to prevent. Run `python tools/make_header.py` after any change
+> to the module, and `--check` to confirm the committed header is current.
+>
+> **`vmhook.hpp` is C++23 and stays C++23.** If a change to the module needs a
+> C++26 feature, the generator needs a C++23 substitute for it in the same commit.
 
-- **Single-header library**: All code in `vmhook.hpp` with no external dependencies beyond standard library.
+For `vmhook.ixx` / `vmhook.hpp` and related C++ files:
+
+- **Single-file library**: All code in one module interface unit, with no external dependencies beyond the standard library and Win32.
 - **Trailing return types**: Always use `auto function_name() -> return_type`.
 - **Explicit constructors**: Use `explicit` only for constructors with exactly one parameter.
 - **Brace initialization**: `int x{0};` not `int x(0);` or `int x = 0;`.

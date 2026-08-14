@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(vmhook
-    VERSION 6.0.0
-    DESCRIPTION "Single-header HotSpot JVM hooking library"
+    VERSION 7.0.0
+    DESCRIPTION "C++26 module (and a generated C++23 header) for hooking a running HotSpot JVM"
     LANGUAGES CXX)
 
 # ── Where things land ───────────────────────────────────────────────────────
@@ -135,15 +135,23 @@ option(VMHOOK_BUILD_TESTS    "Build the standalone unit-test suite (no JVM neede
 option(VMHOOK_WARNINGS_AS_ERRORS "Treat warnings as errors for first-party code"
        OFF)
 
-# The C++20 named-module interface (vmhook.ixx), letting consumers write
-# `import vmhook;` instead of including the 24k-line header in every TU.
+# The C++26 named module (vmhook.ixx), letting consumers write `import vmhook;`
+# instead of including 27k lines in every TU.  Measured here, GCC 16.2.0, one TU
+# that names vmhook::version and nothing else:
 #
-# OFF by default, and deliberately so: building a named module needs CMake 3.28+,
-# a generator that scans for module dependencies (Ninja or VS), and a toolchain
-# whose module support is solid.  None of that is required to USE vmhook -- the
-# header remains the primary interface and the module is a thin re-export of it
-# -- so making it opt-in keeps every existing consumer and CI cell unaffected.
-option(VMHOOK_BUILD_MODULE   "Build the C++20 named module (import vmhook;)"
+#     #include <vmhook/vmhook.hpp>    1.74 s
+#     import vmhook;                  0.10 s   (+ 4.2 s once, to build the module)
+#
+# THE MODULE IS THE LIBRARY, and the header is generated from it by
+# tools/make_header.py.  vmhook.ixx is C++26 and uses static reflection;
+# vmhook.hpp is the same source with every C++26 construct transformed away, and
+# is C++23 forever.  Neither includes the other.
+#
+# OFF by default: building a named module needs CMake 3.28+, a generator that
+# scans for module dependencies (Ninja or VS), and a compiler with both modules
+# and reflection -- which today means GCC 16.2 or newer.  A consumer who has none
+# of that includes the header and loses nothing but the compile time.
+option(VMHOOK_BUILD_MODULE   "Build the C++26 named module (import vmhook;)"
        OFF)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT GENERATOR_IS_MULTI_CONFIG)
@@ -243,7 +251,12 @@ option(VMHOOK_BUILD_COMPILED "Build the compiled library (vmhook.lib) and the sh
 if(VMHOOK_BUILD_COMPILED)
     add_library(vmhook_compiled STATIC vmhook/ext/vmhook/vmhook.cpp)
     add_library(vmhook::compiled ALIAS vmhook_compiled)
-    set_target_properties(vmhook_compiled PROPERTIES OUTPUT_NAME "vmhook")
+    # "vmhook_pch", not "vmhook": the name vmhook now belongs to the MODULE's
+    # archive, which is the one a release ships and the one that actually holds
+    # compiled code.  This target's product is the precompiled header; the
+    # archive beside it carries a single version symbol.  Consumers name the
+    # CMake target (vmhook::compiled), not the file, so only the filename moved.
+    set_target_properties(vmhook_compiled PROPERTIES OUTPUT_NAME "vmhook_pch")
     target_link_libraries(vmhook_compiled PUBLIC vmhook)
     # PUBLIC: consumers inherit the header and build their own PCH from it, which
     # is what makes their TUs cheap.  BUILD_INTERFACE-only because a PCH is tied
@@ -255,31 +268,43 @@ if(VMHOOK_BUILD_COMPILED)
 endif()
 
 # ---------------------------------------------------------------------------
-# Optional: the C++20 named module.
+# Optional: the C++26 named module, and the vmhook.lib a release ships.
 #
 # `vmhook_module` is a real library target whose sole source is a CXX_MODULES
-# file set holding vmhook.ixx.  It links the INTERFACE header target, because
-# the module's global module fragment includes vmhook.hpp -- the module does not
-# duplicate the library, it re-exports it.
+# file set holding vmhook.ixx.  It does NOT link the header target: the module
+# is the library and the header is generated from it, so pulling vmhook.hpp into
+# the same build would define everything twice.
+#
+# It is C++26 and it needs -freflection.  Both are on the TARGET rather than in
+# CMAKE_CXX_FLAGS, because a global -freflection makes every unrelated
+# try_compile() probe fail with "'-freflection' only supported with '-std=c++26'"
+# -- a try_compile inherits CMAKE_CXX_STANDARD but not a raw flag, so the probe
+# compiles at C++23 with a flag that requires C++26 and blames the flag.
 #
 # Requires CMake 3.28+ for stable CXX_MODULES support.  We check rather than
 # raise the project-wide minimum, so a consumer on an older CMake still gets the
-# header-only library and simply cannot opt into the module.
+# header library and simply cannot opt into the module.
 # ---------------------------------------------------------------------------
 if(VMHOOK_BUILD_MODULE)
     if(CMAKE_VERSION VERSION_LESS "3.28")
         message(WARNING
-            "VMHOOK_BUILD_MODULE requires CMake 3.28+ for C++20 module support "
+            "VMHOOK_BUILD_MODULE requires CMake 3.28+ for C++26 module support "
             "(found ${CMAKE_VERSION}); skipping the module target.  The "
-            "header-only vmhook::vmhook target is unaffected.")
+            "header vmhook::vmhook target is unaffected.")
+    elseif(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        message(WARNING
+            "VMHOOK_BUILD_MODULE needs GCC 16.2+ (modules AND P2996 reflection); "
+            "found ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}.  "
+            "Skipping the module target; the header is unaffected.")
     else()
-        add_library(vmhook_module)
+        add_library(vmhook_module STATIC)
         add_library(vmhook::module ALIAS vmhook_module)
+        set_target_properties(vmhook_module PROPERTIES OUTPUT_NAME "vmhook")
         target_sources(vmhook_module
             PUBLIC FILE_SET CXX_MODULES FILES
                 "${CMAKE_CURRENT_SOURCE_DIR}/vmhook/ext/vmhook/vmhook.ixx")
-        target_link_libraries(vmhook_module PUBLIC vmhook::vmhook)
-        target_compile_features(vmhook_module PUBLIC cxx_std_23)
+        target_compile_features(vmhook_module PUBLIC cxx_std_26)
+        target_compile_options(vmhook_module PUBLIC -freflection)
         set_target_properties(vmhook_module PROPERTIES CXX_SCAN_FOR_MODULES ON)
         vmhook_apply_warnings(vmhook_module)
     endif()
@@ -404,6 +429,11 @@ install(TARGETS vmhook EXPORT vmhookTargets)
 if(VMHOOK_BUILD_COMPILED)
     install(TARGETS vmhook_compiled EXPORT vmhookTargets
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+if(VMHOOK_BUILD_MODULE AND TARGET vmhook_module)
+    install(TARGETS vmhook_module EXPORT vmhookTargets
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            FILE_SET CXX_MODULES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vmhook)
 endif()
 install(EXPORT vmhookTargets
         NAMESPACE vmhook::

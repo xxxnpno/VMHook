@@ -1,14 +1,28 @@
 // vmhook - read fields, call methods and hook a running HotSpot JVM, from C++.
 //
-// A MODULE, and free of the preprocessor apart from the global module fragment
-// below -- which is unavoidable: Win32 has no module, so <windows.h> and its two
-// configuration macros have nowhere else to live.  Everything that used to be a
-// macro is now a value or a function template: see vmhook::version_major,
-// vmhook::debug_logs, vmhook::log_file_path and vmhook::detail::log_line.
+// GENERATED FROM vmhook.ixx BY tools/make_header.py -- DO NOT EDIT.
+// Edit the module and regenerate; an edit made here is lost at the next run.
+//
+// THE C++23 INTERFACE.  vmhook.ixx is the library, and it is C++26: a named
+// module that uses static reflection.  This header is that same source with
+// every C++26 construct transformed away, for a consumer whose toolchain has
+// neither modules nor reflection.  It is C++23 and stays C++23 -- nothing here
+// may ever depend on a C++26 feature, which is the whole reason it exists.
+//
+// What differs, and it is only this:
+//
+//   import vmhook;                  #include <vmhook/vmhook.hpp>
+//   type_name<T>() reflects         it parses std::source_location instead, and
+//                                   produces the same spelling
+//   java_class annotations read     they cannot be read; an annotated wrapper
+//                                   falls back to the runtime registry, exactly
+//                                   as a string-registered one always has
+//   = delete("reason")              = delete, with the reason as a comment
 //
 // Targets the newest g++ on Windows x86-64 and nothing else.  The portability
 // branches for MSVC, clang, Linux, macOS, iOS, Android and aarch64 are gone.
-module;
+
+#pragma once
 
 
 /*
@@ -92,11 +106,13 @@ module;
 // <typeindex>; in a module's global module fragment that no longer reaches the
 // purview, and every typeid() below fails to compile.
 #include <typeinfo>
-// <meta>: reflection is used UNCONDITIONALLY now.  It was optional and gated on
-// __cpp_impl_reflection, which GCC does not define even with -freflection, so the
-// reflected branch was dead everywhere -- and a collapse pass then deleted it as
-// unreachable.  One toolchain means it is simply on.
-#include <meta>
+// <source_location>: type_name() and enum_name() below read function_name() out
+// of it to spell a type and an enumerator.  The module reflects for both --
+// std::meta::display_string_of(^^T) and enumerators_of(^^E) -- and this is the
+// C++20 way to the same two strings.  <utility> comes with it, for the
+// index_sequence that drives enum_name()'s table.
+#include <source_location>
+#include <utility>
 #include <memory>
 #include <new>          // std::nothrow — object<T>::create() is noexcept
 #include <mutex>
@@ -115,14 +131,13 @@ module;
 #include <limits>
 
 // ---------------------------------------------------------------------------
-// THE GLOBAL MODULE FRAGMENT, and the only preprocessor left in this library.
+// WIN32, and the only preprocessor left in this library.
 //
-// Everything above is an `#include`, because a header is the only way to reach
-// the standard library and Win32 from a module: `import std;` would cover the
-// first, but <windows.h> has no module and never will.  The two `#define`s
-// below configure that header and MUST be macros -- they are read by the
-// preprocessor while it is expanding it, which is not a thing a `constexpr` can
-// participate in.
+// The two `#define`s below configure <windows.h> and MUST be macros -- they are
+// read by the preprocessor while it is expanding that header, which is not a
+// thing a `constexpr` can participate in.  In the module these live in the
+// global module fragment; here they are simply at the top of the header, and
+// the effect is the same.
 //
 // Everything that used to live here is gone.  There is no compiler detection,
 // no OS detection, no architecture check and no feature probe, because this
@@ -159,8 +174,6 @@ module;
     #endif
     #include <windows.h>
     #include <tlhelp32.h>   // CreateToolhelp32Snapshot, THREADENTRY32, ...
-
-export module vmhook;
 
 // ---------------------------------------------------------------------------
 // vmhook::auto_attach_threads - call Java from any thread, not just a detour.
@@ -200,7 +213,7 @@ export module vmhook;
 // ---------------------------------------------------------------------------
 
 
-export namespace vmhook
+namespace vmhook
 {
     /*
         @brief This library's version, as values rather than as macros.
@@ -267,7 +280,7 @@ export namespace vmhook
 
 }
 
-export namespace vmhook::detail
+namespace vmhook::detail
 {
     /*
         @brief Format a log line using std::format if available, otherwise stream-format.
@@ -325,7 +338,7 @@ export namespace vmhook::detail
     }
 }
 
-export namespace vmhook::detail
+namespace vmhook::detail
 {
     /*
         @brief One diagnostic line.  Was the log_line() macro.
@@ -357,7 +370,7 @@ export namespace vmhook::detail
     }
 }
 
-export namespace vmhook
+namespace vmhook
 {
     /*
         @brief Log-prefix tags used in diagnostic messages emitted by this library.
@@ -377,28 +390,15 @@ export namespace vmhook
         ships both, so they agree; a working copy that rebuilt one and not the
         other is where they stop agreeing.
 
-        DEFINED HERE, not merely declared, because these are the module's own
-        symbols and the module's archive is where they have to live -- a
-        `import vmhook;` consumer that linked only libvmhook.a would otherwise
-        get an undefined reference to a function the interface plainly offers.
-        They are deliberately NOT inline: one definition, in one object, is the
-        whole point of a check on which object you linked.
-
-        vmhook.hpp keeps the declaration and takes its definition from
-        vmhook.cpp instead, which is the same arrangement one build system down.
+        DECLARED HERE, DEFINED in vmhook/ext/vmhook/vmhook.cpp -- so these link
+        only if you link vmhook::compiled, and a consumer that never calls them
+        is unaffected.  vmhook.ixx defines them in its own purview instead,
+        because a module's archive is the only object its symbols could live in.
     */
-    [[nodiscard]] auto compiled_version() noexcept
-        -> std::uint32_t
-    {
-        return static_cast<std::uint32_t>(vmhook::version);
-    }
+    [[nodiscard]] auto compiled_version() noexcept -> std::uint32_t;
 
     /* @brief @see compiled_version. */
-    [[nodiscard]] auto compiled_version_string() noexcept
-        -> const char*
-    {
-        return vmhook::version_string.data();
-    }
+    [[nodiscard]] auto compiled_version_string() noexcept -> const char*;
 
     /*
         @brief Exception type thrown internally by VMHook to report unrecoverable errors.
@@ -1378,7 +1378,7 @@ export namespace vmhook
 
         the name travels WITH the type:
 
-            class [[= vmhook::java_class("com/example/Player")]] player
+            class player  // [[= vmhook::java_class("com/example/Player")]] in vmhook.ixx
                 : public vmhook::object<player> { ... };
             vmhook::register_class<player>();
 
@@ -1614,9 +1614,11 @@ export namespace vmhook
             own error message.  MSVC happens to return "class player", which made
             the problem invisible to anyone testing only on Windows.
 
-            With C++26 reflection this is exact: identifier_of(^^T) is the name
-            as written.  Without it we fall back to typeid, i.e. to today's
-            behaviour - no diagnostic gets WORSE, some get much better.
+            The module gets this exactly, from identifier_of(^^T).  A C++23
+            toolchain has no reflection, but it does have std::source_location,
+            and GCC writes the template argument as spelled into
+            function_name() -- so parsing it out gives the SAME answer without
+            the mangling that typeid would have produced.
 
             Returns std::string rather than string_view because the reflection
             branch produces a string_view into a value that does not outlive the
@@ -1626,42 +1628,41 @@ export namespace vmhook
             Exception safety: may allocate (the string).  Thread safety: safe.
         */
         template<typename type>
+        [[nodiscard]] consteval auto type_name_view() noexcept
+            -> std::string_view
+        {
+            // GCC writes this function's signature into function_name() with the
+            // template argument SPELLED AS THE USER WROTE IT:
+            //
+            //     consteval std::string_view vmhook::detail::type_name_view()
+            //         [with type = sdk::player; ...]
+            //
+            // so the name is already in there and only has to be cut out.  That
+            // is the same string std::meta::display_string_of(^^type) hands the
+            // module, and it is emphatically not typeid(type).name(), which is
+            // the mangled "5playerE" that used to reach user-facing warnings.
+            //
+            // consteval: the parse happens while compiling, the result is a view
+            // into a string literal with static storage, and nothing of this
+            // survives into the binary but the bytes of the name itself.
+            const std::string_view signature{ std::source_location::current().function_name() };
+            constexpr std::string_view opener{ "type = " };
+
+            const auto opener_at{ signature.find(opener) };
+            if (opener_at == std::string_view::npos) { return {}; }
+
+            const auto first{ opener_at + opener.size() };
+            auto last{ signature.find_first_of(";]", first) };
+            if (last == std::string_view::npos) { last = signature.size(); }
+
+            return signature.substr(first, last - first);
+        }
+
+        template<typename type>
         inline auto type_name() noexcept
             -> std::string
         {
-            // display_string_of() over identifier_of(): the former handles
-            // unnamed and closure types, which a wrapper never is but a
-            // mis-instantiated template argument can be.  This used to fall back
-            // to typeid(type).name(), which emits a mangled identifier
-            // ("5playerE") into a user-facing warning.
-            const std::string_view spelling{ std::meta::display_string_of(^^type) };
-
-            // GCC marks a MODULE-ATTACHED entity with its module: every one of
-            // this library's own types comes back as "vmhook::object_base@vmhook".
-            // That suffix is an implementation detail of how vmhook is built and
-            // means nothing to the reader of a warning, so it is dropped here --
-            // including inside template arguments, where it appears once per
-            // module-attached component ("ref<player@vmhook>@vmhook").
-            std::string name{};
-            name.reserve(spelling.size());
-            for (std::size_t index{ 0 }; index < spelling.size(); ++index)
-            {
-                if (spelling[index] != '@') { name.push_back(spelling[index]); continue; }
-
-                // Skip the module name: identifier characters and the dots that
-                // separate the components of a partitioned name.
-                ++index;
-                while (index < spelling.size()
-                       && (spelling[index] == '_' || spelling[index] == '.'
-                           || (spelling[index] >= '0' && spelling[index] <= '9')
-                           || (spelling[index] >= 'a' && spelling[index] <= 'z')
-                           || (spelling[index] >= 'A' && spelling[index] <= 'Z')))
-                {
-                    ++index;
-                }
-                --index;    // the outer ++index re-reads the character that ended it
-            }
-            return name;
+            return std::string{ vmhook::detail::type_name_view<type>() };
         }
 
         /*
@@ -1677,31 +1678,26 @@ export namespace vmhook
             no reflection there is nothing to read, so every lookup falls back and
             behaviour is exactly what it was before this existed.
 
-            consteval on the reflected branch: an annotated wrapper's descriptor
-            becomes a compile-time constant, so it cannot drift from the registry
-            and cannot silently degrade to Ljava/lang/Object;.
+            Empty is what this header ALWAYS returns.  Annotations are C++26 and
+            have no C++23 spelling at all, so there is nothing to read and every
+            wrapper resolves through the runtime registry -- which is the path
+            a string-registered wrapper has always taken, and is why removing
+            the annotation costs correctness nothing.  Use vmhook.ixx if you
+            want a wrapper's descriptor fixed at compile time.
 
             Complexity: O(annotations) at compile time, zero at runtime.
         */
         template<typename wrapper_type>
-        consteval auto annotated_class_name() noexcept
+        constexpr auto annotated_class_name() noexcept
             -> std::string_view
         {
-            // A type may carry several annotations; take the first java_class.
-            // More than one is a user error we cannot diagnose from here without
-            // making this a hard compile failure for a merely redundant tag, so
-            // first-wins is the forgiving reading.
+            // Nothing to read: reading an annotation needs C++26 reflection, and
+            // this header is C++23.  Empty makes has_annotated_class_name_v
+            // false, which sends every caller down the runtime-registry path.
             //
-            // consteval: an annotated wrapper's descriptor becomes a
-            // compile-time constant, so it cannot drift from the registry and
-            // cannot silently degrade to Ljava/lang/Object;.
-            for (const std::meta::info annotation : std::meta::annotations_of(^^wrapper_type))
-            {
-                if (std::meta::type_of(annotation) == ^^vmhook::java_class)
-                {
-                    return std::meta::extract<vmhook::java_class>(annotation).name;
-                }
-            }
+            // constexpr rather than consteval: with no annotation there is no
+            // compile-time descriptor to protect, and a consteval function here
+            // would force every caller to be consteval too for no gain.
             return {};
         }
 
@@ -1714,11 +1710,20 @@ export namespace vmhook
             stale the moment an enumerator is added and answers with the fallback
             for the one case a reader most wants named.
 
-            std::meta::enumerators_of(^^enum_type) IS the list, so there is no
-            second one to keep.  A new enumerator is named the day it is
-            declared, and an enum that never had a name function gets one for
-            nothing -- which is why java_thread_state now reads as
-            "_thread_in_Java" in a trace instead of as 8.
+            The module reflects: std::meta::enumerators_of(^^enum_type) IS the
+            list, so there is no second one to keep.  C++23 cannot ask an enum
+            what its enumerators are, but it can ask the COMPILER what it would
+            call one: std::source_location::current().function_name() inside a
+            template taking the value as a non-type parameter spells it, and
+            spells a non-enumerator as a cast -- "(vmhook::anchor_kind)99" --
+            which is what tells the two apart.
+
+            The cost of that difference is a BOUND.  The module reads the real
+            enumerator list; this walks candidate values 0 .. enum_scan_limit and
+            keeps the ones the compiler names, so an enumerator outside that
+            range, or a negative one, reads as empty here and exactly in
+            vmhook.ixx.  Every enum in this library is small and non-negative,
+            which is what makes the bound affordable rather than merely lucky.
 
             Returns an EMPTY view for a value that is not an enumerator, which is
             reachable: these enums are read out of JVM memory, and a JDK this
@@ -1727,48 +1732,94 @@ export namespace vmhook
             gc_collector_name() keep their switches for exactly that reason, as
             their strings are prose and display names rather than identifiers.
 
-            The expansion is over std::define_static_array(...) rather than the
-            vector itself: enumerators_of() allocates during constant evaluation
-            and such an allocation cannot escape it, so the array is what gives
-            the reflections storage that outlives the consteval region.
-            identifier_of() has the same problem and define_static_string() is
-            the same answer, which is what makes the returned view safe to hold.
-
-            INSTANTIATE IT INSIDE THIS MODULE, which is why every enum vmhook
-            names has a small named function of its own (anchor_kind_name,
-            thread_state_name) rather than callers reaching for this directly.
-            enumerators_of() returns a std::vector, <vector> lives in the global
-            module fragment, and a global-module-fragment name is not reachable
-            from a consumer's translation unit -- so instantiating this template
-            THERE fails with "couldn't look up 'std::vector'", pointing at a line
-            in this file that is perfectly well-formed.  Measured on GCC 16.2.0.
-            Instantiated here, the module's own object carries it and a consumer
-            calling one of the named wrappers never sees the problem.
+            Nothing here is module-attached, so unlike vmhook.ixx -- where this
+            template has to be instantiated inside the module or the consumer's
+            lookup of std::vector fails -- this one may be called from anywhere,
+            including on an enum of your own.  Within the bound above.
 
             Complexity: O(enumerators), fully unrolled, no allocation and no
             static initialiser at run time.  noexcept.  Thread safety: safe.
         */
+        /*
+            @brief How far enum_name() probes for enumerators.  See it for why a
+            bound exists at all; 128 covers every enum in this library with room
+            to spare, and each enum pays for its own probe only when a name for
+            it is actually asked for.
+        */
+        inline constexpr std::size_t enum_scan_limit{ 128u };
+
+        /*
+            @brief The identifier of one enumerator, or empty if `value` is none.
+            @details
+            GCC writes the non-type argument into function_name() the way it
+            would spell it in source:
+
+                consteval std::string_view vmhook::detail::enumerator_name_of()
+                    [with auto value = vmhook::anchor_kind::field_of]
+
+            and, for a value no enumerator has, as an explicit cast instead:
+
+                [with auto value = (vmhook::anchor_kind)99]
+
+            The leading '(' is therefore the whole test for "not an enumerator",
+            and the text after the last "::" is the identifier.
+
+            consteval: every one of these is answered while compiling, and what
+            reaches the binary is the bytes of the names and nothing else.
+        */
+        template<auto value>
+        [[nodiscard]] consteval auto enumerator_name_of() noexcept
+            -> std::string_view
+        {
+            const std::string_view signature{ std::source_location::current().function_name() };
+            constexpr std::string_view opener{ "value = " };
+
+            const auto opener_at{ signature.find(opener) };
+            if (opener_at == std::string_view::npos) { return {}; }
+
+            const auto first{ opener_at + opener.size() };
+            auto last{ signature.find_first_of(";]", first) };
+            if (last == std::string_view::npos) { last = signature.size(); }
+
+            const std::string_view spelling{ signature.substr(first, last - first) };
+            if (spelling.empty() || spelling.front() == '(') { return {}; }
+
+            const auto scope{ spelling.rfind("::") };
+            if (scope == std::string_view::npos) { return spelling; }
+            return spelling.substr(scope + 2u);
+        }
+
+        /*
+            @brief enum_scan_limit names, indexed by value; empty where none.
+            @details Built once per enum a name is asked for, entirely at compile
+            time, and never initialised at run time.
+        */
+        template<typename enum_type, std::size_t... candidates>
+        [[nodiscard]] consteval auto enum_names(std::index_sequence<candidates...>) noexcept
+            -> std::array<std::string_view, sizeof...(candidates)>
+        {
+            return { vmhook::detail::enumerator_name_of<static_cast<enum_type>(candidates)>()... };
+        }
+
+        template<typename enum_type>
+            requires std::is_enum_v<enum_type>
+        inline constexpr auto enum_names_v{
+            vmhook::detail::enum_names<enum_type>(
+                std::make_index_sequence<vmhook::detail::enum_scan_limit>{}) };
+
         template<typename enum_type>
             requires std::is_enum_v<enum_type>
         [[nodiscard]] inline auto enum_name(const enum_type value) noexcept
             -> std::string_view
         {
-            std::string_view name{};
+            // Unsigned, so a negative enumerator becomes a large index and is
+            // rejected by the bound rather than indexing backwards out of the
+            // array.
+            const auto index{
+                static_cast<std::make_unsigned_t<std::underlying_type_t<enum_type>>>(value) };
+            if (index >= vmhook::detail::enum_scan_limit) { return {}; }
 
-            // An expansion statement, not a loop: `break` is ill-formed in one,
-            // so every enumerator is compared and the last match wins.  For a
-            // well-formed enum there is at most one, and duplicate enumerators
-            // with one value are indistinguishable anyway.
-            template for (constexpr auto enumerator :
-                          std::define_static_array(std::meta::enumerators_of(^^enum_type)))
-            {
-                if (value == [:enumerator:])
-                {
-                    name = std::define_static_string(std::meta::identifier_of(enumerator));
-                }
-            }
-
-            return name;
+            return vmhook::detail::enum_names_v<enum_type>[index];
         }
 
         /*
@@ -11474,7 +11525,7 @@ export namespace vmhook
         @details
         The zero-ceremony registration:
 
-            class [[= vmhook::java_class("com/example/Player")]] player
+            class player  // [[= vmhook::java_class("com/example/Player")]] in vmhook.ixx
                 : public vmhook::object<player> { ... };
 
             vmhook::register_class<player>();     // no string
@@ -11687,12 +11738,16 @@ export namespace vmhook
         {
         }
 
-        watch_handle(const watch_handle&) = delete (
-            "a watch_handle OWNS the installed watcher; copying it would arm two "
-            "owners for one watcher and uninstall it twice.  Move it instead.");
-        auto operator=(const watch_handle&) -> watch_handle & = delete (
-            "a watch_handle OWNS the installed watcher; copying it would arm two "
-            "owners for one watcher and uninstall it twice.  Move it instead.");
+        // DELETED, and the reason is a comment because C++23 has no
+        // `= delete("reason")` -- vmhook.ixx does, and says this there:
+        // a watch_handle OWNS the installed watcher; copying it would arm two owners
+        // for one watcher and uninstall it twice. Move it instead.
+        watch_handle(const watch_handle&) = delete;
+        // DELETED, and the reason is a comment because C++23 has no
+        // `= delete("reason")` -- vmhook.ixx does, and says this there:
+        // a watch_handle OWNS the installed watcher; copying it would arm two owners
+        // for one watcher and uninstall it twice. Move it instead.
+        auto operator=(const watch_handle&) -> watch_handle & = delete;
 
         watch_handle(watch_handle&& other) noexcept
             : block{ std::move(other.block) }
@@ -11791,12 +11846,16 @@ export namespace vmhook
         {
         }
 
-        hook_handle(const hook_handle&) = delete (
-            "a hook_handle OWNS the installed detour; copying it would leave two "
-            "owners for one hook and unhook it twice.  Move it instead.");
-        auto operator=(const hook_handle&) -> hook_handle& = delete (
-            "a hook_handle OWNS the installed detour; copying it would leave two "
-            "owners for one hook and unhook it twice.  Move it instead.");
+        // DELETED, and the reason is a comment because C++23 has no
+        // `= delete("reason")` -- vmhook.ixx does, and says this there:
+        // a hook_handle OWNS the installed detour; copying it would leave two owners
+        // for one hook and unhook it twice. Move it instead.
+        hook_handle(const hook_handle&) = delete;
+        // DELETED, and the reason is a comment because C++23 has no
+        // `= delete("reason")` -- vmhook.ixx does, and says this there:
+        // a hook_handle OWNS the installed detour; copying it would leave two owners
+        // for one hook and unhook it twice. Move it instead.
+        auto operator=(const hook_handle&) -> hook_handle& = delete;
 
         hook_handle(hook_handle&& other) noexcept
             : method{ other.method }
@@ -25892,16 +25951,24 @@ namespace hotspot
             // immovable is what turns "do not hoist this" from a comment into a
             // compile error -- a hoisted access outlives the resolve that
             // produced it and reads a possibly-relocated object.
-            access(const access&) = delete (
-                "an access proxy is bound for ONE expression and cannot be stored.  "
-                "Keep the ref or borrowed it came from, and re-bind at each use.");
-            access(access&&) = delete (
-                "an access proxy is bound for ONE expression and cannot be stored.  "
-                "Keep the ref or borrowed it came from, and re-bind at each use.");
-            auto operator=(const access&) -> access& = delete (
-                "an access proxy is bound for ONE expression and cannot be reseated.");
-            auto operator=(access&&) -> access& = delete (
-                "an access proxy is bound for ONE expression and cannot be reseated.");
+            // DELETED, and the reason is a comment because C++23 has no
+            // `= delete("reason")` -- vmhook.ixx does, and says this there:
+            // an access proxy is bound for ONE expression and cannot be stored. Keep the
+            // ref or borrowed it came from, and re-bind at each use.
+            access(const access&) = delete;
+            // DELETED, and the reason is a comment because C++23 has no
+            // `= delete("reason")` -- vmhook.ixx does, and says this there:
+            // an access proxy is bound for ONE expression and cannot be stored. Keep the
+            // ref or borrowed it came from, and re-bind at each use.
+            access(access&&) = delete;
+            // DELETED, and the reason is a comment because C++23 has no
+            // `= delete("reason")` -- vmhook.ixx does, and says this there:
+            // an access proxy is bound for ONE expression and cannot be reseated.
+            auto operator=(const access&) -> access& = delete;
+            // DELETED, and the reason is a comment because C++23 has no
+            // `= delete("reason")` -- vmhook.ixx does, and says this there:
+            // an access proxy is bound for ONE expression and cannot be reseated.
+            auto operator=(access&&) -> access& = delete;
             ~access()                                = default;
 
             auto operator->() noexcept
@@ -26643,17 +26710,25 @@ namespace hotspot
         {
         }
 
-        root(const root&) = delete (
-            "a root IS the anchor every ref beneath it resolves through, so it has "
-            "to stay put.  Hold it where it lives (a static, a member) and hand out "
-            "refs anchored on it.");
-        root(root&&) = delete (
-            "a root IS the anchor every ref beneath it resolves through, so it has "
-            "to stay put.  Hold it where it lives and hand out refs anchored on it.");
-        auto operator=(const root&) -> root& = delete (
-            "a root cannot be reseated; construct the one you want.");
-        auto operator=(root&&) -> root& = delete (
-            "a root cannot be reseated; construct the one you want.");
+        // DELETED, and the reason is a comment because C++23 has no
+        // `= delete("reason")` -- vmhook.ixx does, and says this there:
+        // a root IS the anchor every ref beneath it resolves through, so it has to
+        // stay put. Hold it where it lives (a static, a member) and hand out refs
+        // anchored on it.
+        root(const root&) = delete;
+        // DELETED, and the reason is a comment because C++23 has no
+        // `= delete("reason")` -- vmhook.ixx does, and says this there:
+        // a root IS the anchor every ref beneath it resolves through, so it has to
+        // stay put. Hold it where it lives and hand out refs anchored on it.
+        root(root&&) = delete;
+        // DELETED, and the reason is a comment because C++23 has no
+        // `= delete("reason")` -- vmhook.ixx does, and says this there:
+        // a root cannot be reseated; construct the one you want.
+        auto operator=(const root&) -> root& = delete;
+        // DELETED, and the reason is a comment because C++23 has no
+        // `= delete("reason")` -- vmhook.ixx does, and says this there:
+        // a root cannot be reseated; construct the one you want.
+        auto operator=(root&&) -> root& = delete;
         ~root()                              = default;
 
         /*
@@ -27611,13 +27686,17 @@ namespace hotspot
 
         ~oop_pin() noexcept = default;
 
-        oop_pin(const oop_pin&) = delete (
-            "an oop_pin carries the collection epoch its address was captured in.  "
-            "Copying it would duplicate that stamp and let a stale copy outlive the "
-            "check.  Move it, or take a fresh pin.");
-        auto operator=(const oop_pin&) -> oop_pin& = delete (
-            "an oop_pin carries the collection epoch its address was captured in; "
-            "copying it would duplicate that stamp.  Move it instead.");
+        // DELETED, and the reason is a comment because C++23 has no
+        // `= delete("reason")` -- vmhook.ixx does, and says this there:
+        // an oop_pin carries the collection epoch its address was captured in.
+        // Copying it would duplicate that stamp and let a stale copy outlive the
+        // check. Move it, or take a fresh pin.
+        oop_pin(const oop_pin&) = delete;
+        // DELETED, and the reason is a comment because C++23 has no
+        // `= delete("reason")` -- vmhook.ixx does, and says this there:
+        // an oop_pin carries the collection epoch its address was captured in;
+        // copying it would duplicate that stamp. Move it instead.
+        auto operator=(const oop_pin&) -> oop_pin& = delete;
 
         oop_pin(oop_pin&& other) noexcept
             : oop_{ other.oop_ }

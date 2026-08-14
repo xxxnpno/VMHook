@@ -2,15 +2,40 @@
 
 Read fields, call methods, construct objects and hook methods in a **running HotSpot JVM**, from C++, without asking the JVM's permission. No JVMTI, no JNI.
 
-**A C++26 module, and g++ only.** `import vmhook;` — there is no header any more, and no
-preprocessor in the library beyond the global module fragment that `<windows.h>` requires.
-The portability branches for MSVC, clang, Linux, macOS, iOS, Android and aarch64 are gone: this
-targets the newest g++ on Windows x86-64 and nothing else.
+**A C++26 module, and g++ only**, with a **generated C++23 header** beside it for a toolchain
+that has neither modules nor reflection. No preprocessor in the library beyond the global module
+fragment that `<windows.h>` requires. The portability branches for MSVC, clang, Linux, macOS,
+iOS, Android and aarch64 are gone: this targets the newest g++ on Windows x86-64 and nothing
+else.
 
 ```bash
-g++ -std=c++26 -fmodules -c vmhook/ext/vmhook/vmhook.ixx -o vmhook.o
-g++ -std=c++26 -fmodules your.cpp vmhook.o -o your.exe -Wl,--allow-multiple-definition
+# the module — C++26, static reflection, and what the library is written in
+g++ -std=c++26 -freflection -fmodules -c vmhook/ext/vmhook/vmhook.ixx -o vmhook.o
+g++ -std=c++26 -freflection -fmodules your.cpp vmhook.o -o your.exe -Wl,--allow-multiple-definition
+
+# or the header — C++23, no flags, nothing to build first
+g++ -std=c++23 -I vmhook/ext your.cpp -o your.exe
 ```
+
+`vmhook.hpp` is **generated from `vmhook.ixx`** by `tools/make_header.py`, so the two cannot
+drift: everything is edited in the module. The transform removes exactly the C++26 from it —
+the module preamble, `std::meta`, `^^`, annotations, `= delete("reason")` — and supplies a
+C++23 answer for each, so the same call returns the same string either way. **The header is
+C++23 and stays C++23**; nothing in it may ever need a C++26 feature.
+
+Two things the module does that the header cannot, both diagnostics rather than behaviour:
+
+| | module | header |
+|---|---|---|
+| `type_name<T>()` | `std::meta::display_string_of(^^T)` | parses `std::source_location`, same spelling |
+| enumerator names | `std::meta::enumerators_of(^^E)` | probes values 0–127 via `source_location` |
+| `[[= vmhook::java_class("…")]]` | read at compile time | not readable; falls back to `register_class` |
+
+A consumer of the module includes its own headers **before** the import — `#include <cstdio>`
+then `import vmhook;`, never the other way round, or GCC 16.2 reports a redefinition of
+`std::__is_constant_evaluated`. It also includes `<string_view>` if it means to compare the
+views vmhook returns: their operators live in the global module fragment, which a consumer's
+lookup does not reach.
 
 That link flag is working around a **GCC 16.2 bug**, not a design choice: a function-local
 `static` inside an inline function in a module's purview is emitted into the module's object
@@ -247,29 +272,73 @@ vmhook::shutdown_hooks();
 
 ## Faster builds
 
-The header is 27k lines and every one of your TUs parses all of it. Link
-`vmhook::compiled` (`vmhook.lib` / `libvmhook.a`) instead of `vmhook::vmhook`
-and your targets inherit a precompiled header built from it:
+Measured here on GCC 16.2.0, one TU that names `vmhook::version` and nothing
+else:
+
+| | cost |
+|---|---|
+| `#include <vmhook/vmhook.hpp>` | **1.74 s per TU**, every TU |
+| `import vmhook;` | **0.10 s per TU**, plus 4 s once to build the module |
+
+Seventeen times cheaper per TU, and that is the whole argument for the module.
+
+### Take the prebuilt one
+
+Every [release](https://github.com/xxxnpno/vmhook/releases) carries the module
+already compiled, so you pay neither the 4 s nor the 1.7 s:
+
+```
+libvmhook.a    the module's static archive — this toolchain's "vmhook.lib"
+vmhook.gcm     the compiled module interface
+vmhook.ixx     the module source
+vmhook.hpp     the generated C++23 header
+```
+
+Put `vmhook.gcm` in a `gcm.cache/` directory beside where you compile, link
+`libvmhook.a`, and `import vmhook;` costs a tenth of a second with nothing to
+build first:
+
+```bash
+mkdir -p gcm.cache && cp /path/to/vmhook.gcm gcm.cache/
+g++ -std=c++26 -freflection -fmodules -O2 -c your.cpp -o your.o
+g++ your.o -l:libvmhook.a -o your.exe -Wl,--allow-multiple-definition
+```
+
+**The `.gcm` is not portable, by design.** It is GCC's own on-disk form of the
+module, valid only for the exact compiler build and flags named in the release's
+`BUILD-INFO.txt`. Any other compiler rejects it and rebuilds from `vmhook.ixx` —
+correct behaviour, and it costs only the 4 s the file was saving. The archive and
+the two sources have no such tie.
+
+### Or build it yourself
 
 ```cmake
 add_subdirectory(vmhook)
+set(VMHOOK_BUILD_MODULE ON)
+target_link_libraries(your_payload PRIVATE vmhook::module)
+```
+
+### If you are on the header
+
+Link `vmhook::compiled` instead of `vmhook::vmhook` and your targets inherit a
+precompiled header built from `vmhook.hpp`:
+
+```cmake
 target_link_libraries(your_payload PRIVATE vmhook::compiled)
 ```
 
 A 7-TU project, rebuilding all of its sources: **12.3 s → 2.2 s** on MSVC 19.44,
 **12.1 s → 6.8 s** on GCC 15. The PCH costs a few seconds to build once, so a
-one-TU project gains nothing — keep `vmhook::vmhook` there.
-
-If you consume an installed vmhook rather than a subdirectory, the PCH cannot
-come with it (it is tied to the exact compiler and flags that made it), so ask
-for one yourself:
+one-TU project gains nothing — keep `vmhook::vmhook` there. A PCH cannot ship
+(it is tied to the exact compiler and flags that made it), so an installed
+vmhook needs you to ask for one yourself:
 
 ```cmake
 target_precompile_headers(your_payload PRIVATE <vmhook/vmhook.hpp>)
 ```
 
-`vmhook::compiled_version()` returns the version the `.lib` was built from —
-compare it with `VMHOOK_VERSION` if you ever suspect a stale one.
+`vmhook::compiled_version()` returns the version the archive was built from —
+compare it with `vmhook::version` if you ever suspect a stale one.
 
 ## How the hook actually works
 

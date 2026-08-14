@@ -23,14 +23,18 @@ namespace vmhook
     /*
         @brief The library version this archive was compiled from.
         @details
-        Compare against VMHOOK_VERSION (the value your TU sees) to catch a .lib
+        Compare against vmhook::version (the value your TU sees) to catch a .lib
         built from a different header than the one you included.  They differ
         only if the two came from different checkouts.
+
+        It reads a `constexpr int` rather than the VMHOOK_VERSION macro it used
+        to, because that macro no longer exists anywhere: a macro cannot cross a
+        module boundary, so the version became a value when vmhook did.
     */
     auto compiled_version() noexcept
         -> std::uint32_t
     {
-        return static_cast<std::uint32_t>(VMHOOK_VERSION);
+        return static_cast<std::uint32_t>(vmhook::version);
     }
 
     /*
@@ -39,6 +43,6 @@ namespace vmhook
     auto compiled_version_string() noexcept
         -> const char*
     {
-        return VMHOOK_VERSION_STRING;
+        return vmhook::version_string.data();
     }
 }

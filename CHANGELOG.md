@@ -4,9 +4,94 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [7.0.0] — 2026-08-14
+
+### Changed
+- **vmhook is a C++26 named module, and the preprocessor is gone.**  `import
+  vmhook;`.  Every consumer-visible macro had to become a real declaration,
+  because a macro cannot cross a module boundary and an importing consumer would
+  have seen nothing at all — which is the better shape regardless, since a macro
+  is invisible to the type system, the debugger and every tool that reads the
+  code.
+
+  | was | is |
+  |---|---|
+  | `VMHOOK_VERSION_*` | `vmhook::version_major` / `_minor` / `_patch` / `version` / `version_string` |
+  | `VMHOOK_DEBUG_LOGS` | `vmhook::debug_logs`, a `constexpr bool` behind `if constexpr` |
+  | `VMHOOK_LOG_FILE` | `vmhook::log_file_path`, and now a **run-time** path |
+  | `VMHOOK_AUTO_ATTACH_THREADS` | `vmhook::auto_attach_threads` |
+  | `VMHOOK_DISABLE_AUTO_REPAIR` | `vmhook::auto_repair` |
+  | `VMHOOK_LOG(...)` | `vmhook::detail::log_line(...)`, a variadic function template |
+  | `VMHOOK_JNICALL` | nothing — one calling convention on x86-64 |
+  | `VMHOOK_DELETED(reason)` | `= delete(reason)` |
+
+  The only directives left are the `#include`s in the global module fragment and
+  the two macros `<windows.h>` insists on.  Win32 has no module; that is
+  unavoidable rather than a shortcut.
+
+- **`vmhook.hpp` is back, and it is GENERATED from `vmhook.ixx`.**  The module
+  refactor deleted the header outright, which left every consumer without a
+  modules-and-reflection toolchain with nothing at all — and left this
+  repository unable to build its own test suite, since all 106 tests include it.
+
+  `tools/make_header.py` derives it: the module preamble becomes `#pragma once`,
+  `export namespace` becomes `namespace`, `<meta>` goes, and each C++26
+  construct is replaced by a C++23 answer rather than a stub.  Every anchor must
+  match exactly once and nothing C++26 may survive the transform, both checked
+  by the script — a miss is a hard error, because a silently half-transformed
+  header is the one outcome worth crashing to avoid.
+
+  **`vmhook.hpp` is C++23 and stays C++23.**  It is not hand-edited; edit the
+  module and regenerate.  `make_header.py --check` fails if the committed header
+  is stale.
+
+- **`vmhook::compiled` produces `libvmhook_pch.a`, not `libvmhook.a`.**  The name
+  `vmhook` now belongs to the module's archive, which is the one a release ships
+  and the one that holds compiled code.  Consumers name the CMake target
+  (`vmhook::compiled`), not the file, so only the filename moved.
+
+### Added
+- **Prebuilt artefacts on every release, so a consumer compiles neither.**
+  Measured on GCC 16.2.0 for one TU that names `vmhook::version`: including the
+  header costs **1.74 s per TU**, importing the module costs **0.10 s** — plus
+  4 s, once, to build the module, which the release removes as well.
+
+  `libvmhook.a` (the module's archive — this toolchain's `vmhook.lib`),
+  `vmhook.gcm` (the compiled module interface), and both sources.  The `.gcm` is
+  valid only for the exact compiler and flags in `BUILD-INFO.txt`; any other
+  compiler rejects it and rebuilds from `vmhook.ixx`, which is correct and costs
+  only the time the file was saving.  `tools/make_release.sh` builds all of it
+  and proves each artefact works — one smoke test imports the module with no
+  `vmhook.ixx` anywhere in reach, another compiles the header alone at C++23 —
+  before anything is staged.
+
+- **`vmhook::detail::enum_name<E>()`, reflected, and the names it gives.**
+  `std::meta::enumerators_of(^^E)` IS the enumerator list, so the switches that
+  spelled each identifier back as a string literal are gone with the second list
+  they were.  `anchor_kind_name()` is now four lines instead of a switch that a
+  fifth anchor kind would have left answering "empty" for itself.
+
+  `vmhook::hotspot::thread_state_name()` is new, and is why a refused call now
+  reads `refusing to invoke on a JavaThread in state _thread_blocked_trans`
+  instead of `in state 11` — a number the reader had to look up in HotSpot's own
+  headers before the message meant anything.
+
+  `error_message()` and `gc_collector_name()` keep their switches on purpose:
+  their strings are prose and display names ("ZGC", "Shenandoah"), not
+  identifiers.
+
+  The header gets the same names without reflection, by probing candidate values
+  0–127 through `std::source_location` — GCC spells an enumerator as
+  `anchor_kind::field_of` and a non-enumerator as `(anchor_kind)99`, which is
+  what tells them apart.  Same output, bounded rather than exact.
 
 ### Fixed
+- **`type_name<T>()` reported the module in the name.**  GCC marks a
+  module-attached entity with its module, so every one of this library's own
+  types came back as `vmhook::object_base@vmhook`, suffix and all, in
+  user-facing warnings.  The suffix is now stripped, including inside template
+  arguments where it appears once per component.
+
 - **The JDK 8-17 class lookup found roughly one class per hash bucket instead of
   all of them.**  `BasicHashtableEntry` keeps `_hash` at +0 and `_next` at +8;
   the per-CLD and SystemDictionary walks read `_next` from +0.  That is `_hash`,
@@ -24,6 +109,29 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   takes the linked-list path instead — so this code only runs on JDK 8-17, which
   in practice means Minecraft.  Found from chatwire, which could not attach to
   any 1.8.9 client at all.
+
+- **`vmhook.cpp` did not compile.**  It read `VMHOOK_VERSION` and
+  `VMHOOK_VERSION_STRING`, macros the de-macro pass had already deleted.  It
+  reads `vmhook::version` and `vmhook::version_string` now.
+
+### Removed
+- **The GUI viewer, and a 25 MB module cache.**  The viewer is a separate
+  application that happened to live in this tree; nothing in the library's
+  CMakeLists built it and no consumer wanted it in their clone.
+  `gcm.cache/vmhook.gcm` was never deliberate — GCC's compiled-module cache,
+  tied to one compiler version and one set of flags, regenerated by any build
+  that needs it.  Both are untracked rather than deleted: the history still has
+  every revision.  `.editorconfig` and `.clang-format` went the same way; they
+  configure a working copy, and `vmhook.hpp` is generated rather than formatted.
+
+### Known issues
+- **The standalone test suite does not build.**  93 of its 106 translation units
+  do; the other 13 assert on macros the de-macro pass removed
+  (`VMHOOK_OS_WINDOWS`, `VMHOOK_VERSION`, `VMHOOK_HAS_DEDUCING_THIS`, …), and six
+  of the tests that do build carry POSIX assumptions that a Windows-only library
+  cannot satisfy.  Every one of those failures is in `tests/`, which is
+  developer-only and not published with the library; no error is in `vmhook.hpp`
+  or `vmhook.ixx`.
 
 ## [6.0.0] — 2026-08-06
 
@@ -814,7 +922,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   cancel, arg mutation), `make_unique` Java-object allocation, class
   lookup via VMStructs with JNI fallback.
 
-[Unreleased]: https://github.com/xxxnpno/vmhook/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/xxxnpno/vmhook/compare/v7.0.0...HEAD
+[7.0.0]: https://github.com/xxxnpno/vmhook/compare/v6.0.0...v7.0.0
 [0.4.0]: https://github.com/xxxnpno/vmhook/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/xxxnpno/vmhook/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/xxxnpno/vmhook/compare/v0.1.0...v0.2.0
